@@ -117,9 +117,11 @@ class StateMachine:
                 self.state = State.EXIT_ROW
 
         elif self.state == State.EXIT_ROW:
+            # To-Do: Aus Reihe herausfahren
             self.state = State.TURN
 
         elif self.state == State.TURN:
+            # To-Do: Wende gemäß Muster (rechts oder links)
             self.state = State.ENTER_ROW
 
         elif self.state == State.ENTER_ROW:
