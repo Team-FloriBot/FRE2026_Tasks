@@ -26,7 +26,7 @@ class ControlCommand:
 
 # class Perception handles laser data preprocessing
 class Perception:
-    def __init__(self, x_min=0.0, x_max=2.0, y_min=0.1, y_max=1.0):
+    def __init__(self, x_min, x_max, y_min, y_max):
         self.x_min = x_min
         self.x_max = x_max
         self.y_min = y_min
@@ -73,7 +73,7 @@ class State(Enum):
     ENTER_ROW = 4
 
 class Pattern:
-    def __init__(self, pattern_str="1L-1R-2L-3R"):
+    def __init__(self, pattern_str):
         self.steps = self.parse(pattern_str)
         self.index = 0
 
@@ -136,7 +136,7 @@ class StateMachine:
 class Controller:
     def __init__(self):
         self.kp = 2.0
-        self.kd = 0.5
+        self.kd = 0.0
         self.ki = 0.0
 
         self.prev_error = 0
@@ -181,55 +181,114 @@ class Controller:
 # ROS Node
 class FieldRobotNavigator(Node):
     def __init__(self):
-        super().__init__("field_robot_navigator")
+        super().__init__("maize_navigator")
 
-        # Module
-        self.perception = Perception()
-        
-        self.pattern = Pattern("1L-1R-2L-3R") # insert required pattern here (later as parameter)
+        # -------------------------
+        # Parameter deklarieren
+        # -------------------------
+        self.declare_parameter("pattern", "1L-1R-2L-3R")
 
+        self.declare_parameter("perception.x_min", 0.0)
+        self.declare_parameter("perception.x_max", 2.0)
+        self.declare_parameter("perception.y_min", 0.1)
+        self.declare_parameter("perception.y_max", 1.0)
+
+        self.declare_parameter("controller.kp", 2.0)
+        self.declare_parameter("controller.kd", 0.5)
+        self.declare_parameter("controller.ki", 0.0)
+
+        self.declare_parameter("topics.pointcloud", "/point_cloud")
+        self.declare_parameter("topics.cmd_vel", "/cmd_vel")
+
+        # -------------------------
+        # Parameter holen
+        # -------------------------
+        pattern_str = self.get_parameter("pattern").get_parameter_value().string_value
+
+        x_min = self.get_parameter("perception.x_min").value
+        x_max = self.get_parameter("perception.x_max").value
+        y_min = self.get_parameter("perception.y_min").value
+        y_max = self.get_parameter("perception.y_max").value
+
+        kp = self.get_parameter("controller.kp").value
+        kd = self.get_parameter("controller.kd").value
+        ki = self.get_parameter("controller.ki").value
+
+        pointcloud_topic = self.get_parameter("topics.pointcloud").value
+        cmd_vel_topic = self.get_parameter("topics.cmd_vel").value
+
+        # -------------------------
+        # Module initialisieren
+        # -------------------------
+        self.perception = Perception(x_min, x_max, y_min, y_max)
+
+        self.pattern = Pattern(pattern_str)
         self.state_machine = StateMachine(self.pattern)
+
         self.controller = Controller()
+        self.controller.kp = kp
+        self.controller.kd = kd
+        self.controller.ki = ki
 
         self.latest_cloud = None
 
-        # ROS
+        # -------------------------
+        # ROS Schnittstellen
+        # -------------------------
         self.create_subscription(
             PointCloud2,
-            "/point_cloud",
+            pointcloud_topic,
             self.cloud_callback,
             10
         )
 
-        self.cmd_pub = self.create_publisher(Twist, "/cmd_vel", 10)
+        self.cmd_pub = self.create_publisher(Twist, cmd_vel_topic, 10)
 
         self.timer = self.create_timer(0.1, self.loop)
 
+        # -------------------------
+        # Parameter-Update Callback (optional, aber stark!)
+        # -------------------------
+        self.add_on_set_parameters_callback(self.parameter_callback)
+
+        self.get_logger().info("FieldRobotNavigator gestartet")
+
+    # -------------------------
+    # Dynamische Parameteränderung
+    # -------------------------
+    def parameter_callback(self, params):
+        for param in params:
+            if param.name == "controller.kp":
+                self.controller.kp = param.value
+            elif param.name == "controller.kd":
+                self.controller.kd = param.value
+            elif param.name == "controller.ki":
+                self.controller.ki = param.value
+
+        return rclpy.parameter.SetParametersResult(successful=True)
+
+    # -------------------------
     def cloud_callback(self, msg):
         self.latest_cloud = msg
 
+    # -------------------------
     def loop(self):
         if self.latest_cloud is None:
             return
 
-        # 1. Wahrnehmung
         perception = self.perception.process(self.latest_cloud)
-
-        # 2. State
         state = self.state_machine.update(perception)
 
-        # 3. Controller
         direction = self.state_machine.current_direction
         cmd = self.controller.compute(state, perception, direction)
 
-        # 4. Publish
         twist = Twist()
         twist.linear.x = cmd.linear
         twist.angular.z = cmd.angular
 
         self.cmd_pub.publish(twist)
 
-        self.get_logger().info(f"State: {state}, cmd: {cmd}")
+        self.get_logger().debug(f"State: {state}, cmd: {cmd}")
 
 
 # main
