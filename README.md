@@ -5,11 +5,11 @@ Dieses Repository beinhaltet die Implementierung der Aufgaben für das Field Rob
 um das Repo zu bauen, folgendes auführen:
 
 ```
-git clone https://github.com/Team-FloriBot/FRE2026.git
+git clone https://github.com/Team-FloriBot/FRE2026_Tasks.git
 ```
 
 ```
-cd FRE2026
+cd FRE2026_Tasks
 ```
 
 ```
@@ -37,8 +37,9 @@ source /opt/ros/jazzy/setup.bash
 source install/local_setup.bash
 ```
 
-## Starte Base
-Für das FRE2026 werden FloriBot1.0 und FloriBOt 4.0 berücksichtigt. Somit kann einer der beiden base-nodes gestaret werden, je nach Verwendung.
-
-... implementierung folgt
-
+## Package Maize Navigation
+Enthält die Navigationslogik für den FloriBot im Rahmen des **Field Robot Event 2026**. Der Fokus liegt auf der autonomen Navigation durch Maisreihen basierend auf einem vordefinierten Muster (Pattern).
+```
+ros2 launch maize_navigation maize_navigation.launch.py
+``` 
+Die Konfiguration erfolgt über die config/params.yaml. Hier können das Fahrmuster sowie wietere Paramter angepasstwerden.
