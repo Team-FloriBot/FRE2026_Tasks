@@ -2,6 +2,7 @@ import rclpy
 from rclpy.node import Node
 from geometry_msgs.msg import Twist, Point32
 from sensor_msgs.msg import LaserScan, PointCloud2, PointField
+from sensor_msgs_py import point_cloud2
 
 import numpy as np
 from enum import Enum
@@ -366,7 +367,7 @@ class FieldRobotNavigator(Node):
         point_data = [(p.x, p.y, p.z) for p in points]
         
         header.stamp = self.get_clock().now().to_msg()
-        header.frame_id = "front_laser" 
+        header.frame_id = self.latest_cloud.header.frame_id
         cloud = point_cloud2.create_cloud(header, fields, point_data)
         self.points_pub.publish(cloud)
 
