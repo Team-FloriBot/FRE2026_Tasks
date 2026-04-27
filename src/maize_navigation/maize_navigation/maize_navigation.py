@@ -23,8 +23,6 @@ class PerceptionData:
     min_dist: float = np.inf
     num_points_in_box: int = 0
     filtered_points: list = None
-    
-    # --- IMU & Odometrie ---
 
 
 @dataclass
@@ -107,8 +105,8 @@ class Perception:
         data.min_dist = min_distance
         data.num_points_in_box = len(points)
         
-        left_y = [p.y for p in points if p.y < 0]
-        right_y = [p.y for p in points if p.y >= 0]
+        left_y = [p.y for p in points if p.y > 0]
+        right_y = [p.y for p in points if p.y <= 0]
         
         data.left_dist = np.mean(np.abs(left_y)) if len(left_y) > 0 else np.inf
         data.right_dist = np.mean(np.abs(right_y)) if len(right_y) > 0 else np.inf
@@ -274,6 +272,7 @@ class Controller:
 
         return cmd
 
+# Wrapper Node to start the autonomous navigation
 class FieldRobotNavigator(Node):
     def __init__(self):
         super().__init__("maize_navigator")
