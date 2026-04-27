@@ -25,10 +25,7 @@ class PerceptionData:
     filtered_points: list = None
     
     # --- IMU & Odometrie ---
-    # Hinweis zur Verbesserung: Die Platzhalter für IMU und Odometrie 
-    # wurden entfernt, da der alte Code diese nicht verwendet hat. 
-    # Es wäre jedoch eine gute Idee für zukünftige Verbesserungen, 
-    # diese Sensoren zur präziseren Orientierung und Positionsbestimmung zu integrieren!
+
 
 @dataclass
 class ControlCommand:
@@ -181,13 +178,15 @@ class StateMachine:
                 self.node.get_logger().info("At least one side has no maize. Reached the end of a row. Leaving the row...")
                 self.exit_start_time = self.node.get_clock().now().nanoseconds / 1e9
                 self.state = State.EXIT_ROW
-                
+                self.node.get_logger().info("Switch to State EXIT_ROW")
+
         elif self.state == State.EXIT_ROW:
             time_to_drive = params['drive_out_dist'] / params['vel_linear_drive']
             current_time = self.node.get_clock().now().nanoseconds / 1e9
             if (current_time - self.exit_start_time) >= time_to_drive:
                 self.node.get_logger().info("Turn and exit...")
                 self.state = State.TURN
+                self.node.get_logger().info("Switch to State TURN")
 
         elif self.state == State.TURN:
             if -0.25 < perception.x_mean < 0.25:
@@ -195,18 +194,21 @@ class StateMachine:
                 step = self.pattern.current()
                 if step and step[0] == 1:
                     self.state = State.ENTER_ROW
+                    self.node.get_logger().info("Switch to State ENTER_ROW")
                 else:
                     self.row_counter = 1
                     self.previous_row = 1
                     self.actual_row = 1
                     self.actual_dist = perception.min_dist
                     self.state = State.COUNTING_ROWS
+                    self.node.get_logger().info("Switch to State COUNTING_ROWS")
 
         elif self.state == State.COUNTING_ROWS:
             step = self.pattern.current()
             if step and step[0] == self.row_counter:
                 self.node.get_logger().info("Start turning to row...")
                 self.state = State.ENTER_ROW
+                self.node.get_logger().info("Switch to State ENTER_ROW")
             else:
                 if perception.num_points_in_box > 0:
                     self.actual_row = 1
@@ -226,7 +228,8 @@ class StateMachine:
                 if self.pattern.current() is None:
                     self.node.get_logger().info("Pattern is now finished")
                 self.state = State.DRIVE_IN_ROW
-                
+                self.node.get_logger().info("Switch to State DRIVE_IN_ROW")
+
         return self.state
 
 class Controller:
