@@ -53,6 +53,14 @@ class Pattern:
                 result.append((count, direction))
         return result
 
+    def current(self):
+        if self.index < len(self.steps):
+            return self.steps[self.index]
+        return None
+
+    def next(self):
+        self.index += 1
+
 
 class Perception:
     def __init__(self, bounding_boxes):
@@ -142,14 +150,6 @@ class Perception:
         data.filtered_points = points
 
         return data
-
-    def current(self):
-        if self.index < len(self.steps):
-            return self.steps[self.index]
-        return None
-
-    def next(self):
-        self.index += 1
 
 class StateMachine:
     def __init__(self, pattern, node):
