@@ -1,8 +1,7 @@
 import rclpy
 from rclpy.node import Node
 from geometry_msgs.msg import Twist, Point32
-from sensor_msgs.msg import PointCloud2, PointField
-from sensor_msgs_py import point_cloud2
+from sensor_msgs.msg import LaserScan, PointCloud2, PointField
 
 import numpy as np
 from enum import Enum
@@ -46,10 +45,11 @@ class Perception:
     def __init__(self, bounding_boxes):
         self.bounding_boxes = bounding_boxes
 
-    def process(self, cloud_msg, current_state, pattern_direction) -> PerceptionData:
+    def process(self, scan_msg, current_state, pattern_direction) -> PerceptionData:
         data = PerceptionData()
         points = []
         
+        # 1. Bestimme die Box basierend auf dem Status
         if current_state == State.DRIVE_IN_ROW:
             box = self.bounding_boxes['drive_in_row']
             both_sides = 'both'
@@ -74,22 +74,38 @@ class Perception:
 
         min_distance = np.inf
 
-        for p in point_cloud2.read_points(cloud_msg, field_names=("x", "y", "z"), skip_nans=True):
-            x, y, z = p
-            distance = np.sqrt(x**2 + y**2)
-            if distance < min_distance:
-                min_distance = distance
+        # 2. Iteriere über die LaserScan-Daten
+        # i ist der Index, dist ist die gemessene Entfernung
+        for i, dist in enumerate(scan_msg.ranges):
+            # Filtere ungültige Werte (inf, nan oder außerhalb des Sensorbereichs)
+            if dist < scan_msg.range_min or dist > scan_msg.range_max or np.isinf(dist):
+                continue
+            
+            # Berechne den Winkel des aktuellen Strahls
+            angle = scan_msg.angle_min + i * scan_msg.angle_increment
+            
+            # Umrechnung Polar -> Kartesisch (X = Vorne, Y = Links)
+            x = dist * np.cos(angle)
+            y = dist * np.sin(angle)
+
+            if dist < min_distance:
+                min_distance = dist
                 
+            # 3. Filterung durch die Bounding Box
+            # 'both' nutzt den Betrag von y (für links und rechts)
             if both_sides == 'both':
                 if y_min < abs(y) < y_max and x_min < x < x_max:
-                    points.append(Point32(x=x, y=y, z=z))
+                    points.append(Point32(x=float(x), y=float(y), z=0.0))
+            # 'L' filtert negative y-Werte (in Stage/ROS ist links oft positiv, 
+            # aber wir folgen hier deiner Logik aus dem Code)
             elif both_sides == 'L':
                 if -y_max < y < -y_min and x_min < x < x_max:
-                    points.append(Point32(x=x, y=y, z=z))
+                    points.append(Point32(x=float(x), y=float(y), z=0.0))
             elif both_sides == 'R':
                 if y_min < y < y_max and x_min < x < x_max:
-                    points.append(Point32(x=x, y=y, z=z))
+                    points.append(Point32(x=float(x), y=float(y), z=0.0))
 
+        # 4. Daten-Aggregation
         data.min_dist = min_distance
         data.num_points_in_box = len(points)
         
@@ -103,6 +119,7 @@ class Perception:
             data.row_end_detected = True
         else:
             data.center_error = (data.right_dist - data.left_dist) / 2.0
+            data.row_end_detected = False # Wichtig: explizit zurücksetzen
             
         points_x = [p.x for p in points]
         data.x_mean = np.mean(points_x) if len(points_x) > 0 else np.inf
@@ -289,7 +306,7 @@ class FieldRobotNavigator(Node):
         self.latest_cloud = None
 
         # ROS Schnittstellen
-        self.create_subscription(PointCloud2, self.params['topic_pointcloud'], self.cloud_callback, 10)
+        self.create_subscription(LaserScan, self.params['topic_pointcloud'], self.cloud_callback, 10)
         self.cmd_pub = self.create_publisher(Twist, self.params['topic_cmd_vel'], 10)
         self.points_pub = self.create_publisher(PointCloud2, self.params['topic_field_points'], 10)
 
