@@ -9,6 +9,10 @@ from enum import Enum
 from dataclasses import dataclass
 import re
 
+# ============================================================
+# >>> DATENCONTAINER: PERCEPTION OUTPUT
+# Wird von Perception berechnet und von StateMachine + Controller genutzt
+# ============================================================
 @dataclass
 class PerceptionData:
     # --- Lidar Daten ---
@@ -25,11 +29,19 @@ class PerceptionData:
     filtered_points: list = None
 
 
+# ============================================================
+# >>> DATENCONTAINER: CONTROLLER OUTPUT
+# Wird später in Twist übersetzt
+# ============================================================
 @dataclass
 class ControlCommand:
     linear: float
     angular: float
 
+
+# ============================================================
+# >>> STATE MACHINE ZUSTÄNDE
+# ============================================================
 class State(Enum):
     DRIVE_IN_ROW = 1
     EXIT_ROW = 2
@@ -37,6 +49,11 @@ class State(Enum):
     COUNTING_ROWS = 4
     ENTER_ROW = 5
 
+
+# ============================================================
+# >>> PATTERN (z.B. "1L-2R")
+# Steuert wie viele Reihen gefahren werden und in welche Richtung
+# ============================================================
 class Pattern:
     def __init__(self, pattern_str):
         self.steps = self.parse(pattern_str)
@@ -62,6 +79,9 @@ class Pattern:
         self.index += 1
 
 
+# ============================================================
+# >>> PERCEPTION (Sensorverarbeitung)
+# ============================================================
 class Perception:
     def __init__(self, bounding_boxes):
         self.bounding_boxes = bounding_boxes
@@ -70,7 +90,9 @@ class Perception:
         data = PerceptionData()
         points = []
         
-        # 1. Bestimme die Box basierend auf dem Status
+        # ========================================================
+        # >>> STATE-ABHÄNGIGE WAHRNEHMUNG (ANPASSBAR!)
+        # ========================================================
         if current_state == State.DRIVE_IN_ROW:
             box = self.bounding_boxes['drive_in_row']
             both_sides = 'both'
@@ -95,25 +117,25 @@ class Perception:
 
         min_distance = np.inf
 
-        # 2. Iteriere über die LaserScan-Daten
-        # i ist der Index, dist ist die gemessene Entfernung
+        # ========================================================
+        # >>> LASERDATEN → PUNKTE
+        # ========================================================
         for i, dist in enumerate(scan_msg.ranges):
-            # Filtere ungültige Werte (inf, nan oder außerhalb des Sensorbereichs)
             if dist < scan_msg.range_min or dist > scan_msg.range_max or np.isinf(dist):
                 continue
             
-            # Berechne den Winkel des aktuellen Strahls
             angle = scan_msg.angle_min + i * scan_msg.angle_increment
             
-            # Umrechnung Polar -> Kartesisch (X = Vorne, Y = Links)
+            # >>> POLAR → KARTESISCH
             x = dist * np.cos(angle)
             y = dist * np.sin(angle)
 
             if dist < min_distance:
                 min_distance = dist
                 
-            # 3. Filterung durch die Bounding Box
-            # 'both' nutzt den Betrag von y (für links und rechts)
+            # ====================================================
+            # >>> FILTERLOGIK (HIER PASSIERT DIE MAGIE!)
+            # ====================================================
             if both_sides == 'both':
                 if y_min < abs(y) < y_max and x_min < x < x_max:
                     points.append(Point32(x=float(x), y=float(y), z=0.0))
@@ -125,7 +147,9 @@ class Perception:
                 if y_min < y < y_max and x_min < x < x_max:
                     points.append(Point32(x=float(x), y=float(y), z=0.0))
 
-        # 4. Daten-Aggregation
+        # ========================================================
+        # >>> FEATURE BERECHNUNG (ENTSCHEIDUNGSBASIS!)
+        # ========================================================
         data.min_dist = min_distance
         data.num_points_in_box = len(points)
         
@@ -135,11 +159,12 @@ class Perception:
         data.left_dist = np.mean(np.abs(left_y)) if len(left_y) > 0 else np.inf
         data.right_dist = np.mean(np.abs(right_y)) if len(right_y) > 0 else np.inf
         
+        # >>> REIHENENDE-ERKENNUNG
         if np.isinf(data.left_dist) or np.isinf(data.right_dist):
             data.row_end_detected = True
         else:
             data.center_error = (data.right_dist - data.left_dist) / 2.0
-            data.row_end_detected = False # Wichtig: explizit zurücksetzen
+            data.row_end_detected = False
             
         points_x = [p.x for p in points]
         data.x_mean = np.mean(points_x) if len(points_x) > 0 else np.inf
@@ -151,12 +176,17 @@ class Perception:
 
         return data
 
+
+# ============================================================
+# >>> STATE MACHINE
+# ============================================================
 class StateMachine:
     def __init__(self, pattern, node):
         self.state = State.DRIVE_IN_ROW
         self.pattern = pattern
         self.node = node
         
+        # >>> INTERNE VARIABLEN (KRITISCH!)
         self.exit_start_time = 0.0
         
         self.row_counter = 1
@@ -171,65 +201,69 @@ class StateMachine:
         return 'L'
 
     def update(self, perception: PerceptionData, params):
+
+        # ====================================================
+        # >>> STATE: DRIVE_IN_ROW
+        # ====================================================
         if self.state == State.DRIVE_IN_ROW:
             if perception.row_end_detected:
-                self.node.get_logger().info("At least one side has no maize. Reached the end of a row. Leaving the row...")
                 self.exit_start_time = self.node.get_clock().now().nanoseconds / 1e9
-                self.state = State.EXIT_ROW
-                self.node.get_logger().info("Switch to State EXIT_ROW")
+                self.state = State.EXIT_ROW  # <<< TRANSITION
 
+        # ====================================================
+        # >>> STATE: EXIT_ROW
+        # ====================================================
         elif self.state == State.EXIT_ROW:
             time_to_drive = params['drive_out_dist'] / params['vel_linear_drive']
             current_time = self.node.get_clock().now().nanoseconds / 1e9
             if (current_time - self.exit_start_time) >= time_to_drive:
-                self.node.get_logger().info("Exit...")
-                self.state = State.TURN
-                self.node.get_logger().info("Switch to State TURN")
+                self.state = State.TURN  # <<< TRANSITION
 
+        # ====================================================
+        # >>> STATE: TURN
+        # ====================================================
         elif self.state == State.TURN:
             if -0.25 < perception.x_mean < 0.25:
-                self.node.get_logger().info("Aligned to the rows...")
                 step = self.pattern.current()
                 if step and step[0] == 1:
                     self.state = State.ENTER_ROW
-                    self.node.get_logger().info("Switch to State ENTER_ROW")
                 else:
                     self.row_counter = 1
                     self.previous_row = 1
                     self.actual_row = 1
                     self.actual_dist = perception.min_dist
                     self.state = State.COUNTING_ROWS
-                    self.node.get_logger().info("Switch to State COUNTING_ROWS")
 
+        # ====================================================
+        # >>> STATE: COUNTING_ROWS
+        # ====================================================
         elif self.state == State.COUNTING_ROWS:
             step = self.pattern.current()
             if step and step[0] == self.row_counter:
-                self.node.get_logger().info("Start turning to row...")
                 self.state = State.ENTER_ROW
-                self.node.get_logger().info("Switch to State ENTER_ROW")
             else:
-                if perception.num_points_in_box > 0:
-                    self.actual_row = 1
-                else:
-                    self.actual_row = 0
-                    
+                self.actual_row = 1 if perception.num_points_in_box > 0 else 0
+                
+                # >>> FLANKENERKENNUNG
                 if self.actual_row > self.previous_row:
                     self.row_counter += 1
-                    self.node.get_logger().info(f"Increment row_counter to {self.row_counter}")
-                self.node.get_logger().info(f"Passing row {self.row_counter} of {step[0] if step else 0}")
+
                 self.previous_row = self.actual_row
 
+        # ====================================================
+        # >>> STATE: ENTER_ROW
+        # ====================================================
         elif self.state == State.ENTER_ROW:
             if -0.25 < perception.y_mean < 0.25:
-                self.node.get_logger().info("Start driving in row...")
                 self.pattern.next()
-                if self.pattern.current() is None:
-                    self.node.get_logger().info("Pattern is now finished")
                 self.state = State.DRIVE_IN_ROW
-                self.node.get_logger().info("Switch to State DRIVE_IN_ROW")
 
         return self.state
 
+
+# ============================================================
+# >>> CONTROLLER
+# ============================================================
 class Controller:
     def compute(self, state, perception, direction, params, node):
         cmd = ControlCommand(linear=0.0, angular=0.0)
@@ -237,10 +271,10 @@ class Controller:
         if state == State.DRIVE_IN_ROW:
             if not perception.row_end_detected:
                 cmd.angular = -perception.center_error * 5 * params['vel_linear_drive']
+
+                # >>> GESCHWINDIGKEIT + STABILITÄT
                 if np.abs(perception.center_error) > 0.15:
                     cmd.linear = 0.1
-                    if np.abs(perception.center_error) > 0.20:
-                        node.get_logger().warn('Too close to row!!!')
                 else:
                     cmd.linear = params['vel_linear_drive'] * (params['max_dist_in_row'] - np.abs(perception.center_error)) / params['max_dist_in_row']
 
@@ -272,11 +306,17 @@ class Controller:
 
         return cmd
 
-# Wrapper Node to start the autonomous navigation
+
+# ============================================================
+# >>> HAUPTNODE (ALLES KOMMT HIER ZUSAMMEN)
+# ============================================================
 class FieldRobotNavigator(Node):
     def __init__(self):
         super().__init__("maize_navigator")
 
+        # ====================================================
+        # >>> PARAMETER DEKLARATION (ROS2)
+        # ====================================================
         self.declare_parameter("pattern", "1L-1R-2L-3R")
         self.declare_parameter("max_dist_in_row", 0.375)
         self.declare_parameter("row_width", 0.75)
@@ -286,6 +326,7 @@ class FieldRobotNavigator(Node):
         self.declare_parameter("vel_linear_count", 0.5)
         self.declare_parameter("vel_linear_turn", 0.3)
 
+        # >>> PERCEPTION PARAMETER (BOUNDING BOXEN)
         states = ['drive_in_row', 'turn_and_exit', 'counting_rows', 'turn_to_row']
         for s in states:
             self.declare_parameter(f"perception.{s}.x_min", 0.0)
@@ -293,14 +334,19 @@ class FieldRobotNavigator(Node):
             self.declare_parameter(f"perception.{s}.y_min", 0.1)
             self.declare_parameter(f"perception.{s}.y_max", 1.0)
 
+        # >>> ROS TOPICS
         self.declare_parameter("topics.pointcloud", "/merged_point_cloud")
         self.declare_parameter("topics.cmd_vel", "/cmd_vel")
         self.declare_parameter("topics.field_points", "/field_points")
 
-        # Parameter abrufen
+        # ====================================================
+        # >>> PARAMETER EINLESEN
+        # ====================================================
         self.params = self.get_all_params()
 
-        # Module initialisieren
+        # ====================================================
+        # >>> MODULE INITIALISIEREN
+        # ====================================================
         self.perception = Perception(self.params['bounding_boxes'])
         self.pattern = Pattern(self.params['pattern'])
         self.state_machine = StateMachine(self.pattern, self)
@@ -308,19 +354,25 @@ class FieldRobotNavigator(Node):
 
         self.latest_cloud = None
 
-        # ROS Schnittstellen
+        # ====================================================
+        # >>> ROS KOMMUNIKATION
+        # ====================================================
         self.create_subscription(LaserScan, self.params['topic_pointcloud'], self.cloud_callback, 10)
         self.cmd_pub = self.create_publisher(Twist, self.params['topic_cmd_vel'], 10)
         self.points_pub = self.create_publisher(PointCloud2, self.params['topic_field_points'], 10)
 
+        # >>> HAUPTLOOP (10 Hz)
         self.timer = self.create_timer(0.1, self.loop)
         
-        # Parameter-Update Callback
+        # >>> DYNAMISCHE PARAMETERÄNDERUNG
         self.add_on_set_parameters_callback(self.parameter_callback)
         
         self.get_logger().info("FieldRobotNavigator gestartet")
 
     def parameter_callback(self, params):
+        # ====================================================
+        # >>> LIVE PARAMETER UPDATE (SEHR PRAKTISCH!)
+        # ====================================================
         for param in params:
             keys = param.name.split('.')
             if len(keys) == 1:
@@ -331,6 +383,9 @@ class FieldRobotNavigator(Node):
         return rclpy.parameter.SetParametersResult(successful=True)
 
     def get_all_params(self):
+        # ====================================================
+        # >>> SAMMELT ALLE ROS PARAMETER IN EIN DICT
+        # ====================================================
         p = {}
         p['pattern'] = self.get_parameter("pattern").value
         p['max_dist_in_row'] = self.get_parameter("max_dist_in_row").value
@@ -340,6 +395,7 @@ class FieldRobotNavigator(Node):
         p['vel_linear_count'] = self.get_parameter("vel_linear_count").value
         p['vel_linear_turn'] = self.get_parameter("vel_linear_turn").value
         
+        # >>> BOUNDING BOXEN
         p['bounding_boxes'] = {}
         states = ['drive_in_row', 'turn_and_exit', 'counting_rows', 'turn_to_row']
         for s in states:
@@ -356,9 +412,13 @@ class FieldRobotNavigator(Node):
         return p
 
     def cloud_callback(self, msg):
+        # >>> SPEICHERT AKTUELLSTE SENSOR DATEN
         self.latest_cloud = msg
 
     def publish_points(self, points, header):
+        # ====================================================
+        # >>> DEBUG VISUALISIERUNG (RViz)
+        # ====================================================
         if not points:
             return
         fields = [
@@ -374,6 +434,9 @@ class FieldRobotNavigator(Node):
         self.points_pub.publish(cloud)
 
     def loop(self):
+        # ====================================================
+        # >>> HAUPTABLAUF (PIPELINE)
+        # ====================================================
         if self.latest_cloud is None:
             return
 
@@ -384,16 +447,21 @@ class FieldRobotNavigator(Node):
 
         state = self.state_machine.update(perception, self.params)
         
-        # Actual dist is needed for COUNTING_ROWS
+        # >>> WICHTIG FÜR COUNTING_ROWS
         self.params['actual_dist_target'] = getattr(self.state_machine, 'actual_dist', np.inf)
 
         cmd = self.controller.compute(state, perception, direction, self.params, self)
 
+        # >>> BEWEGUNG PUBISHEN
         twist = Twist()
         twist.linear.x = cmd.linear
         twist.angular.z = cmd.angular
         self.cmd_pub.publish(twist)
 
+
+# ============================================================
+# >>> PROGRAMMSTART
+# ============================================================
 def main(args=None):
     rclpy.init(args=args)
     node = FieldRobotNavigator()
