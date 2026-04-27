@@ -37,6 +37,23 @@ class State(Enum):
     COUNTING_ROWS = 4
     ENTER_ROW = 5
 
+class Pattern:
+    def __init__(self, pattern_str):
+        self.steps = self.parse(pattern_str)
+        self.index = 0
+
+    def parse(self, pattern_str):
+        tokens = pattern_str.split("-")
+        result = []
+        for t in tokens:
+            match = re.match(r"(\d+)([LR])", t.strip())
+            if match:
+                count = int(match.group(1))
+                direction = match.group(2)
+                result.append((count, direction))
+        return result
+
+
 class Perception:
     def __init__(self, bounding_boxes):
         self.bounding_boxes = bounding_boxes
@@ -92,12 +109,11 @@ class Perception:
             if both_sides == 'both':
                 if y_min < abs(y) < y_max and x_min < x < x_max:
                     points.append(Point32(x=float(x), y=float(y), z=0.0))
-            # 'L' filtert negative y-Werte (in Stage/ROS ist links oft positiv, 
-            # aber wir folgen hier deiner Logik aus dem Code)
-            elif both_sides == 'L':
+
+            elif both_sides == 'R':
                 if -y_max < y < -y_min and x_min < x < x_max:
                     points.append(Point32(x=float(x), y=float(y), z=0.0))
-            elif both_sides == 'R':
+            elif both_sides == 'L':
                 if y_min < y < y_max and x_min < x < x_max:
                     points.append(Point32(x=float(x), y=float(y), z=0.0))
 
@@ -126,22 +142,6 @@ class Perception:
         data.filtered_points = points
 
         return data
-
-class Pattern:
-    def __init__(self, pattern_str):
-        self.steps = self.parse(pattern_str)
-        self.index = 0
-
-    def parse(self, pattern_str):
-        tokens = pattern_str.split("-")
-        result = []
-        for t in tokens:
-            match = re.match(r"(\d+)([LR])", t.strip())
-            if match:
-                count = int(match.group(1))
-                direction = match.group(2)
-                result.append((count, direction))
-        return result
 
     def current(self):
         if self.index < len(self.steps):
@@ -182,7 +182,7 @@ class StateMachine:
             time_to_drive = params['drive_out_dist'] / params['vel_linear_drive']
             current_time = self.node.get_clock().now().nanoseconds / 1e9
             if (current_time - self.exit_start_time) >= time_to_drive:
-                self.node.get_logger().info("Turn and exit...")
+                self.node.get_logger().info("Exit...")
                 self.state = State.TURN
                 self.node.get_logger().info("Switch to State TURN")
 
