@@ -42,4 +42,9 @@ Enthält die Navigationslogik für den FloriBot im Rahmen des **Field Robot Even
 ```
 ros2 launch maize_navigation maize_navigation.launch.py
 ``` 
-Die Konfiguration erfolgt über die config/params.yaml. Hier können das Fahrmuster sowie wietere Paramter angepasstwerden.
+Die Konfiguration erfolgt über die config/params.yaml. Hier können das Fahrmuster sowie wietere Paramter angepasst werden.
+
+Zum Starten des Roboters folgenden Service in der Kommandozeile aufrufen:
+```
+ros2 service call /start_navigation std_srvs/srv/Trigger {}
+``` 
