@@ -201,6 +201,7 @@ class StateMachine:
         return 'L'
 
     def update(self, perception: PerceptionData, params):
+        old_state = self.state
 
         # ====================================================
         # >>> STATE: DRIVE_IN_ROW
@@ -257,6 +258,9 @@ class StateMachine:
             if -0.25 < perception.y_mean < 0.25:
                 self.pattern.next()
                 self.state = State.DRIVE_IN_ROW
+
+        if self.state != old_state:
+            self.node.get_logger().info(f"State transition: {old_state.name} -> {self.state.name}")
 
         return self.state
 
