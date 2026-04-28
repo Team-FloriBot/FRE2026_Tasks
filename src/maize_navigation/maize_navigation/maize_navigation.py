@@ -3,6 +3,7 @@ from rclpy.node import Node
 from geometry_msgs.msg import Twist, Point32
 from sensor_msgs.msg import LaserScan, PointCloud2, PointField
 from sensor_msgs_py import point_cloud2
+from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy
 
 import numpy as np
 from enum import Enum
@@ -317,6 +318,11 @@ class Controller:
 class FieldRobotNavigator(Node):
     def __init__(self):
         super().__init__("maize_navigator")
+        qos_profile = QoSProfile(
+        reliability=ReliabilityPolicy.RELIABLE,
+        durability=DurabilityPolicy.TRANSIENT_LOCAL,
+        history=10
+        )
 
         # ====================================================
         # >>> PARAMETER DEKLARATION (ROS2)
@@ -361,7 +367,7 @@ class FieldRobotNavigator(Node):
         # ====================================================
         # >>> ROS KOMMUNIKATION
         # ====================================================
-        self.create_subscription(LaserScan, self.params['topic_pointcloud'], self.cloud_callback, 10)
+        self.create_subscription(LaserScan, self.params['topic_pointcloud'], self.cloud_callback, qos_profile)   
         self.cmd_pub = self.create_publisher(Twist, self.params['topic_cmd_vel'], 10)
         self.points_pub = self.create_publisher(PointCloud2, self.params['topic_field_points'], 10)
 
