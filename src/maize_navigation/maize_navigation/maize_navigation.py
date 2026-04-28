@@ -3,6 +3,7 @@ from rclpy.node import Node
 from geometry_msgs.msg import Twist, Point32
 from sensor_msgs.msg import LaserScan, PointCloud2, PointField
 from sensor_msgs_py import point_cloud2
+from std_srvs.srv import Trigger
 
 import numpy as np
 from enum import Enum
@@ -43,6 +44,7 @@ class ControlCommand:
 # >>> STATE MACHINE ZUSTÄNDE
 # ============================================================
 class State(Enum):
+    ROBOT_STOP = 0
     DRIVE_IN_ROW = 1
     EXIT_ROW = 2
     TURN = 3
@@ -182,9 +184,10 @@ class Perception:
 # ============================================================
 class StateMachine:
     def __init__(self, pattern, node):
-        self.state = State.DRIVE_IN_ROW
+        self.state = State.ROBOT_STOP # Initialer State
         self.pattern = pattern
         self.node = node
+        self.navigation_triggered = False # Flag für den Service-Start
         
         # >>> INTERNE VARIABLEN (KRITISCH!)
         self.exit_start_time = 0.0
@@ -202,6 +205,14 @@ class StateMachine:
 
     def update(self, perception: PerceptionData, params):
         old_state = self.state
+
+        # ====================================================
+        # >>> STATE: ROBOT_STOP
+        # ====================================================
+        if self.state == State.ROBOT_STOP:
+            if self.navigation_triggered:
+                self.state = State.DRIVE_IN_ROW
+                self.navigation_triggered = False # Reset Flag
 
         # ====================================================
         # >>> STATE: DRIVE_IN_ROW
@@ -252,12 +263,18 @@ class StateMachine:
                 self.previous_row = self.actual_row
 
         # ====================================================
-        # >>> STATE: ENTER_ROW
+        # >>> STATE: ENTER_ROW (Angepasst für Ende-Erkennung)
         # ====================================================
         elif self.state == State.ENTER_ROW:
             if -0.25 < perception.y_mean < 0.25:
-                self.pattern.next()
-                self.state = State.DRIVE_IN_ROW
+                self.pattern.next() # Zum nächsten Schritt im Muster
+                
+                # Prüfen, ob das Muster beendet ist
+                if self.pattern.current() is None:
+                    self.state = State.ROBOT_STOP
+                    self.node.get_logger().info("PATTERN COMPLETED. Stopping Robot.")
+                else:
+                    self.state = State.DRIVE_IN_ROW
 
         if self.state != old_state:
             self.node.get_logger().info(f"State transition: {old_state.name} -> {self.state.name}")
@@ -271,6 +288,9 @@ class StateMachine:
 class Controller:
     def compute(self, state, perception, direction, params, node):
         cmd = ControlCommand(linear=0.0, angular=0.0)
+
+        if state == State.ROBOT_STOP:
+            return cmd
         
         if state == State.DRIVE_IN_ROW:
             if not perception.row_end_detected:
@@ -364,6 +384,7 @@ class FieldRobotNavigator(Node):
         self.create_subscription(LaserScan, self.params['topic_pointcloud'], self.cloud_callback, 10)
         self.cmd_pub = self.create_publisher(Twist, self.params['topic_cmd_vel'], 10)
         self.points_pub = self.create_publisher(PointCloud2, self.params['topic_field_points'], 10)
+        self.start_srv = self.create_service(Trigger, 'start_navigation', self.start_nav_callback)
 
         # >>> HAUPTLOOP (10 Hz)
         self.timer = self.create_timer(0.1, self.loop)
@@ -418,6 +439,17 @@ class FieldRobotNavigator(Node):
     def cloud_callback(self, msg):
         # >>> SPEICHERT AKTUELLSTE SENSOR DATEN
         self.latest_cloud = msg
+    def start_nav_callback(self, request, response):
+        """Wird aufgerufen, wenn der ROS Service gerufen wird."""
+        if self.state_machine.state == State.ROBOT_STOP:
+            self.state_machine.navigation_triggered = True
+            response.success = True
+            response.message = "Navigation gestartet!"
+            self.get_logger().info("Service 'start_navigation' empfangen. Fahre los...")
+        else:
+            response.success = False
+            response.message = f"Roboter ist bereits im Zustand {self.state_machine.state.name}"
+        return response
 
     def publish_points(self, points, header):
         # ====================================================
