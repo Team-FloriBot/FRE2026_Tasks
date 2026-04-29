@@ -21,7 +21,7 @@ class LaserMerger(Node):
         try:
             # Transformiere Scan direkt in den base_link
             # Die "Auf dem Kopf" Info kommt automatisch aus der URDF/TF
-            trans = self.tf_buffer.lookup_transform('base_link', msg.header.frame_id, rclpy.time.Time())
+            trans = self.tf_buffer.lookup_transform('FloriBot/base_link', msg.header.frame_id, rclpy.time.Time())
             cloud_out = self.lp.projectLaser(msg)
             res_cloud = do_transform_cloud(cloud_out, trans)
             self.pc_pub.publish(res_cloud)
