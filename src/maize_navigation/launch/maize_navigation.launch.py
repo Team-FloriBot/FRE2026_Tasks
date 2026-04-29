@@ -15,5 +15,14 @@ def generate_launch_description():
             name='maize_navigator',
             output='screen',
             parameters=[param_file]
-        )
+        ),
+        Node(
+            package='maize_navigation', 
+            executable='laser_merger',  
+            name='laser_merger',
+            output='screen',
+            parameters=[{
+                'use_sim_time': True 
+            }]
+        ),
     ])
