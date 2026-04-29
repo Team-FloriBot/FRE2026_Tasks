@@ -88,67 +88,68 @@ class Perception:
     def __init__(self, bounding_boxes):
         self.bounding_boxes = bounding_boxes
 
-    def process(self, scan_msg, current_state, pattern_direction) -> PerceptionData:
+    def is_in_box(self, x, y, box, direction):
+        """Prüft, ob ein Punkt (x,y) innerhalb der aktiven Bounding Box liegt."""
+        x_min, x_max = box['x_min'], box['x_max']
+        y_min, y_max = box['y_min'], box['y_max']
+
+        # X-Check (Längsrichtung) ist immer gleich
+        if not (x_min < x < x_max):
+            return False
+
+        # Y-Check (Seitlich) abhängig von der Fahrtrichtung
+        if direction == 'both':
+            return y_min < abs(y) < y_max
+        elif direction == 'L':
+            return y_min < y < y_max
+        elif direction == 'R':
+            return -y_max < y < -y_min
+        return False
+
+    def process(self, cloud_msg, current_state, pattern_direction) -> PerceptionData:
         data = PerceptionData()
         points = []
         
         # ========================================================
         # >>> STATE-ABHÄNGIGE WAHRNEHMUNG (ANPASSBAR!)
         # ========================================================
-        if current_state == State.DRIVE_IN_ROW:
-            box = self.bounding_boxes['drive_in_row']
-            both_sides = 'both'
-        elif current_state == State.EXIT_ROW:
-            box = self.bounding_boxes['turn_and_exit']
-            both_sides = pattern_direction
-        elif current_state == State.TURN:
-            box = self.bounding_boxes['turn_and_exit']
-            both_sides = pattern_direction
-        elif current_state == State.COUNTING_ROWS:
-            box = self.bounding_boxes['counting_rows']
-            both_sides = pattern_direction
-        elif current_state == State.ENTER_ROW:
-            box = self.bounding_boxes['turn_to_row']
-            both_sides = 'both'
-        else:
-            box = self.bounding_boxes['drive_in_row']
-            both_sides = 'both'
+        state_key_map = {
+            State.DRIVE_IN_ROW: 'drive_in_row',
+            State.EXIT_ROW: 'turn_and_exit',
+            State.TURN: 'turn_and_exit',
+            State.COUNTING_ROWS: 'counting_rows',
+            State.ENTER_ROW: 'turn_to_row'
+        }
 
-        x_min, x_max = box['x_min'], box['x_max']
-        y_min, y_max = box['y_min'], box['y_max']
+        box_key = state_key_map.get(current_state, 'drive_in_row')
+        box = self.bounding_boxes[box_key]
+
+        if current_state == State.DRIVE_IN_ROW or current_state == State.ENTER_ROW:
+            filter_dir = 'both'
+        else:
+            filter_dir = pattern_direction
+
+
+        # ========================================================
+        # >>> LASERDATEN AUSLESEN
+        # ========================================================
+        # Punkte extrahieren und filtern
+        # read_points gibt ein Iterable zurück (x, y, z, ...)
+        cloud_points = point_cloud2.read_points(cloud_msg, field_names=("x", "y", "z"), skip_nans=True)
 
         min_distance = np.inf
-
-        # ========================================================
-        # >>> LASERDATEN → PUNKTE
-        # ========================================================
-        for i, dist in enumerate(scan_msg.ranges):
-            if dist < scan_msg.range_min or dist > scan_msg.range_max or np.isinf(dist):
-                continue
+        for p in cloud_points:
+            x, y, z = p[0], p[1], p[2]
             
-            angle = scan_msg.angle_min + i * scan_msg.angle_increment
-            
-            # >>> POLAR → KARTESISCH
-            x = dist * np.cos(angle)
-            y = dist * np.sin(angle)
-
+            # Euklidische Distanz für min_dist Feature
+            dist = np.sqrt(x**2 + y**2)
             if dist < min_distance:
                 min_distance = dist
-                
-            # ====================================================
-            # >>> FILTERLOGIK (HIER PASSIERT DIE MAGIE!)
-            # ====================================================
-            if both_sides == 'both':
-                if y_min < abs(y) < y_max and x_min < x < x_max:
-                    points.append(Point32(x=float(x), y=float(y), z=0.0))
 
-            elif both_sides == 'R':
-                if -y_max < y < -y_min and x_min < x < x_max:
-                    points.append(Point32(x=float(x), y=float(y), z=0.0))
-            elif both_sides == 'L':
-                if y_min < y < y_max and x_min < x < x_max:
-                    points.append(Point32(x=float(x), y=float(y), z=0.0))
-
+            # Bounding Box Filter
+            if self.is_in_box(x, y, box, filter_dir):
+                points.append(Point32(x=float(x), y=float(y), z=0.0))
+        
         # ========================================================
         # >>> FEATURE BERECHNUNG (ENTSCHEIDUNGSBASIS!)
         # ========================================================
@@ -381,7 +382,7 @@ class FieldRobotNavigator(Node):
         # ====================================================
         # >>> ROS KOMMUNIKATION
         # ====================================================
-        self.create_subscription(LaserScan, self.params['topic_pointcloud'], self.cloud_callback, 10)
+        self.create_subscription(PointCloud2, self.params['topic_pointcloud'], self.cloud_callback, 10)
         self.cmd_pub = self.create_publisher(Twist, self.params['topic_cmd_vel'], 10)
         self.points_pub = self.create_publisher(PointCloud2, self.params['topic_field_points'], 10)
         self.start_srv = self.create_service(Trigger, 'start_navigation', self.start_nav_callback)
@@ -439,6 +440,7 @@ class FieldRobotNavigator(Node):
     def cloud_callback(self, msg):
         # >>> SPEICHERT AKTUELLSTE SENSOR DATEN
         self.latest_cloud = msg
+        
     def start_nav_callback(self, request, response):
         """Wird aufgerufen, wenn der ROS Service gerufen wird."""
         if self.state_machine.state == State.ROBOT_STOP:
