@@ -24,9 +24,10 @@ setup(
             'pytest',
         ],
     },
-    entry_points={
+entry_points={
         'console_scripts': [
             'navigator = maize_navigation.maize_navigation:main',
+            'laser_merger = maize_navigation.laser_merger:main',
         ],
     },
 )
