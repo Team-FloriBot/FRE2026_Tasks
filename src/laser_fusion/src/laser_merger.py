@@ -27,3 +27,12 @@ class LaserMerger(Node):
             self.pc_pub.publish(res_cloud)
         except Exception as e:
             self.get_logger().debug(f"TF wait: {e}")
+
+def main(args=None):
+    rclpy.init(args=args)
+    node = LaserMerger()
+    rclpy.spin(node)
+    rclpy.shutdown()
+
+if __name__ == "__main__":
+    main()
