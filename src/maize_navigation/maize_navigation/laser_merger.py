@@ -34,8 +34,8 @@ class LaserMerger(Node):
             cloud_rear = self.lp.projectLaser(scan_rear)
             
             # 2. Transformationen holen
-            trans_front = self.tf_buffer.lookup_transform('FloriBot/base_link', scan_front.header.frame_id, rclpy.time.Time())
-            trans_rear = self.tf_buffer.lookup_transform('FloriBot/base_link', scan_rear.header.frame_id, rclpy.time.Time())
+            trans_front = self.tf_buffer.lookup_transform('base_link', scan_front.header.frame_id, rclpy.time.Time())
+            trans_rear = self.tf_buffer.lookup_transform('base_link', scan_rear.header.frame_id, rclpy.time.Time())
             
             # 3. Beide in den base_link transformieren
             tf_front = do_transform_cloud(cloud_front, trans_front)
