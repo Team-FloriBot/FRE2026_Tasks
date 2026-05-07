@@ -88,6 +88,74 @@ class Perception:
     def __init__(self, bounding_boxes):
         self.bounding_boxes = bounding_boxes
 
+    def process(self, cloud_msg, current_state, pattern_direction) -> PerceptionData:
+        data = PerceptionData()
+        points = []
+        
+        # ========================================================
+        # >>> BOXFILTER Implementierung
+        # ========================================================
+        state_key_map = {
+            State.DRIVE_IN_ROW: 'drive_in_row',
+            State.EXIT_ROW: 'turn_and_exit',
+            State.TURN: 'turn_and_exit',
+            State.COUNTING_ROWS: 'counting_rows',
+            State.ENTER_ROW: 'turn_to_row'
+        }
+
+        box_key = state_key_map.get(current_state, 'drive_in_row')
+        box = self.bounding_boxes[box_key]
+
+        if current_state == State.DRIVE_IN_ROW or current_state == State.ENTER_ROW:
+            filter_dir = 'both'
+        else:
+            filter_dir = pattern_direction
+
+        cloud_points = point_cloud2.read_points(cloud_msg, field_names=("x", "y", "z"), skip_nans=True)
+
+        min_distance = np.inf
+        for p in cloud_points:
+            x, y, z = p[0], p[1], p[2]
+            
+            # Euklidische Distanz für min_dist Feature
+            dist = np.sqrt(x**2 + y**2)
+            if dist < min_distance:
+                min_distance = dist
+
+            # Bounding Box Filter
+            if self.is_in_box(x, y, box, filter_dir):
+                points.append(Point32(x=float(x), y=float(y), z=0.0))
+        
+        # FEATURE BERECHNUNG (ENTSCHEIDUNGSBASIS!)
+        data.min_dist = min_distance
+        data.num_points_in_box = len(points)
+        
+        left_y = [p.y for p in points if p.y > 0]
+        right_y = [p.y for p in points if p.y <= 0]
+        
+        data.left_dist = np.mean(np.abs(left_y)) if len(left_y) > 0 else np.inf
+        data.right_dist = np.mean(np.abs(right_y)) if len(right_y) > 0 else np.inf
+        
+        # ========================================================
+        # >>> Reihenende Erkennung
+        # ========================================================
+        if np.isinf(data.left_dist) or np.isinf(data.right_dist):
+            data.row_end_detected = True
+        else:
+            data.center_error = (data.right_dist - data.left_dist) / 2.0
+            data.row_end_detected = False
+            
+        points_x = [p.x for p in points]
+        data.x_mean = np.mean(points_x) if len(points_x) > 0 else np.inf
+        
+        points_y = [p.y for p in points]
+        data.y_mean = np.mean(points_y) if len(points_y) > 0 else np.inf
+
+        data.filtered_points = points
+
+        return data
+    
+    # Nützliche Funktionen 
     def is_in_box(self, x, y, box, direction):
         """Prüft, ob ein Punkt (x,y) innerhalb der aktiven Bounding Box liegt."""
         x_min, x_max = box['x_min'], box['x_max']
@@ -106,79 +174,6 @@ class Perception:
             return -y_max < y < -y_min
         return False
 
-    def process(self, cloud_msg, current_state, pattern_direction) -> PerceptionData:
-        data = PerceptionData()
-        points = []
-        
-        # ========================================================
-        # >>> STATE-ABHÄNGIGE WAHRNEHMUNG (ANPASSBAR!)
-        # ========================================================
-        state_key_map = {
-            State.DRIVE_IN_ROW: 'drive_in_row',
-            State.EXIT_ROW: 'turn_and_exit',
-            State.TURN: 'turn_and_exit',
-            State.COUNTING_ROWS: 'counting_rows',
-            State.ENTER_ROW: 'turn_to_row'
-        }
-
-        box_key = state_key_map.get(current_state, 'drive_in_row')
-        box = self.bounding_boxes[box_key]
-
-        if current_state == State.DRIVE_IN_ROW or current_state == State.ENTER_ROW:
-            filter_dir = 'both'
-        else:
-            filter_dir = pattern_direction
-
-
-        # ========================================================
-        # >>> LASERDATEN AUSLESEN
-        # ========================================================
-        # Punkte extrahieren und filtern
-        # read_points gibt ein Iterable zurück (x, y, z, ...)
-        cloud_points = point_cloud2.read_points(cloud_msg, field_names=("x", "y", "z"), skip_nans=True)
-
-        min_distance = np.inf
-        for p in cloud_points:
-            x, y, z = p[0], p[1], p[2]
-            
-            # Euklidische Distanz für min_dist Feature
-            dist = np.sqrt(x**2 + y**2)
-            if dist < min_distance:
-                min_distance = dist
-
-            # Bounding Box Filter
-            if self.is_in_box(x, y, box, filter_dir):
-                points.append(Point32(x=float(x), y=float(y), z=0.0))
-        
-        # ========================================================
-        # >>> FEATURE BERECHNUNG (ENTSCHEIDUNGSBASIS!)
-        # ========================================================
-        data.min_dist = min_distance
-        data.num_points_in_box = len(points)
-        
-        left_y = [p.y for p in points if p.y > 0]
-        right_y = [p.y for p in points if p.y <= 0]
-        
-        data.left_dist = np.mean(np.abs(left_y)) if len(left_y) > 0 else np.inf
-        data.right_dist = np.mean(np.abs(right_y)) if len(right_y) > 0 else np.inf
-        
-        # >>> REIHENENDE-ERKENNUNG
-        if np.isinf(data.left_dist) or np.isinf(data.right_dist):
-            data.row_end_detected = True
-        else:
-            data.center_error = (data.right_dist - data.left_dist) / 2.0
-            data.row_end_detected = False
-            
-        points_x = [p.x for p in points]
-        data.x_mean = np.mean(points_x) if len(points_x) > 0 else np.inf
-        
-        points_y = [p.y for p in points]
-        data.y_mean = np.mean(points_y) if len(points_y) > 0 else np.inf
-
-        data.filtered_points = points
-
-        return data
-
 
 # ============================================================
 # >>> STATE MACHINE
@@ -190,7 +185,6 @@ class StateMachine:
         self.node = node
         self.navigation_triggered = False # Flag für den Service-Start
         
-        # >>> INTERNE VARIABLEN (KRITISCH!)
         self.exit_start_time = 0.0
         
         self.row_counter = 1
@@ -206,6 +200,8 @@ class StateMachine:
 
     def update(self, perception: PerceptionData, params):
         old_state = self.state
+
+        # Hier sind die State Transistions implementiert
 
         # ====================================================
         # >>> STATE: ROBOT_STOP
@@ -290,8 +286,16 @@ class Controller:
     def compute(self, state, perception, direction, params, node):
         cmd = ControlCommand(linear=0.0, angular=0.0)
 
+        # ====================================================
+        # >>> STATE: ROBOT_STOP
+        # ====================================================
+
         if state == State.ROBOT_STOP:
             return cmd
+        
+        # ====================================================
+        # >>> STATE: DRIVE_IN_ROW
+        # ====================================================        
         
         if state == State.DRIVE_IN_ROW:
             if not perception.row_end_detected:
@@ -302,9 +306,17 @@ class Controller:
                     cmd.linear = 0.1
                 else:
                     cmd.linear = params['vel_linear_drive'] * (params['max_dist_in_row'] - np.abs(perception.center_error)) / params['max_dist_in_row']
-
+       
+        # ====================================================
+        # >>> STATE: EXIT_ROW
+        # ==================================================== 
+       
         elif state == State.EXIT_ROW:
             cmd.linear = params['vel_linear_drive']
+
+        # ====================================================
+        # >>> STATE: TURN
+        # ==================================================== 
             
         elif state == State.TURN:
             if not (-0.25 < perception.x_mean < 0.25):
@@ -314,6 +326,10 @@ class Controller:
                     radius = -radius
                 cmd.angular = params['vel_linear_turn'] / radius
 
+        # ====================================================
+        # >>> STATE: COUNTING_ROWS
+        # ==================================================== 
+
         elif state == State.COUNTING_ROWS:
             gain = 2.5 if direction == 'L' else -2.5
             cmd.linear = params['vel_linear_count']
@@ -321,6 +337,17 @@ class Controller:
                 cmd.angular = gain * (perception.min_dist - params['actual_dist_target'])
             else:
                 cmd.angular = 0.0
+
+        # ====================================================
+        # >>> STATE: EXIT_ROW
+        # ==================================================== 
+
+        elif state == State.EXIT_ROW:
+            cmd.linear = params['vel_linear_drive']
+
+        # ====================================================
+        # >>> STATE: ENTER_ROW
+        # ==================================================== 
 
         elif state == State.ENTER_ROW:
             if not (-0.25 < perception.y_mean < 0.25):
@@ -479,15 +506,16 @@ class FieldRobotNavigator(Node):
             return
 
         direction = self.state_machine.get_current_direction()
-        perception = self.perception.process(self.latest_cloud, self.state_machine.state, direction)
-        
-        self.publish_points(perception.filtered_points, self.latest_cloud.header)
 
+        # >>> PERCEPTION AUFRUF: Hier werden die Sensor Daten verarbeitet und die wichtigen Features berechnet
+        perception = self.perception.process(self.latest_cloud, self.state_machine.state, direction)
+        # >>> DEBUG: Gefilterte Punkte für RViz veröffentlichen
+        self.publish_points(perception.filtered_points, self.latest_cloud.header)
+        # >>> STATE MACHINE AUFRUF: Hier wird basierend auf den Perception Daten und dem aktuellen State entschieden, in welchen neuen State der Roboter wechseln soll
         state = self.state_machine.update(perception, self.params)
-        
         # >>> WICHTIG FÜR COUNTING_ROWS
         self.params['actual_dist_target'] = getattr(self.state_machine, 'actual_dist', np.inf)
-
+        # >>> CONTROLLER AUFRUF: Hier wird basierend auf dem aktuellen State und den Perception Daten die konkrete Bewegung (linear + angular) berechnet
         cmd = self.controller.compute(state, perception, direction, self.params, self)
 
         # >>> BEWEGUNG PUBISHEN
