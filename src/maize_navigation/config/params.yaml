@@ -12,6 +12,10 @@ maize_navigator:
     vel_linear_count: 0.5
     vel_linear_turn: 0.3
     
+    # Velocity Ramper - Verhindert harte Sprünge bei State-Wechseln
+    accel_max_linear: 0.5      # Max lineare Beschleunigung [m/s²]
+    accel_max_angular: 1.0     # Max Winkel-Beschleunigung [rad/s²]
+    
     perception:
       drive_in_row:
         x_min: 0.0

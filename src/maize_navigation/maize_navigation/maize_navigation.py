@@ -41,6 +41,55 @@ class ControlCommand:
 
 
 # ============================================================
+# >>> VELOCITY RAMPER FÜR SMOOTH TRANSITIONS
+# ============================================================
+class VelocityRamper:
+    """
+    Smooth velocity transitions zwischen Sollwerten.
+    Verhindert harte Sprünge bei State-Wechseln durch Rate Limiting.
+    """
+    def __init__(self, max_accel_linear=0.5, max_accel_angular=1.0, dt=0.1):
+        """
+        Args:
+            max_accel_linear: Max Beschleunigung linear [m/s²]
+            max_accel_angular: Max Beschleunigung angular [rad/s²]
+            dt: Cycle Zeit [s] (default 10Hz = 0.1s)
+        """
+        self.max_accel_linear = max_accel_linear
+        self.max_accel_angular = max_accel_angular
+        self.dt = dt
+        
+        self.current_linear = 0.0
+        self.current_angular = 0.0
+    
+    def update(self, setpoint_linear: float, setpoint_angular: float) -> tuple:
+        """
+        Rampe smoothly von current zu setpoint.
+        
+        Returns: (ramped_linear, ramped_angular)
+        """
+        # === Linear Velocity Ramping ===
+        # Max Change pro Zyklus = max_accel * dt
+        max_delta_linear = self.max_accel_linear * self.dt
+        delta_linear = setpoint_linear - self.current_linear
+        delta_linear = np.clip(delta_linear, -max_delta_linear, max_delta_linear)
+        self.current_linear += delta_linear
+        
+        # === Angular Velocity Ramping ===
+        max_delta_angular = self.max_accel_angular * self.dt
+        delta_angular = setpoint_angular - self.current_angular
+        delta_angular = np.clip(delta_angular, -max_delta_angular, max_delta_angular)
+        self.current_angular += delta_angular
+        
+        return self.current_linear, self.current_angular
+    
+    def reset(self):
+        """Reset bei Notfall / ROBOT_STOP"""
+        self.current_linear = 0.0
+        self.current_angular = 0.0
+
+
+# ============================================================
 # >>> STATE MACHINE ZUSTÄNDE
 # ============================================================
 class State(Enum):
@@ -280,23 +329,25 @@ class StateMachine:
 
 
 # ============================================================
-# >>> CONTROLLER
+# >>> CONTROLLER (SOLLWERTE FÜR RAMPER)
 # ============================================================
 class Controller:
+    """
+    Berechnet Sollwerte (Setpoints) für Velocity Ramper.
+    Keine direkten Speeds mehr - nur Zielwerte vor Ramping!
+    """
     def compute(self, state, perception, direction, params, node):
         cmd = ControlCommand(linear=0.0, angular=0.0)
 
         # ====================================================
         # >>> STATE: ROBOT_STOP
         # ====================================================
-
         if state == State.ROBOT_STOP:
             return cmd
         
         # ====================================================
         # >>> STATE: DRIVE_IN_ROW
         # ====================================================        
-        
         if state == State.DRIVE_IN_ROW:
             if not perception.row_end_detected:
                 cmd.angular = -perception.center_error * 5 * params['vel_linear_drive']
@@ -306,18 +357,17 @@ class Controller:
                     cmd.linear = 0.1
                 else:
                     cmd.linear = params['vel_linear_drive'] * (params['max_dist_in_row'] - np.abs(perception.center_error)) / params['max_dist_in_row']
-       
+        
         # ====================================================
-        # >>> STATE: EXIT_ROW
+        # >>> STATE: EXIT_ROW - NUR EINMAL DEFINIERT (BUG FIX)
         # ==================================================== 
-       
         elif state == State.EXIT_ROW:
             cmd.linear = params['vel_linear_drive']
+            cmd.angular = 0.0
 
         # ====================================================
         # >>> STATE: TURN
         # ==================================================== 
-            
         elif state == State.TURN:
             if not (-0.25 < perception.x_mean < 0.25):
                 cmd.linear = params['vel_linear_turn']
@@ -325,11 +375,13 @@ class Controller:
                 if direction == 'R':
                     radius = -radius
                 cmd.angular = params['vel_linear_turn'] / radius
+            else:
+                cmd.linear = 0.0
+                cmd.angular = 0.0
 
         # ====================================================
         # >>> STATE: COUNTING_ROWS
         # ==================================================== 
-
         elif state == State.COUNTING_ROWS:
             gain = 2.5 if direction == 'L' else -2.5
             cmd.linear = params['vel_linear_count']
@@ -339,22 +391,17 @@ class Controller:
                 cmd.angular = 0.0
 
         # ====================================================
-        # >>> STATE: EXIT_ROW
-        # ==================================================== 
-
-        elif state == State.EXIT_ROW:
-            cmd.linear = params['vel_linear_drive']
-
-        # ====================================================
         # >>> STATE: ENTER_ROW
         # ==================================================== 
-
         elif state == State.ENTER_ROW:
             if not (-0.25 < perception.y_mean < 0.25):
                 cmd.linear = params['vel_linear_turn']
                 gain = 1 if direction == 'L' else -1
                 radius = gain * params['row_width'] / 2.0
                 cmd.angular = params['vel_linear_turn'] / radius
+            else:
+                cmd.linear = 0.0
+                cmd.angular = 0.0
 
         return cmd
 
@@ -377,6 +424,10 @@ class FieldRobotNavigator(Node):
         self.declare_parameter("vel_linear_drive", 0.5)
         self.declare_parameter("vel_linear_count", 0.5)
         self.declare_parameter("vel_linear_turn", 0.3)
+        
+        # >>> VELOCITY RAMPER PARAMETER
+        self.declare_parameter("accel_max_linear", 0.5)
+        self.declare_parameter("accel_max_angular", 1.0)
 
         # >>> PERCEPTION PARAMETER (BOUNDING BOXEN)
         states = ['drive_in_row', 'turn_and_exit', 'counting_rows', 'turn_to_row']
@@ -403,6 +454,15 @@ class FieldRobotNavigator(Node):
         self.pattern = Pattern(self.params['pattern'])
         self.state_machine = StateMachine(self.pattern, self)
         self.controller = Controller()
+        
+        # ====================================================
+        # >>> VELOCITY RAMPER INITIALISIEREN
+        # ====================================================
+        self.velocity_ramper = VelocityRamper(
+            max_accel_linear=self.params['accel_max_linear'],
+            max_accel_angular=self.params['accel_max_angular'],
+            dt=0.1  # 10 Hz Loop
+        )
 
         self.latest_cloud = None
 
@@ -430,6 +490,13 @@ class FieldRobotNavigator(Node):
             keys = param.name.split('.')
             if len(keys) == 1:
                 self.params[keys[0]] = param.value
+                
+                # Update auch im Ramper (für Echtzeit-Tuning)
+                if param.name == "accel_max_linear":
+                    self.velocity_ramper.max_accel_linear = param.value
+                elif param.name == "accel_max_angular":
+                    self.velocity_ramper.max_accel_angular = param.value
+                    
             elif len(keys) == 3 and keys[0] == 'perception':
                 self.params['bounding_boxes'][keys[1]][keys[2]] = param.value
                 
@@ -447,6 +514,10 @@ class FieldRobotNavigator(Node):
         p['vel_linear_drive'] = self.get_parameter("vel_linear_drive").value
         p['vel_linear_count'] = self.get_parameter("vel_linear_count").value
         p['vel_linear_turn'] = self.get_parameter("vel_linear_turn").value
+        
+        # >>> VELOCITY RAMPER PARAMETER
+        p['accel_max_linear'] = self.get_parameter("accel_max_linear").value
+        p['accel_max_angular'] = self.get_parameter("accel_max_angular").value
         
         # >>> BOUNDING BOXEN
         p['bounding_boxes'] = {}
@@ -509,19 +580,33 @@ class FieldRobotNavigator(Node):
 
         # >>> PERCEPTION AUFRUF: Hier werden die Sensor Daten verarbeitet und die wichtigen Features berechnet
         perception = self.perception.process(self.latest_cloud, self.state_machine.state, direction)
+        
         # >>> DEBUG: Gefilterte Punkte für RViz veröffentlichen
         self.publish_points(perception.filtered_points, self.latest_cloud.header)
+        
         # >>> STATE MACHINE AUFRUF: Hier wird basierend auf den Perception Daten und dem aktuellen State entschieden, in welchen neuen State der Roboter wechseln soll
         state = self.state_machine.update(perception, self.params)
+        
         # >>> WICHTIG FÜR COUNTING_ROWS
         self.params['actual_dist_target'] = getattr(self.state_machine, 'actual_dist', np.inf)
-        # >>> CONTROLLER AUFRUF: Hier wird basierend auf dem aktuellen State und den Perception Daten die konkrete Bewegung (linear + angular) berechnet
-        cmd = self.controller.compute(state, perception, direction, self.params, self)
-
-        # >>> BEWEGUNG PUBISHEN
+        
+        # >>> CONTROLLER AUFRUF: Berechnet SOLLWERTE (Setpoints vor Ramping!)
+        cmd_setpoint = self.controller.compute(state, perception, direction, self.params, self)
+        
+        # >>> VELOCITY RAMPER: Macht es smooth! (Verhindert harte Sprünge)
+        cmd_ramped_linear, cmd_ramped_angular = self.velocity_ramper.update(
+            cmd_setpoint.linear,
+            cmd_setpoint.angular
+        )
+        
+        # >>> RESET Ramper bei ROBOT_STOP
+        if state == State.ROBOT_STOP:
+            self.velocity_ramper.reset()
+        
+        # >>> BEWEGUNG PUBSLIHEN (JETZT OHNE SPRÜNGE!)
         twist = Twist()
-        twist.linear.x = cmd.linear
-        twist.angular.z = cmd.angular
+        twist.linear.x = cmd_ramped_linear
+        twist.angular.z = cmd_ramped_angular
         self.cmd_pub.publish(twist)
 
 
