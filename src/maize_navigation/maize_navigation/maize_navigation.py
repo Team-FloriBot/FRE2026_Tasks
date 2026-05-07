@@ -41,55 +41,6 @@ class ControlCommand:
 
 
 # ============================================================
-# >>> VELOCITY RAMPER FÜR SMOOTH TRANSITIONS
-# ============================================================
-class VelocityRamper:
-    """
-    Smooth velocity transitions zwischen Sollwerten.
-    Verhindert harte Sprünge bei State-Wechseln durch Rate Limiting.
-    """
-    def __init__(self, max_accel_linear=0.5, max_accel_angular=1.0, dt=0.1):
-        """
-        Args:
-            max_accel_linear: Max Beschleunigung linear [m/s²]
-            max_accel_angular: Max Beschleunigung angular [rad/s²]
-            dt: Cycle Zeit [s] (default 10Hz = 0.1s)
-        """
-        self.max_accel_linear = max_accel_linear
-        self.max_accel_angular = max_accel_angular
-        self.dt = dt
-        
-        self.current_linear = 0.0
-        self.current_angular = 0.0
-    
-    def update(self, setpoint_linear: float, setpoint_angular: float) -> tuple:
-        """
-        Rampe smoothly von current zu setpoint.
-        
-        Returns: (ramped_linear, ramped_angular)
-        """
-        # === Linear Velocity Ramping ===
-        # Max Change pro Zyklus = max_accel * dt
-        max_delta_linear = self.max_accel_linear * self.dt
-        delta_linear = setpoint_linear - self.current_linear
-        delta_linear = np.clip(delta_linear, -max_delta_linear, max_delta_linear)
-        self.current_linear += delta_linear
-        
-        # === Angular Velocity Ramping ===
-        max_delta_angular = self.max_accel_angular * self.dt
-        delta_angular = setpoint_angular - self.current_angular
-        delta_angular = np.clip(delta_angular, -max_delta_angular, max_delta_angular)
-        self.current_angular += delta_angular
-        
-        return self.current_linear, self.current_angular
-    
-    def reset(self):
-        """Reset bei Notfall / ROBOT_STOP"""
-        self.current_linear = 0.0
-        self.current_angular = 0.0
-
-
-# ============================================================
 # >>> STATE MACHINE ZUSTÄNDE
 # ============================================================
 class State(Enum):
@@ -404,6 +355,54 @@ class Controller:
                 cmd.angular = 0.0
 
         return cmd
+    
+# ============================================================
+# >>> VELOCITY RAMPER FÜR SMOOTH TRANSITIONS
+# ============================================================
+class VelocityRamper:
+    """
+    Smooth velocity transitions zwischen Sollwerten.
+    Verhindert harte Sprünge bei State-Wechseln durch Rate Limiting.
+    """
+    def __init__(self, max_accel_linear=0.5, max_accel_angular=1.0, dt=0.1):
+        """
+        Args:
+            max_accel_linear: Max Beschleunigung linear [m/s²]
+            max_accel_angular: Max Beschleunigung angular [rad/s²]
+            dt: Cycle Zeit [s] (default 10Hz = 0.1s)
+        """
+        self.max_accel_linear = max_accel_linear
+        self.max_accel_angular = max_accel_angular
+        self.dt = dt
+        
+        self.current_linear = 0.0
+        self.current_angular = 0.0
+    
+    def update(self, setpoint_linear: float, setpoint_angular: float) -> tuple:
+        """
+        Rampe smoothly von current zu setpoint.
+        
+        Returns: (ramped_linear, ramped_angular)
+        """
+        # === Linear Velocity Ramping ===
+        # Max Change pro Zyklus = max_accel * dt
+        max_delta_linear = self.max_accel_linear * self.dt
+        delta_linear = setpoint_linear - self.current_linear
+        delta_linear = np.clip(delta_linear, -max_delta_linear, max_delta_linear)
+        self.current_linear += delta_linear
+        
+        # === Angular Velocity Ramping ===
+        max_delta_angular = self.max_accel_angular * self.dt
+        delta_angular = setpoint_angular - self.current_angular
+        delta_angular = np.clip(delta_angular, -max_delta_angular, max_delta_angular)
+        self.current_angular += delta_angular
+        
+        return self.current_linear, self.current_angular
+    
+    def reset(self):
+        """Reset bei Notfall / ROBOT_STOP"""
+        self.current_linear = 0.0
+        self.current_angular = 0.0
 
 
 # ============================================================
