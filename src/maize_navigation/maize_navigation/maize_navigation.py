@@ -111,18 +111,30 @@ class Perception:
         else:
             filter_dir = pattern_direction
 
-        cloud_points = point_cloud2.read_points(cloud_msg, field_names=("x", "y", "z"), skip_nans=True)
-
+        # ========================================================
+        # >>> LASERSCAN ZU KARTESISCH (X, Y) KONVERTIERUNG
+        # ========================================================
         min_distance = np.inf
-        for p in cloud_points:
-            x, y, z = p[0], p[1], p[2]
+        
+        # Wir iterieren über alle Messwerte im LaserScan
+        for i, dist in enumerate(scan_msg.ranges):
+            # Filtere ungültige Messwerte (Inf, NaN oder außerhalb der Sensorlimits)
+            if dist < scan_msg.range_min or dist > scan_msg.range_max or np.isinf(dist) or np.isnan(dist):
+                continue
+
+            # Berechnung des Winkels für diesen spezifischen Strahl
+            angle = scan_msg.angle_min + i * scan_msg.angle_increment
             
+            # Umrechnung in X (Vorwärts) und Y (Seitlich)
+            # Annahme: Laser ist nach vorne ausgerichtet (0 rad = vorne)
+            x = dist * np.cos(angle)
+            y = dist * np.sin(angle)
+
             # Euklidische Distanz für min_dist Feature
-            dist = np.sqrt(x**2 + y**2)
             if dist < min_distance:
                 min_distance = dist
 
-            # Bounding Box Filter
+            # Bounding Box Filter (nutzt jetzt die berechneten x, y)
             if self.is_in_box(x, y, box, filter_dir):
                 points.append(Point32(x=float(x), y=float(y), z=0.0))
         
@@ -437,7 +449,7 @@ class FieldRobotNavigator(Node):
             self.declare_parameter(f"perception.{s}.y_max", 1.0)
 
         # >>> ROS TOPICS
-        self.declare_parameter("topics.pointcloud", "/merged_point_cloud")
+        self.declare_parameter("topics.laserscan", "/sensors/merged_scan")
         self.declare_parameter("topics.cmd_vel", "/cmd_vel")
         self.declare_parameter("topics.field_points", "/field_points")
 
@@ -463,12 +475,12 @@ class FieldRobotNavigator(Node):
             dt=0.1  # 10 Hz Loop
         )
 
-        self.latest_cloud = None
+        self.latest_scan = None
 
         # ====================================================
         # >>> ROS KOMMUNIKATION
         # ====================================================
-        self.create_subscription(PointCloud2, self.params['topic_pointcloud'], self.cloud_callback, 10)
+        self.create_subscription(LaserScan, self.params['topic_laserscan'], self.scan_callback, 10)
         self.cmd_pub = self.create_publisher(Twist, self.params['topic_cmd_vel'], 10)
         self.points_pub = self.create_publisher(PointCloud2, self.params['topic_field_points'], 10)
         self.start_srv = self.create_service(Trigger, 'start_navigation', self.start_nav_callback)
@@ -534,9 +546,9 @@ class FieldRobotNavigator(Node):
         p['topic_field_points'] = self.get_parameter("topics.field_points").value
         return p
 
-    def cloud_callback(self, msg):
+    def scan_callback(self, msg):
         # >>> SPEICHERT AKTUELLSTE SENSOR DATEN
-        self.latest_cloud = msg
+        self.latest_scan = msg
         
     def start_nav_callback(self, request, response):
         """Wird aufgerufen, wenn der ROS Service gerufen wird."""
@@ -564,7 +576,7 @@ class FieldRobotNavigator(Node):
         point_data = [(p.x, p.y, p.z) for p in points]
         
         header.stamp = self.get_clock().now().to_msg()
-        header.frame_id = self.latest_cloud.header.frame_id
+        header.frame_id = self.latest_scan.header.frame_id
         cloud = point_cloud2.create_cloud(header, fields, point_data)
         self.points_pub.publish(cloud)
 
@@ -572,16 +584,16 @@ class FieldRobotNavigator(Node):
         # ====================================================
         # >>> HAUPTABLAUF (PIPELINE)
         # ====================================================
-        if self.latest_cloud is None:
+        if self.latest_scan is None:
             return
 
         direction = self.state_machine.get_current_direction()
 
         # >>> PERCEPTION AUFRUF: Hier werden die Sensor Daten verarbeitet und die wichtigen Features berechnet
-        perception = self.perception.process(self.latest_cloud, self.state_machine.state, direction)
+        perception = self.perception.process(self.latest_scan, self.state_machine.state, direction)
         
         # >>> DEBUG: Gefilterte Punkte für RViz veröffentlichen
-        self.publish_points(perception.filtered_points, self.latest_cloud.header)
+        self.publish_points(perception.filtered_points, self.latest_scan.header)
         
         # >>> STATE MACHINE AUFRUF: Hier wird basierend auf den Perception Daten und dem aktuellen State entschieden, in welchen neuen State der Roboter wechseln soll
         state = self.state_machine.update(perception, self.params)

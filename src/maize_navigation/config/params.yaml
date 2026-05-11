@@ -39,6 +39,6 @@ maize_navigator:
         y_max: 1.0
 
     topics:
-      pointcloud: "/sensors/merged_cloud"
+      laserscan: "/sensors/merged_scan"
       cmd_vel: "/cmd_vel"
       field_points: "/field_points"
