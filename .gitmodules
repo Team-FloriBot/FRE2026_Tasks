@@ -1,0 +1,3 @@
+[submodule "src/--recurse-submodules"]
+	path = src/--recurse-submodules
+	url = https://github.com/BruceChanJianLe/laser_scan_merger.git
