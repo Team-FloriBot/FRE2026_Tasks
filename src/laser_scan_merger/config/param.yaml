@@ -30,4 +30,4 @@
 
 
     # self added
-    output_topic: ["/sensors/merged_scan"]
+    output_topic: "/sensors/merged_scan"
