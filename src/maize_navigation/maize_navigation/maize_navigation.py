@@ -541,7 +541,7 @@ class FieldRobotNavigator(Node):
                 'y_max': self.get_parameter(f"perception.{s}.y_max").value,
             }
             
-        p['topic_pointcloud'] = self.get_parameter("topics.pointcloud").value
+        p['topic_laserscan'] = self.get_parameter("topics.laserscan").value
         p['topic_cmd_vel'] = self.get_parameter("topics.cmd_vel").value
         p['topic_field_points'] = self.get_parameter("topics.field_points").value
         return p
