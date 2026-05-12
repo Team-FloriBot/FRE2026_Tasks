@@ -8,7 +8,7 @@
     scan_policies: [0, 0, 0, 0, 0, 0, 0, 0, 0]
 
     # Declare the frame id for output scan, most likely base_link is appropriate.
-    merged_frame_id: "base_footprint"
+    merged_frame_id: "base_link" # später wieder auf base_footprint ändern
 
     tolerance: 0.01
     min_height: 0.01 # default to std::numeric_limits<double>::min() if not given
