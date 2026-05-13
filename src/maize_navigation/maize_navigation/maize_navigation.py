@@ -88,7 +88,7 @@ class Perception:
     def __init__(self, bounding_boxes):
         self.bounding_boxes = bounding_boxes
 
-    def process(self, cloud_msg, current_state, pattern_direction) -> PerceptionData:
+    def process(self, scan_msg, current_state, pattern_direction) -> PerceptionData:
         data = PerceptionData()
         points = []
         
