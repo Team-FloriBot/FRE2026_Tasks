@@ -1066,10 +1066,32 @@ class Controller:
         elif state == State.ENTER_ROW:
             cmd.linear = params["vel_linear_enter_row"]
 
-            if not perception.row_end_detected:
-                cmd.angular = -perception.center_error * 4.0 * params["vel_linear_enter_row"]
+            # Beim Einfahren darf ein alter/gefilterter Center-Fehler den Roboter
+            # nicht sofort seitlich aus der Reihe drehen. Deshalb zuerst die
+            # Ausrichtung aus der SLAM-Zielpose halten und Laser-Centering nur
+            # zuschalten, wenn die neue Reihe wirklich beidseitig plausibel sichtbar ist.
+            yaw_hold_term = 0.0
+            if (
+                robot_pose.valid
+                and state_machine.align_target_pose is not None
+                and state_machine.align_target_pose.valid
+            ):
+                yaw_error = normalize_angle(state_machine.align_target_pose.yaw - robot_pose.yaw)
+                yaw_hold_term = params["turn_k_yaw"] * yaw_error
+
+            row_center_visible = (
+                not perception.row_end_detected
+                and not np.isinf(perception.left_dist)
+                and not np.isinf(perception.right_dist)
+                and abs(perception.center_error) < params["enter_row_max_center_error"]
+            )
+
+            if row_center_visible:
+                center_term = -0.45 * params["row_center_kp"] * perception.center_error
             else:
-                cmd.angular = 0.0
+                center_term = 0.0
+
+            cmd.angular = yaw_hold_term + center_term
 
             cmd.angular = float(
                 np.clip(
