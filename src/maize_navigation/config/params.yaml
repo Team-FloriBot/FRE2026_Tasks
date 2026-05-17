@@ -100,13 +100,13 @@ maize_navigator:
       confirm_cycles: 4
       free_cycles: 3
       min_strength: 5
-      max_width: 0.45
+      max_width: 0.35
 
       # Für Feldtests zunächst false.
       # true nur setzen, wenn SLAM zuverlässig ist und das Row-Counting sauber validiert wurde.
-      fallback_to_slam: true
+      fallback_to_slam: false
 
-      max_extra_shift: 0.35
+      max_extra_shift: 0.20
 
     # ============================================================
     # TF-Ausfälle tolerieren
@@ -119,7 +119,7 @@ maize_navigator:
     # ============================================================
     turn:
       headland_exit_dist: 1.0
-      pre_entry_offset: 0.50
+      pre_entry_offset: 0.35
 
       # Toleranzen
       exit_pos_tolerance: 0.08
@@ -132,13 +132,13 @@ maize_navigator:
       slowdown_distance: 0.65
       k_heading: 0.9
       k_yaw: 0.75
-      max_angular: 0.30
+      max_angular: 0.25
 
       # Überblenddistanzen für flüssigeres Wenden.
       # Größer = früherer Übergang zum nächsten Wendeschritt.
       # Kleiner = exakter, aber hakeliger.
-      exit_blend_distance: 0.22
-      shift_blend_distance: 0.18
+      exit_blend_distance: 0.12
+      shift_blend_distance: 0.08
 
     # ============================================================
     # Einfahren in die nächste Reihe
