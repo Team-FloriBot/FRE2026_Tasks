@@ -131,11 +131,15 @@ class RowModel:
     s_center:
         Laterale Koordinate der aktuellen Reihenmitte.
         s = dot([x, y], e_lateral) mit e_lateral = [-sin(yaw), cos(yaw)].
+    target_s_center:
+        Laterale Koordinate der nächsten Zielreihe nach einer Wende.
+        Während ENTER_ROW wird diese Position bevorzugt genutzt.
     confidence:
         Qualitätsmaß 0..1, wird bei stabiler Laserdetektion erhöht und sonst langsam abgebaut.
     """
     yaw_map: float = 0.0
     s_center: float = 0.0
+    target_s_center: float = 0.0
     confidence: float = 0.0
     valid: bool = False
     last_update_sec: float = 0.0
@@ -682,6 +686,12 @@ class StateMachine:
             valid=True,
         )
 
+        # Zielreihe für das spätere ENTER_ROW speichern.
+        # Dadurch kann der Roboter beim Einbiegen die bekannte SLAM-/Map-Position
+        # der neuen Reihenmitte halten, bevor die Laserdetektion stabil ist.
+        if row_model is not None and row_model.valid:
+            row_model.target_s_center = row_model.s_center + row_shift
+
         return exit_pose, shift_pose, align_pose
 
     def update(self, perception: PerceptionData, params, robot_pose: RobotPose):
@@ -1066,38 +1076,59 @@ class Controller:
         elif state == State.ENTER_ROW:
             cmd.linear = params["vel_linear_enter_row"]
 
-            # Beim Einfahren darf ein alter/gefilterter Center-Fehler den Roboter
-            # nicht sofort seitlich aus der Reihe drehen. Deshalb zuerst die
-            # Ausrichtung aus der SLAM-Zielpose halten und Laser-Centering nur
-            # zuschalten, wenn die neue Reihe wirklich beidseitig plausibel sichtbar ist.
             yaw_hold_term = 0.0
+            slam_center_term = 0.0
+            laser_center_term = 0.0
+            laser_heading_term = 0.0
+
+            # 1) Beim Einfahren zuerst die Zielausrichtung aus der Wende halten.
             if (
                 robot_pose.valid
                 and state_machine.align_target_pose is not None
                 and state_machine.align_target_pose.valid
             ):
                 yaw_error = normalize_angle(state_machine.align_target_pose.yaw - robot_pose.yaw)
-                yaw_hold_term = params["turn_k_yaw"] * yaw_error
+                yaw_hold_term = params["enter_row_yaw_kp"] * yaw_error
 
-            row_center_visible = (
+            # 2) Zusätzlich die erwartete Zielreihe aus SLAM/Map halten.
+            # Das verhindert Schwingen, wenn beim Einfahren zuerst nur einzelne Pflanzen
+            # links oder rechts sichtbar werden.
+            if params["slam_row_enable"] and robot_pose.valid:
+                slam_center_error, _slam_heading_error, slam_valid = node.compute_slam_row_errors(
+                    robot_pose,
+                    use_target=True,
+                )
+
+                if slam_valid:
+                    slam_center_term = -params["enter_row_slam_center_kp"] * slam_center_error
+
+            # 3) Laser-Centering erst aktivieren, wenn die neue Reihe beidseitig
+            # und mit plausibler Richtung stabil erkannt ist.
+            laser_row_locked = (
                 not perception.row_end_detected
                 and not np.isinf(perception.left_dist)
                 and not np.isinf(perception.right_dist)
+                and perception.row_heading_valid
                 and abs(perception.center_error) < params["enter_row_max_center_error"]
+                and abs(perception.row_heading_error) < params["enter_row_max_heading_error"]
             )
 
-            if row_center_visible:
-                center_term = -0.45 * params["row_center_kp"] * perception.center_error
-            else:
-                center_term = 0.0
+            if laser_row_locked:
+                laser_center_term = -params["enter_row_laser_center_kp"] * perception.center_error
+                laser_heading_term = params["enter_row_laser_heading_kp"] * perception.row_heading_error
 
-            cmd.angular = yaw_hold_term + center_term
+            cmd.angular = (
+                yaw_hold_term
+                + slam_center_term
+                + laser_center_term
+                + laser_heading_term
+            )
 
             cmd.angular = float(
                 np.clip(
                     cmd.angular,
-                    -params["turn_max_angular"],
-                    params["turn_max_angular"],
+                    -params["enter_row_max_angular"],
+                    params["enter_row_max_angular"],
                 )
             )
 
@@ -1371,8 +1402,14 @@ class FieldRobotNavigator(Node):
         self.declare_parameter("turn.shift_blend_distance", 0.18)
 
         # ENTER_ROW
-        self.declare_parameter("enter_row.confirm_cycles", 5)
-        self.declare_parameter("enter_row.max_center_error", 0.20)
+        self.declare_parameter("enter_row.confirm_cycles", 8)
+        self.declare_parameter("enter_row.max_center_error", 0.16)
+        self.declare_parameter("enter_row.yaw_kp", 0.9)
+        self.declare_parameter("enter_row.slam_center_kp", 0.8)
+        self.declare_parameter("enter_row.laser_center_kp", 0.25)
+        self.declare_parameter("enter_row.laser_heading_kp", 0.25)
+        self.declare_parameter("enter_row.max_heading_error", 0.18)
+        self.declare_parameter("enter_row.max_angular", 0.25)
 
         # PERCEPTION PARAMETER
         states = ["drive_in_row", "turn_and_exit", "counting_rows", "turn_to_row"]
@@ -1555,6 +1592,18 @@ class FieldRobotNavigator(Node):
                     self.params["enter_row_confirm_cycles"] = int(param.value)
                 elif keys[1] == "max_center_error":
                     self.params["enter_row_max_center_error"] = param.value
+                elif keys[1] == "yaw_kp":
+                    self.params["enter_row_yaw_kp"] = param.value
+                elif keys[1] == "slam_center_kp":
+                    self.params["enter_row_slam_center_kp"] = param.value
+                elif keys[1] == "laser_center_kp":
+                    self.params["enter_row_laser_center_kp"] = param.value
+                elif keys[1] == "laser_heading_kp":
+                    self.params["enter_row_laser_heading_kp"] = param.value
+                elif keys[1] == "max_heading_error":
+                    self.params["enter_row_max_heading_error"] = param.value
+                elif keys[1] == "max_angular":
+                    self.params["enter_row_max_angular"] = param.value
 
             elif len(keys) == 3 and keys[0] == "perception":
                 self.params["bounding_boxes"][keys[1]][keys[2]] = param.value
@@ -1633,6 +1682,12 @@ class FieldRobotNavigator(Node):
 
         p["enter_row_confirm_cycles"] = int(self.get_parameter("enter_row.confirm_cycles").value)
         p["enter_row_max_center_error"] = self.get_parameter("enter_row.max_center_error").value
+        p["enter_row_yaw_kp"] = self.get_parameter("enter_row.yaw_kp").value
+        p["enter_row_slam_center_kp"] = self.get_parameter("enter_row.slam_center_kp").value
+        p["enter_row_laser_center_kp"] = self.get_parameter("enter_row.laser_center_kp").value
+        p["enter_row_laser_heading_kp"] = self.get_parameter("enter_row.laser_heading_kp").value
+        p["enter_row_max_heading_error"] = self.get_parameter("enter_row.max_heading_error").value
+        p["enter_row_max_angular"] = self.get_parameter("enter_row.max_angular").value
 
         p["bounding_boxes"] = {}
         states = ["drive_in_row", "turn_and_exit", "counting_rows", "turn_to_row"]
@@ -1792,6 +1847,7 @@ class FieldRobotNavigator(Node):
         if not self.row_model.valid:
             self.row_model.yaw_map = row_yaw_meas
             self.row_model.s_center = s_center_meas
+            self.row_model.target_s_center = s_center_meas
             self.row_model.confidence = min(1.0, 0.30 + perception.line_confidence)
             self.row_model.valid = True
         else:
@@ -1814,7 +1870,7 @@ class FieldRobotNavigator(Node):
 
         self.row_model.last_update_sec = float(self.get_clock().now().nanoseconds) * 1e-9
 
-    def compute_slam_row_errors(self, robot_pose: RobotPose):
+    def compute_slam_row_errors(self, robot_pose: RobotPose, use_target: bool = False):
         """
         Liefert Cross-Track- und Heading-Fehler relativ zur globalen Reihenhypothese.
         center_error > 0 bedeutet analog zur Laserdetektion: Roboter ist links der Reihenmitte.
@@ -1831,7 +1887,8 @@ class FieldRobotNavigator(Node):
         e_lateral = np.array([-np.sin(yaw_row), np.cos(yaw_row)], dtype=float)
         robot_xy = np.array([robot_pose.x, robot_pose.y], dtype=float)
 
-        center_error = float(np.dot(robot_xy, e_lateral) - self.row_model.s_center)
+        s_reference = self.row_model.target_s_center if use_target else self.row_model.s_center
+        center_error = float(np.dot(robot_xy, e_lateral) - s_reference)
         heading_error = normalize_angle(yaw_row - robot_pose.yaw)
 
         return center_error, heading_error, True
