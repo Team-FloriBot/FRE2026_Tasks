@@ -3,22 +3,30 @@
 <package format="3">
   <name>maize_navigation</name>
   <version>0.0.0</version>
-  <description>TODO: Package description</description>
+  <description>Maize row navigation with LaserScan perception and SLAM-based headland turning</description>
+
   <maintainer email="norika.schneider@gmail.com">norika-schneider</maintainer>
   <license>Apache-2.0</license>
+
+  <depend>rclpy</depend>
+  <depend>rcl_interfaces</depend>
+
+  <depend>geometry_msgs</depend>
+  <depend>sensor_msgs</depend>
+  <depend>sensor_msgs_py</depend>
+  <depend>std_srvs</depend>
+
+  <depend>tf2_ros</depend>
+  <depend>tf2_sensor_msgs</depend>
+
+  <depend>laser_geometry</depend>
+  <depend>message_filters</depend>
+  <depend>python3-numpy</depend>
 
   <test_depend>ament_copyright</test_depend>
   <test_depend>ament_flake8</test_depend>
   <test_depend>ament_pep257</test_depend>
   <test_depend>python3-pytest</test_depend>
-  <depend>rclpy</depend>
-  <depend>sensor_msgs</depend>
-  <depend>sensor_msgs_py</depend>
-  <depend>laser_geometry</depend>
-  <depend>tf2_ros</depend>
-  <depend>tf2_sensor_msgs</depend>
-  <depend>message_filters</depend>
-  <depend>python3-numpy</depend>
 
   <export>
     <build_type>ament_python</build_type>
