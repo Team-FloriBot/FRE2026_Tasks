@@ -176,21 +176,21 @@ class NavigatorParams:
     front_density_x_min: float = 0.60
     front_density_x_max: float = 2.00
     front_density_y_abs: float = 0.45
-    front_density_threshold: int = 2
-    end_probability_threshold: float = 0.85
-    end_stable_frames_required: int = 12
+    front_density_threshold: int = 1
+    end_probability_threshold: float = 0.95
+    end_stable_frames_required: int = 25
 
-    min_follow_confidence: float = 0.25
+    min_follow_confidence: float = 0.10
     min_enter_confidence: float = 0.18
     enter_stable_frames_required: int = 5
     acquire_timeout_sec: float = 8.0
 
-    follow_speed: float = 0.25
-    slow_speed: float = 0.10
-    enter_speed: float = 0.12
-    turn_speed: float = 0.10
-    max_linear_speed: float = 0.35
-    max_angular_speed: float = 1.40
+    follow_speed: float = 0.18
+    slow_speed: float = 0.08
+    enter_speed: float = 0.10
+    turn_speed: float = 0.08
+    max_linear_speed: float = 0.25
+    max_angular_speed: float = 1.20
 
     lookahead_distance: float = 0.25
     path_goal_xy_tolerance: float = 0.12
@@ -203,8 +203,8 @@ class NavigatorParams:
     row_shift_direction: str = "L"
     turn_180: bool = True
 
-    obstacle_stop_distance: float = 0.12
-    obstacle_slow_distance: float = 0.30
+    obstacle_stop_distance: float = 0.18
+    obstacle_slow_distance: float = 0.35
 
     publish_debug: bool = True
 
@@ -470,7 +470,7 @@ class RowTracker:
             self.model.missing_frames += 1
             self.model.confidence *= self.p.confidence_decay
 
-            if self.model.confidence < 0.05:
+            if self.model.confidence < 0.01 and self.model.missing_frames > 20:
                 self.model.valid = False
 
         self.model.end_probability = (
@@ -554,20 +554,12 @@ class LocalPlanner:
 
         local: List[PathPoint] = []
 
-        # Kurzer Ausfahrabschnitt vor dem Halbkreis.
-        # Für einen reinen Halbkreis exit_distance in params.yaml auf 0.0 setzen.
         if self.p.exit_distance > 0.01:
             for x in np.linspace(0.0, self.p.exit_distance, 12):
                 local.append(PathPoint(float(x), 0.0, 0.0, self.p.slow_speed))
 
         x_offset = self.p.exit_distance
 
-        # Echte Halbkreiswende:
-        # Start:  (x_offset, 0), Tangente +x
-        # Ende:   (x_offset, +/- 2R), Tangente -x
-        #
-        # Mittelpunkt links:  (x_offset, +R)
-        # Mittelpunkt rechts: (x_offset, -R)
         for phi in np.linspace(-math.pi / 2.0, math.pi / 2.0, 90):
             x = x_offset + radius * math.cos(phi)
             y = direction * (radius + radius * math.sin(phi))
@@ -586,8 +578,6 @@ class LocalPlanner:
                 )
             )
 
-        # Kurzer Einfahrabschnitt in Gegenrichtung.
-        # Nach der Halbkreiswende zeigt der Roboter nach hinten.
         end_y = direction * row_shift
 
         if self.p.enter_distance > 0.01:
@@ -656,7 +646,7 @@ class PathFollower:
             return cmd
 
         alpha = math.atan2(target.y, target.x)
-        curvature = 2.0 * math.sin(alpha) / max(self.p.lookahead_distance, 1e-3)
+        curvature = 2.0 * math.sin(alpha) / max(0.45, 1e-3)
 
         v = clamp(target.v, 0.0, self.p.max_linear_speed)
 
@@ -730,9 +720,11 @@ class PathFollower:
         return cmd
 
     def find_lookahead_base_link(self, points: List[PathPoint]) -> Optional[PathPoint]:
+        follow_lookahead = 0.45
+
         for p in points:
             d = math.hypot(p.x, p.y)
-            if d >= self.p.lookahead_distance and p.x > 0.0:
+            if d >= follow_lookahead and p.x > 0.0:
                 return p
 
         return points[-1] if points else None
@@ -796,33 +788,55 @@ class SafetySupervisor:
         if scan is None:
             return self.stop()
 
-        front_min = self.front_min_distance(scan)
+        front_min = self.front_min_distance(scan, state)
 
         if front_min < self.p.obstacle_stop_distance:
             return self.stop()
 
         if front_min < self.p.obstacle_slow_distance:
-            cmd.linear.x *= 0.4
+            cmd.linear.x *= 0.35
+            cmd.angular.z *= 0.7
 
         if state == MissionState.FOLLOW_ROW:
-            if row.confidence < 0.10:
-                return self.stop()
+            if row.confidence < 0.05:
+                cmd.linear.x *= 0.3
 
             if row.confidence < self.p.min_follow_confidence:
-                cmd.linear.x *= 0.45
+                cmd.linear.x *= 0.6
 
-        cmd.linear.x = clamp(cmd.linear.x, -self.p.max_linear_speed, self.p.max_linear_speed)
-        cmd.angular.z = clamp(cmd.angular.z, -self.p.max_angular_speed, self.p.max_angular_speed)
+        cmd.linear.x = clamp(
+            cmd.linear.x,
+            -self.p.max_linear_speed,
+            self.p.max_linear_speed,
+        )
+        cmd.angular.z = clamp(
+            cmd.angular.z,
+            -self.p.max_angular_speed,
+            self.p.max_angular_speed,
+        )
 
         return cmd
 
-    def front_min_distance(self, scan: LaserScan) -> float:
+    def front_min_distance(self, scan: LaserScan, state: MissionState) -> float:
         angle = scan.angle_min
         min_r = float("inf")
 
+        if state == MissionState.FOLLOW_ROW:
+            front_angle = math.radians(8.0)
+        elif state in (
+            MissionState.EXECUTE_TURN,
+            MissionState.ACQUIRE_ROW,
+            MissionState.ENTER_ROW,
+            MissionState.EXIT_ROW,
+            MissionState.PLAN_TURN,
+        ):
+            front_angle = math.radians(35.0)
+        else:
+            front_angle = math.radians(15.0)
+
         for r in scan.ranges:
             if math.isfinite(r) and scan.range_min < r < scan.range_max:
-                if abs(angle) < math.radians(10.0):
+                if abs(angle) < front_angle:
                     min_r = min(min_r, r)
 
             angle += scan.angle_increment
