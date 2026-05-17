@@ -586,6 +586,7 @@ class StateMachine:
         self.shift_target_pose = None
         self.align_target_pose = None
         self.shift_start_pose = None
+        self.enter_row_start_pose = None
 
         self.row_end_counter = 0
         self.enter_row_seen_counter = 0
@@ -616,6 +617,7 @@ class StateMachine:
         self.shift_target_pose = None
         self.align_target_pose = None
         self.shift_start_pose = None
+        self.enter_row_start_pose = None
 
         self.row_end_counter = 0
         self.enter_row_seen_counter = 0
@@ -783,6 +785,7 @@ class StateMachine:
                         self.enter_row_seen_counter = 0
                         self.reset_shift_row_detection()
                         self.shift_start_pose = None
+                        self.enter_row_start_pose = None
                         self.tf_missing_counter = 0
                         self.state = State.EXIT_ROW
 
@@ -932,6 +935,12 @@ class StateMachine:
 
                 if yaw_error < params["turn_yaw_tolerance"]:
                     self.enter_row_seen_counter = 0
+                    self.enter_row_start_pose = RobotPose(
+                        x=robot_pose.x,
+                        y=robot_pose.y,
+                        yaw=robot_pose.yaw,
+                        valid=True,
+                    )
                     self.state = State.ENTER_ROW
 
         # ====================================================
@@ -950,7 +959,24 @@ class StateMachine:
                 and abs(perception.row_heading_error) < params["enter_row_max_heading_error"]
             )
 
-            if row_visible:
+            enter_row_distance = 0.0
+            if (
+                robot_pose.valid
+                and self.enter_row_start_pose is not None
+                and self.enter_row_start_pose.valid
+            ):
+                enter_row_distance = distance_2d(robot_pose, self.enter_row_start_pose)
+
+            # Der erste Abschnitt der neuen Reihe wird bewusst aus der map-/SLAM-
+            # Zielreihe gefahren. Die lokale Laserdetektion darf den Zustand erst
+            # übernehmen, nachdem diese Mindeststrecke erreicht wurde. Dadurch
+            # springen einzelne erste Pflanzen oder Lücken nicht sofort in die
+            # Reihenführung.
+            map_guided_distance_reached = (
+                enter_row_distance >= params["enter_row_map_guided_distance"]
+            )
+
+            if row_visible and map_guided_distance_reached:
                 self.enter_row_seen_counter += 1
             else:
                 self.enter_row_seen_counter = 0
@@ -965,6 +991,7 @@ class StateMachine:
                 self.enter_row_seen_counter = 0
                 self.reset_shift_row_detection()
                 self.shift_start_pose = None
+                self.enter_row_start_pose = None
                 self.tf_missing_counter = 0
 
                 self.exit_target_pose = None
@@ -1152,6 +1179,16 @@ class Controller:
             laser_center_term = 0.0
             laser_heading_term = 0.0
 
+            enter_row_distance = 0.0
+            if (
+                robot_pose.valid
+                and state_machine.enter_row_start_pose is not None
+                and state_machine.enter_row_start_pose.valid
+            ):
+                enter_row_distance = distance_2d(robot_pose, state_machine.enter_row_start_pose)
+
+            map_guided_phase = enter_row_distance < params["enter_row_map_guided_distance"]
+
             # 1) Beim Einfahren zuerst die Zielausrichtung aus der Wende halten.
             if (
                 robot_pose.valid
@@ -1173,10 +1210,12 @@ class Controller:
                 if slam_valid:
                     slam_center_term = -params["enter_row_slam_center_kp"] * slam_center_error
 
-            # 3) Laser-Centering erst aktivieren, wenn die neue Reihe beidseitig
-            # und mit plausibler Richtung stabil erkannt ist.
+            # 3) Laser-Centering erst nach dem map-geführten ersten Abschnitt
+            # aktivieren. Vorher bestimmen Zielreihe und Ziel-Yaw aus der Karte
+            # die Bewegung.
             laser_row_locked = (
-                not perception.row_end_detected
+                not map_guided_phase
+                and not perception.row_end_detected
                 and not np.isinf(perception.left_dist)
                 and not np.isinf(perception.right_dist)
                 and perception.row_heading_valid
@@ -1474,6 +1513,7 @@ class FieldRobotNavigator(Node):
 
         # ENTER_ROW
         self.declare_parameter("enter_row.confirm_cycles", 8)
+        self.declare_parameter("enter_row.map_guided_distance", 1.0)
         self.declare_parameter("enter_row.max_center_error", 0.16)
         self.declare_parameter("enter_row.yaw_kp", 0.9)
         self.declare_parameter("enter_row.slam_center_kp", 0.8)
@@ -1661,6 +1701,8 @@ class FieldRobotNavigator(Node):
             elif len(keys) == 2 and keys[0] == "enter_row":
                 if keys[1] == "confirm_cycles":
                     self.params["enter_row_confirm_cycles"] = int(param.value)
+                elif keys[1] == "map_guided_distance":
+                    self.params["enter_row_map_guided_distance"] = param.value
                 elif keys[1] == "max_center_error":
                     self.params["enter_row_max_center_error"] = param.value
                 elif keys[1] == "yaw_kp":
@@ -1752,6 +1794,7 @@ class FieldRobotNavigator(Node):
         p["turn_shift_blend_distance"] = self.get_parameter("turn.shift_blend_distance").value
 
         p["enter_row_confirm_cycles"] = int(self.get_parameter("enter_row.confirm_cycles").value)
+        p["enter_row_map_guided_distance"] = self.get_parameter("enter_row.map_guided_distance").value
         p["enter_row_max_center_error"] = self.get_parameter("enter_row.max_center_error").value
         p["enter_row_yaw_kp"] = self.get_parameter("enter_row.yaw_kp").value
         p["enter_row_slam_center_kp"] = self.get_parameter("enter_row.slam_center_kp").value
