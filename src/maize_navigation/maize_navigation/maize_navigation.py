@@ -22,7 +22,6 @@ from std_srvs.srv import Trigger
 from visualization_msgs.msg import Marker, MarkerArray
 
 import tf2_ros
-from tf_transformations import euler_from_quaternion, quaternion_from_euler
 
 
 def clamp(value: float, lo: float, hi: float) -> float:
@@ -35,6 +34,22 @@ def wrap_to_pi(angle: float) -> float:
     while angle < -math.pi:
         angle += 2.0 * math.pi
     return angle
+
+
+def yaw_from_quaternion(q) -> float:
+    siny_cosp = 2.0 * (q.w * q.z + q.x * q.y)
+    cosy_cosp = 1.0 - 2.0 * (q.y * q.y + q.z * q.z)
+    return math.atan2(siny_cosp, cosy_cosp)
+
+
+def quaternion_from_yaw(yaw: float):
+    half = 0.5 * yaw
+    return (
+        0.0,
+        0.0,
+        math.sin(half),
+        math.cos(half),
+    )
 
 
 @dataclass
@@ -258,6 +273,7 @@ class RowPerception:
                 x = r * math.cos(angle)
                 y = r * math.sin(angle)
                 points.append(ScanPoint(x, y))
+
             angle += scan.angle_increment
 
         return points
@@ -1047,7 +1063,7 @@ class MaizeNavigator(Node):
             return None
 
         q = tf.transform.rotation
-        _, _, yaw = euler_from_quaternion([q.x, q.y, q.z, q.w])
+        yaw = yaw_from_quaternion(q)
 
         t = tf.transform.translation
 
@@ -1084,7 +1100,7 @@ class MaizeNavigator(Node):
             pose.pose.position.y = float(p.y)
             pose.pose.position.z = 0.0
 
-            q = quaternion_from_euler(0.0, 0.0, p.yaw)
+            q = quaternion_from_yaw(p.yaw)
 
             pose.pose.orientation.x = q[0]
             pose.pose.orientation.y = q[1]
