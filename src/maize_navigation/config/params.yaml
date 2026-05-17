@@ -14,7 +14,7 @@ maize_navigator:
     # ============================================================
     vel_linear_drive: 0.22
     vel_linear_count: 0.35
-    vel_linear_turn: 0.14
+    vel_linear_turn: 0.12
 
     # Für das Einfahren bewusst langsamer, damit ENTER_ROW nicht überschwingt.
     vel_linear_enter_row: 0.08
@@ -99,14 +99,14 @@ maize_navigator:
     row_pass:
       confirm_cycles: 4
       free_cycles: 3
-      min_strength: 8
-      max_width: 0.30
+      min_strength: 5
+      max_width: 0.45
 
       # Für Feldtests zunächst false.
       # true nur setzen, wenn SLAM zuverlässig ist und das Row-Counting sauber validiert wurde.
-      fallback_to_slam: false
+      fallback_to_slam: true
 
-      max_extra_shift: 0.20
+      max_extra_shift: 0.35
 
     # ============================================================
     # TF-Ausfälle tolerieren
