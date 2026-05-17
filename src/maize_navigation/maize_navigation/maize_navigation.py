@@ -122,6 +122,15 @@ class PerceptionData:
     forward_center_error: float = 0.0
     forward_center_valid: bool = False
 
+    # Explizite Fahrgassen-Geometrie.
+    # Diese Werte beschreiben die Mitte zwischen linker und rechter Pflanzenreihe,
+    # nicht den Mittelpunkt einer einzelnen Pflanzenlinie.
+    left_row_y: float = np.inf
+    right_row_y: float = -np.inf
+    lane_center_y: float = 0.0
+    lane_width: float = np.inf
+    lane_center_valid: bool = False
+
     # Linienmodell der lokalen Reihe.
     left_line_valid: bool = False
     right_line_valid: bool = False
@@ -320,6 +329,7 @@ class Perception:
 
         if near_valid:
             data.center_error = data.near_center_error
+            lane_points = near_points
         else:
             (
                 data.left_dist,
@@ -330,6 +340,18 @@ class Perception:
                 _all_valid,
             ) = self.compute_side_distances(points)
             data.min_side_clearance = min(data.left_near, data.right_near)
+            lane_points = points
+
+        (
+            data.left_row_y,
+            data.right_row_y,
+            data.lane_center_y,
+            data.lane_width,
+            data.lane_center_valid,
+        ) = self.compute_lane_geometry(lane_points)
+
+        if not data.lane_center_valid:
+            data.center_error = 0.0
 
         (
             _forward_left,
@@ -357,14 +379,10 @@ class Perception:
         data.right_line_valid = right_line is not None
         data.line_inlier_count = len(left_inliers) + len(right_inliers)
 
-        slopes = []
-        if left_line is not None:
-            slopes.append(left_line[0])
-        if right_line is not None:
-            slopes.append(right_line[0])
-
-        if slopes:
-            center_slope = float(np.mean(slopes))
+        # Eine einzelne Pflanzenlinie darf die Fahrgassenrichtung nicht bestimmen.
+        # Erst zwei Seitenlinien definieren die Richtung der Fahrgasse robust.
+        if left_line is not None and right_line is not None:
+            center_slope = float(np.mean([left_line[0], right_line[0]]))
             data.row_heading_error = float(np.arctan(center_slope))
             data.row_heading_valid = True
 
@@ -472,6 +490,33 @@ class Perception:
 
         return float(np.median(cluster_ys)), True, int(len(cluster_ys)), width
 
+    def compute_lane_geometry(self, points):
+        """
+        Bestimmt die Fahrgassenmitte aus zwei gegenüberliegenden Pflanzenreihen.
+
+        y > 0 ist links, y < 0 ist rechts. Eine einzelne sichtbare Pflanzenreihe
+        ist keine gültige Fahrgasse und darf daher keine Querregelung auslösen.
+
+        center_error > 0 bedeutet: Der Roboter steht links der Fahrgassenmitte
+        und muss nach rechts korrigieren. Deshalb gilt center_error = -lane_center_y.
+        """
+        left_y = np.array([p.y for p in points if p.y > 0.0], dtype=float)
+        right_y = np.array([p.y for p in points if p.y < 0.0], dtype=float)
+
+        if len(left_y) == 0 or len(right_y) == 0:
+            return np.inf, -np.inf, 0.0, np.inf, False
+
+        # Innere Kanten der Pflanzenreihen: links nahe 0, rechts nahe 0.
+        left_row_y = float(np.percentile(left_y, 25.0))
+        right_row_y = float(np.percentile(right_y, 75.0))
+        lane_width = float(left_row_y - right_row_y)
+        lane_center_y = 0.5 * (left_row_y + right_row_y)
+
+        # Plausibilisierung gegen Einzelpflanzen, falsche Cluster oder Wendeobjekte.
+        valid = bool(0.25 <= lane_width <= 1.40)
+
+        return left_row_y, right_row_y, lane_center_y, lane_width, valid
+
     def compute_side_distances(self, points):
         """
         Robuste Seitenabstände für linke und rechte Pflanzenreihe.
@@ -497,9 +542,14 @@ class Perception:
             center_error = 0.0
             valid = False
         else:
-            # Positiv bedeutet: Roboter ist zu weit links und muss nach rechts korrigieren.
-            center_error = (right_dist - left_dist) / 2.0
-            valid = True
+            _left_row_y, _right_row_y, lane_center_y, _lane_width, lane_valid = self.compute_lane_geometry(points)
+            if lane_valid:
+                # Positiv bedeutet: Roboter ist links der Fahrgassenmitte und muss nach rechts.
+                center_error = -lane_center_y
+                valid = True
+            else:
+                center_error = 0.0
+                valid = False
 
         return left_dist, right_dist, left_near, right_near, center_error, valid
 
@@ -605,6 +655,7 @@ class StateMachine:
 
         self.row_end_counter = 0
         self.enter_row_seen_counter = 0
+        self.align_yaw_stable_counter = 0
 
         # Sobald der letzte Pattern-Schritt abgeschlossen ist,
         # wird nicht sofort gestoppt, sondern die letzte Reihe bis zum Ende gefahren.
@@ -636,6 +687,7 @@ class StateMachine:
 
         self.row_end_counter = 0
         self.enter_row_seen_counter = 0
+        self.align_yaw_stable_counter = 0
         self.final_row_active = False
 
         self.reset_shift_row_detection()
@@ -798,6 +850,7 @@ class StateMachine:
                         and self.align_target_pose is not None
                     ):
                         self.enter_row_seen_counter = 0
+                        self.align_yaw_stable_counter = 0
                         self.reset_shift_row_detection()
                         self.shift_start_pose = None
                         self.enter_row_start_pose = None
@@ -949,7 +1002,13 @@ class StateMachine:
                 yaw_error = abs(normalize_angle(self.align_target_pose.yaw - robot_pose.yaw))
 
                 if yaw_error < params["turn_yaw_tolerance"]:
+                    self.align_yaw_stable_counter += 1
+                else:
+                    self.align_yaw_stable_counter = 0
+
+                if self.align_yaw_stable_counter >= params["turn_align_confirm_cycles"]:
                     self.enter_row_seen_counter = 0
+                    self.align_yaw_stable_counter = 0
                     self.enter_row_start_pose = RobotPose(
                         x=robot_pose.x,
                         y=robot_pose.y,
@@ -968,6 +1027,7 @@ class StateMachine:
                 and np.isfinite(perception.left_dist)
                 and np.isfinite(perception.right_dist)
                 and perception.row_heading_valid
+                and perception.lane_center_valid
                 and perception.left_line_valid
                 and perception.right_line_valid
                 and abs(perception.center_error) < params["enter_row_max_center_error"]
@@ -1063,12 +1123,17 @@ class Controller:
 
                     if slam_valid:
                         if (
-                            perception.left_line_valid
+                            perception.lane_center_valid
+                            and perception.left_line_valid
                             and perception.right_line_valid
                             and perception.line_confidence >= params["slam_row_laser_conf_high"]
                         ):
                             w_laser = params["slam_row_laser_weight_high"]
-                        elif perception.left_line_valid or perception.right_line_valid:
+                        elif (
+                            perception.lane_center_valid
+                            and perception.left_line_valid
+                            and perception.right_line_valid
+                        ):
                             w_laser = params["slam_row_laser_weight_medium"]
                         else:
                             w_laser = 0.0
@@ -1183,11 +1248,12 @@ class Controller:
         # ====================================================
 
         elif state == State.ALIGN_TO_NEXT_ROW:
-            cmd = self.compute_yaw_control_with_creep(
+            # Reine Yaw-Ausrichtung ohne Vorwärtskriechen.
+            # Dadurch wird beim Links-/Rechtsdrehen kein Bogen gefahren.
+            cmd = self.compute_yaw_control(
                 robot_pose=robot_pose,
                 target_pose=state_machine.align_target_pose,
                 params=params,
-                creep_linear=params["vel_linear_enter_row"] * 0.45,
             )
 
         # ====================================================
@@ -1250,8 +1316,11 @@ class Controller:
             laser_row_locked = (
                 not map_guided_phase
                 and not perception.row_end_detected
+                and perception.lane_center_valid
                 and not np.isinf(perception.left_dist)
                 and not np.isinf(perception.right_dist)
+                and perception.left_line_valid
+                and perception.right_line_valid
                 and perception.row_heading_valid
                 and abs(perception.center_error) < params["enter_row_max_center_error"]
                 and abs(perception.row_heading_error) < params["enter_row_max_heading_error"]
@@ -1534,12 +1603,13 @@ class FieldRobotNavigator(Node):
         self.declare_parameter("turn.exit_pos_tolerance", 0.08)
         self.declare_parameter("turn.shift_pos_tolerance", 0.08)
         self.declare_parameter("turn.pos_tolerance", 0.07)
-        self.declare_parameter("turn.yaw_tolerance", 0.06)
+        self.declare_parameter("turn.yaw_tolerance", 0.04)
+        self.declare_parameter("turn.align_confirm_cycles", 5)
 
         self.declare_parameter("turn.slowdown_distance", 0.65)
         self.declare_parameter("turn.k_heading", 0.9)
-        self.declare_parameter("turn.k_yaw", 1.0)
-        self.declare_parameter("turn.max_angular", 0.45)
+        self.declare_parameter("turn.k_yaw", 0.75)
+        self.declare_parameter("turn.max_angular", 0.30)
 
         # Überblenddistanzen für flüssigere Wendebewegung.
         self.declare_parameter("turn.exit_blend_distance", 0.22)
@@ -1721,6 +1791,7 @@ class FieldRobotNavigator(Node):
                     "shift_pos_tolerance": "turn_shift_pos_tolerance",
                     "pos_tolerance": "turn_pos_tolerance",
                     "yaw_tolerance": "turn_yaw_tolerance",
+                    "align_confirm_cycles": "turn_align_confirm_cycles",
                     "slowdown_distance": "turn_slowdown_distance",
                     "k_heading": "turn_k_heading",
                     "k_yaw": "turn_k_yaw",
@@ -1730,7 +1801,10 @@ class FieldRobotNavigator(Node):
                 }
 
                 if keys[1] in mapping:
-                    self.params[mapping[keys[1]]] = param.value
+                    if keys[1] == "align_confirm_cycles":
+                        self.params[mapping[keys[1]]] = int(param.value)
+                    else:
+                        self.params[mapping[keys[1]]] = param.value
 
             elif len(keys) == 2 and keys[0] == "enter_row":
                 if keys[1] == "confirm_cycles":
@@ -1818,6 +1892,7 @@ class FieldRobotNavigator(Node):
         p["turn_shift_pos_tolerance"] = self.get_parameter("turn.shift_pos_tolerance").value
         p["turn_pos_tolerance"] = self.get_parameter("turn.pos_tolerance").value
         p["turn_yaw_tolerance"] = self.get_parameter("turn.yaw_tolerance").value
+        p["turn_align_confirm_cycles"] = int(self.get_parameter("turn.align_confirm_cycles").value)
 
         p["turn_slowdown_distance"] = self.get_parameter("turn.slowdown_distance").value
         p["turn_k_heading"] = self.get_parameter("turn.k_heading").value
@@ -1960,6 +2035,7 @@ class FieldRobotNavigator(Node):
 
         stable_local_row = (
             perception.row_heading_valid
+            and perception.lane_center_valid
             and perception.left_line_valid
             and perception.right_line_valid
             and perception.line_confidence >= self.params["slam_row_min_line_confidence"]
