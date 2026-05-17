@@ -73,6 +73,13 @@ class PerceptionData:
     forward_center_error: float = 0.0
     forward_center_valid: bool = False
 
+    # Reihenerkennung beim seitlichen Vorbeifahren im Vorgewende.
+    # row_candidate_y ist die seitliche Position der detektierten Reihe im Roboter-Frame.
+    row_candidate_y: float = np.inf
+    row_candidate_valid: bool = False
+    row_candidate_strength: int = 0
+    row_candidate_width: float = np.inf
+
 
 # ============================================================
 # >>> DATENCONTAINER: ROBOTERPOSE AUS SLAM / TF
@@ -158,7 +165,7 @@ class Perception:
         state_key_map = {
             State.DRIVE_IN_ROW: "drive_in_row",
             State.EXIT_ROW: "turn_and_exit",
-            State.SHIFT_TO_NEXT_ROW: "turn_and_exit",
+            State.SHIFT_TO_NEXT_ROW: "counting_rows",
             State.ALIGN_TO_NEXT_ROW: "turn_and_exit",
             State.ENTER_ROW: "turn_to_row",
         }
@@ -247,6 +254,14 @@ class Perception:
         data.x_mean = np.mean(points_x) if len(points_x) > 0 else np.inf
         data.y_mean = np.mean(points_y) if len(points_y) > 0 else np.inf
 
+        if current_state == State.SHIFT_TO_NEXT_ROW:
+            (
+                data.row_candidate_y,
+                data.row_candidate_valid,
+                data.row_candidate_strength,
+                data.row_candidate_width,
+            ) = self.detect_lateral_row_candidate(points)
+
         left_points = [p for p in points if p.y > 0.0]
         right_points = [p for p in points if p.y <= 0.0]
 
@@ -267,6 +282,69 @@ class Perception:
         data.filtered_points = points
 
         return data
+
+    def detect_lateral_row_candidate(
+        self,
+        points,
+        bin_size=0.05,
+        min_points=6,
+        max_cluster_width=0.35,
+    ):
+        """
+        Detektiert eine Maisreihe beim seitlichen Vorbeifahren.
+
+        Verfahren:
+        1. Seitliche Koordinate y der gefilterten Laserpunktwolke auswerten.
+        2. Histogramm über y bilden.
+        3. Histogramm glätten.
+        4. Dichtestes y-Band als Reihenkandidat wählen.
+        5. Nur kompakte Cluster mit genügend Punkten akzeptieren.
+
+        Rückgabe:
+            candidate_y, valid, strength, width
+        """
+        if len(points) < min_points:
+            return np.inf, False, 0, np.inf
+
+        ys = np.array([p.y for p in points], dtype=float)
+
+        if len(ys) < min_points or np.all(~np.isfinite(ys)):
+            return np.inf, False, 0, np.inf
+
+        y_min = float(np.min(ys))
+        y_max = float(np.max(ys))
+
+        if y_max - y_min < bin_size:
+            width = float(y_max - y_min)
+            return float(np.median(ys)), True, int(len(ys)), width
+
+        bins = np.arange(y_min, y_max + 2.0 * bin_size, bin_size)
+
+        if len(bins) < 3:
+            return np.inf, False, 0, np.inf
+
+        hist, edges = np.histogram(ys, bins=bins)
+        hist_smooth = np.convolve(hist, np.ones(3) / 3.0, mode="same")
+
+        peak_idx = int(np.argmax(hist_smooth))
+        peak_value = hist_smooth[peak_idx]
+
+        if peak_value < min_points:
+            return np.inf, False, int(round(float(peak_value))), np.inf
+
+        peak_center = 0.5 * (edges[peak_idx] + edges[peak_idx + 1])
+        cluster_mask = np.abs(ys - peak_center) <= max_cluster_width / 2.0
+        cluster_ys = ys[cluster_mask]
+
+        if len(cluster_ys) < min_points:
+            return np.inf, False, int(len(cluster_ys)), np.inf
+
+        width = float(np.ptp(cluster_ys)) if len(cluster_ys) > 1 else 0.0
+
+        if width > max_cluster_width:
+            return float(np.median(cluster_ys)), False, int(len(cluster_ys)), width
+
+        return float(np.median(cluster_ys)), True, int(len(cluster_ys)), width
 
     def compute_side_distances(self, points):
         """
@@ -359,6 +437,13 @@ class StateMachine:
 
         self.row_end_counter = 0
         self.enter_row_seen_counter = 0
+
+        self.shift_row_count = 0
+        self.shift_row_visible_counter = 0
+        self.shift_row_free_counter = 0
+        self.shift_ready_for_next_row = True
+        self.last_shift_row_y = np.inf
+
         self.tf_missing_counter = 0
         self.tf_warning_printed = False
 
@@ -377,8 +462,22 @@ class StateMachine:
 
         self.row_end_counter = 0
         self.enter_row_seen_counter = 0
+
+        self.shift_row_count = 0
+        self.shift_row_visible_counter = 0
+        self.shift_row_free_counter = 0
+        self.shift_ready_for_next_row = True
+        self.last_shift_row_y = np.inf
+
         self.tf_missing_counter = 0
         self.tf_warning_printed = False
+
+    def reset_shift_row_detection(self):
+        self.shift_row_count = 0
+        self.shift_row_visible_counter = 0
+        self.shift_row_free_counter = 0
+        self.shift_ready_for_next_row = True
+        self.last_shift_row_y = np.inf
 
     def is_tf_available_or_stop(self, robot_pose: RobotPose, params, state_name: str) -> bool:
         """
@@ -505,6 +604,7 @@ class StateMachine:
                         and self.align_target_pose is not None
                     ):
                         self.enter_row_seen_counter = 0
+                        self.reset_shift_row_detection()
                         self.tf_missing_counter = 0
                         self.state = State.EXIT_ROW
                 else:
@@ -534,6 +634,7 @@ class StateMachine:
         # ====================================================
         # >>> STATE: SHIFT_TO_NEXT_ROW
         # Seitlich vor die Zielreihe fahren.
+        # Die Zielreihe wird zusätzlich über Laser-Dichteprofil bestätigt.
         # ====================================================
 
         elif self.state == State.SHIFT_TO_NEXT_ROW:
@@ -541,9 +642,48 @@ class StateMachine:
                 self.node.get_logger().warn("SHIFT_TO_NEXT_ROW abgebrochen: keine shift_target_pose.")
                 self.state = State.ROBOT_STOP
             elif self.is_tf_available_or_stop(robot_pose, params, "SHIFT_TO_NEXT_ROW"):
+                step = self.pattern.current()
+                target_row_count = step[0] if step is not None else 1
+
+                row_candidate_ok = (
+                    perception.row_candidate_valid
+                    and perception.row_candidate_strength >= params["row_pass_min_strength"]
+                    and perception.row_candidate_width <= params["row_pass_max_width"]
+                )
+
+                if row_candidate_ok:
+                    self.shift_row_visible_counter += 1
+                    self.shift_row_free_counter = 0
+                else:
+                    self.shift_row_visible_counter = 0
+                    self.shift_row_free_counter += 1
+
+                    if self.shift_row_free_counter >= params["row_pass_free_cycles"]:
+                        self.shift_ready_for_next_row = True
+
+                if (
+                    row_candidate_ok
+                    and self.shift_ready_for_next_row
+                    and self.shift_row_visible_counter >= params["row_pass_confirm_cycles"]
+                ):
+                    self.shift_row_count += 1
+                    self.last_shift_row_y = perception.row_candidate_y
+                    self.shift_ready_for_next_row = False
+
+                    self.node.get_logger().info(
+                        f"Reihe beim Vorbeifahren bestätigt: "
+                        f"{self.shift_row_count}/{target_row_count}, "
+                        f"y={perception.row_candidate_y:.2f} m, "
+                        f"points={perception.row_candidate_strength}, "
+                        f"width={perception.row_candidate_width:.2f} m"
+                    )
+
                 dist_error = distance_2d(robot_pose, self.shift_target_pose)
 
-                if dist_error < params["turn_shift_pos_tolerance"]:
+                enough_rows_seen = self.shift_row_count >= target_row_count
+                slam_target_reached = dist_error < params["turn_shift_pos_tolerance"]
+
+                if enough_rows_seen or (slam_target_reached and params["row_pass_fallback_to_slam"]):
                     self.state = State.ALIGN_TO_NEXT_ROW
 
         # ====================================================
@@ -586,6 +726,7 @@ class StateMachine:
 
                 self.row_end_counter = 0
                 self.enter_row_seen_counter = 0
+                self.reset_shift_row_detection()
                 self.tf_missing_counter = 0
 
                 self.exit_target_pose = None
@@ -955,6 +1096,13 @@ class FieldRobotNavigator(Node):
         # >>> REIHENENDE
         self.declare_parameter("row_end.confirm_cycles", 5)
 
+        # >>> REIHENERKENNUNG BEIM SEITLICHEN VORBEIFAHREN
+        self.declare_parameter("row_pass.confirm_cycles", 4)
+        self.declare_parameter("row_pass.free_cycles", 3)
+        self.declare_parameter("row_pass.min_strength", 6)
+        self.declare_parameter("row_pass.max_width", 0.35)
+        self.declare_parameter("row_pass.fallback_to_slam", True)
+
         # >>> TF
         self.declare_parameter("tf.missing_max_cycles", 10)
 
@@ -979,13 +1127,26 @@ class FieldRobotNavigator(Node):
         # >>> PERCEPTION PARAMETER
         states = ["drive_in_row", "turn_and_exit", "counting_rows", "turn_to_row"]
         for state_name in states:
-            default_x_max = 1.6 if state_name == "drive_in_row" else 2.0
-            default_y_min = 0.03 if state_name == "drive_in_row" else 0.1
+            if state_name == "drive_in_row":
+                default_x_min = 0.0
+                default_x_max = 1.6
+                default_y_min = 0.03
+                default_y_max = 1.0
+            elif state_name == "counting_rows":
+                default_x_min = -0.45
+                default_x_max = 0.45
+                default_y_min = 0.15
+                default_y_max = 1.6
+            else:
+                default_x_min = 0.0
+                default_x_max = 2.0
+                default_y_min = 0.1
+                default_y_max = 1.0
 
-            self.declare_parameter(f"perception.{state_name}.x_min", 0.0)
+            self.declare_parameter(f"perception.{state_name}.x_min", default_x_min)
             self.declare_parameter(f"perception.{state_name}.x_max", default_x_max)
             self.declare_parameter(f"perception.{state_name}.y_min", default_y_min)
-            self.declare_parameter(f"perception.{state_name}.y_max", 1.0)
+            self.declare_parameter(f"perception.{state_name}.y_max", default_y_max)
 
         # >>> ROS TOPICS
         self.declare_parameter("topics.laserscan", "/sensors/merged_scan")
@@ -1083,6 +1244,21 @@ class FieldRobotNavigator(Node):
                 if keys[1] == "confirm_cycles":
                     self.params["row_end_confirm_cycles"] = int(param.value)
 
+            elif len(keys) == 2 and keys[0] == "row_pass":
+                mapping = {
+                    "confirm_cycles": "row_pass_confirm_cycles",
+                    "free_cycles": "row_pass_free_cycles",
+                    "min_strength": "row_pass_min_strength",
+                    "max_width": "row_pass_max_width",
+                    "fallback_to_slam": "row_pass_fallback_to_slam",
+                }
+
+                if keys[1] in mapping:
+                    if keys[1] in ("confirm_cycles", "free_cycles", "min_strength"):
+                        self.params[mapping[keys[1]]] = int(param.value)
+                    else:
+                        self.params[mapping[keys[1]]] = param.value
+
             elif len(keys) == 2 and keys[0] == "tf":
                 if keys[1] == "missing_max_cycles":
                     self.params["tf_missing_max_cycles"] = int(param.value)
@@ -1149,6 +1325,13 @@ class FieldRobotNavigator(Node):
         p["frame_robot_base"] = self.get_parameter("frames.robot_base").value
 
         p["row_end_confirm_cycles"] = int(self.get_parameter("row_end.confirm_cycles").value)
+
+        p["row_pass_confirm_cycles"] = int(self.get_parameter("row_pass.confirm_cycles").value)
+        p["row_pass_free_cycles"] = int(self.get_parameter("row_pass.free_cycles").value)
+        p["row_pass_min_strength"] = int(self.get_parameter("row_pass.min_strength").value)
+        p["row_pass_max_width"] = self.get_parameter("row_pass.max_width").value
+        p["row_pass_fallback_to_slam"] = self.get_parameter("row_pass.fallback_to_slam").value
+
         p["tf_missing_max_cycles"] = int(self.get_parameter("tf.missing_max_cycles").value)
 
         p["turn_headland_exit_dist"] = self.get_parameter("turn.headland_exit_dist").value
