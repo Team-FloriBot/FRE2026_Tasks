@@ -27,6 +27,21 @@ def normalize_angle(angle: float) -> float:
     return float(np.arctan2(np.sin(angle), np.cos(angle)))
 
 
+def align_yaw_to_reference(yaw: float, reference_yaw: float) -> float:
+    """
+    Richtet eine achsensymmetrische Reihenrichtung so aus, dass sie
+    zur aktuellen Fahrtrichtung passt. Eine Maisreihe ist geometrisch
+    unter yaw und yaw + pi identisch.
+    """
+    yaw = normalize_angle(yaw)
+    yaw_opposite = normalize_angle(yaw + np.pi)
+
+    if abs(normalize_angle(yaw_opposite - reference_yaw)) < abs(normalize_angle(yaw - reference_yaw)):
+        return yaw_opposite
+
+    return yaw
+
+
 def yaw_from_quaternion(q) -> float:
     """
     Berechnet Yaw aus Quaternion.
@@ -74,6 +89,15 @@ class PerceptionData:
     forward_center_error: float = 0.0
     forward_center_valid: bool = False
 
+    # Linienmodell der lokalen Reihe.
+    left_line_valid: bool = False
+    right_line_valid: bool = False
+    line_inlier_count: int = 0
+    line_confidence: float = 0.0
+
+    # Dichte im vorderen Bereich zur robusteren Reihenende-Erkennung.
+    front_density: int = 0
+
     # Reihenerkennung beim seitlichen Vorbeifahren im Vorgewende.
     row_candidate_y: float = np.inf
     row_candidate_valid: bool = False
@@ -91,6 +115,30 @@ class RobotPose:
     y: float = 0.0
     yaw: float = 0.0
     valid: bool = False
+
+
+# ============================================================
+# >>> DATENCONTAINER: SLAM-REIHENMODELL
+# ============================================================
+
+@dataclass
+class RowModel:
+    """
+    Globale Reihenhypothese im map-Frame.
+
+    yaw_map:
+        Richtung der Maisreihe im map-Frame.
+    s_center:
+        Laterale Koordinate der aktuellen Reihenmitte.
+        s = dot([x, y], e_lateral) mit e_lateral = [-sin(yaw), cos(yaw)].
+    confidence:
+        Qualitätsmaß 0..1, wird bei stabiler Laserdetektion erhöht und sonst langsam abgebaut.
+    """
+    yaw_map: float = 0.0
+    s_center: float = 0.0
+    confidence: float = 0.0
+    valid: bool = False
+    last_update_sec: float = 0.0
 
 
 # ============================================================
@@ -208,9 +256,12 @@ class Perception:
 
         data.min_dist = min_distance
         data.num_points_in_box = len(points)
+        data.filtered_points = points
 
         near_points = [p for p in points if 0.00 <= p.x <= 0.70]
         forward_points = [p for p in points if 0.70 < p.x <= 1.60]
+        front_points = [p for p in points if 0.50 <= p.x <= 1.60 and abs(p.y) <= 0.90]
+        data.front_density = len(front_points)
 
         (
             data.left_dist,
@@ -225,7 +276,6 @@ class Perception:
 
         if near_valid:
             data.center_error = data.near_center_error
-            data.row_end_detected = False
         else:
             (
                 data.left_dist,
@@ -233,11 +283,9 @@ class Perception:
                 data.left_near,
                 data.right_near,
                 data.center_error,
-                all_valid,
+                _all_valid,
             ) = self.compute_side_distances(points)
-
             data.min_side_clearance = min(data.left_near, data.right_near)
-            data.row_end_detected = not all_valid
 
         (
             _forward_left,
@@ -254,6 +302,44 @@ class Perception:
         data.x_mean = np.mean(points_x) if len(points_x) > 0 else np.inf
         data.y_mean = np.mean(points_y) if len(points_y) > 0 else np.inf
 
+        # Robustes Linienmodell links/rechts.
+        left_points = [p for p in points if p.y > 0.0]
+        right_points = [p for p in points if p.y <= 0.0]
+
+        left_line, left_inliers = self.fit_ransac_line(left_points)
+        right_line, right_inliers = self.fit_ransac_line(right_points)
+
+        data.left_line_valid = left_line is not None
+        data.right_line_valid = right_line is not None
+        data.line_inlier_count = len(left_inliers) + len(right_inliers)
+
+        slopes = []
+        if left_line is not None:
+            slopes.append(left_line[0])
+        if right_line is not None:
+            slopes.append(right_line[0])
+
+        if slopes:
+            center_slope = float(np.mean(slopes))
+            data.row_heading_error = float(np.arctan(center_slope))
+            data.row_heading_valid = True
+
+        expected_points = max(len(points), 1)
+        data.line_confidence = float(np.clip(data.line_inlier_count / expected_points, 0.0, 1.0))
+
+        # Konservative Reihenende-Erkennung:
+        # Nicht schon am Reihenende, nur weil eine Seite kurz fehlt.
+        # Reihenende wird erst gemeldet, wenn kaum Frontpunkte vorhanden sind
+        # und keine stabile linke oder rechte Reihenlinie mehr erkannt wird.
+        side_line_valid = data.left_line_valid or data.right_line_valid
+        both_dist_valid = np.isfinite(data.left_dist) and np.isfinite(data.right_dist)
+        data.row_end_detected = (
+            current_state == State.DRIVE_IN_ROW
+            and data.front_density < 4
+            and not side_line_valid
+            and not both_dist_valid
+        )
+
         if current_state == State.SHIFT_TO_NEXT_ROW:
             (
                 data.row_candidate_y,
@@ -261,23 +347,6 @@ class Perception:
                 data.row_candidate_strength,
                 data.row_candidate_width,
             ) = self.detect_lateral_row_candidate(points)
-
-        left_points = [p for p in points if p.y > 0.0]
-        right_points = [p for p in points if p.y <= 0.0]
-
-        slopes = []
-        left_slope = self.fit_side_slope(left_points)
-        right_slope = self.fit_side_slope(right_points)
-
-        if left_slope is not None:
-            slopes.append(left_slope)
-        if right_slope is not None:
-            slopes.append(right_slope)
-
-        if slopes:
-            center_slope = float(np.mean(slopes))
-            data.row_heading_error = float(np.arctan(center_slope))
-            data.row_heading_valid = True
 
         # Tiefpassfilter gegen Reglerzittern.
         if np.isfinite(data.center_error):
@@ -301,16 +370,14 @@ class Perception:
             )
             data.row_heading_error = self.heading_error_filtered
 
-        data.filtered_points = points
-
         return data
 
     def detect_lateral_row_candidate(
         self,
         points,
         bin_size=0.05,
-        min_points=5,
-        max_cluster_width=0.45,
+        min_points=8,
+        max_cluster_width=0.30,
     ):
         """
         Detektiert eine Maisreihe beim seitlichen Vorbeifahren.
@@ -386,6 +453,7 @@ class Perception:
             center_error = 0.0
             valid = False
         else:
+            # Positiv bedeutet: Roboter ist zu weit links und muss nach rechts korrigieren.
             center_error = (right_dist - left_dist) / 2.0
             valid = True
 
@@ -409,21 +477,68 @@ class Perception:
 
         return False
 
-    def fit_side_slope(self, points, min_points=4):
+    def fit_ransac_line(
+        self,
+        points,
+        min_points=5,
+        dist_thresh=0.06,
+        iterations=80,
+        min_x_span=0.20,
+    ):
         """
-        Fit y = m*x + b für eine Pflanzenseite im Roboterkoordinatensystem.
+        Robuster Fit einer Seitenlinie y = m*x + b.
+        Gibt ((m, b), inlier_points) zurück oder (None, []).
         """
         if len(points) < min_points:
+            return None, []
+
+        pts = np.array([[p.x, p.y] for p in points], dtype=float)
+
+        finite_mask = np.isfinite(pts).all(axis=1)
+        pts = pts[finite_mask]
+
+        if len(pts) < min_points or np.ptp(pts[:, 0]) < min_x_span:
+            return None, []
+
+        best_inliers = np.array([], dtype=int)
+
+        for _ in range(iterations):
+            i, j = np.random.choice(len(pts), 2, replace=False)
+            p1 = pts[i]
+            p2 = pts[j]
+            v = p2 - p1
+            norm = np.linalg.norm(v)
+
+            if norm < 1e-6:
+                continue
+
+            v = v / norm
+            diffs = pts - p1
+            dists = np.abs(diffs[:, 0] * v[1] - diffs[:, 1] * v[0])
+            inliers = np.where(dists < dist_thresh)[0]
+
+            if len(inliers) > len(best_inliers):
+                best_inliers = inliers
+
+        if len(best_inliers) < min_points:
+            return None, []
+
+        inlier_pts = pts[best_inliers]
+
+        if np.ptp(inlier_pts[:, 0]) < min_x_span:
+            return None, []
+
+        m, b = np.polyfit(inlier_pts[:, 0], inlier_pts[:, 1], 1)
+        return (float(m), float(b)), inlier_pts.tolist()
+
+    def fit_side_slope(self, points, min_points=5):
+        """
+        Kompatibilitätsfunktion. Intern wird RANSAC verwendet.
+        """
+        line, _inliers = self.fit_ransac_line(points, min_points=min_points)
+        if line is None:
             return None
-
-        xs = np.array([p.x for p in points], dtype=float)
-        ys = np.array([p.y for p in points], dtype=float)
-
-        if np.ptp(xs) < 0.20:
-            return None
-
-        m, _ = np.polyfit(xs, ys, 1)
-        return float(m)
+        return float(line[0])
 
 
 # ============================================================
@@ -510,7 +625,7 @@ class StateMachine:
 
         return False
 
-    def compute_headland_targets(self, robot_pose: RobotPose, params):
+    def compute_headland_targets(self, robot_pose: RobotPose, params, row_model: RowModel = None):
         """
         Berechnet drei Zielposen im map-Frame.
         """
@@ -522,7 +637,15 @@ class StateMachine:
 
         side = 1.0 if direction == "L" else -1.0
 
-        yaw_old = robot_pose.yaw
+        if (
+            row_model is not None
+            and row_model.valid
+            and row_model.confidence >= params["slam_row_min_confidence"]
+        ):
+            yaw_old = align_yaw_to_reference(row_model.yaw_map, robot_pose.yaw)
+        else:
+            yaw_old = robot_pose.yaw
+
         yaw_new = normalize_angle(yaw_old + np.pi)
 
         forward_x = np.cos(yaw_old)
@@ -601,7 +724,11 @@ class StateMachine:
                         self.exit_target_pose,
                         self.shift_target_pose,
                         self.align_target_pose,
-                    ) = self.compute_headland_targets(robot_pose, params)
+                    ) = self.compute_headland_targets(
+                        robot_pose,
+                        params,
+                        getattr(self.node, "row_model", None),
+                    )
 
                     if (
                         self.exit_target_pose is not None
@@ -710,11 +837,12 @@ class StateMachine:
                 enough_rows_seen = self.shift_row_count >= target_row_count
                 slam_target_reached = dist_error < params["turn_shift_blend_distance"]
 
-                # SLAM-Fallback nur erlauben, wenn mindestens eine Reihe gesehen wurde.
+                # SLAM-Fallback nur sehr konservativ erlauben.
+                # Bei Mehrfachsprüngen darf SLAM nicht zu früh abbrechen.
                 guarded_slam_fallback = (
                     slam_target_reached
                     and params["row_pass_fallback_to_slam"]
-                    and self.shift_row_count > 0
+                    and self.shift_row_count >= max(target_row_count - 1, 0)
                 )
 
                 if enough_rows_seen or guarded_slam_fallback:
@@ -796,10 +924,39 @@ class Controller:
 
         if state == State.DRIVE_IN_ROW:
             if not perception.row_end_detected:
-                center_term = -params["row_center_kp"] * perception.center_error
+                fused_center_error = perception.center_error
+                fused_heading_error = perception.row_heading_error if perception.row_heading_valid else 0.0
 
-                if perception.row_heading_valid:
-                    heading_term = params["row_heading_kp"] * perception.row_heading_error
+                if params["slam_row_enable"] and robot_pose.valid:
+                    slam_center_error, slam_heading_error, slam_valid = node.compute_slam_row_errors(robot_pose)
+
+                    if slam_valid:
+                        if (
+                            perception.left_line_valid
+                            and perception.right_line_valid
+                            and perception.line_confidence >= params["slam_row_laser_conf_high"]
+                        ):
+                            w_laser = params["slam_row_laser_weight_high"]
+                        elif perception.left_line_valid or perception.right_line_valid:
+                            w_laser = params["slam_row_laser_weight_medium"]
+                        else:
+                            w_laser = 0.0
+
+                        w_slam = 1.0 - w_laser
+                        fused_center_error = w_laser * perception.center_error + w_slam * slam_center_error
+
+                        if perception.row_heading_valid:
+                            fused_heading_error = (
+                                w_laser * perception.row_heading_error
+                                + w_slam * slam_heading_error
+                            )
+                        else:
+                            fused_heading_error = slam_heading_error
+
+                center_term = -params["row_center_kp"] * fused_center_error
+
+                if perception.row_heading_valid or params["slam_row_enable"]:
+                    heading_term = params["row_heading_kp"] * fused_heading_error
                 else:
                     heading_term = 0.0
 
@@ -833,7 +990,7 @@ class Controller:
                     )
                 )
 
-                center_ratio = abs(perception.center_error) / params["max_dist_in_row"]
+                center_ratio = abs(fused_center_error) / params["max_dist_in_row"]
                 angular_ratio = abs(cmd.angular) / max(params["row_max_angular"], 1e-6)
                 curve_ratio = max(center_ratio, angular_ratio)
 
@@ -1126,12 +1283,12 @@ class FieldRobotNavigator(Node):
         self.declare_parameter("vel_linear_enter_row", 0.12)
 
         # Reihenregler
-        self.declare_parameter("row_center_kp", 1.8)
-        self.declare_parameter("row_heading_kp", 0.45)
-        self.declare_parameter("row_forward_kp", 0.55)
+        self.declare_parameter("row_center_kp", 1.2)
+        self.declare_parameter("row_heading_kp", 0.8)
+        self.declare_parameter("row_forward_kp", 0.35)
         self.declare_parameter("row_max_angular", 0.65)
         self.declare_parameter("row_min_linear", 0.0)
-        self.declare_parameter("row_curve_slowdown_gain", 0.65)
+        self.declare_parameter("row_curve_slowdown_gain", 0.8)
 
         # Nahbereichs-Kollisionsvermeidung
         self.declare_parameter("row_clearance_kp", 1.4)
@@ -1148,16 +1305,27 @@ class FieldRobotNavigator(Node):
         self.declare_parameter("frames.map", "map")
         self.declare_parameter("frames.robot_base", "base_link")
 
+        # SLAM-basiertes Reihenmodell
+        self.declare_parameter("slam_row.enable", True)
+        self.declare_parameter("slam_row.update_alpha", 0.08)
+        self.declare_parameter("slam_row.min_line_confidence", 0.35)
+        self.declare_parameter("slam_row.min_confidence", 0.25)
+        self.declare_parameter("slam_row.confidence_decay", 0.995)
+        self.declare_parameter("slam_row.x_ref", 0.80)
+        self.declare_parameter("slam_row.laser_conf_high", 0.55)
+        self.declare_parameter("slam_row.laser_weight_high", 0.80)
+        self.declare_parameter("slam_row.laser_weight_medium", 0.50)
+
         # Reihenende
-        self.declare_parameter("row_end.confirm_cycles", 5)
+        self.declare_parameter("row_end.confirm_cycles", 10)
 
         # Reihenerkennung beim seitlichen Vorbeifahren
-        self.declare_parameter("row_pass.confirm_cycles", 3)
-        self.declare_parameter("row_pass.free_cycles", 2)
-        self.declare_parameter("row_pass.min_strength", 5)
-        self.declare_parameter("row_pass.max_width", 0.45)
-        self.declare_parameter("row_pass.fallback_to_slam", True)
-        self.declare_parameter("row_pass.max_extra_shift", 0.25)
+        self.declare_parameter("row_pass.confirm_cycles", 4)
+        self.declare_parameter("row_pass.free_cycles", 3)
+        self.declare_parameter("row_pass.min_strength", 8)
+        self.declare_parameter("row_pass.max_width", 0.30)
+        self.declare_parameter("row_pass.fallback_to_slam", False)
+        self.declare_parameter("row_pass.max_extra_shift", 0.20)
 
         # TF
         self.declare_parameter("tf.missing_max_cycles", 10)
@@ -1242,6 +1410,7 @@ class FieldRobotNavigator(Node):
         )
 
         self.latest_scan = None
+        self.row_model = RowModel()
 
         # ====================================================
         # >>> ROS KOMMUNIKATION
@@ -1299,6 +1468,22 @@ class FieldRobotNavigator(Node):
                     self.params["frame_map"] = param.value
                 elif keys[1] == "robot_base":
                     self.params["frame_robot_base"] = param.value
+
+            elif len(keys) == 2 and keys[0] == "slam_row":
+                mapping = {
+                    "enable": "slam_row_enable",
+                    "update_alpha": "slam_row_update_alpha",
+                    "min_line_confidence": "slam_row_min_line_confidence",
+                    "min_confidence": "slam_row_min_confidence",
+                    "confidence_decay": "slam_row_confidence_decay",
+                    "x_ref": "slam_row_x_ref",
+                    "laser_conf_high": "slam_row_laser_conf_high",
+                    "laser_weight_high": "slam_row_laser_weight_high",
+                    "laser_weight_medium": "slam_row_laser_weight_medium",
+                }
+
+                if keys[1] in mapping:
+                    self.params[mapping[keys[1]]] = param.value
 
             elif len(keys) == 2 and keys[0] == "row_end":
                 if keys[1] == "confirm_cycles":
@@ -1386,6 +1571,16 @@ class FieldRobotNavigator(Node):
 
         p["frame_map"] = self.get_parameter("frames.map").value
         p["frame_robot_base"] = self.get_parameter("frames.robot_base").value
+
+        p["slam_row_enable"] = self.get_parameter("slam_row.enable").value
+        p["slam_row_update_alpha"] = self.get_parameter("slam_row.update_alpha").value
+        p["slam_row_min_line_confidence"] = self.get_parameter("slam_row.min_line_confidence").value
+        p["slam_row_min_confidence"] = self.get_parameter("slam_row.min_confidence").value
+        p["slam_row_confidence_decay"] = self.get_parameter("slam_row.confidence_decay").value
+        p["slam_row_x_ref"] = self.get_parameter("slam_row.x_ref").value
+        p["slam_row_laser_conf_high"] = self.get_parameter("slam_row.laser_conf_high").value
+        p["slam_row_laser_weight_high"] = self.get_parameter("slam_row.laser_weight_high").value
+        p["slam_row_laser_weight_medium"] = self.get_parameter("slam_row.laser_weight_medium").value
 
         p["row_end_confirm_cycles"] = int(self.get_parameter("row_end.confirm_cycles").value)
 
@@ -1520,6 +1715,105 @@ class FieldRobotNavigator(Node):
 
         self.points_pub.publish(cloud)
 
+    def update_row_model_from_perception(self, perception: PerceptionData, robot_pose: RobotPose, state: State):
+        """
+        Aktualisiert die globale Reihenhypothese aus lokaler Laserdetektion und SLAM-Pose.
+        Das Modell wird nur in DRIVE_IN_ROW und ENTER_ROW aktualisiert.
+        """
+        if not self.params["slam_row_enable"]:
+            return
+
+        if not robot_pose.valid:
+            self.row_model.confidence *= self.params["slam_row_confidence_decay"]
+            if self.row_model.confidence < 0.05:
+                self.row_model.valid = False
+            return
+
+        if state not in (State.DRIVE_IN_ROW, State.ENTER_ROW):
+            self.row_model.confidence *= self.params["slam_row_confidence_decay"]
+            return
+
+        stable_local_row = (
+            perception.row_heading_valid
+            and perception.left_line_valid
+            and perception.right_line_valid
+            and perception.line_confidence >= self.params["slam_row_min_line_confidence"]
+            and not perception.row_end_detected
+        )
+
+        if not stable_local_row:
+            self.row_model.confidence *= self.params["slam_row_confidence_decay"]
+            if self.row_model.confidence < 0.05:
+                self.row_model.valid = False
+            return
+
+        row_yaw_meas = normalize_angle(robot_pose.yaw + perception.row_heading_error)
+        row_yaw_meas = align_yaw_to_reference(row_yaw_meas, robot_pose.yaw)
+
+        forward = np.array([np.cos(robot_pose.yaw), np.sin(robot_pose.yaw)], dtype=float)
+        left = np.array([-np.sin(robot_pose.yaw), np.cos(robot_pose.yaw)], dtype=float)
+        robot_xy = np.array([robot_pose.x, robot_pose.y], dtype=float)
+
+        # center_error > 0 bedeutet: Roboter ist links der Reihenmitte.
+        # Die reale Reihenmitte liegt daher im lokalen Frame bei y = -center_error.
+        center_point = (
+            robot_xy
+            + forward * self.params["slam_row_x_ref"]
+            + left * (-perception.center_error)
+        )
+
+        e_lateral = np.array([-np.sin(row_yaw_meas), np.cos(row_yaw_meas)], dtype=float)
+        s_center_meas = float(np.dot(center_point, e_lateral))
+
+        alpha = float(self.params["slam_row_update_alpha"])
+
+        if not self.row_model.valid:
+            self.row_model.yaw_map = row_yaw_meas
+            self.row_model.s_center = s_center_meas
+            self.row_model.confidence = min(1.0, 0.30 + perception.line_confidence)
+            self.row_model.valid = True
+        else:
+            old_yaw = align_yaw_to_reference(self.row_model.yaw_map, row_yaw_meas)
+            yaw_error = normalize_angle(row_yaw_meas - old_yaw)
+            self.row_model.yaw_map = normalize_angle(old_yaw + alpha * yaw_error)
+
+            # s_center hängt von der Reihenrichtung ab. Nach dem Yaw-Update neu glätten.
+            self.row_model.s_center = (
+                (1.0 - alpha) * self.row_model.s_center
+                + alpha * s_center_meas
+            )
+            self.row_model.confidence = float(
+                np.clip(
+                    self.row_model.confidence + 0.08 * perception.line_confidence,
+                    0.0,
+                    1.0,
+                )
+            )
+
+        self.row_model.last_update_sec = float(self.get_clock().now().nanoseconds) * 1e-9
+
+    def compute_slam_row_errors(self, robot_pose: RobotPose):
+        """
+        Liefert Cross-Track- und Heading-Fehler relativ zur globalen Reihenhypothese.
+        center_error > 0 bedeutet analog zur Laserdetektion: Roboter ist links der Reihenmitte.
+        """
+        if (
+            not self.params["slam_row_enable"]
+            or not robot_pose.valid
+            or not self.row_model.valid
+            or self.row_model.confidence < self.params["slam_row_min_confidence"]
+        ):
+            return 0.0, 0.0, False
+
+        yaw_row = align_yaw_to_reference(self.row_model.yaw_map, robot_pose.yaw)
+        e_lateral = np.array([-np.sin(yaw_row), np.cos(yaw_row)], dtype=float)
+        robot_xy = np.array([robot_pose.x, robot_pose.y], dtype=float)
+
+        center_error = float(np.dot(robot_xy, e_lateral) - self.row_model.s_center)
+        heading_error = normalize_angle(yaw_row - robot_pose.yaw)
+
+        return center_error, heading_error, True
+
     def loop(self):
         if self.latest_scan is None:
             return
@@ -1536,6 +1830,12 @@ class FieldRobotNavigator(Node):
             self.publish_points(perception.filtered_points, self.latest_scan.header)
 
         robot_pose = self.get_robot_pose_map()
+
+        self.update_row_model_from_perception(
+            perception=perception,
+            robot_pose=robot_pose,
+            state=self.state_machine.state,
+        )
 
         state = self.state_machine.update(
             perception=perception,
