@@ -63,6 +63,16 @@ class PerceptionData:
     row_heading_error: float = 0.0
     row_heading_valid: bool = False
 
+    # Nahbereich für Kollisionsvermeidung in der Reihe.
+    left_near: float = np.inf
+    right_near: float = np.inf
+    min_side_clearance: float = np.inf
+
+    # Zusatz für schnelle S-Kurven.
+    near_center_error: float = 0.0
+    forward_center_error: float = 0.0
+    forward_center_valid: bool = False
+
 
 # ============================================================
 # >>> DATENCONTAINER: ROBOTERPOSE AUS SLAM / TF
@@ -186,17 +196,50 @@ class Perception:
         data.min_dist = min_distance
         data.num_points_in_box = len(points)
 
-        left_y = [p.y for p in points if p.y > 0.0]
-        right_y = [p.y for p in points if p.y <= 0.0]
+        # Nahbereich direkt vor dem Roboter:
+        # Dieser Bereich ist maßgeblich für Abstandsschutz und kurzfristige S-Kurven.
+        near_points = [p for p in points if 0.00 <= p.x <= 0.70]
 
-        data.left_dist = np.mean(np.abs(left_y)) if len(left_y) > 0 else np.inf
-        data.right_dist = np.mean(np.abs(right_y)) if len(right_y) > 0 else np.inf
+        # Vorschau-Bereich:
+        # Dieser Bereich erkennt die kommende Kurve früher, ohne den Nahbereich zu überstimmen.
+        forward_points = [p for p in points if 0.70 < p.x <= 1.60]
 
-        if np.isinf(data.left_dist) or np.isinf(data.right_dist):
-            data.row_end_detected = True
-        else:
-            data.center_error = (data.right_dist - data.left_dist) / 2.0
+        (
+            data.left_dist,
+            data.right_dist,
+            data.left_near,
+            data.right_near,
+            data.near_center_error,
+            near_valid,
+        ) = self.compute_side_distances(near_points)
+
+        data.min_side_clearance = min(data.left_near, data.right_near)
+
+        if near_valid:
+            data.center_error = data.near_center_error
             data.row_end_detected = False
+        else:
+            # Fallback auf gesamte Box, falls im Nahbereich nicht beide Seiten sichtbar sind.
+            (
+                data.left_dist,
+                data.right_dist,
+                data.left_near,
+                data.right_near,
+                data.center_error,
+                all_valid,
+            ) = self.compute_side_distances(points)
+
+            data.min_side_clearance = min(data.left_near, data.right_near)
+            data.row_end_detected = not all_valid
+
+        (
+            _forward_left,
+            _forward_right,
+            _forward_left_near,
+            _forward_right_near,
+            data.forward_center_error,
+            data.forward_center_valid,
+        ) = self.compute_side_distances(forward_points)
 
         points_x = [p.x for p in points]
         points_y = [p.y for p in points]
@@ -224,6 +267,43 @@ class Perception:
         data.filtered_points = points
 
         return data
+
+    def compute_side_distances(self, points):
+        """
+        Robuste Seitenabstände für linke und rechte Pflanzenreihe.
+
+        left_dist/right_dist:
+            25-%-Perzentil statt Mittelwert. Dadurch reagiert die Regelung stärker
+            auf nahe Pflanzen, ohne vollständig von einzelnen Ausreißern dominiert zu werden.
+
+        left_near/right_near:
+            Minimaler seitlicher Abstand pro Seite für Kollisionsschutz.
+        """
+        left_y = np.array([abs(p.y) for p in points if p.y > 0.0], dtype=float)
+        right_y = np.array([abs(p.y) for p in points if p.y <= 0.0], dtype=float)
+
+        if len(left_y) > 0:
+            left_dist = float(np.percentile(left_y, 25.0))
+            left_near = float(np.min(left_y))
+        else:
+            left_dist = np.inf
+            left_near = np.inf
+
+        if len(right_y) > 0:
+            right_dist = float(np.percentile(right_y, 25.0))
+            right_near = float(np.min(right_y))
+        else:
+            right_dist = np.inf
+            right_near = np.inf
+
+        if np.isinf(left_dist) or np.isinf(right_dist):
+            center_error = 0.0
+            valid = False
+        else:
+            center_error = (right_dist - left_dist) / 2.0
+            valid = True
+
+        return left_dist, right_dist, left_near, right_near, center_error, valid
 
     def is_in_box(self, x, y, box, direction):
         x_min, x_max = box["x_min"], box["x_max"]
@@ -541,7 +621,7 @@ class Controller:
 
         # ====================================================
         # >>> STATE: DRIVE_IN_ROW
-        # Laserbasierte Reihenmittenregelung.
+        # Laserbasierte Reihenmittenregelung mit Nahbereichsschutz.
         # ====================================================
 
         if state == State.DRIVE_IN_ROW:
@@ -553,7 +633,34 @@ class Controller:
                 else:
                     heading_term = 0.0
 
-                cmd.angular = center_term + heading_term
+                if perception.forward_center_valid:
+                    forward_term = -params["row_forward_kp"] * perception.forward_center_error
+                else:
+                    forward_term = 0.0
+
+                cmd.angular = center_term + heading_term + forward_term
+
+                # Nahbereichs-Abstoßung.
+                # Rechts zu nah -> positive Winkelgeschwindigkeit -> nach links.
+                # Links zu nah  -> negative Winkelgeschwindigkeit -> nach rechts.
+                if np.isfinite(perception.left_near) and np.isfinite(perception.right_near):
+                    clearance_error = perception.right_near - perception.left_near
+
+                    if perception.min_side_clearance < params["row_slow_clearance"]:
+                        clearance_term = -params["row_clearance_kp"] * clearance_error
+                        cmd.angular += clearance_term
+
+                # Sicherheitspriorität:
+                # Wenn eine Seite kritisch nah ist, darf der Kurven-/Heading-Anteil
+                # nicht mehr in die falsche Richtung lenken.
+                if np.isfinite(perception.right_near):
+                    if perception.right_near < params["row_guard_clearance"]:
+                        cmd.angular = max(cmd.angular, params["row_guard_min_angular"])
+
+                if np.isfinite(perception.left_near):
+                    if perception.left_near < params["row_guard_clearance"]:
+                        cmd.angular = min(cmd.angular, -params["row_guard_min_angular"])
+
                 cmd.angular = float(
                     np.clip(
                         cmd.angular,
@@ -562,8 +669,6 @@ class Controller:
                     )
                 )
 
-                # In engen Kurven und bei großem Mittenfehler langsamer fahren,
-                # aber nicht hart auf einen festen Wert springen.
                 center_ratio = abs(perception.center_error) / params["max_dist_in_row"]
                 angular_ratio = abs(cmd.angular) / max(params["row_max_angular"], 1e-6)
                 curve_ratio = max(center_ratio, angular_ratio)
@@ -571,14 +676,32 @@ class Controller:
                 speed_factor = 1.0 - params["row_curve_slowdown_gain"] * curve_ratio
                 speed_factor = float(np.clip(speed_factor, 0.0, 1.0))
 
-                cmd.linear = params["vel_linear_drive"] * speed_factor
-                cmd.linear = float(
-                    np.clip(
-                        cmd.linear,
-                        params["row_min_linear"],
-                        params["vel_linear_drive"],
+                # Zusätzliche weiche Geschwindigkeitsreduktion bei geringer Seitenfreiheit.
+                if np.isfinite(perception.min_side_clearance):
+                    clearance_speed_factor = (
+                        perception.min_side_clearance - params["row_emergency_clearance"]
+                    ) / max(
+                        params["row_slow_clearance"] - params["row_emergency_clearance"],
+                        1e-6,
                     )
-                )
+
+                    clearance_speed_factor = float(np.clip(clearance_speed_factor, 0.0, 1.0))
+                    speed_factor *= clearance_speed_factor
+
+                cmd.linear = params["vel_linear_drive"] * speed_factor
+
+                # Bei unterschrittener Sicherheitsdistanz wird der Sollwert auf 0 gesetzt.
+                # Der VelocityRamper glättet diesen Übergang.
+                if perception.min_side_clearance <= params["row_emergency_clearance"]:
+                    cmd.linear = 0.0
+                else:
+                    cmd.linear = float(
+                        np.clip(
+                            cmd.linear,
+                            params["row_min_linear"],
+                            params["vel_linear_drive"],
+                        )
+                    )
 
         # ====================================================
         # >>> STATE: EXIT_ROW
@@ -757,7 +880,7 @@ class Controller:
 # ============================================================
 
 class VelocityRamper:
-    def __init__(self, max_accel_linear=0.5, max_accel_angular=1.0, dt=0.1):
+    def __init__(self, max_accel_linear=0.35, max_accel_angular=4.0, dt=0.1):
         self.max_accel_linear = max_accel_linear
         self.max_accel_angular = max_accel_angular
         self.dt = dt
@@ -801,20 +924,29 @@ class FieldRobotNavigator(Node):
         self.declare_parameter("row_width", 0.75)
         self.declare_parameter("drive_out_dist", 1.0)
 
-        self.declare_parameter("vel_linear_drive", 0.5)
+        self.declare_parameter("vel_linear_drive", 0.30)
         self.declare_parameter("vel_linear_count", 0.5)
         self.declare_parameter("vel_linear_turn", 0.25)
         self.declare_parameter("vel_linear_enter_row", 0.15)
 
         # Reihenregler
-        self.declare_parameter("row_center_kp", 2.5)
-        self.declare_parameter("row_heading_kp", 1.2)
-        self.declare_parameter("row_max_angular", 0.9)
-        self.declare_parameter("row_min_linear", 0.08)
-        self.declare_parameter("row_curve_slowdown_gain", 0.75)
+        self.declare_parameter("row_center_kp", 3.4)
+        self.declare_parameter("row_heading_kp", 0.8)
+        self.declare_parameter("row_forward_kp", 1.6)
+        self.declare_parameter("row_max_angular", 1.3)
+        self.declare_parameter("row_min_linear", 0.0)
+        self.declare_parameter("row_curve_slowdown_gain", 0.90)
 
-        self.declare_parameter("accel_max_linear", 0.5)
-        self.declare_parameter("accel_max_angular", 2.0)
+        # Nahbereichs-Kollisionsvermeidung
+        self.declare_parameter("row_clearance_kp", 2.5)
+        self.declare_parameter("row_slow_clearance", 0.28)
+        self.declare_parameter("row_emergency_clearance", 0.10)
+        self.declare_parameter("row_guard_clearance", 0.16)
+        self.declare_parameter("row_guard_min_angular", 0.45)
+
+        # Velocity Ramper
+        self.declare_parameter("accel_max_linear", 0.35)
+        self.declare_parameter("accel_max_angular", 4.0)
 
         # >>> SLAM / TF FRAMES
         self.declare_parameter("frames.map", "map")
@@ -847,9 +979,12 @@ class FieldRobotNavigator(Node):
         # >>> PERCEPTION PARAMETER
         states = ["drive_in_row", "turn_and_exit", "counting_rows", "turn_to_row"]
         for state_name in states:
+            default_x_max = 1.6 if state_name == "drive_in_row" else 2.0
+            default_y_min = 0.03 if state_name == "drive_in_row" else 0.1
+
             self.declare_parameter(f"perception.{state_name}.x_min", 0.0)
-            self.declare_parameter(f"perception.{state_name}.x_max", 2.0)
-            self.declare_parameter(f"perception.{state_name}.y_min", 0.1)
+            self.declare_parameter(f"perception.{state_name}.x_max", default_x_max)
+            self.declare_parameter(f"perception.{state_name}.y_min", default_y_min)
             self.declare_parameter(f"perception.{state_name}.y_max", 1.0)
 
         # >>> ROS TOPICS
@@ -996,9 +1131,16 @@ class FieldRobotNavigator(Node):
 
         p["row_center_kp"] = self.get_parameter("row_center_kp").value
         p["row_heading_kp"] = self.get_parameter("row_heading_kp").value
+        p["row_forward_kp"] = self.get_parameter("row_forward_kp").value
         p["row_max_angular"] = self.get_parameter("row_max_angular").value
         p["row_min_linear"] = self.get_parameter("row_min_linear").value
         p["row_curve_slowdown_gain"] = self.get_parameter("row_curve_slowdown_gain").value
+
+        p["row_clearance_kp"] = self.get_parameter("row_clearance_kp").value
+        p["row_slow_clearance"] = self.get_parameter("row_slow_clearance").value
+        p["row_emergency_clearance"] = self.get_parameter("row_emergency_clearance").value
+        p["row_guard_clearance"] = self.get_parameter("row_guard_clearance").value
+        p["row_guard_min_angular"] = self.get_parameter("row_guard_min_angular").value
 
         p["accel_max_linear"] = self.get_parameter("accel_max_linear").value
         p["accel_max_angular"] = self.get_parameter("accel_max_angular").value
