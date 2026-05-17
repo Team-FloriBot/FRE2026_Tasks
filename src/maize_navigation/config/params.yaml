@@ -13,9 +13,16 @@ maize_navigator:
     vel_linear_turn: 0.25
     vel_linear_enter_row: 0.15
 
+    # Reihenregler
+    row_center_kp: 2.5
+    row_heading_kp: 1.2
+    row_max_angular: 0.9
+    row_min_linear: 0.08
+    row_curve_slowdown_gain: 0.75
+
     # Velocity Ramper
     accel_max_linear: 0.5
-    accel_max_angular: 1.0
+    accel_max_angular: 2.0
 
     # SLAM / TF Frames
     # Stage:
