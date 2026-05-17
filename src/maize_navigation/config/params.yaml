@@ -10,39 +10,53 @@ maize_navigator:
     # Geschwindigkeiten
     vel_linear_drive: 0.5
     vel_linear_count: 0.5
-    vel_linear_turn: 0.3
-    vel_linear_enter_row: 0.25
+    vel_linear_turn: 0.25
+    vel_linear_enter_row: 0.15
 
     # Velocity Ramper
     accel_max_linear: 0.5
     accel_max_angular: 1.0
 
     # SLAM / TF Frames
-    # Für Stage:
+    # Stage:
     #   robot_base: "base_link"
-    # Für den echten Roboter später ggf.:
+    # Hardware später ggf.:
     #   robot_base: "base_footprint"
     frames:
       map: "map"
       robot_base: "base_link"
 
+    # Reihenende-Erkennung entprellen
+    row_end:
+      confirm_cycles: 5
+
+    # TF-Ausfälle tolerieren
+    tf:
+      missing_max_cycles: 10
+
     # SLAM-basierte Wende
     turn:
-      # Strecke, die der Roboter nach erkanntem Reihenende
-      # noch aus der aktuellen Reihe herausfahren soll.
+      # Strecke nach erkanntem Reihenende aus der aktuellen Reihe heraus
       headland_exit_dist: 1.0
+
+      # Roboter bleibt etwas vor der neuen Reihe stehen
+      # und fährt anschließend in ENTER_ROW kontrolliert hinein.
+      pre_entry_offset: 0.3
 
       # Toleranz für Ende von EXIT_ROW
       exit_pos_tolerance: 0.10
 
-      # Zielposentoleranz für TURN
+      # Toleranz für seitliches Verschieben zur nächsten Reihe
+      shift_pos_tolerance: 0.10
+
+      # Zielposentoleranz allgemein
       pos_tolerance: 0.10
 
-      # Yaw-Toleranz für TURN [rad]
-      yaw_tolerance: 0.15
+      # Yaw-Toleranz für ALIGN_TO_NEXT_ROW [rad]
+      yaw_tolerance: 0.12
 
       # Ab dieser Entfernung wird linear abgebremst
-      slowdown_distance: 0.60
+      slowdown_distance: 0.80
 
       # Reglerverstärkung Richtung Zielpunkt
       k_heading: 1.5
@@ -51,12 +65,14 @@ maize_navigator:
       k_yaw: 1.8
 
       # Begrenzung Winkelgeschwindigkeit [rad/s]
-      max_angular: 0.8
+      max_angular: 0.6
 
     # Neue Reihe gilt erst als erkannt,
-    # wenn beide Seiten mehrere Zyklen stabil sichtbar sind.
+    # wenn beide Seiten mehrere Zyklen stabil sichtbar sind
+    # und der Mittenfehler klein genug ist.
     enter_row:
       confirm_cycles: 5
+      max_center_error: 0.20
 
     perception:
       drive_in_row:
