@@ -42,6 +42,24 @@ def align_yaw_to_reference(yaw: float, reference_yaw: float) -> float:
     return yaw
 
 
+def align_row_coordinate(yaw: float, s_center: float, reference_yaw: float) -> tuple:
+    """
+    Richtet eine globale Reihenkoordinate konsistent zur Fahrtrichtung aus.
+
+    Wichtig: Bei yaw -> yaw + pi dreht sich der laterale Einheitsvektor
+    e_lateral = [-sin(yaw), cos(yaw)] um. Deshalb muss auch die laterale
+    Koordinate s ihr Vorzeichen wechseln. Andernfalls liegt die Zielreihe
+    nach einer 180°-Wende rechnerisch auf der falschen Seite.
+    """
+    yaw = normalize_angle(yaw)
+    yaw_opposite = normalize_angle(yaw + np.pi)
+
+    if abs(normalize_angle(yaw_opposite - reference_yaw)) < abs(normalize_angle(yaw - reference_yaw)):
+        return yaw_opposite, -float(s_center)
+
+    return yaw, float(s_center)
+
+
 def yaw_from_quaternion(q) -> float:
     """
     Berechnet Yaw aus Quaternion.
@@ -140,6 +158,8 @@ class RowModel:
     yaw_map: float = 0.0
     s_center: float = 0.0
     target_s_center: float = 0.0
+    target_yaw_map: float = 0.0
+    target_valid: bool = False
     confidence: float = 0.0
     valid: bool = False
     last_update_sec: float = 0.0
@@ -215,6 +235,11 @@ class Perception:
         self.forward_center_error_filtered = 0.0
         self.heading_error_filtered = 0.0
         self.filter_alpha = 0.25
+
+    def reset_filters(self):
+        self.center_error_filtered = 0.0
+        self.forward_center_error_filtered = 0.0
+        self.heading_error_filtered = 0.0
 
     def process(self, scan_msg, current_state, pattern_direction) -> PerceptionData:
         data = PerceptionData()
@@ -641,12 +666,18 @@ class StateMachine:
 
         side = 1.0 if direction == "L" else -1.0
 
+        row_model_s_aligned = None
+
         if (
             row_model is not None
             and row_model.valid
             and row_model.confidence >= params["slam_row_min_confidence"]
         ):
-            yaw_old = align_yaw_to_reference(row_model.yaw_map, robot_pose.yaw)
+            yaw_old, row_model_s_aligned = align_row_coordinate(
+                row_model.yaw_map,
+                row_model.s_center,
+                robot_pose.yaw,
+            )
         else:
             yaw_old = robot_pose.yaw
 
@@ -687,10 +718,14 @@ class StateMachine:
         )
 
         # Zielreihe für das spätere ENTER_ROW speichern.
-        # Dadurch kann der Roboter beim Einbiegen die bekannte SLAM-/Map-Position
-        # der neuen Reihenmitte halten, bevor die Laserdetektion stabil ist.
-        if row_model is not None and row_model.valid:
-            row_model.target_s_center = row_model.s_center + row_shift
+        # target_s_center wird bewusst in der Koordinate der Ziel-Fahrtrichtung
+        # yaw_new abgelegt. Bei der 180°-Wende kehrt sich die laterale Achse um,
+        # daher muss die zuvor in yaw_old berechnete Zielkoordinate invertiert werden.
+        if row_model is not None and row_model.valid and row_model_s_aligned is not None:
+            target_s_in_old_direction = row_model_s_aligned + row_shift
+            row_model.target_yaw_map = yaw_new
+            row_model.target_s_center = -target_s_in_old_direction
+            row_model.target_valid = True
 
         return exit_pose, shift_pose, align_pose
 
@@ -906,9 +941,13 @@ class StateMachine:
         elif self.state == State.ENTER_ROW:
             row_visible = (
                 not perception.row_end_detected
-                and not np.isinf(perception.left_dist)
-                and not np.isinf(perception.right_dist)
+                and np.isfinite(perception.left_dist)
+                and np.isfinite(perception.right_dist)
+                and perception.row_heading_valid
+                and perception.left_line_valid
+                and perception.right_line_valid
                 and abs(perception.center_error) < params["enter_row_max_center_error"]
+                and abs(perception.row_heading_error) < params["enter_row_max_heading_error"]
             )
 
             if row_visible:
@@ -917,6 +956,9 @@ class StateMachine:
                 self.enter_row_seen_counter = 0
 
             if self.enter_row_seen_counter >= params["enter_row_confirm_cycles"]:
+                if hasattr(self.node, "promote_target_row_model"):
+                    self.node.promote_target_row_model(robot_pose)
+
                 self.pattern.next()
 
                 self.row_end_counter = 0
@@ -938,6 +980,9 @@ class StateMachine:
                 self.state = State.DRIVE_IN_ROW
 
         if self.state != old_state:
+            if hasattr(self.node, "perception") and hasattr(self.node.perception, "reset_filters"):
+                self.node.perception.reset_filters()
+
             self.node.get_logger().info(f"State transition: {old_state.name} -> {self.state.name}")
 
         return self.state
@@ -1873,7 +1918,9 @@ class FieldRobotNavigator(Node):
         if not self.row_model.valid:
             self.row_model.yaw_map = row_yaw_meas
             self.row_model.s_center = s_center_meas
+            self.row_model.target_yaw_map = row_yaw_meas
             self.row_model.target_s_center = s_center_meas
+            self.row_model.target_valid = False
             self.row_model.confidence = min(1.0, 0.30 + perception.line_confidence)
             self.row_model.valid = True
         else:
@@ -1896,6 +1943,40 @@ class FieldRobotNavigator(Node):
 
         self.row_model.last_update_sec = float(self.get_clock().now().nanoseconds) * 1e-9
 
+    def promote_target_row_model(self, robot_pose: RobotPose):
+        """
+        Übernimmt nach stabilem ENTER_ROW die Zielreihe als neue aktuelle Reihe.
+        Damit verwendet DRIVE_IN_ROW nach dem Einfahren nicht versehentlich weiter
+        die s-Koordinate der vorherigen Reihe.
+        """
+        if not self.params["slam_row_enable"]:
+            return
+
+        if not self.row_model.valid or not self.row_model.target_valid:
+            return
+
+        reference_yaw = robot_pose.yaw if robot_pose.valid else self.row_model.target_yaw_map
+        yaw_row, s_center = align_row_coordinate(
+            self.row_model.target_yaw_map,
+            self.row_model.target_s_center,
+            reference_yaw,
+        )
+
+        self.row_model.yaw_map = yaw_row
+        self.row_model.s_center = s_center
+        self.row_model.target_yaw_map = yaw_row
+        self.row_model.target_s_center = s_center
+        self.row_model.target_valid = False
+        self.row_model.valid = True
+        self.row_model.confidence = float(
+            np.clip(
+                max(self.row_model.confidence, self.params["slam_row_min_confidence"]),
+                0.0,
+                1.0,
+            )
+        )
+        self.row_model.last_update_sec = float(self.get_clock().now().nanoseconds) * 1e-9
+
     def compute_slam_row_errors(self, robot_pose: RobotPose, use_target: bool = False):
         """
         Liefert Cross-Track- und Heading-Fehler relativ zur globalen Reihenhypothese.
@@ -1909,11 +1990,22 @@ class FieldRobotNavigator(Node):
         ):
             return 0.0, 0.0, False
 
-        yaw_row = align_yaw_to_reference(self.row_model.yaw_map, robot_pose.yaw)
+        if use_target and self.row_model.target_valid:
+            yaw_reference = self.row_model.target_yaw_map
+            s_reference = self.row_model.target_s_center
+        else:
+            yaw_reference = self.row_model.yaw_map
+            s_reference = self.row_model.s_center
+
+        yaw_row, s_reference = align_row_coordinate(
+            yaw_reference,
+            s_reference,
+            robot_pose.yaw,
+        )
+
         e_lateral = np.array([-np.sin(yaw_row), np.cos(yaw_row)], dtype=float)
         robot_xy = np.array([robot_pose.x, robot_pose.y], dtype=float)
 
-        s_reference = self.row_model.target_s_center if use_target else self.row_model.s_center
         center_error = float(np.dot(robot_xy, e_lateral) - s_reference)
         heading_error = normalize_angle(yaw_row - robot_pose.yaw)
 
