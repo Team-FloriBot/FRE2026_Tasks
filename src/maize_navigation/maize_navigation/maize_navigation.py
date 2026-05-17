@@ -74,6 +74,21 @@ def distance_2d(a, b) -> float:
     return float(np.hypot(a.x - b.x, a.y - b.y))
 
 
+def projected_progress_along_yaw(current_pose, start_pose, yaw: float) -> float:
+    """
+    Fortschritt entlang einer vorgegebenen Reihenachse.
+
+    Für ENTER_ROW darf nicht die reine 2D-Distanz verwendet werden, weil
+    seitliches Driften, Schwingen oder kleine SLAM-Sprünge sonst fälschlich
+    als Einfahrstrecke gezählt werden. Gezählt wird nur die Projektion der
+    Bewegung auf die Ziel-Reihenrichtung. Negative Werte werden auf 0 gesetzt.
+    """
+    dx = float(current_pose.x - start_pose.x)
+    dy = float(current_pose.y - start_pose.y)
+    progress = dx * float(np.cos(yaw)) + dy * float(np.sin(yaw))
+    return max(0.0, float(progress))
+
+
 # ============================================================
 # >>> DATENCONTAINER: PERCEPTION OUTPUT
 # ============================================================
@@ -959,13 +974,21 @@ class StateMachine:
                 and abs(perception.row_heading_error) < params["enter_row_max_heading_error"]
             )
 
-            enter_row_distance = 0.0
+            enter_row_progress = 0.0
             if (
                 robot_pose.valid
                 and self.enter_row_start_pose is not None
                 and self.enter_row_start_pose.valid
             ):
-                enter_row_distance = distance_2d(robot_pose, self.enter_row_start_pose)
+                if self.align_target_pose is not None and self.align_target_pose.valid:
+                    progress_yaw = self.align_target_pose.yaw
+                else:
+                    progress_yaw = robot_pose.yaw
+                enter_row_progress = projected_progress_along_yaw(
+                    robot_pose,
+                    self.enter_row_start_pose,
+                    progress_yaw,
+                )
 
             # Der erste Abschnitt der neuen Reihe wird bewusst aus der map-/SLAM-
             # Zielreihe gefahren. Die lokale Laserdetektion darf den Zustand erst
@@ -973,7 +996,7 @@ class StateMachine:
             # springen einzelne erste Pflanzen oder Lücken nicht sofort in die
             # Reihenführung.
             map_guided_distance_reached = (
-                enter_row_distance >= params["enter_row_map_guided_distance"]
+                enter_row_progress >= params["enter_row_map_guided_distance"]
             )
 
             if row_visible and map_guided_distance_reached:
@@ -1179,15 +1202,26 @@ class Controller:
             laser_center_term = 0.0
             laser_heading_term = 0.0
 
-            enter_row_distance = 0.0
+            enter_row_progress = 0.0
             if (
                 robot_pose.valid
                 and state_machine.enter_row_start_pose is not None
                 and state_machine.enter_row_start_pose.valid
             ):
-                enter_row_distance = distance_2d(robot_pose, state_machine.enter_row_start_pose)
+                if (
+                    state_machine.align_target_pose is not None
+                    and state_machine.align_target_pose.valid
+                ):
+                    progress_yaw = state_machine.align_target_pose.yaw
+                else:
+                    progress_yaw = robot_pose.yaw
+                enter_row_progress = projected_progress_along_yaw(
+                    robot_pose,
+                    state_machine.enter_row_start_pose,
+                    progress_yaw,
+                )
 
-            map_guided_phase = enter_row_distance < params["enter_row_map_guided_distance"]
+            map_guided_phase = enter_row_progress < params["enter_row_map_guided_distance"]
 
             # 1) Beim Einfahren zuerst die Zielausrichtung aus der Wende halten.
             if (
@@ -1443,7 +1477,7 @@ class FieldRobotNavigator(Node):
         self.declare_parameter("vel_linear_drive", 0.22)
         self.declare_parameter("vel_linear_count", 0.35)
         self.declare_parameter("vel_linear_turn", 0.12)
-        self.declare_parameter("vel_linear_enter_row", 0.12)
+        self.declare_parameter("vel_linear_enter_row", 0.06)
 
         # Reihenregler
         self.declare_parameter("row_center_kp", 1.2)
@@ -1495,12 +1529,12 @@ class FieldRobotNavigator(Node):
 
         # SLAM-basierte Wendeparameter
         self.declare_parameter("turn.headland_exit_dist", 0.65)
-        self.declare_parameter("turn.pre_entry_offset", 0.15)
+        self.declare_parameter("turn.pre_entry_offset", 0.50)
 
         self.declare_parameter("turn.exit_pos_tolerance", 0.08)
         self.declare_parameter("turn.shift_pos_tolerance", 0.08)
-        self.declare_parameter("turn.pos_tolerance", 0.10)
-        self.declare_parameter("turn.yaw_tolerance", 0.10)
+        self.declare_parameter("turn.pos_tolerance", 0.07)
+        self.declare_parameter("turn.yaw_tolerance", 0.06)
 
         self.declare_parameter("turn.slowdown_distance", 0.65)
         self.declare_parameter("turn.k_heading", 0.9)
@@ -1512,14 +1546,14 @@ class FieldRobotNavigator(Node):
         self.declare_parameter("turn.shift_blend_distance", 0.18)
 
         # ENTER_ROW
-        self.declare_parameter("enter_row.confirm_cycles", 8)
+        self.declare_parameter("enter_row.confirm_cycles", 12)
         self.declare_parameter("enter_row.map_guided_distance", 1.0)
-        self.declare_parameter("enter_row.max_center_error", 0.16)
-        self.declare_parameter("enter_row.yaw_kp", 0.9)
-        self.declare_parameter("enter_row.slam_center_kp", 0.8)
-        self.declare_parameter("enter_row.laser_center_kp", 0.25)
-        self.declare_parameter("enter_row.laser_heading_kp", 0.25)
-        self.declare_parameter("enter_row.max_heading_error", 0.18)
+        self.declare_parameter("enter_row.max_center_error", 0.12)
+        self.declare_parameter("enter_row.yaw_kp", 1.0)
+        self.declare_parameter("enter_row.slam_center_kp", 0.9)
+        self.declare_parameter("enter_row.laser_center_kp", 0.15)
+        self.declare_parameter("enter_row.laser_heading_kp", 0.15)
+        self.declare_parameter("enter_row.max_heading_error", 0.12)
         self.declare_parameter("enter_row.max_angular", 0.25)
 
         # PERCEPTION PARAMETER
