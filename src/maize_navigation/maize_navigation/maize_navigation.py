@@ -23,7 +23,7 @@ def normalize_angle(angle: float) -> float:
     """
     Normiert einen Winkel auf den Bereich [-pi, pi].
     """
-    return np.arctan2(np.sin(angle), np.cos(angle))
+    return float(np.arctan2(np.sin(angle), np.cos(angle)))
 
 
 def yaw_from_quaternion(q) -> float:
@@ -33,7 +33,7 @@ def yaw_from_quaternion(q) -> float:
     """
     siny_cosp = 2.0 * (q.w * q.z + q.x * q.y)
     cosy_cosp = 1.0 - 2.0 * (q.y * q.y + q.z * q.z)
-    return np.arctan2(siny_cosp, cosy_cosp)
+    return float(np.arctan2(siny_cosp, cosy_cosp))
 
 
 def distance_2d(a, b) -> float:
@@ -89,8 +89,8 @@ class State(Enum):
     ROBOT_STOP = 0
     DRIVE_IN_ROW = 1
     EXIT_ROW = 2
-    TURN = 3
-    COUNTING_ROWS = 4
+    SHIFT_TO_NEXT_ROW = 3
+    ALIGN_TO_NEXT_ROW = 4
     ENTER_ROW = 5
 
 
@@ -143,15 +143,15 @@ class Perception:
         state_key_map = {
             State.DRIVE_IN_ROW: "drive_in_row",
             State.EXIT_ROW: "turn_and_exit",
-            State.TURN: "turn_and_exit",
-            State.COUNTING_ROWS: "counting_rows",
+            State.SHIFT_TO_NEXT_ROW: "turn_and_exit",
+            State.ALIGN_TO_NEXT_ROW: "turn_and_exit",
             State.ENTER_ROW: "turn_to_row",
         }
 
         box_key = state_key_map.get(current_state, "drive_in_row")
         box = self.bounding_boxes[box_key]
 
-        if current_state == State.DRIVE_IN_ROW or current_state == State.ENTER_ROW:
+        if current_state in (State.DRIVE_IN_ROW, State.ENTER_ROW):
             filter_dir = "both"
         else:
             filter_dir = pattern_direction
@@ -235,16 +235,13 @@ class StateMachine:
         self.navigation_triggered = False
 
         self.exit_target_pose = None
-        self.turn_target_pose = None
+        self.shift_target_pose = None
+        self.align_target_pose = None
 
+        self.row_end_counter = 0
         self.enter_row_seen_counter = 0
+        self.tf_missing_counter = 0
         self.tf_warning_printed = False
-
-        # Alte Variablen bleiben erhalten, falls COUNTING_ROWS später wieder genutzt wird.
-        self.row_counter = 1
-        self.previous_row = 1
-        self.actual_row = 1
-        self.actual_dist = np.inf
 
     def get_current_direction(self):
         step = self.pattern.current()
@@ -252,50 +249,103 @@ class StateMachine:
             return step[1]
         return "L"
 
+    def reset_mission_state(self):
+        self.pattern.reset()
+
+        self.exit_target_pose = None
+        self.shift_target_pose = None
+        self.align_target_pose = None
+
+        self.row_end_counter = 0
+        self.enter_row_seen_counter = 0
+        self.tf_missing_counter = 0
+        self.tf_warning_printed = False
+
+    def is_tf_available_or_stop(self, robot_pose: RobotPose, params, state_name: str) -> bool:
+        """
+        TF-Ausfälle werden toleriert.
+        Erst nach tf.missing_max_cycles wird die Mission gestoppt.
+        """
+        if robot_pose.valid:
+            self.tf_missing_counter = 0
+            return True
+
+        self.tf_missing_counter += 1
+
+        if self.tf_missing_counter >= params["tf_missing_max_cycles"]:
+            self.node.get_logger().warn(
+                f"{state_name} abgebrochen: TF fehlt seit "
+                f"{self.tf_missing_counter} Zyklen."
+            )
+            self.state = State.ROBOT_STOP
+            return False
+
+        return False
+
     def compute_headland_targets(self, robot_pose: RobotPose, params):
         """
-        Berechnet zwei Zielposen im map-Frame:
+        Berechnet drei Zielposen im map-Frame:
 
         1. exit_target_pose:
-           Roboter fährt aus der aktuellen Reihe heraus.
+           Aus der aktuellen Reihe herausfahren, Yaw wird gehalten.
 
-        2. turn_target_pose:
-           Roboter steht versetzt vor der Zielreihe und ist um pi gedreht.
+        2. shift_target_pose:
+           Seitlich vor die nächste Reihe verschieben,
+           noch mit alter Ausrichtung.
+
+        3. align_target_pose:
+           Gleiche Position wie shift_target_pose,
+           aber mit yaw + pi.
+
+        pre_entry_offset sorgt dafür, dass der Roboter etwas vor der neuen Reihe steht.
+        ENTER_ROW fährt anschließend kontrolliert in die Reihe hinein.
         """
         step = self.pattern.current()
         if step is None:
-            return None, None
+            return None, None, None
 
         row_count, direction = step
 
         side = 1.0 if direction == "L" else -1.0
 
-        yaw = robot_pose.yaw
+        yaw_old = robot_pose.yaw
+        yaw_new = normalize_angle(yaw_old + np.pi)
 
-        forward_x = np.cos(yaw)
-        forward_y = np.sin(yaw)
+        forward_x = np.cos(yaw_old)
+        forward_y = np.sin(yaw_old)
 
-        left_x = -np.sin(yaw)
-        left_y = np.cos(yaw)
+        left_x = -np.sin(yaw_old)
+        left_y = np.cos(yaw_old)
 
         exit_dist = params["turn_headland_exit_dist"]
         row_shift = side * row_count * params["row_width"]
+        pre_entry_offset = params["turn_pre_entry_offset"]
 
         exit_pose = RobotPose(
             x=robot_pose.x + forward_x * exit_dist,
             y=robot_pose.y + forward_y * exit_dist,
-            yaw=yaw,
+            yaw=yaw_old,
             valid=True,
         )
 
-        turn_pose = RobotPose(
-            x=exit_pose.x + left_x * row_shift,
-            y=exit_pose.y + left_y * row_shift,
-            yaw=normalize_angle(yaw + np.pi),
+        row_entry_pose_x = exit_pose.x + left_x * row_shift
+        row_entry_pose_y = exit_pose.y + left_y * row_shift
+
+        shift_pose = RobotPose(
+            x=row_entry_pose_x + forward_x * pre_entry_offset,
+            y=row_entry_pose_y + forward_y * pre_entry_offset,
+            yaw=yaw_old,
             valid=True,
         )
 
-        return exit_pose, turn_pose
+        align_pose = RobotPose(
+            x=shift_pose.x,
+            y=shift_pose.y,
+            yaw=yaw_new,
+            valid=True,
+        )
+
+        return exit_pose, shift_pose, align_pose
 
     def update(self, perception: PerceptionData, params, robot_pose: RobotPose):
         old_state = self.state
@@ -306,82 +356,97 @@ class StateMachine:
 
         if self.state == State.ROBOT_STOP:
             if self.navigation_triggered:
-                self.pattern.reset()
-                self.exit_target_pose = None
-                self.turn_target_pose = None
-                self.enter_row_seen_counter = 0
+                self.reset_mission_state()
                 self.navigation_triggered = False
                 self.state = State.DRIVE_IN_ROW
 
         # ====================================================
         # >>> STATE: DRIVE_IN_ROW
+        # Reihenende wird entprellt.
         # ====================================================
 
         elif self.state == State.DRIVE_IN_ROW:
             if perception.row_end_detected:
-                if robot_pose.valid:
-                    self.exit_target_pose, self.turn_target_pose = self.compute_headland_targets(
-                        robot_pose,
-                        params,
-                    )
+                self.row_end_counter += 1
+            else:
+                self.row_end_counter = 0
+                self.tf_warning_printed = False
 
-                    if self.exit_target_pose is not None and self.turn_target_pose is not None:
+            if self.row_end_counter >= params["row_end_confirm_cycles"]:
+                if robot_pose.valid:
+                    (
+                        self.exit_target_pose,
+                        self.shift_target_pose,
+                        self.align_target_pose,
+                    ) = self.compute_headland_targets(robot_pose, params)
+
+                    if (
+                        self.exit_target_pose is not None
+                        and self.shift_target_pose is not None
+                        and self.align_target_pose is not None
+                    ):
                         self.enter_row_seen_counter = 0
+                        self.tf_missing_counter = 0
                         self.state = State.EXIT_ROW
                 else:
                     if not self.tf_warning_printed:
                         self.node.get_logger().warn(
-                            "Reihenende erkannt, aber keine gültige SLAM-Pose verfügbar. "
+                            "Reihenende bestätigt, aber keine gültige SLAM-Pose verfügbar. "
                             "Bleibe in DRIVE_IN_ROW."
                         )
                         self.tf_warning_printed = True
 
         # ====================================================
         # >>> STATE: EXIT_ROW
-        # Fährt aus der Reihe heraus bis zur SLAM-Zielpose.
+        # Gerade aus der aktuellen Reihe herausfahren.
+        # Yaw wird gehalten.
         # ====================================================
 
         elif self.state == State.EXIT_ROW:
-            if not robot_pose.valid or self.exit_target_pose is None:
+            if self.exit_target_pose is None:
+                self.node.get_logger().warn("EXIT_ROW abgebrochen: keine exit_target_pose.")
                 self.state = State.ROBOT_STOP
-                self.node.get_logger().warn("EXIT_ROW abgebrochen: keine gültige Zielpose oder TF-Pose.")
-            else:
+            elif self.is_tf_available_or_stop(robot_pose, params, "EXIT_ROW"):
                 dist_error = distance_2d(robot_pose, self.exit_target_pose)
+
                 if dist_error < params["turn_exit_pos_tolerance"]:
-                    self.state = State.TURN
+                    self.state = State.SHIFT_TO_NEXT_ROW
 
         # ====================================================
-        # >>> STATE: TURN
-        # Fährt zur Zielpose vor der nächsten Reihe und richtet sich um 180° aus.
+        # >>> STATE: SHIFT_TO_NEXT_ROW
+        # Seitlich vor die Zielreihe fahren.
         # ====================================================
 
-        elif self.state == State.TURN:
-            if not robot_pose.valid or self.turn_target_pose is None:
+        elif self.state == State.SHIFT_TO_NEXT_ROW:
+            if self.shift_target_pose is None:
+                self.node.get_logger().warn("SHIFT_TO_NEXT_ROW abgebrochen: keine shift_target_pose.")
                 self.state = State.ROBOT_STOP
-                self.node.get_logger().warn("TURN abgebrochen: keine gültige Zielpose oder TF-Pose.")
-            else:
-                dist_error = distance_2d(robot_pose, self.turn_target_pose)
-                yaw_error = abs(normalize_angle(self.turn_target_pose.yaw - robot_pose.yaw))
+            elif self.is_tf_available_or_stop(robot_pose, params, "SHIFT_TO_NEXT_ROW"):
+                dist_error = distance_2d(robot_pose, self.shift_target_pose)
 
-                if (
-                    dist_error < params["turn_pos_tolerance"]
-                    and yaw_error < params["turn_yaw_tolerance"]
-                ):
+                if dist_error < params["turn_shift_pos_tolerance"]:
+                    self.state = State.ALIGN_TO_NEXT_ROW
+
+        # ====================================================
+        # >>> STATE: ALIGN_TO_NEXT_ROW
+        # Auf neue Reihenrichtung ausrichten.
+        # ====================================================
+
+        elif self.state == State.ALIGN_TO_NEXT_ROW:
+            if self.align_target_pose is None:
+                self.node.get_logger().warn("ALIGN_TO_NEXT_ROW abgebrochen: keine align_target_pose.")
+                self.state = State.ROBOT_STOP
+            elif self.is_tf_available_or_stop(robot_pose, params, "ALIGN_TO_NEXT_ROW"):
+                yaw_error = abs(normalize_angle(self.align_target_pose.yaw - robot_pose.yaw))
+
+                if yaw_error < params["turn_yaw_tolerance"]:
                     self.enter_row_seen_counter = 0
                     self.state = State.ENTER_ROW
 
         # ====================================================
-        # >>> STATE: COUNTING_ROWS
-        # Wird in der SLAM-basierten Version nicht mehr aktiv verwendet.
-        # ====================================================
-
-        elif self.state == State.COUNTING_ROWS:
-            self.state = State.ENTER_ROW
-
-        # ====================================================
         # >>> STATE: ENTER_ROW
-        # Laser übernimmt wieder. Sobald beide Pflanzenreihen stabil erkannt werden,
-        # gilt die neue Reihe als erreicht.
+        # Langsam in die neue Reihe fahren.
+        # Umschalten auf DRIVE_IN_ROW erst bei stabiler Laser-Erkennung.
         # ====================================================
 
         elif self.state == State.ENTER_ROW:
@@ -389,6 +454,7 @@ class StateMachine:
                 not perception.row_end_detected
                 and not np.isinf(perception.left_dist)
                 and not np.isinf(perception.right_dist)
+                and abs(perception.center_error) < params["enter_row_max_center_error"]
             )
 
             if row_visible:
@@ -398,9 +464,14 @@ class StateMachine:
 
             if self.enter_row_seen_counter >= params["enter_row_confirm_cycles"]:
                 self.pattern.next()
+
+                self.row_end_counter = 0
                 self.enter_row_seen_counter = 0
+                self.tf_missing_counter = 0
+
                 self.exit_target_pose = None
-                self.turn_target_pose = None
+                self.shift_target_pose = None
+                self.align_target_pose = None
 
                 if self.pattern.current() is None:
                     self.state = State.ROBOT_STOP
@@ -431,7 +502,7 @@ class Controller:
 
         # ====================================================
         # >>> STATE: DRIVE_IN_ROW
-        # Laserbasierte Reihenmittenregelung bleibt unverändert.
+        # Laserbasierte Reihenmittenregelung.
         # ====================================================
 
         if state == State.DRIVE_IN_ROW:
@@ -441,52 +512,57 @@ class Controller:
                 if np.abs(perception.center_error) > 0.15:
                     cmd.linear = 0.1
                 else:
-                    cmd.linear = (
-                        params["vel_linear_drive"]
-                        * (params["max_dist_in_row"] - np.abs(perception.center_error))
-                        / params["max_dist_in_row"]
-                    )
+                    speed_factor = (
+                        params["max_dist_in_row"] - np.abs(perception.center_error)
+                    ) / params["max_dist_in_row"]
+
+                    speed_factor = float(np.clip(speed_factor, 0.0, 1.0))
+                    cmd.linear = params["vel_linear_drive"] * speed_factor
 
         # ====================================================
         # >>> STATE: EXIT_ROW
-        # SLAM-basierter Positionsregler zur Exit-Pose.
+        # Gerade herausfahren, Yaw halten.
         # ====================================================
 
         elif state == State.EXIT_ROW:
-            cmd = self.compute_pose_position_control(
+            cmd = self.compute_forward_with_yaw_hold(
                 robot_pose=robot_pose,
                 target_pose=state_machine.exit_target_pose,
                 params=params,
-                max_linear=params["vel_linear_drive"],
-                stop_at_target=True,
+                linear_speed=params["vel_linear_drive"],
+                pos_tolerance=params["turn_exit_pos_tolerance"],
             )
 
         # ====================================================
-        # >>> STATE: TURN
-        # SLAM-basierter Positions- und Yaw-Regler.
+        # >>> STATE: SHIFT_TO_NEXT_ROW
+        # Zur seitlichen Zielpose fahren, noch ohne Endausrichtung.
         # ====================================================
 
-        elif state == State.TURN:
-            cmd = self.compute_pose_position_and_yaw_control(
+        elif state == State.SHIFT_TO_NEXT_ROW:
+            cmd = self.compute_pose_position_control(
                 robot_pose=robot_pose,
-                target_pose=state_machine.turn_target_pose,
+                target_pose=state_machine.shift_target_pose,
                 params=params,
                 max_linear=params["vel_linear_turn"],
+                pos_tolerance=params["turn_shift_pos_tolerance"],
             )
 
         # ====================================================
-        # >>> STATE: COUNTING_ROWS
-        # In der SLAM-Version deaktiviert.
+        # >>> STATE: ALIGN_TO_NEXT_ROW
+        # Nur drehen, keine Linearbewegung.
         # ====================================================
 
-        elif state == State.COUNTING_ROWS:
-            cmd.linear = 0.0
-            cmd.angular = 0.0
+        elif state == State.ALIGN_TO_NEXT_ROW:
+            cmd = self.compute_yaw_control(
+                robot_pose=robot_pose,
+                target_pose=state_machine.align_target_pose,
+                params=params,
+            )
 
         # ====================================================
         # >>> STATE: ENTER_ROW
-        # Langsam in die neue Reihe fahren.
-        # Sobald beide Seiten erkannt sind, wieder Laser-Zentrierung nutzen.
+        # Langsam in die neue Reihe einfahren.
+        # Sobald beide Seiten sichtbar sind, leichte Laserzentrierung.
         # ====================================================
 
         elif state == State.ENTER_ROW:
@@ -497,6 +573,49 @@ class Controller:
             else:
                 cmd.angular = 0.0
 
+            cmd.angular = float(
+                np.clip(
+                    cmd.angular,
+                    -params["turn_max_angular"],
+                    params["turn_max_angular"],
+                )
+            )
+
+        return cmd
+
+    def compute_forward_with_yaw_hold(
+        self,
+        robot_pose: RobotPose,
+        target_pose: RobotPose,
+        params,
+        linear_speed: float,
+        pos_tolerance: float,
+    ) -> ControlCommand:
+        cmd = ControlCommand(linear=0.0, angular=0.0)
+
+        if not robot_pose.valid or target_pose is None or not target_pose.valid:
+            return cmd
+
+        dist_error = distance_2d(robot_pose, target_pose)
+
+        if dist_error < pos_tolerance:
+            return cmd
+
+        yaw_error = normalize_angle(target_pose.yaw - robot_pose.yaw)
+
+        linear_scale = np.clip(dist_error / params["turn_slowdown_distance"], 0.0, 1.0)
+
+        cmd.linear = linear_speed * linear_scale
+        cmd.angular = params["turn_k_yaw"] * yaw_error
+
+        cmd.angular = float(
+            np.clip(
+                cmd.angular,
+                -params["turn_max_angular"],
+                params["turn_max_angular"],
+            )
+        )
+
         return cmd
 
     def compute_pose_position_control(
@@ -505,7 +624,7 @@ class Controller:
         target_pose: RobotPose,
         params,
         max_linear: float,
-        stop_at_target: bool,
+        pos_tolerance: float,
     ) -> ControlCommand:
         cmd = ControlCommand(linear=0.0, angular=0.0)
 
@@ -516,15 +635,20 @@ class Controller:
         dy = target_pose.y - robot_pose.y
 
         dist_error = float(np.hypot(dx, dy))
+
+        if dist_error < pos_tolerance:
+            return cmd
+
         target_heading = np.arctan2(dy, dx)
         heading_error = normalize_angle(target_heading - robot_pose.yaw)
 
-        if stop_at_target and dist_error < params["turn_exit_pos_tolerance"]:
-            return cmd
-
         linear_scale = np.clip(dist_error / params["turn_slowdown_distance"], 0.0, 1.0)
 
-        cmd.linear = max_linear * linear_scale
+        # Rückwärtsfahren wird vermieden.
+        # Bei großem Winkelfehler erst stärker eindrehen, dann fahren.
+        heading_factor = max(0.0, np.cos(heading_error))
+
+        cmd.linear = max_linear * linear_scale * heading_factor
         cmd.angular = params["turn_k_heading"] * heading_error
 
         cmd.angular = float(
@@ -537,35 +661,24 @@ class Controller:
 
         return cmd
 
-    def compute_pose_position_and_yaw_control(
+    def compute_yaw_control(
         self,
         robot_pose: RobotPose,
         target_pose: RobotPose,
         params,
-        max_linear: float,
     ) -> ControlCommand:
         cmd = ControlCommand(linear=0.0, angular=0.0)
 
         if not robot_pose.valid or target_pose is None or not target_pose.valid:
             return cmd
 
-        dx = target_pose.x - robot_pose.x
-        dy = target_pose.y - robot_pose.y
-
-        dist_error = float(np.hypot(dx, dy))
-        target_heading = np.arctan2(dy, dx)
-
-        heading_error = normalize_angle(target_heading - robot_pose.yaw)
         yaw_error = normalize_angle(target_pose.yaw - robot_pose.yaw)
 
-        if dist_error > params["turn_pos_tolerance"]:
-            linear_scale = np.clip(dist_error / params["turn_slowdown_distance"], 0.0, 1.0)
+        if abs(yaw_error) < params["turn_yaw_tolerance"]:
+            return cmd
 
-            cmd.linear = max_linear * linear_scale
-            cmd.angular = params["turn_k_heading"] * heading_error
-        else:
-            cmd.linear = 0.0
-            cmd.angular = params["turn_k_yaw"] * yaw_error
+        cmd.linear = 0.0
+        cmd.angular = params["turn_k_yaw"] * yaw_error
 
         cmd.angular = float(
             np.clip(
@@ -622,14 +735,15 @@ class FieldRobotNavigator(Node):
         # ====================================================
 
         self.declare_parameter("pattern", "1L-1R-2L-3R")
+
         self.declare_parameter("max_dist_in_row", 0.375)
         self.declare_parameter("row_width", 0.75)
         self.declare_parameter("drive_out_dist", 1.0)
 
         self.declare_parameter("vel_linear_drive", 0.5)
         self.declare_parameter("vel_linear_count", 0.5)
-        self.declare_parameter("vel_linear_turn", 0.3)
-        self.declare_parameter("vel_linear_enter_row", 0.25)
+        self.declare_parameter("vel_linear_turn", 0.25)
+        self.declare_parameter("vel_linear_enter_row", 0.15)
 
         self.declare_parameter("accel_max_linear", 0.5)
         self.declare_parameter("accel_max_angular", 1.0)
@@ -638,18 +752,29 @@ class FieldRobotNavigator(Node):
         self.declare_parameter("frames.map", "map")
         self.declare_parameter("frames.robot_base", "base_link")
 
+        # >>> REIHENENDE
+        self.declare_parameter("row_end.confirm_cycles", 5)
+
+        # >>> TF
+        self.declare_parameter("tf.missing_max_cycles", 10)
+
         # >>> SLAM-BASIERTE WENDEPARAMETER
         self.declare_parameter("turn.headland_exit_dist", 1.0)
+        self.declare_parameter("turn.pre_entry_offset", 0.3)
+
         self.declare_parameter("turn.exit_pos_tolerance", 0.10)
+        self.declare_parameter("turn.shift_pos_tolerance", 0.10)
         self.declare_parameter("turn.pos_tolerance", 0.10)
-        self.declare_parameter("turn.yaw_tolerance", 0.15)
-        self.declare_parameter("turn.slowdown_distance", 0.60)
+        self.declare_parameter("turn.yaw_tolerance", 0.12)
+
+        self.declare_parameter("turn.slowdown_distance", 0.80)
         self.declare_parameter("turn.k_heading", 1.5)
         self.declare_parameter("turn.k_yaw", 1.8)
-        self.declare_parameter("turn.max_angular", 0.8)
+        self.declare_parameter("turn.max_angular", 0.6)
 
         # >>> ENTER_ROW
         self.declare_parameter("enter_row.confirm_cycles", 5)
+        self.declare_parameter("enter_row.max_center_error", 0.20)
 
         # >>> PERCEPTION PARAMETER
         states = ["drive_in_row", "turn_and_exit", "counting_rows", "turn_to_row"]
@@ -751,10 +876,20 @@ class FieldRobotNavigator(Node):
                 elif keys[1] == "robot_base":
                     self.params["frame_robot_base"] = param.value
 
+            elif len(keys) == 2 and keys[0] == "row_end":
+                if keys[1] == "confirm_cycles":
+                    self.params["row_end_confirm_cycles"] = int(param.value)
+
+            elif len(keys) == 2 and keys[0] == "tf":
+                if keys[1] == "missing_max_cycles":
+                    self.params["tf_missing_max_cycles"] = int(param.value)
+
             elif len(keys) == 2 and keys[0] == "turn":
                 mapping = {
                     "headland_exit_dist": "turn_headland_exit_dist",
+                    "pre_entry_offset": "turn_pre_entry_offset",
                     "exit_pos_tolerance": "turn_exit_pos_tolerance",
+                    "shift_pos_tolerance": "turn_shift_pos_tolerance",
                     "pos_tolerance": "turn_pos_tolerance",
                     "yaw_tolerance": "turn_yaw_tolerance",
                     "slowdown_distance": "turn_slowdown_distance",
@@ -769,6 +904,8 @@ class FieldRobotNavigator(Node):
             elif len(keys) == 2 and keys[0] == "enter_row":
                 if keys[1] == "confirm_cycles":
                     self.params["enter_row_confirm_cycles"] = int(param.value)
+                elif keys[1] == "max_center_error":
+                    self.params["enter_row_max_center_error"] = param.value
 
             elif len(keys) == 3 and keys[0] == "perception":
                 self.params["bounding_boxes"][keys[1]][keys[2]] = param.value
@@ -779,6 +916,7 @@ class FieldRobotNavigator(Node):
         p = {}
 
         p["pattern"] = self.get_parameter("pattern").value
+
         p["max_dist_in_row"] = self.get_parameter("max_dist_in_row").value
         p["row_width"] = self.get_parameter("row_width").value
         p["drive_out_dist"] = self.get_parameter("drive_out_dist").value
@@ -794,16 +932,24 @@ class FieldRobotNavigator(Node):
         p["frame_map"] = self.get_parameter("frames.map").value
         p["frame_robot_base"] = self.get_parameter("frames.robot_base").value
 
+        p["row_end_confirm_cycles"] = int(self.get_parameter("row_end.confirm_cycles").value)
+        p["tf_missing_max_cycles"] = int(self.get_parameter("tf.missing_max_cycles").value)
+
         p["turn_headland_exit_dist"] = self.get_parameter("turn.headland_exit_dist").value
+        p["turn_pre_entry_offset"] = self.get_parameter("turn.pre_entry_offset").value
+
         p["turn_exit_pos_tolerance"] = self.get_parameter("turn.exit_pos_tolerance").value
+        p["turn_shift_pos_tolerance"] = self.get_parameter("turn.shift_pos_tolerance").value
         p["turn_pos_tolerance"] = self.get_parameter("turn.pos_tolerance").value
         p["turn_yaw_tolerance"] = self.get_parameter("turn.yaw_tolerance").value
+
         p["turn_slowdown_distance"] = self.get_parameter("turn.slowdown_distance").value
         p["turn_k_heading"] = self.get_parameter("turn.k_heading").value
         p["turn_k_yaw"] = self.get_parameter("turn.k_yaw").value
         p["turn_max_angular"] = self.get_parameter("turn.max_angular").value
 
         p["enter_row_confirm_cycles"] = int(self.get_parameter("enter_row.confirm_cycles").value)
+        p["enter_row_max_center_error"] = self.get_parameter("enter_row.max_center_error").value
 
         p["bounding_boxes"] = {}
         states = ["drive_in_row", "turn_and_exit", "counting_rows", "turn_to_row"]
@@ -902,12 +1048,6 @@ class FieldRobotNavigator(Node):
             perception=perception,
             params=self.params,
             robot_pose=robot_pose,
-        )
-
-        self.params["actual_dist_target"] = getattr(
-            self.state_machine,
-            "actual_dist",
-            np.inf,
         )
 
         cmd_setpoint = self.controller.compute(
