@@ -1,37 +1,82 @@
 maize_navigator:
   ros__parameters:
     pattern: "1L-1R-2L-3R"
-    
-    # Abstandsziel in der Reihe (ersetzt max_dist_in_row)
+
+    # Reihenparameter
     max_dist_in_row: 0.375
     row_width: 0.75
     drive_out_dist: 1.0
-    
+
     # Geschwindigkeiten
     vel_linear_drive: 0.5
     vel_linear_count: 0.5
     vel_linear_turn: 0.3
-    
-    # Velocity Ramper - Verhindert harte Sprünge bei State-Wechseln
-    accel_max_linear: 0.5      # Max lineare Beschleunigung [m/s²]
-    accel_max_angular: 1.0     # Max Winkel-Beschleunigung [rad/s²]
-    
+    vel_linear_enter_row: 0.25
+
+    # Velocity Ramper
+    accel_max_linear: 0.5
+    accel_max_angular: 1.0
+
+    # SLAM / TF Frames
+    # Für Stage:
+    #   robot_base: "base_link"
+    # Für den echten Roboter später ggf.:
+    #   robot_base: "base_footprint"
+    frames:
+      map: "map"
+      robot_base: "base_link"
+
+    # SLAM-basierte Wende
+    turn:
+      # Strecke, die der Roboter nach erkanntem Reihenende
+      # noch aus der aktuellen Reihe herausfahren soll.
+      headland_exit_dist: 1.0
+
+      # Toleranz für Ende von EXIT_ROW
+      exit_pos_tolerance: 0.10
+
+      # Zielposentoleranz für TURN
+      pos_tolerance: 0.10
+
+      # Yaw-Toleranz für TURN [rad]
+      yaw_tolerance: 0.15
+
+      # Ab dieser Entfernung wird linear abgebremst
+      slowdown_distance: 0.60
+
+      # Reglerverstärkung Richtung Zielpunkt
+      k_heading: 1.5
+
+      # Reglerverstärkung Endausrichtung
+      k_yaw: 1.8
+
+      # Begrenzung Winkelgeschwindigkeit [rad/s]
+      max_angular: 0.8
+
+    # Neue Reihe gilt erst als erkannt,
+    # wenn beide Seiten mehrere Zyklen stabil sichtbar sind.
+    enter_row:
+      confirm_cycles: 5
+
     perception:
       drive_in_row:
         x_min: 0.0
         x_max: 2.0
         y_min: 0.1
         y_max: 1.0
+
       turn_and_exit:
         x_min: -0.5
         x_max: 0.5
         y_min: 0.1
         y_max: 1.0
+
       counting_rows:
         x_min: -0.5
         x_max: 0.5
         y_min: 0.1
         y_max: 1.5
+
       turn_to_row:
         x_min: 0.0
         x_max: 1.5
