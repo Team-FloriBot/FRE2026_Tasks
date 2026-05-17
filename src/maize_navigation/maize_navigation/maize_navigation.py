@@ -58,6 +58,11 @@ class PerceptionData:
     num_points_in_box: int = 0
     filtered_points: list = None
 
+    # Lokale Reihenausrichtung aus Laserpunktwolke.
+    # Positiv: Reihenmittelpunkt läuft nach links, wenn x nach vorne zunimmt.
+    row_heading_error: float = 0.0
+    row_heading_valid: bool = False
+
 
 # ============================================================
 # >>> DATENCONTAINER: ROBOTERPOSE AUS SLAM / TF
@@ -199,6 +204,23 @@ class Perception:
         data.x_mean = np.mean(points_x) if len(points_x) > 0 else np.inf
         data.y_mean = np.mean(points_y) if len(points_y) > 0 else np.inf
 
+        left_points = [p for p in points if p.y > 0.0]
+        right_points = [p for p in points if p.y <= 0.0]
+
+        slopes = []
+        left_slope = self.fit_side_slope(left_points)
+        right_slope = self.fit_side_slope(right_points)
+
+        if left_slope is not None:
+            slopes.append(left_slope)
+        if right_slope is not None:
+            slopes.append(right_slope)
+
+        if slopes:
+            center_slope = float(np.mean(slopes))
+            data.row_heading_error = float(np.arctan(center_slope))
+            data.row_heading_valid = True
+
         data.filtered_points = points
 
         return data
@@ -220,6 +242,23 @@ class Perception:
             return -y_max < y < -y_min
 
         return False
+
+    def fit_side_slope(self, points, min_points=4):
+        """
+        Fit y = m*x + b für eine Pflanzenseite im Roboterkoordinatensystem.
+        Der Slope m beschreibt die lokale Reihenausrichtung.
+        """
+        if len(points) < min_points:
+            return None
+
+        xs = np.array([p.x for p in points], dtype=float)
+        ys = np.array([p.y for p in points], dtype=float)
+
+        if np.ptp(xs) < 0.20:
+            return None
+
+        m, _ = np.polyfit(xs, ys, 1)
+        return float(m)
 
 
 # ============================================================
@@ -507,17 +546,39 @@ class Controller:
 
         if state == State.DRIVE_IN_ROW:
             if not perception.row_end_detected:
-                cmd.angular = -perception.center_error * 5.0 * params["vel_linear_drive"]
+                center_term = -params["row_center_kp"] * perception.center_error
 
-                if np.abs(perception.center_error) > 0.15:
-                    cmd.linear = 0.1
+                if perception.row_heading_valid:
+                    heading_term = params["row_heading_kp"] * perception.row_heading_error
                 else:
-                    speed_factor = (
-                        params["max_dist_in_row"] - np.abs(perception.center_error)
-                    ) / params["max_dist_in_row"]
+                    heading_term = 0.0
 
-                    speed_factor = float(np.clip(speed_factor, 0.0, 1.0))
-                    cmd.linear = params["vel_linear_drive"] * speed_factor
+                cmd.angular = center_term + heading_term
+                cmd.angular = float(
+                    np.clip(
+                        cmd.angular,
+                        -params["row_max_angular"],
+                        params["row_max_angular"],
+                    )
+                )
+
+                # In engen Kurven und bei großem Mittenfehler langsamer fahren,
+                # aber nicht hart auf einen festen Wert springen.
+                center_ratio = abs(perception.center_error) / params["max_dist_in_row"]
+                angular_ratio = abs(cmd.angular) / max(params["row_max_angular"], 1e-6)
+                curve_ratio = max(center_ratio, angular_ratio)
+
+                speed_factor = 1.0 - params["row_curve_slowdown_gain"] * curve_ratio
+                speed_factor = float(np.clip(speed_factor, 0.0, 1.0))
+
+                cmd.linear = params["vel_linear_drive"] * speed_factor
+                cmd.linear = float(
+                    np.clip(
+                        cmd.linear,
+                        params["row_min_linear"],
+                        params["vel_linear_drive"],
+                    )
+                )
 
         # ====================================================
         # >>> STATE: EXIT_ROW
@@ -745,8 +806,15 @@ class FieldRobotNavigator(Node):
         self.declare_parameter("vel_linear_turn", 0.25)
         self.declare_parameter("vel_linear_enter_row", 0.15)
 
+        # Reihenregler
+        self.declare_parameter("row_center_kp", 2.5)
+        self.declare_parameter("row_heading_kp", 1.2)
+        self.declare_parameter("row_max_angular", 0.9)
+        self.declare_parameter("row_min_linear", 0.08)
+        self.declare_parameter("row_curve_slowdown_gain", 0.75)
+
         self.declare_parameter("accel_max_linear", 0.5)
-        self.declare_parameter("accel_max_angular", 1.0)
+        self.declare_parameter("accel_max_angular", 2.0)
 
         # >>> SLAM / TF FRAMES
         self.declare_parameter("frames.map", "map")
@@ -926,6 +994,12 @@ class FieldRobotNavigator(Node):
         p["vel_linear_turn"] = self.get_parameter("vel_linear_turn").value
         p["vel_linear_enter_row"] = self.get_parameter("vel_linear_enter_row").value
 
+        p["row_center_kp"] = self.get_parameter("row_center_kp").value
+        p["row_heading_kp"] = self.get_parameter("row_heading_kp").value
+        p["row_max_angular"] = self.get_parameter("row_max_angular").value
+        p["row_min_linear"] = self.get_parameter("row_min_linear").value
+        p["row_curve_slowdown_gain"] = self.get_parameter("row_curve_slowdown_gain").value
+
         p["accel_max_linear"] = self.get_parameter("accel_max_linear").value
         p["accel_max_angular"] = self.get_parameter("accel_max_angular").value
 
@@ -1060,13 +1134,15 @@ class FieldRobotNavigator(Node):
             state_machine=self.state_machine,
         )
 
-        cmd_ramped_linear, cmd_ramped_angular = self.velocity_ramper.update(
-            cmd_setpoint.linear,
-            cmd_setpoint.angular,
-        )
-
         if state == State.ROBOT_STOP:
             self.velocity_ramper.reset()
+            cmd_ramped_linear = 0.0
+            cmd_ramped_angular = 0.0
+        else:
+            cmd_ramped_linear, cmd_ramped_angular = self.velocity_ramper.update(
+                cmd_setpoint.linear,
+                cmd_setpoint.angular,
+            )
 
         twist = Twist()
         twist.linear.x = float(cmd_ramped_linear)
