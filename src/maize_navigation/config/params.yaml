@@ -14,12 +14,13 @@ maize_navigator:
     vel_linear_enter_row: 0.12
 
     # Reihenregler
-    row_center_kp: 1.8
-    row_heading_kp: 0.45
-    row_forward_kp: 0.55
+    # Etwas weniger Center-Korrektur, dafür stärkere Heading-Stabilisierung.
+    row_center_kp: 1.2
+    row_heading_kp: 0.8
+    row_forward_kp: 0.35
     row_max_angular: 0.65
     row_min_linear: 0.0
-    row_curve_slowdown_gain: 0.65
+    row_curve_slowdown_gain: 0.8
 
     # Nahbereichs-Kollisionsvermeidung in der Reihe
     row_clearance_kp: 1.4
@@ -37,18 +38,52 @@ maize_navigator:
       map: "map"
       robot_base: "base_link"
 
+    # SLAM-basiertes globales Reihenmodell
+    slam_row:
+      enable: true
+
+      # Tiefpass für das globale Reihenmodell.
+      # Kleiner = stabiler, aber träger.
+      # Größer = schneller, aber unruhiger.
+      update_alpha: 0.08
+
+      # Mindestqualität der lokalen Laser-Linien, damit SLAM-Row-Model aktualisiert wird.
+      min_line_confidence: 0.35
+
+      # Mindestkonfidenz, ab der SLAM im Regler verwendet wird.
+      min_confidence: 0.25
+
+      # Langsames Abklingen, wenn keine gute lokale Reihe sichtbar ist.
+      confidence_decay: 0.995
+
+      # Vorausschaupunkt für Centerline-Fehler in m vor dem Roboter.
+      x_ref: 0.80
+
+      # Ab dieser Laser-Konfidenz dominiert Laser gegenüber SLAM.
+      laser_conf_high: 0.55
+
+      # Gewicht Laser bei guter Detektion.
+      laser_weight_high: 0.80
+
+      # Gewicht Laser bei mittlerer Detektion.
+      laser_weight_medium: 0.50
+
     # Reihenende-Erkennung entprellen
     row_end:
-      confirm_cycles: 5
+      confirm_cycles: 10
 
     # Reihenerkennung beim seitlichen Vorbeifahren
     row_pass:
-      confirm_cycles: 3
-      free_cycles: 2
-      min_strength: 5
-      max_width: 0.45
-      fallback_to_slam: true
-      max_extra_shift: 0.25
+      confirm_cycles: 4
+      free_cycles: 3
+      min_strength: 8
+      max_width: 0.30
+
+      # Für Feldtests zunächst false.
+      # true nur setzen, wenn SLAM zuverlässig ist und das Row-Counting sauber validiert wurde.
+      fallback_to_slam: false
+
+      max_extra_shift: 0.20
 
     # TF-Ausfälle tolerieren
     tf:
@@ -56,10 +91,7 @@ maize_navigator:
 
     # SLAM-basierte Wende
     turn:
-      # Kürzeres Herausfahren aus der Reihe
       headland_exit_dist: 0.65
-
-      # Kleinerer Vorhalteabstand vor der neuen Reihe
       pre_entry_offset: 0.15
 
       # Toleranzen
@@ -75,8 +107,6 @@ maize_navigator:
       max_angular: 0.45
 
       # Überblenddistanzen für flüssigeres Wenden
-      # Größer = früherer Übergang zum nächsten Wendeschritt
-      # Kleiner = exakter, aber hakeliger
       exit_blend_distance: 0.22
       shift_blend_distance: 0.18
 
