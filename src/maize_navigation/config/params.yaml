@@ -33,38 +33,29 @@ maize_navigator:
     front_density_x_min: 0.60
     front_density_x_max: 2.00
     front_density_y_abs: 0.45
-    front_density_threshold: 2
-    end_probability_threshold: 0.85
-    end_stable_frames_required: 12
+    front_density_threshold: 1
+    end_probability_threshold: 0.95
+    end_stable_frames_required: 25
 
-    min_follow_confidence: 0.25
+    min_follow_confidence: 0.10
     min_enter_confidence: 0.18
     enter_stable_frames_required: 5
     acquire_timeout_sec: 8.0
 
-    follow_speed: 0.25
-    slow_speed: 0.10
-    enter_speed: 0.12
-    turn_speed: 0.10
-    max_linear_speed: 0.35
-    max_angular_speed: 1.40
+    follow_speed: 0.18
+    slow_speed: 0.08
+    enter_speed: 0.10
+    turn_speed: 0.08
+    max_linear_speed: 0.25
+    max_angular_speed: 1.20
 
-    # Für kleine Halbkreiswenden muss der Lookahead deutlich kleiner als der Radius sein.
-    # Bei expected_row_width = 0.75 m ist R = 0.375 m.
     lookahead_distance: 0.25
 
     path_goal_xy_tolerance: 0.12
     path_goal_yaw_tolerance: 0.25
 
-    # Für einen reinen Halbkreis auf die Nachbarreihe:
-    # exit_distance = 0.0
-    # Für etwas Sicherheitsabstand vor der Wende:
     exit_distance: 0.20
-
-    # Wird für den Halbkreis selbst nicht mehr als S-Kurven-Länge benutzt,
-    # bleibt aber als Parameter erhalten.
     turn_forward_distance: 2.20
-
     enter_distance: 0.60
 
     row_shift_count: 1
@@ -72,7 +63,7 @@ maize_navigator:
 
     turn_180: true
 
-    obstacle_stop_distance: 0.12
-    obstacle_slow_distance: 0.30
+    obstacle_stop_distance: 0.18
+    obstacle_slow_distance: 0.35
 
     publish_debug: true
