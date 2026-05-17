@@ -118,7 +118,7 @@ maize_navigator:
     # SLAM-basierte Wende
     # ============================================================
     turn:
-      headland_exit_dist: 0.65
+      headland_exit_dist: 1.0
       pre_entry_offset: 0.50
 
       # Toleranzen
