@@ -833,6 +833,7 @@ class StateMachine:
                     + params["row_pass_max_extra_shift"]
                 )
 
+                shifted_distance = None
                 if self.shift_start_pose is not None:
                     shifted_distance = distance_2d(robot_pose, self.shift_start_pose)
 
@@ -847,15 +848,40 @@ class StateMachine:
                 enough_rows_seen = self.shift_row_count >= target_row_count
                 slam_target_reached = dist_error < params["turn_shift_blend_distance"]
 
-                # SLAM-Fallback nur sehr konservativ erlauben.
-                # Bei Mehrfachsprüngen darf SLAM nicht zu früh abbrechen.
+                # Deadlock-Schutz:
+                # Wenn das SLAM-Ziel erreicht ist, der Positionsregler dadurch 0 m/s liefert,
+                # aber die Reihenzählung keine Reihe bestätigt hat, darf der Zustand nicht
+                # dauerhaft in SHIFT_TO_NEXT_ROW hängen bleiben. Für 1L/1R wird dann die
+                # SLAM-Zielposition als grobe Vorgabe akzeptiert. Bei Mehrfachsprüngen muss
+                # mindestens target_row_count - 1 Reihe gesehen worden sein.
                 guarded_slam_fallback = (
                     slam_target_reached
                     and params["row_pass_fallback_to_slam"]
                     and self.shift_row_count >= max(target_row_count - 1, 0)
                 )
 
-                if enough_rows_seen or guarded_slam_fallback:
+                shift_distance_reached = (
+                    shifted_distance is not None
+                    and shifted_distance >= target_row_count * params["row_width"] * 0.85
+                )
+
+                deadlock_guard = (
+                    slam_target_reached
+                    and shift_distance_reached
+                    and (
+                        target_row_count == 1
+                        or self.shift_row_count >= max(target_row_count - 1, 0)
+                    )
+                )
+
+                if deadlock_guard and not enough_rows_seen:
+                    self.node.get_logger().warn(
+                        f"SHIFT_TO_NEXT_ROW: SLAM-Ziel erreicht, aber nur "
+                        f"{self.shift_row_count}/{target_row_count} Reihen gezählt. "
+                        f"Deadlock-Schutz: Wechsle trotzdem zu ALIGN_TO_NEXT_ROW."
+                    )
+
+                if enough_rows_seen or guarded_slam_fallback or deadlock_guard:
                     self.state = State.ALIGN_TO_NEXT_ROW
 
         # ====================================================
@@ -1332,7 +1358,7 @@ class FieldRobotNavigator(Node):
 
         self.declare_parameter("vel_linear_drive", 0.22)
         self.declare_parameter("vel_linear_count", 0.35)
-        self.declare_parameter("vel_linear_turn", 0.14)
+        self.declare_parameter("vel_linear_turn", 0.12)
         self.declare_parameter("vel_linear_enter_row", 0.12)
 
         # Reihenregler
@@ -1375,10 +1401,10 @@ class FieldRobotNavigator(Node):
         # Reihenerkennung beim seitlichen Vorbeifahren
         self.declare_parameter("row_pass.confirm_cycles", 4)
         self.declare_parameter("row_pass.free_cycles", 3)
-        self.declare_parameter("row_pass.min_strength", 8)
-        self.declare_parameter("row_pass.max_width", 0.30)
-        self.declare_parameter("row_pass.fallback_to_slam", False)
-        self.declare_parameter("row_pass.max_extra_shift", 0.20)
+        self.declare_parameter("row_pass.min_strength", 5)
+        self.declare_parameter("row_pass.max_width", 0.45)
+        self.declare_parameter("row_pass.fallback_to_slam", True)
+        self.declare_parameter("row_pass.max_extra_shift", 0.35)
 
         # TF
         self.declare_parameter("tf.missing_max_cycles", 10)
