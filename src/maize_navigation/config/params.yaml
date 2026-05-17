@@ -146,6 +146,10 @@ maize_navigator:
       # Höher als vorher, damit die Reihe erst nach stabiler Sicht übernommen wird.
       confirm_cycles: 8
 
+      # Erster Abschnitt der neuen Reihe, der aus Karte/SLAM-Zielreihe gefahren wird,
+      # bevor die lokale Laserdetektion den Zustand DRIVE_IN_ROW übernehmen darf.
+      map_guided_distance: 1.0
+
       # Die neue Reihe gilt nur als stabil, wenn der Querfehler klein ist.
       max_center_error: 0.16
 
