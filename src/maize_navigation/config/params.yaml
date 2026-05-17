@@ -1,90 +1,68 @@
 maize_navigator:
   ros__parameters:
-    # -------------------------------------------------------------------------
-    # Topics / Frames
-    # -------------------------------------------------------------------------
     scan_topic: "/sensors/merged_scan"
     cmd_vel_topic: "/cmd_vel"
     base_frame: "base_link"
     odom_frame: "odom"
-    control_rate_hz: 20.0
 
-    # -------------------------------------------------------------------------
-    # Mission
-    # -------------------------------------------------------------------------
-    pattern: "1L-1R-2L-3R"
-    auto_start: false
+    control_frequency: 20.0
 
-    # -------------------------------------------------------------------------
-    # Wahrnehmung: Region of Interest im Laser-/base_link-Frame
-    # +x vorne, +y links
-    # -------------------------------------------------------------------------
+    expected_row_width: 0.75
+    min_lane_width: 0.45
+    max_lane_width: 1.15
+
     roi_x_min: 0.15
     roi_x_max: 4.0
     roi_y_abs_min: 0.12
     roi_y_abs_max: 1.50
 
-    front_density_x_min: 0.5
-    front_density_x_max: 2.5
-    front_density_y_abs: 0.35
+    acquire_roi_x_min: -0.30
+    acquire_roi_x_max: 3.20
+    acquire_roi_y_abs_min: 0.05
+    acquire_roi_y_abs_max: 2.20
 
-    # -------------------------------------------------------------------------
-    # Reihenfit
-    # -------------------------------------------------------------------------
     ransac_iterations: 80
-    ransac_distance: 0.06
+    ransac_distance: 0.07
     min_inliers: 5
-    min_visible_length: 0.50
+    min_visible_length: 0.45
+    max_abs_line_slope: 1.8
 
-    expected_row_width: 0.75
-    min_row_width: 0.45
-    max_row_width: 1.10
-    max_row_angle_diff_deg: 15.0
-
-    # -------------------------------------------------------------------------
-    # Tracking / zeitliche Stabilisierung
-    # -------------------------------------------------------------------------
     tracker_alpha: 0.25
-    confidence_decay_no_measurement: 0.95
-    min_detection_confidence_update: 0.25
-    end_detect_threshold: 0.75
+    confidence_decay: 0.95
 
-    # -------------------------------------------------------------------------
-    # Lokaler Reihenpfad
-    # -------------------------------------------------------------------------
-    row_lookahead_distance: 3.0
-    row_path_points: 40
-    nominal_speed: 0.35
-    slow_speed: 0.12
+    front_density_x_min: 0.60
+    front_density_x_max: 2.00
+    front_density_y_abs: 0.45
+    front_density_threshold: 4
+    end_probability_threshold: 0.75
+    end_stable_frames_required: 6
 
-    # -------------------------------------------------------------------------
-    # Vorgewende / Reihenwechsel
-    # -------------------------------------------------------------------------
-    exit_distance: 0.80
-    turn_forward_distance: 2.20
-    enter_distance: 1.20
-    row_spacing: 0.75
-    turn_speed: 0.20
-    enter_speed: 0.18
-    min_enter_confidence: 0.45
-    enter_stable_frames_required: 8
+    min_follow_confidence: 0.40
+    min_enter_confidence: 0.25
+    enter_stable_frames_required: 5
+    acquire_timeout_sec: 8.0
 
-    # -------------------------------------------------------------------------
-    # Pure-Pursuit-Regler
-    # -------------------------------------------------------------------------
-    lookahead_distance: 0.80
+    follow_speed: 0.35
+    slow_speed: 0.14
+    enter_speed: 0.16
+    turn_speed: 0.18
     max_linear_speed: 0.45
     max_angular_speed: 1.20
-    max_linear_accel: 0.50
-    max_angular_accel: 1.80
-    path_goal_tolerance_xy: 0.12
-    path_goal_tolerance_yaw_deg: 12.0
 
-    # -------------------------------------------------------------------------
-    # Safety
-    # -------------------------------------------------------------------------
+    lookahead_distance: 0.75
+    path_goal_xy_tolerance: 0.18
+    path_goal_yaw_tolerance: 0.35
+
+    exit_distance: 0.85
+    turn_forward_distance: 2.20
+    enter_distance: 1.20
+
+    row_shift_count: 1
+    row_shift_direction: "L"
+
+    turn_180: true
+
     obstacle_stop_distance: 0.25
     obstacle_slow_distance: 0.45
-    front_obstacle_angle_deg: 25.0
-    min_follow_confidence_stop: 0.10
-    min_follow_confidence_slow: 0.25
+
+    publish_debug: true
