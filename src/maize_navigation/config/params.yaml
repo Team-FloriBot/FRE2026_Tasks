@@ -14,7 +14,6 @@ maize_navigator:
     vel_linear_enter_row: 0.12
 
     # Reihenregler
-    # Reduziert gegenüber vorher, damit der Roboter nicht zittert.
     row_center_kp: 1.8
     row_heading_kp: 0.45
     row_forward_kp: 0.55
@@ -30,7 +29,6 @@ maize_navigator:
     row_guard_min_angular: 0.25
 
     # Velocity Ramper
-    # Niedrigere Beschleunigungen glätten das Fahrverhalten.
     accel_max_linear: 0.22
     accel_max_angular: 1.2
 
@@ -50,10 +48,6 @@ maize_navigator:
       min_strength: 5
       max_width: 0.45
       fallback_to_slam: true
-
-      # Benötigt den überarbeiteten Python-Code mit row_pass.max_extra_shift.
-      # Begrenzung gegen zu weites seitliches Herausfahren:
-      # maximal target_row_count * row_width + max_extra_shift.
       max_extra_shift: 0.25
 
     # TF-Ausfälle tolerieren
@@ -62,23 +56,29 @@ maize_navigator:
 
     # SLAM-basierte Wende
     turn:
-      # Kürzeres Herausfahren aus der Reihe.
-      # Vorher 1.0 m; das kann den Roboter unnötig weit ins Vorgewende bringen.
+      # Kürzeres Herausfahren aus der Reihe
       headland_exit_dist: 0.65
 
-      # Kleinerer Vorhalteabstand vor der neuen Reihe.
-      # Vorher 0.3 m; reduziert Überschwingen und Suchweg.
+      # Kleinerer Vorhalteabstand vor der neuen Reihe
       pre_entry_offset: 0.15
 
+      # Toleranzen
       exit_pos_tolerance: 0.08
       shift_pos_tolerance: 0.08
       pos_tolerance: 0.10
       yaw_tolerance: 0.10
 
+      # Reglerparameter für die Wende
       slowdown_distance: 0.65
       k_heading: 0.9
       k_yaw: 1.0
       max_angular: 0.45
+
+      # Überblenddistanzen für flüssigeres Wenden
+      # Größer = früherer Übergang zum nächsten Wendeschritt
+      # Kleiner = exakter, aber hakeliger
+      exit_blend_distance: 0.22
+      shift_blend_distance: 0.18
 
     enter_row:
       confirm_cycles: 5
@@ -97,9 +97,7 @@ maize_navigator:
         y_min: 0.1
         y_max: 1.0
 
-      # Suchfenster beim seitlichen Vorbeifahren.
-      # Kleineres y_max verhindert, dass entfernte Objekte oder Nachbarstrukturen
-      # als Reihe interpretiert werden.
+      # Suchfenster beim seitlichen Vorbeifahren
       counting_rows:
         x_min: -0.35
         x_max: 0.35
