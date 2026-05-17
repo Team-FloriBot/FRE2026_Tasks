@@ -1,26 +1,21 @@
 <?xml version="1.0"?>
-<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
 <package format="3">
   <name>maize_navigation</name>
-  <version>0.0.0</version>
-  <description>Maize row navigation with LaserScan perception and SLAM-based headland turning</description>
-
-  <maintainer email="norika.schneider@gmail.com">norika-schneider</maintainer>
+  <version>0.1.0</version>
+  <description>Maize row navigation with local path planning in one ROS 2 node.</description>
+  <maintainer email="tzimmerman@stud.hs-heilbronn.de">floribot</maintainer>
   <license>Apache-2.0</license>
 
+  <buildtool_depend>ament_python</buildtool_depend>
+
   <depend>rclpy</depend>
-  <depend>rcl_interfaces</depend>
-
   <depend>geometry_msgs</depend>
+  <depend>nav_msgs</depend>
   <depend>sensor_msgs</depend>
-  <depend>sensor_msgs_py</depend>
+  <depend>std_msgs</depend>
   <depend>std_srvs</depend>
-
+  <depend>visualization_msgs</depend>
   <depend>tf2_ros</depend>
-  <depend>tf2_sensor_msgs</depend>
-
-  <depend>laser_geometry</depend>
-  <depend>message_filters</depend>
   <depend>python3-numpy</depend>
 
   <test_depend>ament_copyright</test_depend>
