@@ -41,6 +41,14 @@ maize_navigator:
     row_end:
       confirm_cycles: 5
 
+    # Reihenerkennung beim seitlichen Vorbeifahren
+    row_pass:
+      confirm_cycles: 4
+      free_cycles: 3
+      min_strength: 6
+      max_width: 0.35
+      fallback_to_slam: true
+
     # TF-Ausfälle tolerieren
     tf:
       missing_max_cycles: 10
@@ -78,10 +86,10 @@ maize_navigator:
         y_max: 1.0
 
       counting_rows:
-        x_min: -0.5
-        x_max: 0.5
-        y_min: 0.1
-        y_max: 1.5
+        x_min: -0.45
+        x_max: 0.45
+        y_min: 0.15
+        y_max: 1.6
 
       turn_to_row:
         x_min: 0.0
