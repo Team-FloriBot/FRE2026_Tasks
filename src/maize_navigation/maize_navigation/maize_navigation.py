@@ -74,7 +74,6 @@ class PerceptionData:
     forward_center_valid: bool = False
 
     # Reihenerkennung beim seitlichen Vorbeifahren im Vorgewende.
-    # row_candidate_y ist die seitliche Position der detektierten Reihe im Roboter-Frame.
     row_candidate_y: float = np.inf
     row_candidate_valid: bool = False
     row_candidate_strength: int = 0
@@ -158,6 +157,12 @@ class Perception:
     def __init__(self, bounding_boxes):
         self.bounding_boxes = bounding_boxes
 
+        # Tiefpassfilter gegen Zittern durch einzelne Laser-Ausreißer.
+        self.center_error_filtered = 0.0
+        self.forward_center_error_filtered = 0.0
+        self.heading_error_filtered = 0.0
+        self.filter_alpha = 0.25
+
     def process(self, scan_msg, current_state, pattern_direction) -> PerceptionData:
         data = PerceptionData()
         points = []
@@ -203,12 +208,7 @@ class Perception:
         data.min_dist = min_distance
         data.num_points_in_box = len(points)
 
-        # Nahbereich direkt vor dem Roboter:
-        # Dieser Bereich ist maßgeblich für Abstandsschutz und kurzfristige S-Kurven.
         near_points = [p for p in points if 0.00 <= p.x <= 0.70]
-
-        # Vorschau-Bereich:
-        # Dieser Bereich erkennt die kommende Kurve früher, ohne den Nahbereich zu überstimmen.
         forward_points = [p for p in points if 0.70 < p.x <= 1.60]
 
         (
@@ -226,7 +226,6 @@ class Perception:
             data.center_error = data.near_center_error
             data.row_end_detected = False
         else:
-            # Fallback auf gesamte Box, falls im Nahbereich nicht beide Seiten sichtbar sind.
             (
                 data.left_dist,
                 data.right_dist,
@@ -279,6 +278,28 @@ class Perception:
             data.row_heading_error = float(np.arctan(center_slope))
             data.row_heading_valid = True
 
+        # Tiefpassfilter gegen Reglerzittern.
+        if np.isfinite(data.center_error):
+            self.center_error_filtered = (
+                self.filter_alpha * data.center_error
+                + (1.0 - self.filter_alpha) * self.center_error_filtered
+            )
+            data.center_error = self.center_error_filtered
+
+        if data.forward_center_valid and np.isfinite(data.forward_center_error):
+            self.forward_center_error_filtered = (
+                self.filter_alpha * data.forward_center_error
+                + (1.0 - self.filter_alpha) * self.forward_center_error_filtered
+            )
+            data.forward_center_error = self.forward_center_error_filtered
+
+        if data.row_heading_valid and np.isfinite(data.row_heading_error):
+            self.heading_error_filtered = (
+                self.filter_alpha * data.row_heading_error
+                + (1.0 - self.filter_alpha) * self.heading_error_filtered
+            )
+            data.row_heading_error = self.heading_error_filtered
+
         data.filtered_points = points
 
         return data
@@ -287,18 +308,11 @@ class Perception:
         self,
         points,
         bin_size=0.05,
-        min_points=6,
-        max_cluster_width=0.35,
+        min_points=5,
+        max_cluster_width=0.45,
     ):
         """
         Detektiert eine Maisreihe beim seitlichen Vorbeifahren.
-
-        Verfahren:
-        1. Seitliche Koordinate y der gefilterten Laserpunktwolke auswerten.
-        2. Histogramm über y bilden.
-        3. Histogramm glätten.
-        4. Dichtestes y-Band als Reihenkandidat wählen.
-        5. Nur kompakte Cluster mit genügend Punkten akzeptieren.
 
         Rückgabe:
             candidate_y, valid, strength, width
@@ -349,13 +363,6 @@ class Perception:
     def compute_side_distances(self, points):
         """
         Robuste Seitenabstände für linke und rechte Pflanzenreihe.
-
-        left_dist/right_dist:
-            25-%-Perzentil statt Mittelwert. Dadurch reagiert die Regelung stärker
-            auf nahe Pflanzen, ohne vollständig von einzelnen Ausreißern dominiert zu werden.
-
-        left_near/right_near:
-            Minimaler seitlicher Abstand pro Seite für Kollisionsschutz.
         """
         left_y = np.array([abs(p.y) for p in points if p.y > 0.0], dtype=float)
         right_y = np.array([abs(p.y) for p in points if p.y <= 0.0], dtype=float)
@@ -404,7 +411,6 @@ class Perception:
     def fit_side_slope(self, points, min_points=4):
         """
         Fit y = m*x + b für eine Pflanzenseite im Roboterkoordinatensystem.
-        Der Slope m beschreibt die lokale Reihenausrichtung.
         """
         if len(points) < min_points:
             return None
@@ -434,6 +440,7 @@ class StateMachine:
         self.exit_target_pose = None
         self.shift_target_pose = None
         self.align_target_pose = None
+        self.shift_start_pose = None
 
         self.row_end_counter = 0
         self.enter_row_seen_counter = 0
@@ -459,15 +466,11 @@ class StateMachine:
         self.exit_target_pose = None
         self.shift_target_pose = None
         self.align_target_pose = None
+        self.shift_start_pose = None
 
         self.row_end_counter = 0
         self.enter_row_seen_counter = 0
-
-        self.shift_row_count = 0
-        self.shift_row_visible_counter = 0
-        self.shift_row_free_counter = 0
-        self.shift_ready_for_next_row = True
-        self.last_shift_row_y = np.inf
+        self.reset_shift_row_detection()
 
         self.tf_missing_counter = 0
         self.tf_warning_printed = False
@@ -502,21 +505,7 @@ class StateMachine:
 
     def compute_headland_targets(self, robot_pose: RobotPose, params):
         """
-        Berechnet drei Zielposen im map-Frame:
-
-        1. exit_target_pose:
-           Aus der aktuellen Reihe herausfahren, Yaw wird gehalten.
-
-        2. shift_target_pose:
-           Seitlich vor die nächste Reihe verschieben,
-           noch mit alter Ausrichtung.
-
-        3. align_target_pose:
-           Gleiche Position wie shift_target_pose,
-           aber mit yaw + pi.
-
-        pre_entry_offset sorgt dafür, dass der Roboter etwas vor der neuen Reihe steht.
-        ENTER_ROW fährt anschließend kontrolliert in die Reihe hinein.
+        Berechnet drei Zielposen im map-Frame.
         """
         step = self.pattern.current()
         if step is None:
@@ -580,7 +569,6 @@ class StateMachine:
 
         # ====================================================
         # >>> STATE: DRIVE_IN_ROW
-        # Reihenende wird entprellt.
         # ====================================================
 
         elif self.state == State.DRIVE_IN_ROW:
@@ -605,6 +593,7 @@ class StateMachine:
                     ):
                         self.enter_row_seen_counter = 0
                         self.reset_shift_row_detection()
+                        self.shift_start_pose = None
                         self.tf_missing_counter = 0
                         self.state = State.EXIT_ROW
                 else:
@@ -617,8 +606,6 @@ class StateMachine:
 
         # ====================================================
         # >>> STATE: EXIT_ROW
-        # Gerade aus der aktuellen Reihe herausfahren.
-        # Yaw wird gehalten.
         # ====================================================
 
         elif self.state == State.EXIT_ROW:
@@ -629,18 +616,24 @@ class StateMachine:
                 dist_error = distance_2d(robot_pose, self.exit_target_pose)
 
                 if dist_error < params["turn_exit_pos_tolerance"]:
+                    self.shift_start_pose = RobotPose(
+                        x=robot_pose.x,
+                        y=robot_pose.y,
+                        yaw=robot_pose.yaw,
+                        valid=True,
+                    )
+                    self.reset_shift_row_detection()
                     self.state = State.SHIFT_TO_NEXT_ROW
 
         # ====================================================
         # >>> STATE: SHIFT_TO_NEXT_ROW
-        # Seitlich vor die Zielreihe fahren.
-        # Die Zielreihe wird zusätzlich über Laser-Dichteprofil bestätigt.
         # ====================================================
 
         elif self.state == State.SHIFT_TO_NEXT_ROW:
             if self.shift_target_pose is None:
                 self.node.get_logger().warn("SHIFT_TO_NEXT_ROW abgebrochen: keine shift_target_pose.")
                 self.state = State.ROBOT_STOP
+
             elif self.is_tf_available_or_stop(robot_pose, params, "SHIFT_TO_NEXT_ROW"):
                 step = self.pattern.current()
                 target_row_count = step[0] if step is not None else 1
@@ -680,15 +673,38 @@ class StateMachine:
 
                 dist_error = distance_2d(robot_pose, self.shift_target_pose)
 
+                max_shift_distance = (
+                    target_row_count * params["row_width"]
+                    + params["row_pass_max_extra_shift"]
+                )
+
+                if self.shift_start_pose is not None:
+                    shifted_distance = distance_2d(robot_pose, self.shift_start_pose)
+
+                    if shifted_distance > max_shift_distance:
+                        self.node.get_logger().warn(
+                            f"SHIFT_TO_NEXT_ROW Sicherheitslimit erreicht: "
+                            f"{shifted_distance:.2f} m > {max_shift_distance:.2f} m. "
+                            f"Wechsle zu ALIGN_TO_NEXT_ROW."
+                        )
+                        self.state = State.ALIGN_TO_NEXT_ROW
+
                 enough_rows_seen = self.shift_row_count >= target_row_count
                 slam_target_reached = dist_error < params["turn_shift_pos_tolerance"]
 
-                if enough_rows_seen or (slam_target_reached and params["row_pass_fallback_to_slam"]):
+                # SLAM-Fallback nur erlauben, wenn mindestens eine Reihe gesehen wurde.
+                # Dadurch fährt der Roboter nicht blind sehr weit aus dem Feld heraus.
+                guarded_slam_fallback = (
+                    slam_target_reached
+                    and params["row_pass_fallback_to_slam"]
+                    and self.shift_row_count > 0
+                )
+
+                if enough_rows_seen or guarded_slam_fallback:
                     self.state = State.ALIGN_TO_NEXT_ROW
 
         # ====================================================
         # >>> STATE: ALIGN_TO_NEXT_ROW
-        # Auf neue Reihenrichtung ausrichten.
         # ====================================================
 
         elif self.state == State.ALIGN_TO_NEXT_ROW:
@@ -704,8 +720,6 @@ class StateMachine:
 
         # ====================================================
         # >>> STATE: ENTER_ROW
-        # Langsam in die neue Reihe fahren.
-        # Umschalten auf DRIVE_IN_ROW erst bei stabiler Laser-Erkennung.
         # ====================================================
 
         elif self.state == State.ENTER_ROW:
@@ -727,6 +741,7 @@ class StateMachine:
                 self.row_end_counter = 0
                 self.enter_row_seen_counter = 0
                 self.reset_shift_row_detection()
+                self.shift_start_pose = None
                 self.tf_missing_counter = 0
 
                 self.exit_target_pose = None
@@ -753,16 +768,11 @@ class Controller:
     def compute(self, state, perception, direction, params, node, robot_pose, state_machine):
         cmd = ControlCommand(linear=0.0, angular=0.0)
 
-        # ====================================================
-        # >>> STATE: ROBOT_STOP
-        # ====================================================
-
         if state == State.ROBOT_STOP:
             return cmd
 
         # ====================================================
         # >>> STATE: DRIVE_IN_ROW
-        # Laserbasierte Reihenmittenregelung mit Nahbereichsschutz.
         # ====================================================
 
         if state == State.DRIVE_IN_ROW:
@@ -781,9 +791,6 @@ class Controller:
 
                 cmd.angular = center_term + heading_term + forward_term
 
-                # Nahbereichs-Abstoßung.
-                # Rechts zu nah -> positive Winkelgeschwindigkeit -> nach links.
-                # Links zu nah  -> negative Winkelgeschwindigkeit -> nach rechts.
                 if np.isfinite(perception.left_near) and np.isfinite(perception.right_near):
                     clearance_error = perception.right_near - perception.left_near
 
@@ -791,9 +798,6 @@ class Controller:
                         clearance_term = -params["row_clearance_kp"] * clearance_error
                         cmd.angular += clearance_term
 
-                # Sicherheitspriorität:
-                # Wenn eine Seite kritisch nah ist, darf der Kurven-/Heading-Anteil
-                # nicht mehr in die falsche Richtung lenken.
                 if np.isfinite(perception.right_near):
                     if perception.right_near < params["row_guard_clearance"]:
                         cmd.angular = max(cmd.angular, params["row_guard_min_angular"])
@@ -817,7 +821,6 @@ class Controller:
                 speed_factor = 1.0 - params["row_curve_slowdown_gain"] * curve_ratio
                 speed_factor = float(np.clip(speed_factor, 0.0, 1.0))
 
-                # Zusätzliche weiche Geschwindigkeitsreduktion bei geringer Seitenfreiheit.
                 if np.isfinite(perception.min_side_clearance):
                     clearance_speed_factor = (
                         perception.min_side_clearance - params["row_emergency_clearance"]
@@ -831,8 +834,6 @@ class Controller:
 
                 cmd.linear = params["vel_linear_drive"] * speed_factor
 
-                # Bei unterschrittener Sicherheitsdistanz wird der Sollwert auf 0 gesetzt.
-                # Der VelocityRamper glättet diesen Übergang.
                 if perception.min_side_clearance <= params["row_emergency_clearance"]:
                     cmd.linear = 0.0
                 else:
@@ -846,7 +847,6 @@ class Controller:
 
         # ====================================================
         # >>> STATE: EXIT_ROW
-        # Gerade herausfahren, Yaw halten.
         # ====================================================
 
         elif state == State.EXIT_ROW:
@@ -860,7 +860,6 @@ class Controller:
 
         # ====================================================
         # >>> STATE: SHIFT_TO_NEXT_ROW
-        # Zur seitlichen Zielpose fahren, noch ohne Endausrichtung.
         # ====================================================
 
         elif state == State.SHIFT_TO_NEXT_ROW:
@@ -874,7 +873,6 @@ class Controller:
 
         # ====================================================
         # >>> STATE: ALIGN_TO_NEXT_ROW
-        # Nur drehen, keine Linearbewegung.
         # ====================================================
 
         elif state == State.ALIGN_TO_NEXT_ROW:
@@ -886,15 +884,13 @@ class Controller:
 
         # ====================================================
         # >>> STATE: ENTER_ROW
-        # Langsam in die neue Reihe einfahren.
-        # Sobald beide Seiten sichtbar sind, leichte Laserzentrierung.
         # ====================================================
 
         elif state == State.ENTER_ROW:
             cmd.linear = params["vel_linear_enter_row"]
 
             if not perception.row_end_detected:
-                cmd.angular = -perception.center_error * 5.0 * params["vel_linear_enter_row"]
+                cmd.angular = -perception.center_error * 4.0 * params["vel_linear_enter_row"]
             else:
                 cmd.angular = 0.0
 
@@ -969,12 +965,15 @@ class Controller:
 
         linear_scale = np.clip(dist_error / params["turn_slowdown_distance"], 0.0, 1.0)
 
-        # Rückwärtsfahren wird vermieden.
-        # Bei großem Winkelfehler erst stärker eindrehen, dann fahren.
-        heading_factor = max(0.0, np.cos(heading_error))
+        # Weicheres Eindrehen.
+        heading_factor = np.clip(np.cos(heading_error), 0.25, 1.0)
 
         cmd.linear = max_linear * linear_scale * heading_factor
         cmd.angular = params["turn_k_heading"] * heading_error
+
+        # Nahe am Ziel nicht mehr stark drehen.
+        if dist_error < 0.25:
+            cmd.angular *= dist_error / 0.25
 
         cmd.angular = float(
             np.clip(
@@ -1021,7 +1020,7 @@ class Controller:
 # ============================================================
 
 class VelocityRamper:
-    def __init__(self, max_accel_linear=0.35, max_accel_angular=4.0, dt=0.1):
+    def __init__(self, max_accel_linear=0.22, max_accel_angular=1.2, dt=0.1):
         self.max_accel_linear = max_accel_linear
         self.max_accel_angular = max_accel_angular
         self.dt = dt
@@ -1065,66 +1064,67 @@ class FieldRobotNavigator(Node):
         self.declare_parameter("row_width", 0.75)
         self.declare_parameter("drive_out_dist", 1.0)
 
-        self.declare_parameter("vel_linear_drive", 0.30)
-        self.declare_parameter("vel_linear_count", 0.5)
-        self.declare_parameter("vel_linear_turn", 0.25)
-        self.declare_parameter("vel_linear_enter_row", 0.15)
+        self.declare_parameter("vel_linear_drive", 0.22)
+        self.declare_parameter("vel_linear_count", 0.35)
+        self.declare_parameter("vel_linear_turn", 0.14)
+        self.declare_parameter("vel_linear_enter_row", 0.12)
 
         # Reihenregler
-        self.declare_parameter("row_center_kp", 3.4)
-        self.declare_parameter("row_heading_kp", 0.8)
-        self.declare_parameter("row_forward_kp", 1.6)
-        self.declare_parameter("row_max_angular", 1.3)
+        self.declare_parameter("row_center_kp", 1.8)
+        self.declare_parameter("row_heading_kp", 0.45)
+        self.declare_parameter("row_forward_kp", 0.55)
+        self.declare_parameter("row_max_angular", 0.65)
         self.declare_parameter("row_min_linear", 0.0)
-        self.declare_parameter("row_curve_slowdown_gain", 0.90)
+        self.declare_parameter("row_curve_slowdown_gain", 0.65)
 
         # Nahbereichs-Kollisionsvermeidung
-        self.declare_parameter("row_clearance_kp", 2.5)
+        self.declare_parameter("row_clearance_kp", 1.4)
         self.declare_parameter("row_slow_clearance", 0.28)
         self.declare_parameter("row_emergency_clearance", 0.10)
         self.declare_parameter("row_guard_clearance", 0.16)
-        self.declare_parameter("row_guard_min_angular", 0.45)
+        self.declare_parameter("row_guard_min_angular", 0.25)
 
         # Velocity Ramper
-        self.declare_parameter("accel_max_linear", 0.35)
-        self.declare_parameter("accel_max_angular", 4.0)
+        self.declare_parameter("accel_max_linear", 0.22)
+        self.declare_parameter("accel_max_angular", 1.2)
 
-        # >>> SLAM / TF FRAMES
+        # SLAM / TF FRAMES
         self.declare_parameter("frames.map", "map")
         self.declare_parameter("frames.robot_base", "base_link")
 
-        # >>> REIHENENDE
+        # Reihenende
         self.declare_parameter("row_end.confirm_cycles", 5)
 
-        # >>> REIHENERKENNUNG BEIM SEITLICHEN VORBEIFAHREN
-        self.declare_parameter("row_pass.confirm_cycles", 4)
-        self.declare_parameter("row_pass.free_cycles", 3)
-        self.declare_parameter("row_pass.min_strength", 6)
-        self.declare_parameter("row_pass.max_width", 0.35)
+        # Reihenerkennung beim seitlichen Vorbeifahren
+        self.declare_parameter("row_pass.confirm_cycles", 3)
+        self.declare_parameter("row_pass.free_cycles", 2)
+        self.declare_parameter("row_pass.min_strength", 5)
+        self.declare_parameter("row_pass.max_width", 0.45)
         self.declare_parameter("row_pass.fallback_to_slam", True)
+        self.declare_parameter("row_pass.max_extra_shift", 0.25)
 
-        # >>> TF
+        # TF
         self.declare_parameter("tf.missing_max_cycles", 10)
 
-        # >>> SLAM-BASIERTE WENDEPARAMETER
-        self.declare_parameter("turn.headland_exit_dist", 1.0)
-        self.declare_parameter("turn.pre_entry_offset", 0.3)
+        # SLAM-basierte Wendeparameter
+        self.declare_parameter("turn.headland_exit_dist", 0.65)
+        self.declare_parameter("turn.pre_entry_offset", 0.15)
 
-        self.declare_parameter("turn.exit_pos_tolerance", 0.10)
-        self.declare_parameter("turn.shift_pos_tolerance", 0.10)
+        self.declare_parameter("turn.exit_pos_tolerance", 0.08)
+        self.declare_parameter("turn.shift_pos_tolerance", 0.08)
         self.declare_parameter("turn.pos_tolerance", 0.10)
-        self.declare_parameter("turn.yaw_tolerance", 0.12)
+        self.declare_parameter("turn.yaw_tolerance", 0.10)
 
-        self.declare_parameter("turn.slowdown_distance", 0.80)
-        self.declare_parameter("turn.k_heading", 1.5)
-        self.declare_parameter("turn.k_yaw", 1.8)
-        self.declare_parameter("turn.max_angular", 0.6)
+        self.declare_parameter("turn.slowdown_distance", 0.65)
+        self.declare_parameter("turn.k_heading", 0.9)
+        self.declare_parameter("turn.k_yaw", 1.0)
+        self.declare_parameter("turn.max_angular", 0.45)
 
-        # >>> ENTER_ROW
+        # ENTER_ROW
         self.declare_parameter("enter_row.confirm_cycles", 5)
         self.declare_parameter("enter_row.max_center_error", 0.20)
 
-        # >>> PERCEPTION PARAMETER
+        # PERCEPTION PARAMETER
         states = ["drive_in_row", "turn_and_exit", "counting_rows", "turn_to_row"]
         for state_name in states:
             if state_name == "drive_in_row":
@@ -1133,10 +1133,10 @@ class FieldRobotNavigator(Node):
                 default_y_min = 0.03
                 default_y_max = 1.0
             elif state_name == "counting_rows":
-                default_x_min = -0.45
-                default_x_max = 0.45
-                default_y_min = 0.15
-                default_y_max = 1.6
+                default_x_min = -0.35
+                default_x_max = 0.35
+                default_y_min = 0.12
+                default_y_max = 1.05
             else:
                 default_x_min = 0.0
                 default_x_max = 2.0
@@ -1148,7 +1148,7 @@ class FieldRobotNavigator(Node):
             self.declare_parameter(f"perception.{state_name}.y_min", default_y_min)
             self.declare_parameter(f"perception.{state_name}.y_max", default_y_max)
 
-        # >>> ROS TOPICS
+        # ROS TOPICS
         self.declare_parameter("topics.laserscan", "/sensors/merged_scan")
         self.declare_parameter("topics.cmd_vel", "/cmd_vel")
         self.declare_parameter("topics.field_points", "/field_points")
@@ -1251,6 +1251,7 @@ class FieldRobotNavigator(Node):
                     "min_strength": "row_pass_min_strength",
                     "max_width": "row_pass_max_width",
                     "fallback_to_slam": "row_pass_fallback_to_slam",
+                    "max_extra_shift": "row_pass_max_extra_shift",
                 }
 
                 if keys[1] in mapping:
@@ -1331,6 +1332,7 @@ class FieldRobotNavigator(Node):
         p["row_pass_min_strength"] = int(self.get_parameter("row_pass.min_strength").value)
         p["row_pass_max_width"] = self.get_parameter("row_pass.max_width").value
         p["row_pass_fallback_to_slam"] = self.get_parameter("row_pass.fallback_to_slam").value
+        p["row_pass_max_extra_shift"] = self.get_parameter("row_pass.max_extra_shift").value
 
         p["tf_missing_max_cycles"] = int(self.get_parameter("tf.missing_max_cycles").value)
 
