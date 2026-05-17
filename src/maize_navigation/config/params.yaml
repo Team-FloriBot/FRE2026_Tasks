@@ -8,27 +8,28 @@ maize_navigator:
     drive_out_dist: 1.0
 
     # Geschwindigkeiten
-    vel_linear_drive: 0.5
+    vel_linear_drive: 0.35
     vel_linear_count: 0.5
     vel_linear_turn: 0.25
     vel_linear_enter_row: 0.15
 
     # Reihenregler
-    row_center_kp: 2.5
-    row_heading_kp: 1.2
-    row_max_angular: 0.9
-    row_min_linear: 0.08
-    row_curve_slowdown_gain: 0.75
+    row_center_kp: 3.2
+    row_heading_kp: 1.0
+    row_max_angular: 1.0
+    row_min_linear: 0.0
+    row_curve_slowdown_gain: 0.85
+
+    # Nahbereichs-Kollisionsvermeidung in der Reihe
+    row_clearance_kp: 2.0
+    row_slow_clearance: 0.25
+    row_emergency_clearance: 0.10
 
     # Velocity Ramper
-    accel_max_linear: 0.5
-    accel_max_angular: 2.0
+    accel_max_linear: 0.4
+    accel_max_angular: 2.5
 
     # SLAM / TF Frames
-    # Stage:
-    #   robot_base: "base_link"
-    # Hardware später ggf.:
-    #   robot_base: "base_footprint"
     frames:
       map: "map"
       robot_base: "base_link"
@@ -43,40 +44,19 @@ maize_navigator:
 
     # SLAM-basierte Wende
     turn:
-      # Strecke nach erkanntem Reihenende aus der aktuellen Reihe heraus
       headland_exit_dist: 1.0
-
-      # Roboter bleibt etwas vor der neuen Reihe stehen
-      # und fährt anschließend in ENTER_ROW kontrolliert hinein.
       pre_entry_offset: 0.3
 
-      # Toleranz für Ende von EXIT_ROW
       exit_pos_tolerance: 0.10
-
-      # Toleranz für seitliches Verschieben zur nächsten Reihe
       shift_pos_tolerance: 0.10
-
-      # Zielposentoleranz allgemein
       pos_tolerance: 0.10
-
-      # Yaw-Toleranz für ALIGN_TO_NEXT_ROW [rad]
       yaw_tolerance: 0.12
 
-      # Ab dieser Entfernung wird linear abgebremst
       slowdown_distance: 0.80
-
-      # Reglerverstärkung Richtung Zielpunkt
       k_heading: 1.5
-
-      # Reglerverstärkung Endausrichtung
       k_yaw: 1.8
-
-      # Begrenzung Winkelgeschwindigkeit [rad/s]
       max_angular: 0.6
 
-    # Neue Reihe gilt erst als erkannt,
-    # wenn beide Seiten mehrere Zyklen stabil sichtbar sind
-    # und der Mittenfehler klein genug ist.
     enter_row:
       confirm_cycles: 5
       max_center_error: 0.20
@@ -85,7 +65,7 @@ maize_navigator:
       drive_in_row:
         x_min: 0.0
         x_max: 2.0
-        y_min: 0.1
+        y_min: 0.04
         y_max: 1.0
 
       turn_and_exit:
