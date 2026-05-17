@@ -762,9 +762,12 @@ class StateMachine:
         row_shift = side * row_count * params["row_width"]
         pre_entry_offset = params["turn_pre_entry_offset"]
 
+        # Zuerst ausreichend weit aus der aktuellen Reihe herausfahren.
+        # Der pre_entry_offset wird hier addiert, damit der anschließende
+        # seitliche SHIFT nicht diagonal in Richtung Zielreihe schneidet.
         exit_pose = RobotPose(
-            x=robot_pose.x + forward_x * exit_dist,
-            y=robot_pose.y + forward_y * exit_dist,
+            x=robot_pose.x + forward_x * (exit_dist + pre_entry_offset),
+            y=robot_pose.y + forward_y * (exit_dist + pre_entry_offset),
             yaw=yaw_old,
             valid=True,
         )
@@ -772,9 +775,12 @@ class StateMachine:
         row_entry_pose_x = exit_pose.x + left_x * row_shift
         row_entry_pose_y = exit_pose.y + left_y * row_shift
 
+        # Reiner seitlicher Versatz am Vorgewende.
+        # Keine zusätzliche Vorwärtskomponente, sonst entsteht eine diagonale
+        # Bahn, die nahe an Pflanzen oder in die Zielreihe schneiden kann.
         shift_pose = RobotPose(
-            x=row_entry_pose_x + forward_x * pre_entry_offset,
-            y=row_entry_pose_y + forward_y * pre_entry_offset,
+            x=row_entry_pose_x,
+            y=row_entry_pose_y,
             yaw=yaw_old,
             valid=True,
         )
@@ -1589,16 +1595,16 @@ class FieldRobotNavigator(Node):
         self.declare_parameter("row_pass.confirm_cycles", 4)
         self.declare_parameter("row_pass.free_cycles", 3)
         self.declare_parameter("row_pass.min_strength", 5)
-        self.declare_parameter("row_pass.max_width", 0.45)
-        self.declare_parameter("row_pass.fallback_to_slam", True)
-        self.declare_parameter("row_pass.max_extra_shift", 0.35)
+        self.declare_parameter("row_pass.max_width", 0.35)
+        self.declare_parameter("row_pass.fallback_to_slam", False)
+        self.declare_parameter("row_pass.max_extra_shift", 0.20)
 
         # TF
         self.declare_parameter("tf.missing_max_cycles", 10)
 
         # SLAM-basierte Wendeparameter
         self.declare_parameter("turn.headland_exit_dist", 0.65)
-        self.declare_parameter("turn.pre_entry_offset", 0.50)
+        self.declare_parameter("turn.pre_entry_offset", 0.35)
 
         self.declare_parameter("turn.exit_pos_tolerance", 0.08)
         self.declare_parameter("turn.shift_pos_tolerance", 0.08)
@@ -1609,11 +1615,11 @@ class FieldRobotNavigator(Node):
         self.declare_parameter("turn.slowdown_distance", 0.65)
         self.declare_parameter("turn.k_heading", 0.9)
         self.declare_parameter("turn.k_yaw", 0.75)
-        self.declare_parameter("turn.max_angular", 0.30)
+        self.declare_parameter("turn.max_angular", 0.25)
 
         # Überblenddistanzen für flüssigere Wendebewegung.
-        self.declare_parameter("turn.exit_blend_distance", 0.22)
-        self.declare_parameter("turn.shift_blend_distance", 0.18)
+        self.declare_parameter("turn.exit_blend_distance", 0.12)
+        self.declare_parameter("turn.shift_blend_distance", 0.08)
 
         # ENTER_ROW
         self.declare_parameter("enter_row.confirm_cycles", 12)
