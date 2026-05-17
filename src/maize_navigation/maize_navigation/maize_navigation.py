@@ -176,35 +176,35 @@ class NavigatorParams:
     front_density_x_min: float = 0.60
     front_density_x_max: float = 2.00
     front_density_y_abs: float = 0.45
-    front_density_threshold: int = 4
-    end_probability_threshold: float = 0.75
-    end_stable_frames_required: int = 6
+    front_density_threshold: int = 2
+    end_probability_threshold: float = 0.85
+    end_stable_frames_required: int = 12
 
-    min_follow_confidence: float = 0.40
-    min_enter_confidence: float = 0.25
+    min_follow_confidence: float = 0.25
+    min_enter_confidence: float = 0.18
     enter_stable_frames_required: int = 5
     acquire_timeout_sec: float = 8.0
 
-    follow_speed: float = 0.35
-    slow_speed: float = 0.14
-    enter_speed: float = 0.16
-    turn_speed: float = 0.18
-    max_linear_speed: float = 0.45
-    max_angular_speed: float = 1.20
+    follow_speed: float = 0.25
+    slow_speed: float = 0.10
+    enter_speed: float = 0.12
+    turn_speed: float = 0.10
+    max_linear_speed: float = 0.35
+    max_angular_speed: float = 1.40
 
-    lookahead_distance: float = 0.75
-    path_goal_xy_tolerance: float = 0.18
-    path_goal_yaw_tolerance: float = 0.35
+    lookahead_distance: float = 0.25
+    path_goal_xy_tolerance: float = 0.12
+    path_goal_yaw_tolerance: float = 0.25
 
-    exit_distance: float = 0.85
+    exit_distance: float = 0.20
     turn_forward_distance: float = 2.20
-    enter_distance: float = 1.20
+    enter_distance: float = 0.60
     row_shift_count: int = 1
     row_shift_direction: str = "L"
     turn_180: bool = True
 
-    obstacle_stop_distance: float = 0.25
-    obstacle_slow_distance: float = 0.45
+    obstacle_stop_distance: float = 0.12
+    obstacle_slow_distance: float = 0.30
 
     publish_debug: bool = True
 
@@ -509,7 +509,11 @@ class LocalPlanner:
     def plan_exit_row(self) -> LocalPath:
         points: List[PathPoint] = []
 
-        for x in np.linspace(0.2, self.p.exit_distance, 16):
+        if self.p.exit_distance <= 0.01:
+            points.append(PathPoint(0.0, 0.0, 0.0, self.p.slow_speed))
+            return LocalPath(points, True, "base_link")
+
+        for x in np.linspace(0.05, self.p.exit_distance, 12):
             points.append(PathPoint(float(x), 0.0, 0.0, self.p.slow_speed))
 
         return LocalPath(points, True, "base_link")
@@ -541,38 +545,65 @@ class LocalPlanner:
 
     def plan_turn_path_odom(self, start: Pose2D) -> LocalPath:
         direction = 1.0 if self.p.row_shift_direction.upper() == "L" else -1.0
-        lateral_shift = direction * self.p.row_shift_count * self.p.expected_row_width
+
+        row_shift = self.p.row_shift_count * self.p.expected_row_width
+        radius = row_shift / 2.0
+
+        if radius <= 0.05:
+            return LocalPath([], False, "odom", "invalid turn radius")
 
         local: List[PathPoint] = []
 
-        for x in np.linspace(0.0, self.p.exit_distance, 12):
-            local.append(PathPoint(float(x), 0.0, 0.0, self.p.turn_speed))
+        # Kurzer Ausfahrabschnitt vor dem Halbkreis.
+        # Für einen reinen Halbkreis exit_distance in params.yaml auf 0.0 setzen.
+        if self.p.exit_distance > 0.01:
+            for x in np.linspace(0.0, self.p.exit_distance, 12):
+                local.append(PathPoint(float(x), 0.0, 0.0, self.p.slow_speed))
 
-        length = self.p.turn_forward_distance
-        x0 = self.p.exit_distance
+        x_offset = self.p.exit_distance
 
-        for t in np.linspace(0.0, 1.0, 50):
-            s_curve = 3.0 * t * t - 2.0 * t * t * t
-            ds = 6.0 * t - 6.0 * t * t
+        # Echte Halbkreiswende:
+        # Start:  (x_offset, 0), Tangente +x
+        # Ende:   (x_offset, +/- 2R), Tangente -x
+        #
+        # Mittelpunkt links:  (x_offset, +R)
+        # Mittelpunkt rechts: (x_offset, -R)
+        for phi in np.linspace(-math.pi / 2.0, math.pi / 2.0, 90):
+            x = x_offset + radius * math.cos(phi)
+            y = direction * (radius + radius * math.sin(phi))
 
-            x = x0 + length * t
-            y = lateral_shift * s_curve
-            yaw = math.atan2(lateral_shift * ds, length)
+            dx_dphi = -radius * math.sin(phi)
+            dy_dphi = direction * radius * math.cos(phi)
 
-            local.append(PathPoint(float(x), float(y), float(yaw), self.p.turn_speed))
+            yaw = math.atan2(dy_dphi, dx_dphi)
 
-        if self.p.turn_180:
-            final_yaw = math.pi
-        else:
-            final_yaw = 0.0
+            local.append(
+                PathPoint(
+                    float(x),
+                    float(y),
+                    float(yaw),
+                    self.p.turn_speed,
+                )
+            )
 
-        x_start = self.p.exit_distance + self.p.turn_forward_distance
+        # Kurzer Einfahrabschnitt in Gegenrichtung.
+        # Nach der Halbkreiswende zeigt der Roboter nach hinten.
+        end_y = direction * row_shift
 
-        for t in np.linspace(0.0, 1.0, 24):
-            x = x_start + self.p.enter_distance * t
-            y = lateral_shift
-            yaw = wrap_to_pi((1.0 - t) * local[-1].yaw + t * final_yaw)
-            local.append(PathPoint(float(x), float(y), float(yaw), self.p.turn_speed))
+        if self.p.enter_distance > 0.01:
+            for s in np.linspace(0.0, self.p.enter_distance, 20):
+                x = x_offset - float(s)
+                y = end_y
+                yaw = math.pi
+
+                local.append(
+                    PathPoint(
+                        float(x),
+                        float(y),
+                        float(yaw),
+                        self.p.enter_speed,
+                    )
+                )
 
         odom_points: List[PathPoint] = []
 
@@ -583,7 +614,15 @@ class LocalPlanner:
             ox = start.x + c * p.x - s * p.y
             oy = start.y + s * p.x + c * p.y
             oyaw = wrap_to_pi(start.yaw + p.yaw)
-            odom_points.append(PathPoint(ox, oy, oyaw, p.v))
+
+            odom_points.append(
+                PathPoint(
+                    float(ox),
+                    float(oy),
+                    float(oyaw),
+                    float(p.v),
+                )
+            )
 
         return LocalPath(odom_points, True, "odom")
 
@@ -638,6 +677,24 @@ class PathFollower:
         if target is None:
             return cmd
 
+        goal = path.points[-1]
+        goal_dist = math.hypot(goal.x - pose.x, goal.y - pose.y)
+        goal_yaw_err = wrap_to_pi(goal.yaw - pose.yaw)
+
+        if goal_dist < self.p.path_goal_xy_tolerance:
+            if abs(goal_yaw_err) > self.p.path_goal_yaw_tolerance:
+                cmd.linear.x = 0.0
+                cmd.angular.z = clamp(
+                    1.5 * goal_yaw_err,
+                    -self.p.max_angular_speed,
+                    self.p.max_angular_speed,
+                )
+                return cmd
+
+            cmd.linear.x = 0.0
+            cmd.angular.z = 0.0
+            return cmd
+
         dx = target.x - pose.x
         dy = target.y - pose.y
 
@@ -648,24 +705,27 @@ class PathFollower:
         by = s * dx + c * dy
 
         alpha = math.atan2(by, bx)
+
+        if bx < -0.05:
+            cmd.linear.x = 0.0
+            cmd.angular.z = clamp(
+                1.2 * alpha,
+                -self.p.max_angular_speed,
+                self.p.max_angular_speed,
+            )
+            return cmd
+
         curvature = 2.0 * math.sin(alpha) / max(self.p.lookahead_distance, 1e-3)
 
         v = clamp(target.v, 0.0, self.p.max_linear_speed)
 
-        if bx < 0.05:
-            v = min(v, 0.08)
-
-        if abs(curvature) > 1.2:
-            v *= 0.55
+        if abs(curvature) > 1.5:
+            v *= 0.45
 
         w = clamp(v * curvature, -self.p.max_angular_speed, self.p.max_angular_speed)
 
-        if self.path_goal_distance(path, pose) < 0.55:
-            yaw_err = wrap_to_pi(path.points[-1].yaw - pose.yaw)
-            w += clamp(1.4 * yaw_err, -0.45, 0.45)
-
         cmd.linear.x = v
-        cmd.angular.z = clamp(w, -self.p.max_angular_speed, self.p.max_angular_speed)
+        cmd.angular.z = w
 
         return cmd
 
@@ -678,12 +738,30 @@ class PathFollower:
         return points[-1] if points else None
 
     def find_lookahead_odom(self, points: List[PathPoint], pose: Pose2D) -> Optional[PathPoint]:
-        for p in points:
-            d = math.hypot(p.x - pose.x, p.y - pose.y)
-            if d >= self.p.lookahead_distance:
-                return p
+        if not points:
+            return None
 
-        return points[-1] if points else None
+        closest_idx = 0
+        closest_dist = float("inf")
+
+        for i, p in enumerate(points):
+            d = math.hypot(p.x - pose.x, p.y - pose.y)
+            if d < closest_dist:
+                closest_dist = d
+                closest_idx = i
+
+        acc = 0.0
+
+        for i in range(closest_idx, len(points) - 1):
+            p0 = points[i]
+            p1 = points[i + 1]
+            segment = math.hypot(p1.x - p0.x, p1.y - p0.y)
+            acc += segment
+
+            if acc >= self.p.lookahead_distance:
+                return p1
+
+        return points[-1]
 
     def path_goal_distance(self, path: LocalPath, pose: Pose2D) -> float:
         if not path.points:
@@ -744,7 +822,7 @@ class SafetySupervisor:
 
         for r in scan.ranges:
             if math.isfinite(r) and scan.range_min < r < scan.range_max:
-                if abs(angle) < math.radians(18.0):
+                if abs(angle) < math.radians(10.0):
                     min_r = min(min_r, r)
 
             angle += scan.angle_increment
