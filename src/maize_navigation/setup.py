@@ -1,25 +1,25 @@
-from setuptools import find_packages, setup
-import os
+from setuptools import setup
 from glob import glob
+import os
 
 package_name = "maize_navigation"
 
 setup(
     name=package_name,
-    version="0.1.0",
-    packages=find_packages(exclude=["test"]),
+    version="0.0.1",
+    packages=[package_name],
     data_files=[
         ("share/ament_index/resource_index/packages", ["resource/" + package_name]),
         ("share/" + package_name, ["package.xml"]),
-        (os.path.join("share", package_name, "launch"), glob("launch/*.launch.py")),
+        (os.path.join("share", package_name, "launch"), glob("launch/*.py")),
         (os.path.join("share", package_name, "config"), glob("config/*.yaml")),
     ],
     install_requires=["setuptools"],
     zip_safe=True,
-    maintainer="floribot",
+    maintainer="FRE2026 Team",
     maintainer_email="todo@example.com",
-    description="Maize row navigation with local path planning in one ROS 2 node.",
-    license="Apache-2.0",
+    description="Single-node maize row navigation prototype with row acquisition.",
+    license="MIT",
     tests_require=["pytest"],
     entry_points={
         "console_scripts": [
