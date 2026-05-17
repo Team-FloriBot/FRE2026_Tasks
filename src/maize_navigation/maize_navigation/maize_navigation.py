@@ -6,6 +6,7 @@ from geometry_msgs.msg import Twist, Point32
 from sensor_msgs.msg import LaserScan, PointCloud2, PointField
 from sensor_msgs_py import point_cloud2
 from std_srvs.srv import Trigger
+from std_msgs.msg import Header
 
 import tf2_ros
 
@@ -445,6 +446,10 @@ class StateMachine:
         self.row_end_counter = 0
         self.enter_row_seen_counter = 0
 
+        # Sobald der letzte Pattern-Schritt abgeschlossen ist,
+        # wird nicht sofort gestoppt, sondern die letzte Reihe bis zum Ende gefahren.
+        self.final_row_active = False
+
         self.shift_row_count = 0
         self.shift_row_visible_counter = 0
         self.shift_row_free_counter = 0
@@ -470,6 +475,8 @@ class StateMachine:
 
         self.row_end_counter = 0
         self.enter_row_seen_counter = 0
+        self.final_row_active = False
+
         self.reset_shift_row_detection()
 
         self.tf_missing_counter = 0
@@ -579,7 +586,17 @@ class StateMachine:
                 self.tf_warning_printed = False
 
             if self.row_end_counter >= params["row_end_confirm_cycles"]:
-                if robot_pose.valid:
+
+                # Letzte Reihe wurde bis zum Reihenende gefahren.
+                # Erst hier wird die Mission beendet.
+                if self.pattern.current() is None:
+                    self.state = State.ROBOT_STOP
+                    self.final_row_active = False
+                    self.node.get_logger().info(
+                        "Finale Reihe bis zum Reihenende gefahren. Mission beendet."
+                    )
+
+                elif robot_pose.valid:
                     (
                         self.exit_target_pose,
                         self.shift_target_pose,
@@ -596,6 +613,7 @@ class StateMachine:
                         self.shift_start_pose = None
                         self.tf_missing_counter = 0
                         self.state = State.EXIT_ROW
+
                 else:
                     if not self.tf_warning_printed:
                         self.node.get_logger().warn(
@@ -615,7 +633,7 @@ class StateMachine:
             elif self.is_tf_available_or_stop(robot_pose, params, "EXIT_ROW"):
                 dist_error = distance_2d(robot_pose, self.exit_target_pose)
 
-                if dist_error < params["turn_exit_pos_tolerance"]:
+                if dist_error < params["turn_exit_blend_distance"]:
                     self.shift_start_pose = RobotPose(
                         x=robot_pose.x,
                         y=robot_pose.y,
@@ -690,10 +708,9 @@ class StateMachine:
                         self.state = State.ALIGN_TO_NEXT_ROW
 
                 enough_rows_seen = self.shift_row_count >= target_row_count
-                slam_target_reached = dist_error < params["turn_shift_pos_tolerance"]
+                slam_target_reached = dist_error < params["turn_shift_blend_distance"]
 
                 # SLAM-Fallback nur erlauben, wenn mindestens eine Reihe gesehen wurde.
-                # Dadurch fährt der Roboter nicht blind sehr weit aus dem Feld heraus.
                 guarded_slam_fallback = (
                     slam_target_reached
                     and params["row_pass_fallback_to_slam"]
@@ -749,10 +766,12 @@ class StateMachine:
                 self.align_target_pose = None
 
                 if self.pattern.current() is None:
-                    self.state = State.ROBOT_STOP
-                    self.node.get_logger().info("PATTERN COMPLETED. Stopping Robot.")
-                else:
-                    self.state = State.DRIVE_IN_ROW
+                    self.final_row_active = True
+                    self.node.get_logger().info(
+                        "Letzte Reihe erreicht. Fahre bis zum finalen Reihenende weiter."
+                    )
+
+                self.state = State.DRIVE_IN_ROW
 
         if self.state != old_state:
             self.node.get_logger().info(f"State transition: {old_state.name} -> {self.state.name}")
@@ -876,10 +895,11 @@ class Controller:
         # ====================================================
 
         elif state == State.ALIGN_TO_NEXT_ROW:
-            cmd = self.compute_yaw_control(
+            cmd = self.compute_yaw_control_with_creep(
                 robot_pose=robot_pose,
                 target_pose=state_machine.align_target_pose,
                 params=params,
+                creep_linear=params["vel_linear_enter_row"] * 0.45,
             )
 
         # ====================================================
@@ -1014,6 +1034,42 @@ class Controller:
 
         return cmd
 
+    def compute_yaw_control_with_creep(
+        self,
+        robot_pose: RobotPose,
+        target_pose: RobotPose,
+        params,
+        creep_linear: float,
+    ) -> ControlCommand:
+        cmd = ControlCommand(linear=0.0, angular=0.0)
+
+        if not robot_pose.valid or target_pose is None or not target_pose.valid:
+            return cmd
+
+        yaw_error = normalize_angle(target_pose.yaw - robot_pose.yaw)
+
+        if abs(yaw_error) < params["turn_yaw_tolerance"]:
+            return cmd
+
+        yaw_abs = abs(yaw_error)
+
+        # Bei großem Winkelfehler fast auf der Stelle drehen.
+        # Bei kleinerem Winkelfehler langsam weiterrollen.
+        creep_factor = 1.0 - np.clip(yaw_abs / 1.2, 0.0, 1.0)
+
+        cmd.linear = creep_linear * creep_factor
+        cmd.angular = params["turn_k_yaw"] * yaw_error
+
+        cmd.angular = float(
+            np.clip(
+                cmd.angular,
+                -params["turn_max_angular"],
+                params["turn_max_angular"],
+            )
+        )
+
+        return cmd
+
 
 # ============================================================
 # >>> VELOCITY RAMPER
@@ -1119,6 +1175,10 @@ class FieldRobotNavigator(Node):
         self.declare_parameter("turn.k_heading", 0.9)
         self.declare_parameter("turn.k_yaw", 1.0)
         self.declare_parameter("turn.max_angular", 0.45)
+
+        # Überblenddistanzen für flüssigere Wendebewegung.
+        self.declare_parameter("turn.exit_blend_distance", 0.22)
+        self.declare_parameter("turn.shift_blend_distance", 0.18)
 
         # ENTER_ROW
         self.declare_parameter("enter_row.confirm_cycles", 5)
@@ -1276,6 +1336,8 @@ class FieldRobotNavigator(Node):
                     "k_heading": "turn_k_heading",
                     "k_yaw": "turn_k_yaw",
                     "max_angular": "turn_max_angular",
+                    "exit_blend_distance": "turn_exit_blend_distance",
+                    "shift_blend_distance": "turn_shift_blend_distance",
                 }
 
                 if keys[1] in mapping:
@@ -1349,6 +1411,9 @@ class FieldRobotNavigator(Node):
         p["turn_k_yaw"] = self.get_parameter("turn.k_yaw").value
         p["turn_max_angular"] = self.get_parameter("turn.max_angular").value
 
+        p["turn_exit_blend_distance"] = self.get_parameter("turn.exit_blend_distance").value
+        p["turn_shift_blend_distance"] = self.get_parameter("turn.shift_blend_distance").value
+
         p["enter_row_confirm_cycles"] = int(self.get_parameter("enter_row.confirm_cycles").value)
         p["enter_row_max_center_error"] = self.get_parameter("enter_row.max_center_error").value
 
@@ -1411,8 +1476,27 @@ class FieldRobotNavigator(Node):
 
         return response
 
-    def publish_points(self, points, header):
-        if not points:
+    def publish_points(self, points, scan_header):
+        """
+        Veröffentlicht nur gültige, nicht-leere PointCloud2-Nachrichten.
+        Dadurch werden PCL-Warnungen wie
+        [pcl::fromPCLPointCloud2] No data to copy.
+        vermieden, sofern sie von diesem Topic stammen.
+        """
+        if points is None or len(points) == 0:
+            return
+
+        point_data = []
+
+        for p in points:
+            if (
+                np.isfinite(p.x)
+                and np.isfinite(p.y)
+                and np.isfinite(p.z)
+            ):
+                point_data.append((float(p.x), float(p.y), float(p.z)))
+
+        if len(point_data) == 0:
             return
 
         fields = [
@@ -1421,12 +1505,19 @@ class FieldRobotNavigator(Node):
             PointField(name="z", offset=8, datatype=PointField.FLOAT32, count=1),
         ]
 
-        point_data = [(p.x, p.y, p.z) for p in points]
+        cloud_header = Header()
+        cloud_header.stamp = self.get_clock().now().to_msg()
 
-        header.stamp = self.get_clock().now().to_msg()
-        header.frame_id = self.latest_scan.header.frame_id
+        if scan_header is not None and scan_header.frame_id:
+            cloud_header.frame_id = scan_header.frame_id
+        else:
+            cloud_header.frame_id = self.params["frame_robot_base"]
 
-        cloud = point_cloud2.create_cloud(header, fields, point_data)
+        cloud = point_cloud2.create_cloud(cloud_header, fields, point_data)
+
+        if cloud.width == 0 or len(cloud.data) == 0:
+            return
+
         self.points_pub.publish(cloud)
 
     def loop(self):
@@ -1441,7 +1532,8 @@ class FieldRobotNavigator(Node):
             direction,
         )
 
-        self.publish_points(perception.filtered_points, self.latest_scan.header)
+        if perception.filtered_points is not None and len(perception.filtered_points) > 0:
+            self.publish_points(perception.filtered_points, self.latest_scan.header)
 
         robot_pose = self.get_robot_pose_map()
 
