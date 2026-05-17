@@ -2,19 +2,27 @@ maize_navigator:
   ros__parameters:
     pattern: "1L-1R-2L-3R"
 
+    # ============================================================
     # Reihenparameter
+    # ============================================================
     max_dist_in_row: 0.375
     row_width: 0.75
     drive_out_dist: 1.0
 
+    # ============================================================
     # Geschwindigkeiten
+    # ============================================================
     vel_linear_drive: 0.22
     vel_linear_count: 0.35
     vel_linear_turn: 0.14
-    vel_linear_enter_row: 0.12
 
-    # Reihenregler
-    # Etwas weniger Center-Korrektur, dafür stärkere Heading-Stabilisierung.
+    # Für das Einfahren bewusst langsamer, damit ENTER_ROW nicht überschwingt.
+    vel_linear_enter_row: 0.08
+
+    # ============================================================
+    # Reihenregler DRIVE_IN_ROW
+    # ============================================================
+    # Weniger reine Center-Korrektur, stärkere Heading-Stabilisierung.
     row_center_kp: 1.2
     row_heading_kp: 0.8
     row_forward_kp: 0.35
@@ -22,23 +30,31 @@ maize_navigator:
     row_min_linear: 0.0
     row_curve_slowdown_gain: 0.8
 
+    # ============================================================
     # Nahbereichs-Kollisionsvermeidung in der Reihe
+    # ============================================================
     row_clearance_kp: 1.4
     row_slow_clearance: 0.28
     row_emergency_clearance: 0.10
     row_guard_clearance: 0.16
     row_guard_min_angular: 0.25
 
+    # ============================================================
     # Velocity Ramper
+    # ============================================================
     accel_max_linear: 0.22
     accel_max_angular: 1.2
 
+    # ============================================================
     # SLAM / TF Frames
+    # ============================================================
     frames:
       map: "map"
       robot_base: "base_link"
 
+    # ============================================================
     # SLAM-basiertes globales Reihenmodell
+    # ============================================================
     slam_row:
       enable: true
 
@@ -47,7 +63,8 @@ maize_navigator:
       # Größer = schneller, aber unruhiger.
       update_alpha: 0.08
 
-      # Mindestqualität der lokalen Laser-Linien, damit SLAM-Row-Model aktualisiert wird.
+      # Mindestqualität der lokalen Laser-Linien,
+      # damit das SLAM-Row-Model aktualisiert wird.
       min_line_confidence: 0.35
 
       # Mindestkonfidenz, ab der SLAM im Regler verwendet wird.
@@ -68,11 +85,17 @@ maize_navigator:
       # Gewicht Laser bei mittlerer Detektion.
       laser_weight_medium: 0.50
 
-    # Reihenende-Erkennung entprellen
+    # ============================================================
+    # Reihenende-Erkennung
+    # ============================================================
+    # Höher als vorher, damit Lücken oder einzelne fehlende Pflanzen
+    # nicht fälschlich als Reihenende erkannt werden.
     row_end:
       confirm_cycles: 10
 
+    # ============================================================
     # Reihenerkennung beim seitlichen Vorbeifahren
+    # ============================================================
     row_pass:
       confirm_cycles: 4
       free_cycles: 3
@@ -85,11 +108,15 @@ maize_navigator:
 
       max_extra_shift: 0.20
 
+    # ============================================================
     # TF-Ausfälle tolerieren
+    # ============================================================
     tf:
       missing_max_cycles: 10
 
+    # ============================================================
     # SLAM-basierte Wende
+    # ============================================================
     turn:
       headland_exit_dist: 0.65
       pre_entry_offset: 0.15
@@ -106,14 +133,42 @@ maize_navigator:
       k_yaw: 1.0
       max_angular: 0.45
 
-      # Überblenddistanzen für flüssigeres Wenden
+      # Überblenddistanzen für flüssigeres Wenden.
+      # Größer = früherer Übergang zum nächsten Wendeschritt.
+      # Kleiner = exakter, aber hakeliger.
       exit_blend_distance: 0.22
       shift_blend_distance: 0.18
 
+    # ============================================================
+    # Einfahren in die nächste Reihe
+    # ============================================================
     enter_row:
-      confirm_cycles: 5
-      max_center_error: 0.20
+      # Höher als vorher, damit die Reihe erst nach stabiler Sicht übernommen wird.
+      confirm_cycles: 8
 
+      # Die neue Reihe gilt nur als stabil, wenn der Querfehler klein ist.
+      max_center_error: 0.16
+
+      # SLAM-/Map-geführtes Einfahren: Ziel-Yaw halten.
+      yaw_kp: 0.9
+
+      # SLAM-Reihenmitte beim Einfahren halten.
+      slam_center_kp: 0.8
+
+      # Laser beim Einfahren nur schwach zuschalten,
+      # damit die ersten einseitig sichtbaren Pflanzen kein Schwingen auslösen.
+      laser_center_kp: 0.25
+      laser_heading_kp: 0.25
+
+      # Laser-Centering erst zulassen, wenn die lokale Reihenausrichtung plausibel ist.
+      max_heading_error: 0.18
+
+      # Begrenzung der Winkelgeschwindigkeit im ENTER_ROW-Zustand.
+      max_angular: 0.25
+
+    # ============================================================
+    # Perception-Fenster
+    # ============================================================
     perception:
       drive_in_row:
         x_min: 0.0
@@ -127,19 +182,24 @@ maize_navigator:
         y_min: 0.1
         y_max: 1.0
 
-      # Suchfenster beim seitlichen Vorbeifahren
+      # Suchfenster beim seitlichen Vorbeifahren.
       counting_rows:
         x_min: -0.35
         x_max: 0.35
         y_min: 0.12
         y_max: 1.05
 
+      # Beim Einfahren nicht zu weit nach vorne schauen,
+      # damit einzelne erste Pflanzen nicht zu stark dominieren.
       turn_to_row:
         x_min: 0.0
         x_max: 1.5
         y_min: 0.1
         y_max: 1.0
 
+    # ============================================================
+    # ROS Topics
+    # ============================================================
     topics:
       laserscan: "/sensors/merged_scan"
       cmd_vel: "/cmd_vel"
