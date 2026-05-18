@@ -154,8 +154,8 @@ class NavigatorParams:
     min_lane_width: float = 0.45
     max_lane_width: float = 1.15
 
-    roi_x_min: float = 0.15
-    roi_x_max: float = 4.0
+    roi_x_min: float = 0.25
+    roi_x_max: float = 2.0
     roi_y_abs_min: float = 0.12
     roi_y_abs_max: float = 1.50
 
@@ -165,12 +165,14 @@ class NavigatorParams:
     acquire_roi_y_abs_max: float = 2.20
 
     ransac_iterations: int = 80
-    ransac_distance: float = 0.07
+    ransac_distance: float = 0.08
     min_inliers: int = 5
-    min_visible_length: float = 0.45
-    max_abs_line_slope: float = 1.8
+    min_visible_length: float = 0.35
+    max_abs_line_slope: float = 0.9
 
-    tracker_alpha: float = 0.25
+    centerline_max_abs_slope: float = 0.7
+
+    tracker_alpha: float = 0.12
     confidence_decay: float = 0.95
 
     front_density_x_min: float = 0.60
@@ -180,19 +182,22 @@ class NavigatorParams:
     end_probability_threshold: float = 0.95
     end_stable_frames_required: int = 25
 
-    min_follow_confidence: float = 0.10
+    min_follow_confidence: float = 0.15
     min_enter_confidence: float = 0.18
     enter_stable_frames_required: int = 5
     acquire_timeout_sec: float = 8.0
 
-    follow_speed: float = 0.18
-    slow_speed: float = 0.08
-    enter_speed: float = 0.10
+    follow_speed: float = 0.12
+    slow_speed: float = 0.06
+    enter_speed: float = 0.08
     turn_speed: float = 0.08
     max_linear_speed: float = 0.25
     max_angular_speed: float = 1.20
+    follow_max_angular_speed: float = 0.70
+    turn_max_angular_speed: float = 1.20
+    angular_rate_limit: float = 1.0
 
-    lookahead_distance: float = 0.25
+    lookahead_distance: float = 0.75
     path_goal_xy_tolerance: float = 0.12
     path_goal_yaw_tolerance: float = 0.25
 
@@ -499,9 +504,16 @@ class LocalPlanner:
 
         points: List[PathPoint] = []
 
-        for x in np.linspace(0.25, 3.0, 40):
-            y = row.center_a * float(x) + row.center_b
-            yaw = math.atan(row.center_a)
+        center_a = clamp(
+            row.center_a,
+            -self.p.centerline_max_abs_slope,
+            self.p.centerline_max_abs_slope,
+        )
+        path_x_max = max(1.2, min(3.0, self.p.roi_x_max))
+
+        for x in np.linspace(0.25, path_x_max, 40):
+            y = center_a * float(x) + row.center_b
+            yaw = math.atan(center_a)
             points.append(PathPoint(float(x), float(y), float(yaw), float(v)))
 
         return LocalPath(points, True, "base_link")
@@ -620,11 +632,15 @@ class LocalPlanner:
 class PathFollower:
     def __init__(self, params: NavigatorParams):
         self.p = params
+        self.last_w_base = 0.0
+        self.last_w_odom = 0.0
 
     def compute_cmd(self, path: LocalPath, pose_odom: Optional[Pose2D]) -> Twist:
         cmd = Twist()
 
         if not path.valid or len(path.points) == 0:
+            self.last_w_base = 0.0
+            self.last_w_odom = 0.0
             return cmd
 
         if path.frame_id == "base_link":
@@ -646,14 +662,20 @@ class PathFollower:
             return cmd
 
         alpha = math.atan2(target.y, target.x)
-        curvature = 2.0 * math.sin(alpha) / max(0.45, 1e-3)
+        curvature = 2.0 * math.sin(alpha) / max(self.p.lookahead_distance, 1e-3)
 
         v = clamp(target.v, 0.0, self.p.max_linear_speed)
 
         if abs(curvature) > 1.0:
             v *= 0.6
 
-        w = clamp(v * curvature, -self.p.max_angular_speed, self.p.max_angular_speed)
+        w = clamp(
+            v * curvature,
+            -self.p.follow_max_angular_speed,
+            self.p.follow_max_angular_speed,
+        )
+        w = self.rate_limit(w, self.last_w_base)
+        self.last_w_base = w
 
         cmd.linear.x = v
         cmd.angular.z = w
@@ -676,8 +698,8 @@ class PathFollower:
                 cmd.linear.x = 0.0
                 cmd.angular.z = clamp(
                     1.5 * goal_yaw_err,
-                    -self.p.max_angular_speed,
-                    self.p.max_angular_speed,
+                    -self.p.turn_max_angular_speed,
+                    self.p.turn_max_angular_speed,
                 )
                 return cmd
 
@@ -700,8 +722,8 @@ class PathFollower:
             cmd.linear.x = 0.0
             cmd.angular.z = clamp(
                 1.2 * alpha,
-                -self.p.max_angular_speed,
-                self.p.max_angular_speed,
+                -self.p.turn_max_angular_speed,
+                self.p.turn_max_angular_speed,
             )
             return cmd
 
@@ -712,7 +734,9 @@ class PathFollower:
         if abs(curvature) > 1.5:
             v *= 0.45
 
-        w = clamp(v * curvature, -self.p.max_angular_speed, self.p.max_angular_speed)
+        w = clamp(v * curvature, -self.p.turn_max_angular_speed, self.p.turn_max_angular_speed)
+        w = self.rate_limit(w, self.last_w_odom)
+        self.last_w_odom = w
 
         cmd.linear.x = v
         cmd.angular.z = w
@@ -720,7 +744,7 @@ class PathFollower:
         return cmd
 
     def find_lookahead_base_link(self, points: List[PathPoint]) -> Optional[PathPoint]:
-        follow_lookahead = 0.45
+        follow_lookahead = self.p.lookahead_distance
 
         for p in points:
             d = math.hypot(p.x, p.y)
@@ -728,6 +752,13 @@ class PathFollower:
                 return p
 
         return points[-1] if points else None
+
+    def rate_limit(self, target_w: float, last_w: float) -> float:
+        if self.p.control_frequency <= 0.0 or self.p.angular_rate_limit <= 0.0:
+            return target_w
+
+        max_delta = self.p.angular_rate_limit / self.p.control_frequency
+        return clamp(target_w, last_w - max_delta, last_w + max_delta)
 
     def find_lookahead_odom(self, points: List[PathPoint], pose: Pose2D) -> Optional[PathPoint]:
         if not points:
@@ -1053,6 +1084,7 @@ class MaizeNavigator(Node):
         p.min_inliers = int(declare("min_inliers", p.min_inliers))
         p.min_visible_length = float(declare("min_visible_length", p.min_visible_length))
         p.max_abs_line_slope = float(declare("max_abs_line_slope", p.max_abs_line_slope))
+        p.centerline_max_abs_slope = float(declare("centerline_max_abs_slope", p.centerline_max_abs_slope))
 
         p.tracker_alpha = float(declare("tracker_alpha", p.tracker_alpha))
         p.confidence_decay = float(declare("confidence_decay", p.confidence_decay))
@@ -1075,6 +1107,9 @@ class MaizeNavigator(Node):
         p.turn_speed = float(declare("turn_speed", p.turn_speed))
         p.max_linear_speed = float(declare("max_linear_speed", p.max_linear_speed))
         p.max_angular_speed = float(declare("max_angular_speed", p.max_angular_speed))
+        p.follow_max_angular_speed = float(declare("follow_max_angular_speed", p.follow_max_angular_speed))
+        p.turn_max_angular_speed = float(declare("turn_max_angular_speed", p.turn_max_angular_speed))
+        p.angular_rate_limit = float(declare("angular_rate_limit", p.angular_rate_limit))
 
         p.lookahead_distance = float(declare("lookahead_distance", p.lookahead_distance))
         p.path_goal_xy_tolerance = float(declare("path_goal_xy_tolerance", p.path_goal_xy_tolerance))
