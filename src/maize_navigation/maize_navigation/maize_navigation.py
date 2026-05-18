@@ -151,18 +151,18 @@ class NavigatorParams:
     control_frequency: float = 20.0
 
     expected_row_width: float = 0.75
-    min_lane_width: float = 0.45
-    max_lane_width: float = 1.15
+    min_lane_width: float = 0.55
+    max_lane_width: float = 0.95
 
     roi_x_min: float = 0.25
     roi_x_max: float = 2.0
     roi_y_abs_min: float = 0.12
-    roi_y_abs_max: float = 1.50
+    roi_y_abs_max: float = 0.85
 
     acquire_roi_x_min: float = -0.30
-    acquire_roi_x_max: float = 3.20
+    acquire_roi_x_max: float = 2.80
     acquire_roi_y_abs_min: float = 0.05
-    acquire_roi_y_abs_max: float = 2.20
+    acquire_roi_y_abs_max: float = 1.20
 
     ransac_iterations: int = 80
     ransac_distance: float = 0.08
@@ -172,7 +172,7 @@ class NavigatorParams:
 
     centerline_max_abs_slope: float = 0.7
 
-    tracker_alpha: float = 0.12
+    tracker_alpha: float = 0.10
     confidence_decay: float = 0.95
 
     front_density_x_min: float = 0.60
@@ -187,15 +187,15 @@ class NavigatorParams:
     enter_stable_frames_required: int = 5
     acquire_timeout_sec: float = 8.0
 
-    follow_speed: float = 0.12
-    slow_speed: float = 0.06
+    follow_speed: float = 0.10
+    slow_speed: float = 0.05
     enter_speed: float = 0.08
     turn_speed: float = 0.08
     max_linear_speed: float = 0.25
     max_angular_speed: float = 1.20
-    follow_max_angular_speed: float = 0.70
+    follow_max_angular_speed: float = 0.60
     turn_max_angular_speed: float = 1.20
-    angular_rate_limit: float = 1.0
+    angular_rate_limit: float = 0.8
 
     lookahead_distance: float = 0.75
     path_goal_xy_tolerance: float = 0.12
@@ -228,8 +228,8 @@ class RowPerception:
 
         det = RowDetection()
         det.points_all = points
-        det.points_left = [pt for pt in points if pt.y > self.current_y_abs_min()]
-        det.points_right = [pt for pt in points if pt.y < -self.current_y_abs_min()]
+        det.points_left = self.select_nearest_side_points(points, "left")
+        det.points_right = self.select_nearest_side_points(points, "right")
 
         left_line = self.fit_line_ransac(det.points_left)
         right_line = self.fit_line_ransac(det.points_right)
@@ -293,6 +293,31 @@ class RowPerception:
 
         return out
 
+    def select_nearest_side_points(
+        self,
+        points: List[ScanPoint],
+        side: str,
+    ) -> List[ScanPoint]:
+        if side == "left":
+            side_points = [p for p in points if p.y > self.current_y_abs_min()]
+            side_points.sort(key=lambda p: p.y)
+        else:
+            side_points = [p for p in points if p.y < -self.current_y_abs_min()]
+            side_points.sort(key=lambda p: abs(p.y))
+
+        if len(side_points) < self.p.min_inliers:
+            return side_points
+
+        nearest_y_abs = abs(side_points[0].y)
+        band_width = 0.35
+
+        selected = [
+            p for p in side_points
+            if abs(abs(p.y) - nearest_y_abs) <= band_width
+        ]
+
+        return selected
+
     def fit_line_ransac(self, points: List[ScanPoint]) -> LineFit:
         if len(points) < self.p.min_inliers:
             return LineFit(valid=False)
@@ -354,9 +379,23 @@ class RowPerception:
 
     def compute_centerline(self, det: RowDetection) -> None:
         if det.left_valid and det.right_valid:
+            x_ref = 1.0
+
+            left_y = det.left_a * x_ref + det.left_b
+            right_y = det.right_a * x_ref + det.right_b
+
+            det.lane_width = left_y - right_y
+
+            if det.lane_width < self.p.min_lane_width or det.lane_width > self.p.max_lane_width:
+                det.left_valid = False
+                det.right_valid = False
+                det.center_a = 0.0
+                det.center_b = 0.0
+                det.lane_width = 0.0
+                return
+
             det.center_a = 0.5 * (det.left_a + det.right_a)
             det.center_b = 0.5 * (det.left_b + det.right_b)
-            det.lane_width = det.left_b - det.right_b
             return
 
         if det.left_valid:
@@ -509,10 +548,12 @@ class LocalPlanner:
             -self.p.centerline_max_abs_slope,
             self.p.centerline_max_abs_slope,
         )
+        center_b = clamp(row.center_b, -0.25, 0.25)
+
         path_x_max = max(1.2, min(3.0, self.p.roi_x_max))
 
         for x in np.linspace(0.25, path_x_max, 40):
-            y = center_a * float(x) + row.center_b
+            y = center_a * float(x) + center_b
             yaw = math.atan(center_a)
             points.append(PathPoint(float(x), float(y), float(yaw), float(v)))
 
