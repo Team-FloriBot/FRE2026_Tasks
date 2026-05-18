@@ -8,18 +8,18 @@ maize_navigator:
     control_frequency: 20.0
 
     expected_row_width: 0.75
-    min_lane_width: 0.45
-    max_lane_width: 1.15
+    min_lane_width: 0.55
+    max_lane_width: 0.95
 
     roi_x_min: 0.25
     roi_x_max: 2.0
     roi_y_abs_min: 0.12
-    roi_y_abs_max: 1.50
+    roi_y_abs_max: 0.85
 
     acquire_roi_x_min: -0.30
-    acquire_roi_x_max: 3.20
+    acquire_roi_x_max: 2.80
     acquire_roi_y_abs_min: 0.05
-    acquire_roi_y_abs_max: 2.20
+    acquire_roi_y_abs_max: 1.20
 
     ransac_iterations: 80
     ransac_distance: 0.08
@@ -28,7 +28,7 @@ maize_navigator:
     max_abs_line_slope: 0.9
     centerline_max_abs_slope: 0.7
 
-    tracker_alpha: 0.12
+    tracker_alpha: 0.10
     confidence_decay: 0.95
 
     front_density_x_min: 0.60
@@ -43,15 +43,15 @@ maize_navigator:
     enter_stable_frames_required: 5
     acquire_timeout_sec: 8.0
 
-    follow_speed: 0.12
-    slow_speed: 0.06
+    follow_speed: 0.10
+    slow_speed: 0.05
     enter_speed: 0.08
     turn_speed: 0.08
     max_linear_speed: 0.25
     max_angular_speed: 1.20
-    follow_max_angular_speed: 0.70
+    follow_max_angular_speed: 0.60
     turn_max_angular_speed: 1.20
-    angular_rate_limit: 1.0
+    angular_rate_limit: 0.8
 
     lookahead_distance: 0.75
 
