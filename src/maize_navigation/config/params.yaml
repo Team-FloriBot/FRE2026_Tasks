@@ -9,7 +9,7 @@ maize_navigator:
     use_slam_map: true
     require_map_for_turns: true
 
-    control_frequency: 20.0
+    control_frequency: 30.0
 
     expected_row_width: 0.75
     min_lane_width: 0.55
@@ -47,17 +47,17 @@ maize_navigator:
     enter_stable_frames_required: 3
     acquire_timeout_sec: 8.0
 
-    follow_speed: 1.00
-    slow_speed: 0.35
-    enter_speed: 0.50
-    turn_speed: 0.35
-    max_linear_speed: 1.00
+    follow_speed: 0.75
+    slow_speed: 0.30
+    enter_speed: 0.45
+    turn_speed: 0.30
+    max_linear_speed: 0.85
     max_angular_speed: 1.80
-    follow_max_angular_speed: 1.20
-    turn_max_angular_speed: 1.00
-    angular_rate_limit: 1.2
+    follow_max_angular_speed: 1.60
+    turn_max_angular_speed: 1.20
+    angular_rate_limit: 2.5
 
-    lookahead_distance: 0.75
+    lookahead_distance: 0.45
 
     path_goal_xy_tolerance: 0.20
     path_goal_yaw_tolerance: 0.40
