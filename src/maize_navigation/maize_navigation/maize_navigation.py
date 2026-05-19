@@ -283,6 +283,10 @@ class NavigatorParams:
     map_row_min_band_length: float = 1.2
     map_row_max_extrapolated_lanes: int = 3
 
+    turn_replan_enabled: bool = True
+    turn_replan_period_frames: int = 5
+    turn_replan_max_attempts: int = 60
+
     enable_safety: bool = False
 
     obstacle_stop_distance: float = 0.25
@@ -1325,6 +1329,9 @@ class MissionManager:
 
         self.state = MissionState.IDLE
         self.active_turn_path: Optional[LocalPath] = None
+        self.active_turn_uses_map_lane = False
+        self.turn_replan_attempts = 0
+        self.turn_replan_frame_counter = 0
         self.map_lanes: List[MapLane] = []
         self.map_row_bands: List[MapRowBand] = []
         self.target_map_lane: Optional[MapLane] = None
@@ -1349,6 +1356,9 @@ class MissionManager:
     def stop(self) -> None:
         self.started = False
         self.active_turn_path = None
+        self.active_turn_uses_map_lane = False
+        self.turn_replan_attempts = 0
+        self.turn_replan_frame_counter = 0
         self.target_map_lane = None
         self.map_lanes = []
         self.map_row_bands = []
@@ -1399,12 +1409,23 @@ class MissionManager:
 
         self.state = new_state
 
+        if new_state == MissionState.PLAN_TURN:
+            self.active_turn_uses_map_lane = False
+            self.turn_replan_attempts = 0
+            self.turn_replan_frame_counter = 0
+
         if new_state == MissionState.ACQUIRE_ROW:
             self.acquire_start_time = self.node.get_clock().now()
             self.enter_stable_frames = 0
+            self.active_turn_uses_map_lane = False
+            self.turn_replan_attempts = 0
+            self.turn_replan_frame_counter = 0
 
         if new_state == MissionState.FOLLOW_ROW:
             self.end_stable_frames = 0
+            self.active_turn_uses_map_lane = False
+            self.turn_replan_attempts = 0
+            self.turn_replan_frame_counter = 0
 
     def update(
         self,
@@ -1497,6 +1518,9 @@ class MissionManager:
                             self.active_turn_path = planner.plan_turn_path_map(pose_map)
                             self.target_map_lane = None
                         else:
+                            self.active_turn_uses_map_lane = True
+                            self.turn_replan_attempts = 0
+                            self.turn_replan_frame_counter = 0
                             self.node.get_logger().info(
                                 f"PLAN_TURN ok: target SLAM-map lane v={self.target_map_lane.center_v:.3f} m, "
                                 f"width={self.target_map_lane.width:.3f} m, "
@@ -1528,20 +1552,32 @@ class MissionManager:
                         )
                         return self.active_turn_path
 
+                    self.active_turn_uses_map_lane = False
+                    self.turn_replan_attempts = 0
+                    self.turn_replan_frame_counter = 0
                     self.transition(MissionState.EXECUTE_TURN, "turn path planned in map frame with geometric fallback")
                     return self.active_turn_path
 
                 self.active_turn_path = planner.plan_turn_path_map(pose_map)
+                self.active_turn_uses_map_lane = False
+                self.turn_replan_attempts = 0
+                self.turn_replan_frame_counter = 0
                 self.transition(MissionState.EXECUTE_TURN, "turn path planned in map frame")
                 return self.active_turn_path
 
             if self.p.use_slam_map and pose_map is not None:
                 self.active_turn_path = planner.plan_turn_path_map(pose_map)
+                self.active_turn_uses_map_lane = False
+                self.turn_replan_attempts = 0
+                self.turn_replan_frame_counter = 0
                 self.transition(MissionState.EXECUTE_TURN, "turn path planned in map frame")
                 return self.active_turn_path
 
             if pose_odom is not None:
                 self.active_turn_path = planner.plan_turn_path_odom(pose_odom)
+                self.active_turn_uses_map_lane = False
+                self.turn_replan_attempts = 0
+                self.turn_replan_frame_counter = 0
                 self.transition(MissionState.EXECUTE_TURN, "turn path planned in odom frame")
                 return self.active_turn_path
 
@@ -1552,9 +1588,71 @@ class MissionManager:
                 self.transition(MissionState.PLAN_TURN, "missing active turn path")
                 return LocalPath([], False, self.p.map_frame if self.p.use_slam_map else self.p.odom_frame, "missing path")
 
+            # Adaptive Replanung waehrend des Wendens:
+            # Wenn der Turn nur geometrisch im map-Frame gestartet wurde, die SLAM-Map
+            # aber waehrend des Wendens eine Zielgasse sichtbar macht, wird der Rest
+            # des Turns ab der aktuellen map-Pose neu zur erkannten Zielgasse geplant.
+            if (
+                self.p.turn_replan_enabled
+                and self.p.use_slam_map
+                and self.p.require_map_for_turns
+                and self.p.map_row_detection_enabled
+                and not self.active_turn_uses_map_lane
+                and self.active_turn_path.frame_id == self.p.map_frame
+                and pose_map is not None
+                and latest_map is not None
+                and map_detector is not None
+                and self.turn_replan_attempts < max(0, self.p.turn_replan_max_attempts)
+            ):
+                self.turn_replan_frame_counter += 1
+
+                if self.turn_replan_frame_counter >= max(1, self.p.turn_replan_period_frames):
+                    self.turn_replan_frame_counter = 0
+                    self.turn_replan_attempts += 1
+
+                    self.map_lanes, self.map_row_bands, self.last_map_row_reason = map_detector.detect_lanes(
+                        latest_map,
+                        pose_map,
+                    )
+                    replanning_target_lane = map_detector.select_target_lane(
+                        self.map_lanes,
+                        self.p.row_shift_direction,
+                        self.p.row_shift_count,
+                    )
+
+                    if replanning_target_lane is not None:
+                        replanned_path = planner.plan_turn_path_to_map_lane(
+                            pose_map,
+                            replanning_target_lane,
+                        )
+
+                        if replanned_path.valid and len(replanned_path.points) > 0:
+                            self.active_turn_path = replanned_path
+                            self.target_map_lane = replanning_target_lane
+                            self.active_turn_uses_map_lane = True
+
+                            self.node.get_logger().warn(
+                                "EXECUTE_TURN replan: SLAM target lane became available. "
+                                f"Replanned map turn from current pose. "
+                                f"target_v={replanning_target_lane.center_v:.3f}, "
+                                f"width={replanning_target_lane.width:.3f}, "
+                                f"source={replanning_target_lane.source}, "
+                                f"lanes={len(self.map_lanes)}, bands={len(self.map_row_bands)}, "
+                                f"attempt={self.turn_replan_attempts}"
+                            )
+                            return self.active_turn_path
+
+                        self.node.get_logger().warn(
+                            "EXECUTE_TURN replan candidate rejected: invalid replanned path. "
+                            f"reason='{replanned_path.reason}', "
+                            f"points={len(replanned_path.points)}, "
+                            f"target_v={replanning_target_lane.center_v:.3f}"
+                        )
+
             active_pose = pose_map if self.active_turn_path.frame_id == self.p.map_frame else pose_odom
             if active_pose is not None and controller.path_goal_reached(self.active_turn_path, active_pose):
                 self.active_turn_path = None
+                self.active_turn_uses_map_lane = False
                 self.transition(MissionState.ACQUIRE_ROW, "turn path reached")
                 return planner.plan_acquire_row(row)
 
@@ -1754,6 +1852,10 @@ class MaizeNavigator(Node):
         p.map_row_min_band_points = int(declare("map_row_min_band_points", p.map_row_min_band_points))
         p.map_row_min_band_length = float(declare("map_row_min_band_length", p.map_row_min_band_length))
         p.map_row_max_extrapolated_lanes = int(declare("map_row_max_extrapolated_lanes", p.map_row_max_extrapolated_lanes))
+
+        p.turn_replan_enabled = bool(declare("turn_replan_enabled", p.turn_replan_enabled))
+        p.turn_replan_period_frames = int(declare("turn_replan_period_frames", p.turn_replan_period_frames))
+        p.turn_replan_max_attempts = int(declare("turn_replan_max_attempts", p.turn_replan_max_attempts))
 
         p.enable_safety = bool(declare("enable_safety", p.enable_safety))
         p.obstacle_stop_distance = float(declare("obstacle_stop_distance", p.obstacle_stop_distance))
@@ -1974,6 +2076,12 @@ class MaizeNavigator(Node):
                     f"map_reason={self.mission.last_map_row_reason}"
                 )
 
+        if state == MissionState.EXECUTE_TURN:
+            if self.mission.active_turn_uses_map_lane:
+                reasons.append("turn_source=SLAM_map_lane")
+            else:
+                reasons.append("turn_source=geometric_map_fallback")
+
         target_lane = self.mission.target_map_lane
         if target_lane is not None:
             target_lane_text = (
@@ -2010,6 +2118,9 @@ class MaizeNavigator(Node):
             f" | map_lanes={len(self.mission.map_lanes)}"
             f" | map_bands={len(self.mission.map_row_bands)}"
             f" | target_map_lane={target_lane_text}"
+            f" | active_turn_uses_map_lane={self.mission.active_turn_uses_map_lane}"
+            f" | turn_replan_attempts={self.mission.turn_replan_attempts}"
+            f" | turn_replan_enabled={self.p.turn_replan_enabled}"
         )
 
         msg = String()
