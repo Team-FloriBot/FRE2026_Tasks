@@ -74,6 +74,8 @@ maize_navigator:
     row_shift_direction: "L"
     turn_180: true
 
+    enable_safety: false
+
     obstacle_stop_distance: 0.25
     obstacle_slow_distance: 0.45
 
