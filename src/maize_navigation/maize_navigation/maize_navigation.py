@@ -253,6 +253,8 @@ class NavigatorParams:
     row_shift_direction: str = "L"
     turn_180: bool = True
 
+    enable_safety: bool = False
+
     obstacle_stop_distance: float = 0.25
     obstacle_slow_distance: float = 0.45
 
