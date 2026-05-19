@@ -253,12 +253,12 @@ class NavigatorParams:
     follow_speed: float = 0.35
     slow_speed: float = 0.12
     enter_speed: float = 0.22
-    turn_speed: float = 0.18
+    turn_speed: float = 0.28
     max_linear_speed: float = 0.45
-    max_angular_speed: float = 1.00
+    max_angular_speed: float = 1.20
     follow_max_angular_speed: float = 0.90
-    turn_max_angular_speed: float = 0.75
-    angular_rate_limit: float = 1.0
+    turn_max_angular_speed: float = 1.00
+    angular_rate_limit: float = 1.8
 
     lookahead_distance: float = 0.75
     path_goal_xy_tolerance: float = 0.20
@@ -1480,36 +1480,55 @@ class MissionManager:
                         self.p.row_shift_count,
                     )
 
-                    if self.target_map_lane is None:
-                        reason = (
-                            f"PLAN_TURN blocked: no target lane in SLAM map "
-                            f"({self.last_map_row_reason}, lanes={len(self.map_lanes)}, "
-                            f"bands={len(self.map_row_bands)})"
+                    if self.target_map_lane is not None:
+                        self.active_turn_path = planner.plan_turn_path_to_map_lane(
+                            pose_map,
+                            self.target_map_lane,
                         )
-                        self.node.get_logger().warn(reason)
-                        return LocalPath([], False, self.p.map_frame, reason)
 
-                    self.active_turn_path = planner.plan_turn_path_to_map_lane(
-                        pose_map,
-                        self.target_map_lane,
-                    )
+                        if not self.active_turn_path.valid or len(self.active_turn_path.points) == 0:
+                            self.node.get_logger().warn(
+                                f"PLAN_TURN failed: invalid SLAM-map lane turn path. "
+                                f"reason='{self.active_turn_path.reason}', "
+                                f"target_v={self.target_map_lane.center_v:.3f}, "
+                                f"lanes={len(self.map_lanes)}, bands={len(self.map_row_bands)}. "
+                                f"Falling back to geometric map-frame turn."
+                            )
+                            self.active_turn_path = planner.plan_turn_path_map(pose_map)
+                            self.target_map_lane = None
+                        else:
+                            self.node.get_logger().info(
+                                f"PLAN_TURN ok: target SLAM-map lane v={self.target_map_lane.center_v:.3f} m, "
+                                f"width={self.target_map_lane.width:.3f} m, "
+                                f"source={self.target_map_lane.source}, "
+                                f"path_points={len(self.active_turn_path.points)}"
+                            )
+                            self.transition(MissionState.EXECUTE_TURN, "turn path planned to SLAM map lane")
+                            return self.active_turn_path
+                    else:
+                        # Die Zielgasse kann erst dann aus der SLAM-Map erkannt werden,
+                        # wenn sie bereits gemappt wurde. Bei einer noch unbekannten
+                        # Zielgasse wird deshalb NICHT blockiert. Stattdessen wird im
+                        # map-Frame geometrisch anhand expected_row_width gewendet.
+                        # Danach faengt ACQUIRE_ROW die neue Gasse lokal mit LiDAR ein,
+                        # waehrend SLAM die Zielgasse weiter aufbaut.
+                        self.node.get_logger().warn(
+                            f"PLAN_TURN fallback: no target lane in SLAM map "
+                            f"({self.last_map_row_reason}, lanes={len(self.map_lanes)}, "
+                            f"bands={len(self.map_row_bands)}). "
+                            f"Using geometric map-frame turn."
+                        )
+                        self.active_turn_path = planner.plan_turn_path_map(pose_map)
 
                     if not self.active_turn_path.valid or len(self.active_turn_path.points) == 0:
                         self.node.get_logger().warn(
-                            f"PLAN_TURN failed: invalid SLAM-map lane turn path. "
+                            f"PLAN_TURN failed: invalid geometric map-frame fallback path. "
                             f"reason='{self.active_turn_path.reason}', "
-                            f"target_v={self.target_map_lane.center_v:.3f}, "
-                            f"lanes={len(self.map_lanes)}, bands={len(self.map_row_bands)}"
+                            f"points={len(self.active_turn_path.points)}"
                         )
                         return self.active_turn_path
 
-                    self.node.get_logger().info(
-                        f"PLAN_TURN ok: target SLAM-map lane v={self.target_map_lane.center_v:.3f} m, "
-                        f"width={self.target_map_lane.width:.3f} m, "
-                        f"source={self.target_map_lane.source}, "
-                        f"path_points={len(self.active_turn_path.points)}"
-                    )
-                    self.transition(MissionState.EXECUTE_TURN, "turn path planned to SLAM map lane")
+                    self.transition(MissionState.EXECUTE_TURN, "turn path planned in map frame with geometric fallback")
                     return self.active_turn_path
 
                 self.active_turn_path = planner.plan_turn_path_map(pose_map)
