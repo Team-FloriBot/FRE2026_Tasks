@@ -15,7 +15,7 @@ from rclpy.node import Node
 from rclpy.duration import Duration
 
 from geometry_msgs.msg import Twist, PoseStamped, Point
-from nav_msgs.msg import Path
+from nav_msgs.msg import OccupancyGrid, Path
 from sensor_msgs.msg import LaserScan
 from std_msgs.msg import Float32, String
 from std_srvs.srv import Trigger
@@ -130,6 +130,45 @@ class LocalPath:
     reason: str = ""
 
 
+@dataclass(frozen=True)
+class PatternStep:
+    row_shift_count: int
+    row_shift_direction: str
+
+
+def parse_pattern(pattern: str) -> List[PatternStep]:
+    """Parse patterns like "1L 2R 3 L" or "1L-1R-2L"."""
+    normalized = pattern.replace("-", " ").replace(",", " ").upper()
+    raw_tokens = [token for token in normalized.split() if token]
+
+    steps: List[PatternStep] = []
+    pending_count: Optional[int] = None
+
+    for token in raw_tokens:
+        if token.isdigit():
+            pending_count = int(token)
+            continue
+
+        if token in ("L", "R") and pending_count is not None:
+            steps.append(PatternStep(max(1, pending_count), token))
+            pending_count = None
+            continue
+
+        if len(token) >= 2 and token[:-1].isdigit() and token[-1] in ("L", "R"):
+            steps.append(PatternStep(max(1, int(token[:-1])), token[-1]))
+            pending_count = None
+            continue
+
+        raise ValueError(
+            f"Invalid pattern token '{token}'. Use e.g. '1L 2R 3L' or '1 L 2 R'."
+        )
+
+    if pending_count is not None:
+        raise ValueError("Pattern ends with a number but no direction L/R.")
+
+    return steps
+
+
 class MissionState(Enum):
     IDLE = 0
     FOLLOW_ROW = 1
@@ -147,6 +186,10 @@ class NavigatorParams:
     cmd_vel_topic: str = "/cmd_vel"
     base_frame: str = "base_link"
     odom_frame: str = "odom"
+    map_topic: str = "/map"
+    map_frame: str = "map"
+    use_slam_map: bool = True
+    require_map_for_turns: bool = True
 
     control_frequency: float = 20.0
 
@@ -204,6 +247,7 @@ class NavigatorParams:
     exit_distance: float = 0.20
     turn_forward_distance: float = 2.20
     enter_distance: float = 0.60
+    pattern: str = "1L"
     row_shift_count: int = 1
     row_shift_direction: str = "L"
     turn_180: bool = True
@@ -597,13 +641,19 @@ class LocalPlanner:
         return LocalPath(points, True, "base_link")
 
     def plan_turn_path_odom(self, start: Pose2D) -> LocalPath:
+        return self.plan_turn_path_global(start, self.p.odom_frame)
+
+    def plan_turn_path_map(self, start: Pose2D) -> LocalPath:
+        return self.plan_turn_path_global(start, self.p.map_frame)
+
+    def plan_turn_path_global(self, start: Pose2D, frame_id: str) -> LocalPath:
         direction = 1.0 if self.p.row_shift_direction.upper() == "L" else -1.0
 
         row_shift = self.p.row_shift_count * self.p.expected_row_width
         radius = row_shift / 2.0
 
         if radius <= 0.05:
-            return LocalPath([], False, "odom", "invalid turn radius")
+            return LocalPath([], False, frame_id, "invalid turn radius")
 
         local: List[PathPoint] = []
 
@@ -667,7 +717,7 @@ class LocalPlanner:
                 )
             )
 
-        return LocalPath(odom_points, True, "odom")
+        return LocalPath(odom_points, True, frame_id)
 
 
 class PathFollower:
@@ -687,7 +737,7 @@ class PathFollower:
         if path.frame_id == "base_link":
             return self.compute_cmd_base_link(path)
 
-        if path.frame_id == "odom":
+        if path.frame_id in (self.p.odom_frame, self.p.map_frame):
             if pose_odom is None:
                 return cmd
 
@@ -926,6 +976,8 @@ class MissionManager:
 
         self.state = MissionState.IDLE
         self.active_turn_path: Optional[LocalPath] = None
+        self.pattern_steps: List[PatternStep] = []
+        self.pattern_index = 0
 
         self.end_stable_frames = 0
         self.enter_stable_frames = 0
@@ -935,6 +987,9 @@ class MissionManager:
         self.started = False
 
     def start(self) -> None:
+        self.pattern_steps = self.load_pattern()
+        self.pattern_index = 0
+        self.apply_current_pattern_step()
         self.started = True
         self.transition(MissionState.FOLLOW_ROW, "start requested")
 
@@ -942,6 +997,40 @@ class MissionManager:
         self.started = False
         self.active_turn_path = None
         self.transition(MissionState.IDLE, "stop requested")
+
+    def load_pattern(self) -> List[PatternStep]:
+        try:
+            steps = parse_pattern(self.p.pattern)
+        except ValueError as exc:
+            self.node.get_logger().error(str(exc))
+            steps = [PatternStep(self.p.row_shift_count, self.p.row_shift_direction.upper())]
+
+        if len(steps) == 0:
+            steps = [PatternStep(self.p.row_shift_count, self.p.row_shift_direction.upper())]
+
+        text = " ".join(f"{step.row_shift_count}{step.row_shift_direction}" for step in steps)
+        self.node.get_logger().info(f"Loaded row pattern: {text}")
+        return steps
+
+    def apply_current_pattern_step(self) -> None:
+        if not self.pattern_steps:
+            return
+
+        step = self.pattern_steps[self.pattern_index]
+        self.p.row_shift_count = step.row_shift_count
+        self.p.row_shift_direction = step.row_shift_direction
+        self.node.get_logger().info(
+            f"Pattern step {self.pattern_index + 1}/{len(self.pattern_steps)}: "
+            f"{self.p.row_shift_count}{self.p.row_shift_direction}"
+        )
+
+    def advance_pattern(self) -> bool:
+        if self.pattern_index + 1 >= len(self.pattern_steps):
+            return False
+
+        self.pattern_index += 1
+        self.apply_current_pattern_step()
+        return True
 
     def transition(self, new_state: MissionState, reason: str = "") -> None:
         if new_state == self.state:
@@ -965,6 +1054,7 @@ class MissionManager:
         self,
         row: RowModel,
         pose_odom: Optional[Pose2D],
+        pose_map: Optional[Pose2D],
         planner: LocalPlanner,
         controller: PathFollower,
     ) -> LocalPath:
@@ -988,10 +1078,22 @@ class MissionManager:
             return planner.plan_exit_row()
 
         if self.state == MissionState.PLAN_TURN:
-            if pose_odom is None:
-                return LocalPath([], False, "odom", "no odom pose")
+            if self.p.use_slam_map:
+                if pose_map is None:
+                    frame = self.p.map_frame
+                    reason = "no map pose" if self.p.require_map_for_turns else "fallback to odom"
+                    if self.p.require_map_for_turns:
+                        return LocalPath([], False, frame, reason)
+                    if pose_odom is None:
+                        return LocalPath([], False, self.p.odom_frame, "no odom pose")
+                    self.active_turn_path = planner.plan_turn_path_odom(pose_odom)
+                else:
+                    self.active_turn_path = planner.plan_turn_path_map(pose_map)
+            else:
+                if pose_odom is None:
+                    return LocalPath([], False, self.p.odom_frame, "no odom pose")
+                self.active_turn_path = planner.plan_turn_path_odom(pose_odom)
 
-            self.active_turn_path = planner.plan_turn_path_odom(pose_odom)
             self.transition(MissionState.EXECUTE_TURN, "turn path planned")
 
             return self.active_turn_path
@@ -999,9 +1101,10 @@ class MissionManager:
         if self.state == MissionState.EXECUTE_TURN:
             if self.active_turn_path is None:
                 self.transition(MissionState.PLAN_TURN, "missing active turn path")
-                return LocalPath([], False, "odom", "missing path")
+                return LocalPath([], False, self.p.map_frame if self.p.use_slam_map else self.p.odom_frame, "missing path")
 
-            if pose_odom is not None and controller.path_goal_reached(self.active_turn_path, pose_odom):
+            active_pose = pose_map if self.active_turn_path.frame_id == self.p.map_frame else pose_odom
+            if active_pose is not None and controller.path_goal_reached(self.active_turn_path, active_pose):
                 self.active_turn_path = None
                 self.transition(MissionState.ACQUIRE_ROW, "turn path reached")
                 return planner.plan_acquire_row(row)
@@ -1038,10 +1141,17 @@ class MissionManager:
                 self.enter_stable_frames = 0
 
             if self.enter_stable_frames >= self.p.enter_stable_frames_required:
-                self.transition(MissionState.FOLLOW_ROW, "stable row following")
-                return planner.plan_follow_row(row)
+                if self.advance_pattern():
+                    self.transition(MissionState.FOLLOW_ROW, "stable row following")
+                    return planner.plan_follow_row(row)
+
+                self.transition(MissionState.FINISHED, "pattern complete")
+                return LocalPath([], False, "base_link", "pattern complete")
 
             return planner.plan_enter_row(row)
+
+        if self.state == MissionState.FINISHED:
+            return LocalPath([], False, "base_link", "finished")
 
         return LocalPath([], False, "base_link", "unknown state")
 
@@ -1060,6 +1170,7 @@ class MaizeNavigator(Node):
         self.mission = MissionManager(self, self.p)
 
         self.latest_scan: Optional[LaserScan] = None
+        self.latest_map: Optional[OccupancyGrid] = None
         self.latest_path: Optional[LocalPath] = None
         self.latest_row: RowModel = self.tracker.model
 
@@ -1070,6 +1181,12 @@ class MaizeNavigator(Node):
             LaserScan,
             self.p.scan_topic,
             self.scan_callback,
+            10,
+        )
+        self.map_sub = self.create_subscription(
+            OccupancyGrid,
+            self.p.map_topic,
+            self.map_callback,
             10,
         )
 
@@ -1089,7 +1206,8 @@ class MaizeNavigator(Node):
 
         self.get_logger().info("maize_navigator started")
         self.get_logger().info(
-            f"scan_topic={self.p.scan_topic}, cmd_vel_topic={self.p.cmd_vel_topic}"
+            f"scan_topic={self.p.scan_topic}, cmd_vel_topic={self.p.cmd_vel_topic}, "
+            f"map_topic={self.p.map_topic}, map_frame={self.p.map_frame}"
         )
 
     def load_params(self) -> NavigatorParams:
@@ -1103,6 +1221,10 @@ class MaizeNavigator(Node):
         p.cmd_vel_topic = declare("cmd_vel_topic", p.cmd_vel_topic)
         p.base_frame = declare("base_frame", p.base_frame)
         p.odom_frame = declare("odom_frame", p.odom_frame)
+        p.map_topic = declare("map_topic", p.map_topic)
+        p.map_frame = declare("map_frame", p.map_frame)
+        p.use_slam_map = bool(declare("use_slam_map", p.use_slam_map))
+        p.require_map_for_turns = bool(declare("require_map_for_turns", p.require_map_for_turns))
 
         p.control_frequency = float(declare("control_frequency", p.control_frequency))
 
@@ -1159,6 +1281,7 @@ class MaizeNavigator(Node):
         p.exit_distance = float(declare("exit_distance", p.exit_distance))
         p.turn_forward_distance = float(declare("turn_forward_distance", p.turn_forward_distance))
         p.enter_distance = float(declare("enter_distance", p.enter_distance))
+        p.pattern = str(declare("pattern", p.pattern))
         p.row_shift_count = int(declare("row_shift_count", p.row_shift_count))
         p.row_shift_direction = str(declare("row_shift_direction", p.row_shift_direction))
         p.turn_180 = bool(declare("turn_180", p.turn_180))
@@ -1172,6 +1295,9 @@ class MaizeNavigator(Node):
 
     def scan_callback(self, msg: LaserScan) -> None:
         self.latest_scan = msg
+
+    def map_callback(self, msg: OccupancyGrid) -> None:
+        self.latest_map = msg
 
     def start_cb(self, request, response):
         self.mission.start()
@@ -1187,7 +1313,8 @@ class MaizeNavigator(Node):
         return response
 
     def control_loop(self) -> None:
-        pose_odom = self.lookup_pose()
+        pose_odom = self.lookup_pose(self.p.odom_frame)
+        pose_map = self.lookup_pose(self.p.map_frame) if self.p.use_slam_map else None
 
         if self.latest_scan is None:
             self.publish_stop()
@@ -1200,10 +1327,11 @@ class MaizeNavigator(Node):
 
         self.latest_row = row
 
-        path = self.mission.update(row, pose_odom, self.planner, self.controller)
+        path = self.mission.update(row, pose_odom, pose_map, self.planner, self.controller)
         self.latest_path = path
 
-        cmd = self.controller.compute_cmd(path, pose_odom)
+        active_pose = pose_map if path.frame_id == self.p.map_frame else pose_odom
+        cmd = self.controller.compute_cmd(path, active_pose)
         safe_cmd = self.safety.filter_cmd(
             cmd,
             self.latest_scan,
@@ -1211,7 +1339,7 @@ class MaizeNavigator(Node):
             self.mission.state,
         )
 
-        if self.mission.state == MissionState.IDLE:
+        if self.mission.state in (MissionState.IDLE, MissionState.FINISHED):
             safe_cmd = Twist()
 
         self.cmd_pub.publish(safe_cmd)
@@ -1219,10 +1347,10 @@ class MaizeNavigator(Node):
         if self.p.publish_debug:
             self.publish_debug(det, row, path)
 
-    def lookup_pose(self) -> Optional[Pose2D]:
+    def lookup_pose(self, target_frame: str) -> Optional[Pose2D]:
         try:
             tf = self.tf_buffer.lookup_transform(
-                self.p.odom_frame,
+                target_frame,
                 self.p.base_frame,
                 rclpy.time.Time(),
                 timeout=Duration(seconds=0.02),
