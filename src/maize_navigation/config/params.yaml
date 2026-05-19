@@ -68,7 +68,7 @@ maize_navigator:
 
     # Fahrmuster: Anzahl der Maisreihen + Richtung.
     # Gueltige Schreibweisen: "1L 2R 3L", "1L-2R-3L" oder "1 L 2 R".
-    pattern: "1L 2R"
+    pattern: "1L 2R 2L 3R"
 
     # Fallback, falls pattern ungueltig ist.
     row_shift_count: 1
