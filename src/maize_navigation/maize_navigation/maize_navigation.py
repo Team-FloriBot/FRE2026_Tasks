@@ -194,13 +194,13 @@ class NavigatorParams:
     control_frequency: float = 30.0
 
     expected_row_width: float = 0.75
-    min_lane_width: float = 0.55
-    max_lane_width: float = 0.95
+    min_lane_width: float = 0.60
+    max_lane_width: float = 1.00
 
     roi_x_min: float = 0.25
     roi_x_max: float = 2.0
-    roi_y_abs_min: float = 0.12
-    roi_y_abs_max: float = 0.85
+    roi_y_abs_min: float = 0.18
+    roi_y_abs_max: float = 0.90
 
     acquire_roi_x_min: float = -0.30
     acquire_roi_x_max: float = 2.80
@@ -215,46 +215,46 @@ class NavigatorParams:
 
     centerline_max_abs_slope: float = 0.7
 
-    tracker_alpha: float = 0.10
+    tracker_alpha: float = 0.18
     confidence_decay: float = 0.95
 
     front_density_x_min: float = 0.60
     front_density_x_max: float = 2.00
     front_density_y_abs: float = 0.45
     front_density_threshold: int = 1
-    end_probability_threshold: float = 0.95
-    end_stable_frames_required: int = 25
+    end_probability_threshold: float = 0.70
+    end_stable_frames_required: int = 20
 
-    min_follow_confidence: float = 0.15
-    min_enter_confidence: float = 0.18
-    enter_stable_frames_required: int = 5
+    min_follow_confidence: float = 0.10
+    min_enter_confidence: float = 0.12
+    enter_stable_frames_required: int = 3
     acquire_timeout_sec: float = 8.0
 
-    follow_speed: float = 0.75
-    slow_speed: float = 0.30
-    enter_speed: float = 0.45
-    turn_speed: float = 0.30
-    max_linear_speed: float = 0.85
-    max_angular_speed: float = 1.80
-    follow_max_angular_speed: float = 1.60
-    turn_max_angular_speed: float = 1.20
-    angular_rate_limit: float = 2.5
+    follow_speed: float = 0.45
+    slow_speed: float = 0.18
+    enter_speed: float = 0.30
+    turn_speed: float = 0.22
+    max_linear_speed: float = 0.55
+    max_angular_speed: float = 1.30
+    follow_max_angular_speed: float = 1.10
+    turn_max_angular_speed: float = 0.90
+    angular_rate_limit: float = 1.5
 
-    lookahead_distance: float = 0.45
-    path_goal_xy_tolerance: float = 0.12
-    path_goal_yaw_tolerance: float = 0.25
+    lookahead_distance: float = 0.65
+    path_goal_xy_tolerance: float = 0.20
+    path_goal_yaw_tolerance: float = 0.40
 
-    exit_distance: float = 0.20
+    exit_distance: float = 0.70
     turn_forward_distance: float = 2.20
     min_turn_radius: float = 0.38
-    enter_distance: float = 0.60
-    pattern: str = "1L"
+    enter_distance: float = 0.90
+    pattern: str = "1L 2R 2L 3R"
     row_shift_count: int = 1
     row_shift_direction: str = "L"
     turn_180: bool = True
 
-    obstacle_stop_distance: float = 0.18
-    obstacle_slow_distance: float = 0.35
+    obstacle_stop_distance: float = 0.25
+    obstacle_slow_distance: float = 0.45
 
     publish_debug: bool = True
 
@@ -583,7 +583,7 @@ class LocalPlanner:
     def __init__(self, params: NavigatorParams):
         self.p = params
 
-        def plan_follow_row(self, row: RowModel, speed: Optional[float] = None) -> LocalPath:
+    def plan_follow_row(self, row: RowModel, speed: Optional[float] = None) -> LocalPath:
         if not row.valid:
             return LocalPath([], False, "base_link", "row model invalid")
 
@@ -600,13 +600,8 @@ class LocalPlanner:
             self.p.centerline_max_abs_slope,
         )
 
-        # Vorher:
-        # center_b = clamp(row.center_b, -0.25, 0.25)
-        #
-        # Neue Begrenzung:
-        # Der Roboter darf groessere seitliche Fehler korrigieren.
-        # Das hilft, wenn er versetzt in die Reihe einfaehrt oder
-        # durch Pflanzen kurzfristig eine Seite schlechter erkannt wird.
+        # Vorher: clamp(row.center_b, -0.25, 0.25)
+        # Neue Begrenzung: groessere seitliche Fehler duerfen korrigiert werden.
         center_b = clamp(row.center_b, -0.35, 0.35)
 
         path_x_max = max(1.2, min(3.0, self.p.roi_x_max))
