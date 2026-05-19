@@ -11,20 +11,29 @@ maize_navigator:
 
     control_frequency: 30.0
 
+    # Reihenabstand der Maisreihen.
+    # Muss zur realen Feldgeometrie passen.
+    # Bei 75 cm Reihenabstand: 0.75
+    # Bei 80 cm Reihenabstand: 0.80
     expected_row_width: 0.75
-    min_lane_width: 0.55
-    max_lane_width: 0.95
+    min_lane_width: 0.60
+    max_lane_width: 1.00
 
+    # ROI fuer normale Reihenfahrt.
+    # y_abs_min etwas groesser, damit sehr nahe seitliche Punkte
+    # nicht so stark in die Linienerkennung eingehen.
     roi_x_min: 0.25
     roi_x_max: 2.0
-    roi_y_abs_min: 0.12
-    roi_y_abs_max: 0.85
+    roi_y_abs_min: 0.18
+    roi_y_abs_max: 0.90
 
+    # ROI zum Wiederfinden / Einfahren in eine Reihe.
     acquire_roi_x_min: -0.30
     acquire_roi_x_max: 2.80
     acquire_roi_y_abs_min: 0.05
     acquire_roi_y_abs_max: 1.20
 
+    # RANSAC Linienerkennung.
     ransac_iterations: 80
     ransac_distance: 0.08
     min_inliers: 5
@@ -32,9 +41,12 @@ maize_navigator:
     max_abs_line_slope: 0.9
     centerline_max_abs_slope: 0.7
 
-    tracker_alpha: 0.10
+    # Tracking.
+    # Hoeherer alpha-Wert: reagiert schneller auf seitliche Abweichungen.
+    tracker_alpha: 0.18
     confidence_decay: 0.95
 
+    # Erkennung Reihenende / Frontdichte.
     front_density_x_min: 0.60
     front_density_x_max: 2.00
     front_density_y_abs: 0.45
@@ -42,22 +54,30 @@ maize_navigator:
     end_probability_threshold: 0.70
     end_stable_frames_required: 20
 
+    # Mindest-Konfidenzen.
     min_follow_confidence: 0.10
     min_enter_confidence: 0.12
     enter_stable_frames_required: 3
     acquire_timeout_sec: 8.0
 
-    follow_speed: 0.75
-    slow_speed: 0.30
-    enter_speed: 0.45
-    turn_speed: 0.30
-    max_linear_speed: 0.85
-    max_angular_speed: 1.80
-    follow_max_angular_speed: 1.60
-    turn_max_angular_speed: 1.20
-    angular_rate_limit: 2.5
+    # Geschwindigkeiten.
+    # Reduziert, damit der Roboter weniger seitlich in die Pflanzen faehrt.
+    follow_speed: 0.45
+    slow_speed: 0.18
+    enter_speed: 0.30
+    turn_speed: 0.22
 
-    lookahead_distance: 0.45
+    max_linear_speed: 0.55
+
+    # Winkelgeschwindigkeiten.
+    # Reduziert gegen Schlangenlinien und harte Korrekturen.
+    max_angular_speed: 1.30
+    follow_max_angular_speed: 1.10
+    turn_max_angular_speed: 0.90
+    angular_rate_limit: 1.5
+
+    # Groesserer Lookahead macht die Fahrt ruhiger.
+    lookahead_distance: 0.65
 
     path_goal_xy_tolerance: 0.20
     path_goal_yaw_tolerance: 0.40
@@ -77,7 +97,9 @@ maize_navigator:
 
     turn_180: true
 
-    obstacle_stop_distance: 0.18
-    obstacle_slow_distance: 0.35
+    # Sicherheitsabstaende.
+    # Stoppt und verlangsamt frueher als vorher.
+    obstacle_stop_distance: 0.25
+    obstacle_slow_distance: 0.45
 
     publish_debug: true
