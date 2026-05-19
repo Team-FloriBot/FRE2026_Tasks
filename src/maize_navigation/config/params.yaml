@@ -11,29 +11,20 @@ maize_navigator:
 
     control_frequency: 30.0
 
-    # Reihenabstand der Maisreihen.
-    # Muss zur realen Feldgeometrie passen.
-    # Bei 75 cm Reihenabstand: 0.75
-    # Bei 80 cm Reihenabstand: 0.80
     expected_row_width: 0.75
     min_lane_width: 0.60
     max_lane_width: 1.00
 
-    # ROI fuer normale Reihenfahrt.
-    # y_abs_min etwas groesser, damit sehr nahe seitliche Punkte
-    # nicht so stark in die Linienerkennung eingehen.
     roi_x_min: 0.25
     roi_x_max: 2.0
     roi_y_abs_min: 0.18
     roi_y_abs_max: 0.90
 
-    # ROI zum Wiederfinden / Einfahren in eine Reihe.
     acquire_roi_x_min: -0.30
     acquire_roi_x_max: 2.80
     acquire_roi_y_abs_min: 0.05
     acquire_roi_y_abs_max: 1.20
 
-    # RANSAC Linienerkennung.
     ransac_iterations: 80
     ransac_distance: 0.08
     min_inliers: 5
@@ -41,42 +32,32 @@ maize_navigator:
     max_abs_line_slope: 0.9
     centerline_max_abs_slope: 0.7
 
-    # Tracking.
-    # Hoeherer alpha-Wert: reagiert schneller auf seitliche Abweichungen.
     tracker_alpha: 0.18
     confidence_decay: 0.95
 
-    # Erkennung Reihenende / Frontdichte.
     front_density_x_min: 0.60
     front_density_x_max: 2.00
     front_density_y_abs: 0.45
     front_density_threshold: 1
-    end_probability_threshold: 0.70
-    end_stable_frames_required: 20
+    end_probability_threshold: 0.88
+    end_stable_frames_required: 35
 
-    # Mindest-Konfidenzen.
     min_follow_confidence: 0.10
     min_enter_confidence: 0.12
     enter_stable_frames_required: 3
     acquire_timeout_sec: 8.0
 
-    # Geschwindigkeiten.
-    # Reduziert, damit der Roboter weniger seitlich in die Pflanzen faehrt.
     follow_speed: 0.45
     slow_speed: 0.18
     enter_speed: 0.30
     turn_speed: 0.22
 
     max_linear_speed: 0.55
-
-    # Winkelgeschwindigkeiten.
-    # Reduziert gegen Schlangenlinien und harte Korrekturen.
     max_angular_speed: 1.30
     follow_max_angular_speed: 1.10
     turn_max_angular_speed: 0.90
     angular_rate_limit: 1.5
 
-    # Groesserer Lookahead macht die Fahrt ruhiger.
     lookahead_distance: 0.65
 
     path_goal_xy_tolerance: 0.20
@@ -87,18 +68,12 @@ maize_navigator:
     min_turn_radius: 0.38
     enter_distance: 0.90
 
-    # Fahrmuster: Anzahl der Maisreihen + Richtung.
-    # Gueltige Schreibweisen: "1L 2R 3L", "1L-2R-3L" oder "1 L 2 R".
     pattern: "1L 2R 2L 3R"
 
-    # Fallback, falls pattern ungueltig ist.
     row_shift_count: 1
     row_shift_direction: "L"
-
     turn_180: true
 
-    # Sicherheitsabstaende.
-    # Stoppt und verlangsamt frueher als vorher.
     obstacle_stop_distance: 0.25
     obstacle_slow_distance: 0.45
 
