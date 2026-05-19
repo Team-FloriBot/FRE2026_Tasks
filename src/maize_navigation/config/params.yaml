@@ -4,6 +4,10 @@ maize_navigator:
     cmd_vel_topic: "/cmd_vel"
     base_frame: "base_link"
     odom_frame: "odom"
+    map_topic: "/map"
+    map_frame: "map"
+    use_slam_map: true
+    require_map_for_turns: true
 
     control_frequency: 20.0
 
@@ -62,6 +66,11 @@ maize_navigator:
     turn_forward_distance: 2.20
     enter_distance: 0.90
 
+    # Fahrmuster: Anzahl der Maisreihen + Richtung.
+    # Gueltige Schreibweisen: "1L 2R 3L", "1L-2R-3L" oder "1 L 2 R".
+    pattern: "1L 2R"
+
+    # Fallback, falls pattern ungueltig ist.
     row_shift_count: 1
     row_shift_direction: "L"
 
