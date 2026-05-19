@@ -36,31 +36,31 @@ maize_navigator:
     front_density_y_abs: 0.45
     front_density_threshold: 1
     end_probability_threshold: 0.95
-    end_stable_frames_required: 25
+    end_stable_frames_required: 35
 
-    min_follow_confidence: 0.15
-    min_enter_confidence: 0.18
-    enter_stable_frames_required: 5
+    min_follow_confidence: 0.10
+    min_enter_confidence: 0.12
+    enter_stable_frames_required: 3
     acquire_timeout_sec: 8.0
 
-    follow_speed: 0.10
-    slow_speed: 0.05
-    enter_speed: 0.08
+    follow_speed: 0.18
+    slow_speed: 0.10
+    enter_speed: 0.12
     turn_speed: 0.08
-    max_linear_speed: 0.25
+    max_linear_speed: 0.30
     max_angular_speed: 1.20
     follow_max_angular_speed: 0.60
-    turn_max_angular_speed: 1.20
-    angular_rate_limit: 0.8
+    turn_max_angular_speed: 0.80
+    angular_rate_limit: 0.6
 
     lookahead_distance: 0.75
 
-    path_goal_xy_tolerance: 0.12
-    path_goal_yaw_tolerance: 0.25
+    path_goal_xy_tolerance: 0.20
+    path_goal_yaw_tolerance: 0.40
 
-    exit_distance: 0.20
+    exit_distance: 0.70
     turn_forward_distance: 2.20
-    enter_distance: 0.60
+    enter_distance: 0.90
 
     row_shift_count: 1
     row_shift_direction: "L"
