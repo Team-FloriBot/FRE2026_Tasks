@@ -1153,25 +1153,42 @@ class MissionManager:
             return planner.plan_exit_row()
 
         if self.state == MissionState.PLAN_TURN:
-            if self.p.use_slam_map:
+            if self.p.use_slam_map and self.p.require_map_for_turns:
                 if pose_map is None:
-                    frame = self.p.map_frame
-                    reason = "no map pose" if self.p.require_map_for_turns else "fallback to odom"
-                    if self.p.require_map_for_turns:
-                        return LocalPath([], False, frame, reason)
-                    if pose_odom is None:
-                        return LocalPath([], False, self.p.odom_frame, "no odom pose")
-                    self.active_turn_path = planner.plan_turn_path_odom(pose_odom)
-                else:
-                    self.active_turn_path = planner.plan_turn_path_map(pose_map)
-            else:
-                if pose_odom is None:
-                    return LocalPath([], False, self.p.odom_frame, "no odom pose")
+                    self.node.get_logger().warn(
+                        "PLAN_TURN blocked: no map pose available. "
+                        "Check TF map -> base_link and SLAM/localization."
+                    )
+                    return LocalPath([], False, self.p.map_frame, "PLAN_TURN blocked: no map pose")
+
+                self.active_turn_path = planner.plan_turn_path_map(pose_map)
+
+                if not self.active_turn_path.valid or len(self.active_turn_path.points) == 0:
+                    self.node.get_logger().warn(
+                        f"PLAN_TURN failed: invalid map turn path. "
+                        f"reason='{self.active_turn_path.reason}', "
+                        f"points={len(self.active_turn_path.points)}"
+                    )
+                    return self.active_turn_path
+
+                self.node.get_logger().info(
+                    f"PLAN_TURN ok: planned map turn path with "
+                    f"{len(self.active_turn_path.points)} points"
+                )
+                self.transition(MissionState.EXECUTE_TURN, "turn path planned in map frame")
+                return self.active_turn_path
+
+            if self.p.use_slam_map and pose_map is not None:
+                self.active_turn_path = planner.plan_turn_path_map(pose_map)
+                self.transition(MissionState.EXECUTE_TURN, "turn path planned in map frame")
+                return self.active_turn_path
+
+            if pose_odom is not None:
                 self.active_turn_path = planner.plan_turn_path_odom(pose_odom)
+                self.transition(MissionState.EXECUTE_TURN, "turn path planned in odom frame")
+                return self.active_turn_path
 
-            self.transition(MissionState.EXECUTE_TURN, "turn path planned")
-
-            return self.active_turn_path
+            return LocalPath([], False, self.p.map_frame if self.p.use_slam_map else self.p.odom_frame, "no pose for turn planning")
 
         if self.state == MissionState.EXECUTE_TURN:
             if self.active_turn_path is None:
@@ -1272,6 +1289,14 @@ class MaizeNavigator(Node):
         self.end_pub = self.create_publisher(Float32, "/debug/end_probability", 10)
         self.path_pub = self.create_publisher(Path, "/debug/local_path", 10)
         self.marker_pub = self.create_publisher(MarkerArray, "/debug/row_markers", 10)
+
+        self.diag_pub = self.create_publisher(
+            String,
+            "/debug/navigation_diagnostics",
+            10,
+        )
+        self.last_diag_text = ""
+        self.last_diag_log_time = self.get_clock().now()
 
         self.start_srv = self.create_service(Trigger, "/start_navigation", self.start_cb)
         self.stop_srv = self.create_service(Trigger, "/stop_navigation", self.stop_cb)
@@ -1394,6 +1419,16 @@ class MaizeNavigator(Node):
         pose_map = self.lookup_pose(self.p.map_frame) if self.p.use_slam_map else None
 
         if self.latest_scan is None:
+            stop_cmd = Twist()
+            self.publish_navigation_diagnostics(
+                row=self.latest_row,
+                path=LocalPath([], False, "base_link", "no LaserScan received"),
+                cmd=stop_cmd,
+                safe_cmd=stop_cmd,
+                pose_odom=pose_odom,
+                pose_map=pose_map,
+                active_pose=None,
+            )
             self.publish_stop()
             return
 
@@ -1418,6 +1453,16 @@ class MaizeNavigator(Node):
 
         if self.mission.state in (MissionState.IDLE, MissionState.FINISHED):
             safe_cmd = Twist()
+
+        self.publish_navigation_diagnostics(
+            row=row,
+            path=path,
+            cmd=cmd,
+            safe_cmd=safe_cmd,
+            pose_odom=pose_odom,
+            pose_map=pose_map,
+            active_pose=active_pose,
+        )
 
         self.cmd_pub.publish(safe_cmd)
 
@@ -1444,6 +1489,150 @@ class MaizeNavigator(Node):
 
     def publish_stop(self) -> None:
         self.cmd_pub.publish(Twist())
+
+    def publish_navigation_diagnostics(
+        self,
+        row: RowModel,
+        path: LocalPath,
+        cmd: Twist,
+        safe_cmd: Twist,
+        pose_odom: Optional[Pose2D],
+        pose_map: Optional[Pose2D],
+        active_pose: Optional[Pose2D],
+    ) -> None:
+        state = self.mission.state
+
+        pose_odom_text = "ok" if pose_odom is not None else "None"
+        pose_map_text = "ok" if pose_map is not None else "None"
+        active_pose_text = "ok" if active_pose is not None else "None"
+
+        path_points = len(path.points) if path.points is not None else 0
+
+        raw_cmd_zero = (
+            abs(cmd.linear.x) < 1e-4
+            and abs(cmd.angular.z) < 1e-4
+        )
+
+        final_cmd_zero = (
+            abs(safe_cmd.linear.x) < 1e-4
+            and abs(safe_cmd.angular.z) < 1e-4
+        )
+
+        command_changed = (
+            abs(cmd.linear.x - safe_cmd.linear.x) > 1e-4
+            or abs(cmd.angular.z - safe_cmd.angular.z) > 1e-4
+        )
+
+        reasons: List[str] = []
+
+        if self.latest_scan is None:
+            reasons.append("no LaserScan received")
+
+        if self.p.use_slam_map and self.p.require_map_for_turns:
+            if state in (
+                MissionState.EXIT_ROW,
+                MissionState.PLAN_TURN,
+                MissionState.EXECUTE_TURN,
+            ) and pose_map is None:
+                reasons.append("map pose missing while map turn is required")
+
+        if path.frame_id == self.p.map_frame and pose_map is None:
+            reasons.append("path is in map frame but pose_map is missing")
+
+        if path.frame_id == self.p.odom_frame and pose_odom is None:
+            reasons.append("path is in odom frame but pose_odom is missing")
+
+        if not path.valid:
+            if path.reason:
+                reasons.append(f"path invalid: {path.reason}")
+            else:
+                reasons.append("path invalid")
+
+        if path.valid and path_points == 0:
+            reasons.append("path valid but contains zero points")
+
+        if active_pose is None and path.valid and path.frame_id not in ("base_link", ""):
+            reasons.append(f"active pose missing for path frame '{path.frame_id}'")
+
+        if not row.valid and state in (
+            MissionState.FOLLOW_ROW,
+            MissionState.ACQUIRE_ROW,
+            MissionState.ENTER_ROW,
+        ):
+            reasons.append("row model invalid")
+
+        if row.confidence < self.p.min_follow_confidence and state == MissionState.FOLLOW_ROW:
+            reasons.append(
+                f"low row confidence: {row.confidence:.3f} < {self.p.min_follow_confidence:.3f}"
+            )
+
+        if state == MissionState.PLAN_TURN:
+            if pose_map is not None:
+                reasons.append("planning map turn")
+            else:
+                reasons.append("cannot plan map turn without map pose")
+
+        if state == MissionState.EXECUTE_TURN and self.mission.active_turn_path is None:
+            reasons.append("EXECUTE_TURN but active_turn_path is None")
+
+        if raw_cmd_zero and state not in (MissionState.IDLE, MissionState.FINISHED):
+            reasons.append("controller output is zero")
+
+        if command_changed:
+            if self.p.enable_safety:
+                reasons.append("safety modified command")
+            else:
+                reasons.append("command changed although safety is disabled")
+
+        if final_cmd_zero and not raw_cmd_zero and state not in (
+            MissionState.IDLE,
+            MissionState.FINISHED,
+        ):
+            reasons.append("final command is zero although controller command was nonzero")
+
+        if len(reasons) == 0:
+            reasons.append("ok")
+
+        diag_text = (
+            f"STATE={state.name}"
+            f" | reasons={'; '.join(reasons)}"
+            f" | pose_map={pose_map_text}"
+            f" | pose_odom={pose_odom_text}"
+            f" | active_pose={active_pose_text}"
+            f" | path_valid={path.valid}"
+            f" | path_frame={path.frame_id}"
+            f" | path_points={path_points}"
+            f" | path_reason='{path.reason}'"
+            f" | row_valid={row.valid}"
+            f" | row_conf={row.confidence:.3f}"
+            f" | row_end_prob={row.end_probability:.3f}"
+            f" | raw_cmd=({cmd.linear.x:.3f}, {cmd.angular.z:.3f})"
+            f" | final_cmd=({safe_cmd.linear.x:.3f}, {safe_cmd.angular.z:.3f})"
+            f" | safety_enabled={self.p.enable_safety}"
+        )
+
+        msg = String()
+        msg.data = diag_text
+        self.diag_pub.publish(msg)
+
+        self.log_diagnostic_throttled(diag_text)
+
+    def log_diagnostic_throttled(self, text: str) -> None:
+        now = self.get_clock().now()
+        dt = (now - self.last_diag_log_time).nanoseconds * 1e-9
+
+        should_log = text != self.last_diag_text or dt > 2.0
+
+        if not should_log:
+            return
+
+        self.last_diag_text = text
+        self.last_diag_log_time = now
+
+        if "reasons=ok" in text:
+            self.get_logger().info(text)
+        else:
+            self.get_logger().warn(text)
 
     def publish_debug(self, det: RowDetection, row: RowModel, path: LocalPath) -> None:
         state_msg = String()
