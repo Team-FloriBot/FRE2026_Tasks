@@ -246,6 +246,7 @@ class NavigatorParams:
 
     exit_distance: float = 0.20
     turn_forward_distance: float = 2.20
+    min_turn_radius: float = 0.38
     enter_distance: float = 0.60
     pattern: str = "1L"
     row_shift_count: int = 1
@@ -501,24 +502,30 @@ class RowPerception:
         det.confidence = clamp(score, 0.0, 1.0)
 
     def compute_end_probability(self, det: RowDetection) -> None:
-        front_points = [
+        # Reihenende nicht ueber Hindernisse/Waende direkt vor dem Roboter erkennen.
+        # Eine Querwand am Ende der Reihe erzeugt viele Frontpunkte und wuerde sonst
+        # das Reihenende unterdruecken. Entscheidend ist hier, ob die seitlichen
+        # Reihenstrukturen links/rechts im Vorwaertsfenster noch belastbar sichtbar sind.
+        forward_side_points = [
             p for p in det.points_all
             if self.p.front_density_x_min <= p.x <= self.p.front_density_x_max
-            and abs(p.y) <= self.p.front_density_y_abs
+            and self.current_y_abs_min() <= abs(p.y) <= self.current_roi()[3]
         ]
 
-        front_density = len(front_points)
+        side_density = len(forward_side_points)
 
         score = 0.0
 
-        if front_density < self.p.front_density_threshold:
-            score += 0.45
-
-        if not det.left_valid and not det.right_valid:
+        if side_density < self.p.front_density_threshold:
             score += 0.35
 
-        if det.confidence < 0.25:
+        if not det.left_valid and not det.right_valid:
+            score += 0.55
+        elif not det.left_valid or not det.right_valid:
             score += 0.20
+
+        if det.confidence < 0.25:
+            score += 0.25
 
         det.end_probability = clamp(score, 0.0, 1.0)
 
@@ -650,7 +657,7 @@ class LocalPlanner:
         direction = 1.0 if self.p.row_shift_direction.upper() == "L" else -1.0
 
         row_shift = self.p.row_shift_count * self.p.expected_row_width
-        radius = row_shift / 2.0
+        radius = max(row_shift / 2.0, self.p.min_turn_radius)
 
         if radius <= 0.05:
             return LocalPath([], False, frame_id, "invalid turn radius")
@@ -681,7 +688,7 @@ class LocalPlanner:
                 )
             )
 
-        end_y = direction * row_shift
+        end_y = direction * (2.0 * radius)
 
         if self.p.enter_distance > 0.01:
             for s in np.linspace(0.0, self.p.enter_distance, 20):
@@ -915,6 +922,9 @@ class SafetySupervisor:
         if front_min < self.p.obstacle_stop_distance:
             return self.stop()
 
+        # Nach erkanntem Reihenende darf eine Querwand das Wendemanöver nicht blockieren.
+        # Der harte Not-Stopp bleibt nur fuer sehr nahe Hindernisse ueber
+        # obstacle_stop_distance aktiv.
         if front_min < self.p.obstacle_slow_distance:
             cmd.linear.x *= 0.35
             cmd.angular.z *= 0.7
@@ -1280,6 +1290,7 @@ class MaizeNavigator(Node):
 
         p.exit_distance = float(declare("exit_distance", p.exit_distance))
         p.turn_forward_distance = float(declare("turn_forward_distance", p.turn_forward_distance))
+        p.min_turn_radius = float(declare("min_turn_radius", p.min_turn_radius))
         p.enter_distance = float(declare("enter_distance", p.enter_distance))
         p.pattern = str(declare("pattern", p.pattern))
         p.row_shift_count = int(declare("row_shift_count", p.row_shift_count))
