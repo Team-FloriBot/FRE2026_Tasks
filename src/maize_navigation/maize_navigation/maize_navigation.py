@@ -964,6 +964,22 @@ class SafetySupervisor:
         row: RowModel,
         state: MissionState,
     ) -> Twist:
+        # Safety ist per Parameter abschaltbar.
+        # Bei enable_safety=false werden Hindernisse nicht mehr fuer Stop/Slowdown
+        # verwendet. Die globalen Geschwindigkeitslimits bleiben aktiv.
+        if not self.p.enable_safety:
+            cmd.linear.x = clamp(
+                cmd.linear.x,
+                -self.p.max_linear_speed,
+                self.p.max_linear_speed,
+            )
+            cmd.angular.z = clamp(
+                cmd.angular.z,
+                -self.p.max_angular_speed,
+                self.p.max_angular_speed,
+            )
+            return cmd
+
         if scan is None:
             return self.stop()
 
@@ -972,9 +988,6 @@ class SafetySupervisor:
         if front_min < self.p.obstacle_stop_distance:
             return self.stop()
 
-        # Nach erkanntem Reihenende darf eine Querwand das Wendemanöver nicht blockieren.
-        # Der harte Not-Stopp bleibt nur fuer sehr nahe Hindernisse ueber
-        # obstacle_stop_distance aktiv.
         if front_min < self.p.obstacle_slow_distance:
             cmd.linear.x *= 0.35
             cmd.angular.z *= 0.7
@@ -1347,6 +1360,7 @@ class MaizeNavigator(Node):
         p.row_shift_direction = str(declare("row_shift_direction", p.row_shift_direction))
         p.turn_180 = bool(declare("turn_180", p.turn_180))
 
+        p.enable_safety = bool(declare("enable_safety", p.enable_safety))
         p.obstacle_stop_distance = float(declare("obstacle_stop_distance", p.obstacle_stop_distance))
         p.obstacle_slow_distance = float(declare("obstacle_slow_distance", p.obstacle_slow_distance))
 
