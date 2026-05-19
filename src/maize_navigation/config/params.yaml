@@ -84,6 +84,10 @@ maize_navigator:
     map_row_min_band_length: 1.2
     map_row_max_extrapolated_lanes: 3
 
+    turn_replan_enabled: true
+    turn_replan_period_frames: 5
+    turn_replan_max_attempts: 60
+
     enable_safety: false
 
     obstacle_stop_distance: 0.25
