@@ -222,8 +222,8 @@ class NavigatorParams:
     front_density_x_max: float = 2.00
     front_density_y_abs: float = 0.45
     front_density_threshold: int = 1
-    end_probability_threshold: float = 0.70
-    end_stable_frames_required: int = 20
+    end_probability_threshold: float = 0.88
+    end_stable_frames_required: int = 35
 
     min_follow_confidence: float = 0.10
     min_enter_confidence: float = 0.12
@@ -502,10 +502,14 @@ class RowPerception:
         det.confidence = clamp(score, 0.0, 1.0)
 
     def compute_end_probability(self, det: RowDetection) -> None:
-        # Reihenende nicht ueber Hindernisse/Waende direkt vor dem Roboter erkennen.
-        # Eine Querwand am Ende der Reihe erzeugt viele Frontpunkte und wuerde sonst
-        # das Reihenende unterdruecken. Entscheidend ist hier, ob die seitlichen
-        # Reihenstrukturen links/rechts im Vorwaertsfenster noch belastbar sichtbar sind.
+        # Konservative Reihenende-Erkennung.
+        #
+        # Ziel:
+        # - Keine Reihenenden bei kurzen Luecken, duennen Pflanzen oder
+        #   kurzzeitig schlechter Linienerkennung.
+        # - Ein Reihenende nur dann erkennen, wenn ueber mehrere Frames
+        #   beide Seitenstrukturen fehlen und die Detektionskonfidenz niedrig ist.
+
         forward_side_points = [
             p for p in det.points_all
             if self.p.front_density_x_min <= p.x <= self.p.front_density_x_max
@@ -514,18 +518,40 @@ class RowPerception:
 
         side_density = len(forward_side_points)
 
+        both_missing = not det.left_valid and not det.right_valid
+        one_missing = det.left_valid != det.right_valid
+
+        low_confidence = det.confidence < 0.20
+        very_low_confidence = det.confidence < 0.08
+
+        side_window_empty = side_density < self.p.front_density_threshold
+
         score = 0.0
 
-        if side_density < self.p.front_density_threshold:
-            score += 0.35
+        # Sicheres Reihenende:
+        # Beide Seiten fehlen, im Vorwaerts-Seitenfenster sind keine Punkte,
+        # und die Konfidenz ist sehr niedrig.
+        if both_missing and side_window_empty and very_low_confidence:
+            score = 1.0
 
-        if not det.left_valid and not det.right_valid:
-            score += 0.55
-        elif not det.left_valid or not det.right_valid:
-            score += 0.20
+        # Wahrscheinliches Reihenende:
+        # Beide Seiten fehlen und das Seitenfenster ist leer.
+        elif both_missing and side_window_empty and low_confidence:
+            score = 0.85
 
-        if det.confidence < 0.25:
-            score += 0.25
+        # Moegliches Reihenende:
+        # Beide Seiten fehlen, aber es gibt noch einzelne Seitenpunkte.
+        # Das kann auch eine Luecke in der Reihe sein, deshalb nur schwach werten.
+        elif both_missing and low_confidence:
+            score = 0.35
+
+        # Eine einzelne fehlende Seite ist kein Reihenende.
+        # Das passiert haeufig bei schiefen Pflanzen, Luecken oder asymmetrischer Sicht.
+        elif one_missing and side_window_empty and very_low_confidence:
+            score = 0.15
+
+        else:
+            score = 0.0
 
         det.end_probability = clamp(score, 0.0, 1.0)
 
@@ -568,9 +594,17 @@ class RowTracker:
             if self.model.confidence < 0.01 and self.model.missing_frames > 20:
                 self.model.valid = False
 
-        self.model.end_probability = (
-            0.80 * self.model.end_probability + 0.20 * det.end_probability
-        )
+        # Reihenende asymmetrisch filtern:
+        # - langsamer Anstieg, damit kurze Luecken nicht sofort ein Ende ausloesen
+        # - schneller Abfall, damit falsche Ende-Hypothesen rasch verschwinden
+        if det.end_probability > self.model.end_probability:
+            self.model.end_probability = (
+                0.90 * self.model.end_probability + 0.10 * det.end_probability
+            )
+        else:
+            self.model.end_probability = (
+                0.55 * self.model.end_probability + 0.45 * det.end_probability
+            )
 
         self.model.end_detected = (
             self.model.end_probability >= self.p.end_probability_threshold
