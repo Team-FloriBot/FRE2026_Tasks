@@ -583,7 +583,7 @@ class LocalPlanner:
     def __init__(self, params: NavigatorParams):
         self.p = params
 
-    def plan_follow_row(self, row: RowModel, speed: Optional[float] = None) -> LocalPath:
+        def plan_follow_row(self, row: RowModel, speed: Optional[float] = None) -> LocalPath:
         if not row.valid:
             return LocalPath([], False, "base_link", "row model invalid")
 
@@ -599,7 +599,15 @@ class LocalPlanner:
             -self.p.centerline_max_abs_slope,
             self.p.centerline_max_abs_slope,
         )
-        center_b = clamp(row.center_b, -0.25, 0.25)
+
+        # Vorher:
+        # center_b = clamp(row.center_b, -0.25, 0.25)
+        #
+        # Neue Begrenzung:
+        # Der Roboter darf groessere seitliche Fehler korrigieren.
+        # Das hilft, wenn er versetzt in die Reihe einfaehrt oder
+        # durch Pflanzen kurzfristig eine Seite schlechter erkannt wird.
+        center_b = clamp(row.center_b, -0.35, 0.35)
 
         path_x_max = max(1.2, min(3.0, self.p.roi_x_max))
 
