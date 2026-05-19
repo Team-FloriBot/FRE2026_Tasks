@@ -1137,13 +1137,32 @@ class MissionManager:
             return LocalPath([], False, "base_link", "idle")
 
         if self.state == MissionState.FOLLOW_ROW:
+            # Normale Reihenende-Erkennung ueber end_probability.
             if row.end_detected:
                 self.end_stable_frames += 1
             else:
                 self.end_stable_frames = 0
 
             if self.end_stable_frames >= self.p.end_stable_frames_required:
-                self.transition(MissionState.EXIT_ROW, "row end detected")
+                self.transition(MissionState.EXIT_ROW, "row end detected by end_probability")
+                return planner.plan_exit_row()
+
+            # Fallback fuer das echte Reihenende:
+            # Wenn am Reihenende beide Reihenstrukturen aus dem LiDAR verschwinden,
+            # wird das RowModel ungueltig. Ohne diesen Fallback bleibt der Roboter
+            # in FOLLOW_ROW stehen, weil plan_follow_row() dann keinen Pfad erzeugt.
+            # Die Bedingung ist absichtlich ueber mehrere Frames stabilisiert, damit
+            # kurze Luecken in der Reihe nicht sofort als Reihenende interpretiert werden.
+            if (
+                not row.valid
+                and row.missing_frames >= 18
+                and row.confidence < 0.03
+            ):
+                self.node.get_logger().warn(
+                    "FOLLOW_ROW fallback: row lost for several frames, "
+                    "interpreting as row end and switching to EXIT_ROW"
+                )
+                self.transition(MissionState.EXIT_ROW, "row lost fallback")
                 return planner.plan_exit_row()
 
             return planner.plan_follow_row(row)
@@ -1604,6 +1623,7 @@ class MaizeNavigator(Node):
             f" | path_points={path_points}"
             f" | path_reason='{path.reason}'"
             f" | row_valid={row.valid}"
+            f" | row_missing_frames={row.missing_frames}"
             f" | row_conf={row.confidence:.3f}"
             f" | row_end_prob={row.end_probability:.3f}"
             f" | raw_cmd=({cmd.linear.x:.3f}, {cmd.angular.z:.3f})"
