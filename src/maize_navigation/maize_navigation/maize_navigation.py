@@ -191,7 +191,7 @@ class NavigatorParams:
     use_slam_map: bool = True
     require_map_for_turns: bool = True
 
-    control_frequency: float = 20.0
+    control_frequency: float = 30.0
 
     expected_row_width: float = 0.75
     min_lane_width: float = 0.55
@@ -230,17 +230,17 @@ class NavigatorParams:
     enter_stable_frames_required: int = 5
     acquire_timeout_sec: float = 8.0
 
-    follow_speed: float = 1.00
-    slow_speed: float = 0.35
-    enter_speed: float = 0.50
-    turn_speed: float = 0.35
-    max_linear_speed: float = 1.00
+    follow_speed: float = 0.75
+    slow_speed: float = 0.30
+    enter_speed: float = 0.45
+    turn_speed: float = 0.30
+    max_linear_speed: float = 0.85
     max_angular_speed: float = 1.80
-    follow_max_angular_speed: float = 1.20
-    turn_max_angular_speed: float = 1.00
-    angular_rate_limit: float = 1.2
+    follow_max_angular_speed: float = 1.60
+    turn_max_angular_speed: float = 1.20
+    angular_rate_limit: float = 2.5
 
-    lookahead_distance: float = 0.75
+    lookahead_distance: float = 0.45
     path_goal_xy_tolerance: float = 0.12
     path_goal_yaw_tolerance: float = 0.25
 
@@ -764,8 +764,17 @@ class PathFollower:
 
         v = clamp(target.v, 0.0, self.p.max_linear_speed)
 
-        if abs(curvature) > 1.0:
-            v *= 0.6
+        abs_curvature = abs(curvature)
+
+        # Bei engen Kurven innerhalb der Reihe wird die Geschwindigkeit reduziert.
+        # Dadurch bleibt die benoetigte Winkelgeschwindigkeit erreichbar und der
+        # Roboter schneidet Kurven weniger stark.
+        if abs_curvature > 1.6:
+            v *= 0.40
+        elif abs_curvature > 1.1:
+            v *= 0.55
+        elif abs_curvature > 0.7:
+            v *= 0.75
 
         w = clamp(
             v * curvature,
@@ -829,8 +838,12 @@ class PathFollower:
 
         v = clamp(target.v, 0.0, self.p.max_linear_speed)
 
-        if abs(curvature) > 1.5:
+        abs_curvature = abs(curvature)
+
+        if abs_curvature > 1.5:
             v *= 0.45
+        elif abs_curvature > 0.9:
+            v *= 0.65
 
         w = clamp(v * curvature, -self.p.turn_max_angular_speed, self.p.turn_max_angular_speed)
         w = self.rate_limit(w, self.last_w_odom)
