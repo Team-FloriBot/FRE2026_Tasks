@@ -230,15 +230,15 @@ class NavigatorParams:
     enter_stable_frames_required: int = 5
     acquire_timeout_sec: float = 8.0
 
-    follow_speed: float = 0.10
-    slow_speed: float = 0.05
-    enter_speed: float = 0.08
-    turn_speed: float = 0.08
-    max_linear_speed: float = 0.25
-    max_angular_speed: float = 1.20
-    follow_max_angular_speed: float = 0.60
-    turn_max_angular_speed: float = 1.20
-    angular_rate_limit: float = 0.8
+    follow_speed: float = 1.00
+    slow_speed: float = 0.35
+    enter_speed: float = 0.50
+    turn_speed: float = 0.35
+    max_linear_speed: float = 1.00
+    max_angular_speed: float = 1.80
+    follow_max_angular_speed: float = 1.20
+    turn_max_angular_speed: float = 1.00
+    angular_rate_limit: float = 1.2
 
     lookahead_distance: float = 0.75
     path_goal_xy_tolerance: float = 0.12
