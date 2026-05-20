@@ -337,6 +337,13 @@ class NavigatorParams:
     entry_center_b_tolerance: float = 0.14
     entry_lane_width_tolerance: float = 0.22
     entry_row_yaw_tolerance: float = 0.35
+    # Nach dem U-Turn darf die Umschaltung nicht dauerhaft blockieren, nur weil
+    # am Reihenanfang kurzzeitig nur eine Begrenzungsreihe sichtbar ist. Sobald
+    # Querposition und Gesamt-Gierwinkel erreicht sind, reicht fuer ACQUIRE/ENTER
+    # eine stabile, mittige und nahezu gerade lokale Reihenhypothese aus.
+    entry_relaxed_geometry_after_yaw_shift: bool = True
+    entry_relaxed_center_b_tolerance: float = 0.28
+    entry_relaxed_row_yaw_tolerance: float = 0.45
     # Mehrreihige Einfahrt im Vorgewende: ein Teil des seitlichen Versatzes
     # entsteht rechnerisch im ENTRY_CURVE. In asymmetrischen Reihenenden kann
     # dieser Bogen aber zu frueh in die vordere Begrenzungsreihe schneiden.
@@ -2207,11 +2214,26 @@ class MissionManager:
     def _headland_total_yaw_progress(self, pose_map: Optional[Pose2D]) -> float:
         if pose_map is None or self.exit_curve_start_yaw is None:
             return 0.0
-        return self.headland_direction * wrap_to_pi(pose_map.yaw - float(self.exit_curve_start_yaw))
+
+        # Der U-Turn liegt nominal bei pi rad. wrap_to_pi() springt direkt nach
+        # Ueberschreiten von pi auf negative Werte. Genau dadurch wurde im Log
+        # aus einer bereits ueberdrehten Rechtswende ein Fortschritt von ca.
+        # -2.95 rad; _entry_yaw_ok() blieb false und ACQUIRE_ROW blockierte
+        # dauerhaft. Der Drehfortschritt wird deshalb entlang der gewuenschten
+        # Drehrichtung auf [0, 2*pi) entrollt.
+        progress = self.headland_direction * wrap_to_pi(pose_map.yaw - float(self.exit_curve_start_yaw))
+        target = max(0.0, float(self.p.headland_total_yaw_change))
+
+        if target > math.pi / 2.0 and progress < -max(0.0, float(self.p.entry_yaw_accept_tolerance)):
+            progress += 2.0 * math.pi
+
+        return progress
 
     def _entry_yaw_ok(self, pose_map: Optional[Pose2D]) -> bool:
         progress = self._headland_total_yaw_progress(pose_map)
-        return progress >= self.p.headland_total_yaw_change - max(0.0, self.p.entry_yaw_accept_tolerance)
+        target = max(0.0, float(self.p.headland_total_yaw_change))
+        tolerance = max(0.0, float(self.p.entry_yaw_accept_tolerance))
+        return progress >= target - tolerance
 
     def _entry_reference_side_detected(self, row: RowModel) -> bool:
         if not self.p.neighbor_reference_turn_enabled:
@@ -2255,6 +2277,32 @@ class MissionManager:
             width_ok = abs(det.lane_width - self.p.expected_row_width) <= max(0.05, float(self.p.entry_lane_width_tolerance))
 
         return bool(both_rows_visible and center_ok and yaw_ok and width_ok)
+
+    def _entry_row_relaxed_geometry_ok(self, row: RowModel) -> bool:
+        if not self.p.entry_relaxed_geometry_after_yaw_shift:
+            return False
+
+        if not row.valid:
+            return False
+
+        center_ok = abs(row.center_b) <= max(0.02, float(self.p.entry_relaxed_center_b_tolerance))
+        yaw_ok = abs(row.row_yaw_base) <= max(0.02, float(self.p.entry_relaxed_row_yaw_tolerance))
+        return bool(center_ok and yaw_ok)
+
+    def _entry_geometry_accept_ok(self, row: RowModel, shift_ok: bool, yaw_ok: bool) -> bool:
+        if self._entry_row_geometry_ok(row):
+            return True
+
+        # Fuer 2R/2L und groessere Spruenge verhindert die volle Gassenpruefung
+        # das fruehe Einhaken in eine einzelne Reihe. Sobald der pattern-relative
+        # Versatz und die U-Turn-Ausrichtung aber erreicht sind, darf eine
+        # plausible lokale Reihenhypothese die Uebergabe ausloesen. Sonst bleibt
+        # ACQUIRE_ROW am Reihenanfang stehen, wenn nur eine Begrenzungsreihe im
+        # Sichtfeld liegt.
+        if int(self.p.row_shift_count) >= 2 and shift_ok and yaw_ok:
+            return self._entry_row_relaxed_geometry_ok(row)
+
+        return False
 
     def _desired_headland_shift_yaw(self, pose_map: Pose2D, map_detector: Optional[MapRowDetector]) -> Optional[float]:
         if not self.p.headland_use_map_row_heading:
@@ -2491,7 +2539,7 @@ class MissionManager:
             self.entry_shift_ok = self._entry_shift_window_ok()
             self.entry_reference_side_ok = self._entry_reference_side_detected(row)
             entry_yaw_ok = self._entry_yaw_ok(pose_map)
-            entry_geometry_ok = self._entry_row_geometry_ok(row)
+            entry_geometry_ok = self._entry_geometry_accept_ok(row, self.entry_shift_ok, entry_yaw_ok)
 
             if self.p.neighbor_reference_entry_requires_shift and self.p.row_shift_count == 1:
                 entry_shift_condition = self.entry_shift_ok
@@ -2774,7 +2822,7 @@ class MissionManager:
                 acquire_shift_ok = self._entry_shift_window_ok()
                 acquire_yaw_ok = self._entry_yaw_ok(pose_map)
                 acquire_reference_ok = self._entry_reference_side_detected(row)
-                acquire_geometry_ok = self._entry_row_geometry_ok(row)
+                acquire_geometry_ok = self._entry_geometry_accept_ok(row, acquire_shift_ok, acquire_yaw_ok)
 
             acquire_row_ok = (
                 row.valid
@@ -2831,7 +2879,11 @@ class MissionManager:
                 yaw_ok_for_follow = self._entry_yaw_ok(pose_map)
                 reference_ok_for_follow = self._entry_reference_side_detected(row)
 
-            geometry_ok_for_follow = self._entry_row_geometry_ok(row) if self.p.headland_maneuver_enabled else True
+            geometry_ok_for_follow = (
+                self._entry_geometry_accept_ok(row, shift_ok_for_follow, yaw_ok_for_follow)
+                if self.p.headland_maneuver_enabled
+                else True
+            )
 
             enter_guards_ok = (
                 row.valid
@@ -3047,6 +3099,9 @@ class MaizeNavigator(Node):
         p.entry_center_b_tolerance = float(declare("entry_center_b_tolerance", p.entry_center_b_tolerance))
         p.entry_lane_width_tolerance = float(declare("entry_lane_width_tolerance", p.entry_lane_width_tolerance))
         p.entry_row_yaw_tolerance = float(declare("entry_row_yaw_tolerance", p.entry_row_yaw_tolerance))
+        p.entry_relaxed_geometry_after_yaw_shift = bool(declare("entry_relaxed_geometry_after_yaw_shift", p.entry_relaxed_geometry_after_yaw_shift))
+        p.entry_relaxed_center_b_tolerance = float(declare("entry_relaxed_center_b_tolerance", p.entry_relaxed_center_b_tolerance))
+        p.entry_relaxed_row_yaw_tolerance = float(declare("entry_relaxed_row_yaw_tolerance", p.entry_relaxed_row_yaw_tolerance))
         p.multirow_entry_extra_shift = float(declare("multirow_entry_extra_shift", p.multirow_entry_extra_shift))
         p.map_counted_lane_inward_bias_tolerance = float(declare("map_counted_lane_inward_bias_tolerance", p.map_counted_lane_inward_bias_tolerance))
         p.neighbor_reference_turn_enabled = bool(declare("neighbor_reference_turn_enabled", p.neighbor_reference_turn_enabled))
