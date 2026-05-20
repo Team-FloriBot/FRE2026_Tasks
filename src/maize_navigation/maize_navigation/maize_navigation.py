@@ -296,6 +296,10 @@ class NavigatorParams:
     # Robuster Gassenwechsel im Vorgewende.
     # Die Reihenfahrt selbst bleibt davon unberuehrt.
     headland_maneuver_enabled: bool = True
+    # Vor dem eigentlichen Ausfahrbogen wird erst gerade aus der Gasse herausgefahren.
+    # Das verhindert, dass der Roboter beim Rechts-/Linksbogen noch an den letzten Pflanzen haengen bleibt.
+    headland_exit_straight_distance: float = 0.45
+    headland_exit_straight_speed: float = 0.18
     exit_curve_speed: float = 0.18
     exit_curve_angular_speed: float = 0.48
     exit_curve_yaw_change: float = 1.35
@@ -1854,6 +1858,7 @@ class MissionManager:
         self.headland_direction: float = 1.0
         self.headland_required_shift: float = 0.0
         self.headland_measured_shift: float = 0.0
+        self.headland_exit_forward_distance: float = 0.0
         self.entry_row_stable_frames: int = 0
         self.entry_reference_side_ok: bool = False
         self.entry_shift_ok: bool = False
@@ -1901,6 +1906,7 @@ class MissionManager:
         self.headland_direction = 1.0
         self.headland_required_shift = 0.0
         self.headland_measured_shift = 0.0
+        self.headland_exit_forward_distance = 0.0
         self.entry_row_stable_frames = 0
         self.entry_reference_side_ok = False
         self.entry_shift_ok = False
@@ -1981,6 +1987,7 @@ class MissionManager:
             self.headland_direction = 1.0 if self.p.row_shift_direction.upper() == "L" else -1.0
             self.headland_required_shift = self.headland_direction * self.p.row_shift_count * self.p.expected_row_width
             self.headland_measured_shift = 0.0
+            self.headland_exit_forward_distance = 0.0
 
         if new_state == MissionState.HEADLAND_SHIFT:
             self.entry_curve_start_yaw = None
@@ -2018,6 +2025,15 @@ class MissionManager:
         dy = pose_map.y - self.headland_start_pose_map.y
         yaw0 = self.headland_start_pose_map.yaw
         self.headland_measured_shift = -math.sin(yaw0) * dx + math.cos(yaw0) * dy
+
+    def _update_headland_exit_forward_distance(self, pose_map: Optional[Pose2D]) -> None:
+        if pose_map is None or self.headland_start_pose_map is None:
+            return
+
+        dx = pose_map.x - self.headland_start_pose_map.x
+        dy = pose_map.y - self.headland_start_pose_map.y
+        yaw0 = self.headland_start_pose_map.yaw
+        self.headland_exit_forward_distance = math.cos(yaw0) * dx + math.sin(yaw0) * dy
 
     def _effective_entry_curve_yaw_change(self) -> float:
         if self.p.entry_curve_yaw_change > 0.0:
@@ -2117,11 +2133,9 @@ class MissionManager:
 
                 if self.p.headland_maneuver_enabled:
                     self.transition(MissionState.EXIT_CURVE, "row end detected; starting headland maneuver")
-                    return planner.plan_constant_curve_base_link(
-                        1.0 if self.p.row_shift_direction.upper() == "L" else -1.0,
-                        self.p.exit_curve_speed,
-                        self.p.exit_curve_angular_speed,
-                        reason="EXIT_CURVE",
+                    return planner.plan_headland_shift_base_link(
+                        speed=self.p.headland_exit_straight_speed,
+                        reason="EXIT_STRAIGHT",
                     )
 
                 self.transition(MissionState.EXIT_ROW, "row end detected by end_probability")
@@ -2152,11 +2166,9 @@ class MissionManager:
                 )
                 if self.p.headland_maneuver_enabled:
                     self.transition(MissionState.EXIT_CURVE, "row lost fallback; starting headland maneuver")
-                    return planner.plan_constant_curve_base_link(
-                        1.0 if self.p.row_shift_direction.upper() == "L" else -1.0,
-                        self.p.exit_curve_speed,
-                        self.p.exit_curve_angular_speed,
-                        reason="EXIT_CURVE",
+                    return planner.plan_headland_shift_base_link(
+                        speed=self.p.headland_exit_straight_speed,
+                        reason="EXIT_STRAIGHT",
                     )
 
                 self.transition(MissionState.EXIT_ROW, "row lost fallback")
@@ -2172,15 +2184,36 @@ class MissionManager:
             if pose_map is None:
                 return LocalPath([], False, self.p.map_frame, "EXIT_CURVE blocked: no map pose")
 
-            if self.headland_start_pose_map is None or self.exit_curve_start_yaw is None:
+            if self.headland_start_pose_map is None:
                 self.headland_start_pose_map = pose_map
-                self.exit_curve_start_yaw = pose_map.yaw
+                self.exit_curve_start_yaw = None
                 self.headland_direction = 1.0 if self.p.row_shift_direction.upper() == "L" else -1.0
                 self.headland_required_shift = self.headland_direction * self.p.row_shift_count * self.p.expected_row_width
                 self.headland_measured_shift = 0.0
+                self.headland_exit_forward_distance = 0.0
                 self.node.get_logger().info(
-                    f"EXIT_CURVE start: direction={self.p.row_shift_direction}, "
-                    f"count={self.p.row_shift_count}, required_shift={self.headland_required_shift:.3f} m"
+                    f"HEADLAND_EXIT_STRAIGHT start: direction={self.p.row_shift_direction}, "
+                    f"count={self.p.row_shift_count}, required_shift={self.headland_required_shift:.3f} m, "
+                    f"straight_distance={self.p.headland_exit_straight_distance:.3f} m"
+                )
+
+            # Zuerst gerade aus der Reihe herausfahren. Erst danach beginnt der eigentliche
+            # Links-/Rechtsbogen. Das schafft am Reihenende Abstand zu den letzten Pflanzen
+            # und verhindert besonders beim 2. Manöver, dass der Bogen noch in die Reihe schneidet.
+            self._update_headland_exit_forward_distance(pose_map)
+            self._update_headland_measured_shift(pose_map)
+
+            if self.exit_curve_start_yaw is None:
+                if self.headland_exit_forward_distance < max(0.0, self.p.headland_exit_straight_distance):
+                    return planner.plan_headland_shift_base_link(
+                        speed=self.p.headland_exit_straight_speed,
+                        reason="EXIT_STRAIGHT",
+                    )
+
+                self.exit_curve_start_yaw = pose_map.yaw
+                self.node.get_logger().info(
+                    f"EXIT_CURVE arc start after straight clearance: "
+                    f"forward={self.headland_exit_forward_distance:.3f} m"
                 )
 
             yaw_progress = self.headland_direction * wrap_to_pi(pose_map.yaw - float(self.exit_curve_start_yaw))
@@ -2754,6 +2787,8 @@ class MaizeNavigator(Node):
         p.turn_180 = bool(declare("turn_180", p.turn_180))
 
         p.headland_maneuver_enabled = bool(declare("headland_maneuver_enabled", p.headland_maneuver_enabled))
+        p.headland_exit_straight_distance = float(declare("headland_exit_straight_distance", p.headland_exit_straight_distance))
+        p.headland_exit_straight_speed = float(declare("headland_exit_straight_speed", p.headland_exit_straight_speed))
         p.exit_curve_speed = float(declare("exit_curve_speed", p.exit_curve_speed))
         p.exit_curve_angular_speed = float(declare("exit_curve_angular_speed", p.exit_curve_angular_speed))
         p.exit_curve_yaw_change = float(declare("exit_curve_yaw_change", p.exit_curve_yaw_change))
@@ -3073,6 +3108,7 @@ class MaizeNavigator(Node):
             f" | headland_enabled={self.p.headland_maneuver_enabled}"
             f" | headland_required_shift={self.mission.headland_required_shift:.3f}"
             f" | headland_measured_shift={self.mission.headland_measured_shift:.3f}"
+            f" | headland_exit_forward={self.mission.headland_exit_forward_distance:.3f}"
             f" | headland_pre_entry_target={self.mission._headland_pre_entry_shift_target():.3f}"
             f" | headland_total_yaw_progress={self.mission._headland_total_yaw_progress(pose_map):.3f}"
             f" | entry_row_stable_frames={self.mission.entry_row_stable_frames}"
