@@ -81,15 +81,16 @@ maize_navigator:
     # Die normale Reihenfahrt bleibt unveraendert.
     headland_maneuver_enabled: true
     exit_curve_speed: 0.18
-    exit_curve_angular_speed: 0.55
+    exit_curve_angular_speed: 0.48
     exit_curve_yaw_change: 1.35
 
     headland_shift_speed: 0.22
     headland_shift_tolerance: 0.04
+    headland_shift_overshoot_tolerance: 0.08
     headland_yaw_tolerance: 0.25
 
     entry_curve_speed: 0.16
-    entry_curve_angular_speed: 0.50
+    entry_curve_angular_speed: 0.427
     # Automatisch: pi - exit_curve_yaw_change, damit die Wende wirklich ~180 Grad erreicht.
     headland_total_yaw_change: 3.141592653589793
     entry_curve_yaw_change: -1.0
