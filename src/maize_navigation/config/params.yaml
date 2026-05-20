@@ -85,14 +85,21 @@ maize_navigator:
     exit_curve_yaw_change: 1.35
 
     headland_shift_speed: 0.22
-    headland_shift_tolerance: 0.12
+    headland_shift_tolerance: 0.05
     headland_yaw_tolerance: 0.25
 
     entry_curve_speed: 0.16
     entry_curve_angular_speed: 0.50
     entry_curve_yaw_change: 1.35
-    entry_row_min_confidence: 0.22
-    entry_row_stable_frames: 5
+    entry_row_min_confidence: 0.32
+    entry_row_stable_frames: 10
+
+    # Direkter Nachbargassenwechsel 1L/1R:
+    # Zielreihe erst akzeptieren, wenn der Versatz erreicht ist und
+    # die Maisreihe auf der erwarteten Seite sichtbar ist.
+    neighbor_reference_turn_enabled: true
+    neighbor_reference_entry_requires_shift: true
+    neighbor_reference_requires_same_side_row: true
 
     map_row_detection_enabled: true
     map_row_occupancy_threshold: 50
@@ -129,8 +136,8 @@ maize_navigator:
     # Wenn die neue Gasse lokal stabil erkannt ist, wird der globale Turn beendet.
     # Dadurch faehrt der Roboter nicht an der Zielgasse vorbei.
     turn_exit_on_local_row: true
-    turn_exit_min_confidence: 0.22
-    turn_exit_stable_frames: 5
+    turn_exit_min_confidence: 0.32
+    turn_exit_stable_frames: 10
 
     enable_safety: false
 
