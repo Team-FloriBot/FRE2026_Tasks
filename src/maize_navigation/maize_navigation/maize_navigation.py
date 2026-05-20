@@ -306,7 +306,15 @@ class NavigatorParams:
 
     entry_curve_speed: float = 0.16
     entry_curve_angular_speed: float = 0.50
-    entry_curve_yaw_change: float = 1.35
+    # Gesamt-Drehwinkel des Vorgewende-Manoevers. Fuer U-Turns muss die
+    # Endausrichtung der Gegenrichtung entsprechen.
+    headland_total_yaw_change: float = math.pi
+    # Falls kleiner/gleich 0, wird der benoetigte Einfahrbogen automatisch als
+    # headland_total_yaw_change - exit_curve_yaw_change berechnet.
+    entry_curve_yaw_change: float = -1.0
+    # ENTRY_CURVE darf erst lokal uebergeben, wenn Yaw und Versatz plausibel sind.
+    entry_yaw_accept_tolerance: float = 0.35
+    entry_shift_accept_tolerance: float = 0.12
     entry_row_min_confidence: float = 0.32
     entry_row_stable_frames: int = 10
 
@@ -1977,12 +1985,63 @@ class MissionManager:
         if new_state == MissionState.ENTER_ROW:
             self.turn_local_row_stable_frames = 0
 
-    def _headland_shift_reached(self) -> bool:
+    def _update_headland_measured_shift(self, pose_map: Optional[Pose2D]) -> None:
+        if pose_map is None or self.headland_start_pose_map is None:
+            return
+
+        dx = pose_map.x - self.headland_start_pose_map.x
+        dy = pose_map.y - self.headland_start_pose_map.y
+        yaw0 = self.headland_start_pose_map.yaw
+        self.headland_measured_shift = -math.sin(yaw0) * dx + math.cos(yaw0) * dy
+
+    def _effective_entry_curve_yaw_change(self) -> float:
+        if self.p.entry_curve_yaw_change > 0.0:
+            return self.p.entry_curve_yaw_change
+
+        return max(0.20, self.p.headland_total_yaw_change - self.p.exit_curve_yaw_change)
+
+    def _predicted_entry_lateral_shift(self) -> float:
+        # Der zweite Bogen veraendert den lateralen Versatz weiter.
+        # Bisher wurde HEADLAND_SHIFT bis zum gesamten Reihenabstand gefahren
+        # und danach kam nochmals seitlicher Versatz durch ENTRY_CURVE dazu.
+        # Das erzeugt genau den Fehler: bei 1L landet der Roboter eine oder
+        # mehrere Reihen zu weit. Deshalb wird HEADLAND_SHIFT vor dem Einfahrbogen
+        # gestoppt. Der fehlende Rest wird vom Einfahrbogen erzeugt.
+        direction = 1.0 if self.headland_direction >= 0.0 else -1.0
+        entry_yaw = self._effective_entry_curve_yaw_change()
+        exit_yaw = max(0.0, self.p.exit_curve_yaw_change)
+        radius = max(abs(self.p.entry_curve_speed) / max(abs(self.p.entry_curve_angular_speed), 1e-3), 0.05)
+
+        lateral = radius * (math.cos(exit_yaw) - math.cos(exit_yaw + entry_yaw))
+        return direction * lateral
+
+    def _headland_pre_entry_shift_target(self) -> float:
         required = abs(self.headland_required_shift)
+        predicted_entry = abs(self._predicted_entry_lateral_shift())
+        return max(0.0, required - predicted_entry)
+
+    def _headland_shift_reached(self) -> bool:
+        required = self._headland_pre_entry_shift_target()
         measured = abs(self.headland_measured_shift)
         if required <= 1e-6:
             return True
         return measured >= required - max(0.0, self.p.headland_shift_tolerance)
+
+    def _entry_shift_window_ok(self) -> bool:
+        required = abs(self.headland_required_shift)
+        measured = abs(self.headland_measured_shift)
+        if required <= 1e-6:
+            return True
+        return abs(measured - required) <= max(0.0, self.p.entry_shift_accept_tolerance)
+
+    def _headland_total_yaw_progress(self, pose_map: Optional[Pose2D]) -> float:
+        if pose_map is None or self.exit_curve_start_yaw is None:
+            return 0.0
+        return self.headland_direction * wrap_to_pi(pose_map.yaw - float(self.exit_curve_start_yaw))
+
+    def _entry_yaw_ok(self, pose_map: Optional[Pose2D]) -> bool:
+        progress = self._headland_total_yaw_progress(pose_map)
+        return progress >= self.p.headland_total_yaw_change - max(0.0, self.p.entry_yaw_accept_tolerance)
 
     def _entry_reference_side_detected(self, row: RowModel) -> bool:
         if not self.p.neighbor_reference_turn_enabled:
@@ -2120,12 +2179,9 @@ class MissionManager:
                 self.headland_direction = 1.0 if self.p.row_shift_direction.upper() == "L" else -1.0
                 self.headland_required_shift = self.headland_direction * self.p.row_shift_count * self.p.expected_row_width
 
-            dx = pose_map.x - self.headland_start_pose_map.x
-            dy = pose_map.y - self.headland_start_pose_map.y
-            yaw0 = self.headland_start_pose_map.yaw
-            self.headland_measured_shift = -math.sin(yaw0) * dx + math.cos(yaw0) * dy
+            self._update_headland_measured_shift(pose_map)
 
-            remaining = abs(self.headland_required_shift) - abs(self.headland_measured_shift)
+            remaining = self._headland_pre_entry_shift_target() - abs(self.headland_measured_shift)
 
             # SLAM-Reihenlinien weiterhin auswerten, aber hier nur fuer Diagnose und
             # Plausibilisierung. Das Manoever faehrt nicht beliebig zu einer absoluten
@@ -2174,18 +2230,24 @@ class MissionManager:
             # erst akzeptiert, wenn der geforderte seitliche Versatz erreicht ist
             # und die Maisreihe auf der erwarteten Seite sichtbar ist. Das verhindert,
             # dass eine frueh erkannte falsche Struktur als Zielgasse genommen wird.
-            self.entry_shift_ok = self._headland_shift_reached()
+            self._update_headland_measured_shift(pose_map)
+            self.entry_shift_ok = self._entry_shift_window_ok()
             self.entry_reference_side_ok = self._entry_reference_side_detected(row)
+            entry_yaw_ok = self._entry_yaw_ok(pose_map)
 
             if self.p.neighbor_reference_entry_requires_shift and self.p.row_shift_count == 1:
                 entry_shift_condition = self.entry_shift_ok
             else:
-                entry_shift_condition = True
+                # Auch bei uebersprungenen Gassen darf lokal erst uebergeben werden,
+                # wenn der pattern-relative Versatz plausibel ist. Sonst kann eine
+                # zufaellige Zwischenstruktur als Zielgasse akzeptiert werden.
+                entry_shift_condition = self.entry_shift_ok
 
             if (
                 row.valid
                 and row.confidence >= self.p.entry_row_min_confidence
                 and entry_shift_condition
+                and entry_yaw_ok
                 and self.entry_reference_side_ok
             ):
                 self.entry_row_stable_frames += 1
@@ -2193,11 +2255,12 @@ class MissionManager:
                 self.entry_row_stable_frames = 0
 
             if self.entry_row_stable_frames >= max(1, self.p.entry_row_stable_frames):
-                self.transition(MissionState.ENTER_ROW, "target row detected during entry curve with reference-side check")
+                self.transition(MissionState.ENTER_ROW, "target row detected during entry curve with yaw/shift/reference checks")
                 return planner.plan_enter_row(row)
 
             yaw_progress = self.headland_direction * wrap_to_pi(pose_map.yaw - float(self.entry_curve_start_yaw))
-            if yaw_progress >= self.p.entry_curve_yaw_change:
+            target_entry_yaw = self._effective_entry_curve_yaw_change()
+            if yaw_progress >= target_entry_yaw:
                 self.transition(MissionState.ACQUIRE_ROW, "entry curve completed")
                 return planner.plan_acquire_row(row)
 
@@ -2643,7 +2706,10 @@ class MaizeNavigator(Node):
         p.headland_yaw_tolerance = float(declare("headland_yaw_tolerance", p.headland_yaw_tolerance))
         p.entry_curve_speed = float(declare("entry_curve_speed", p.entry_curve_speed))
         p.entry_curve_angular_speed = float(declare("entry_curve_angular_speed", p.entry_curve_angular_speed))
+        p.headland_total_yaw_change = float(declare("headland_total_yaw_change", p.headland_total_yaw_change))
         p.entry_curve_yaw_change = float(declare("entry_curve_yaw_change", p.entry_curve_yaw_change))
+        p.entry_yaw_accept_tolerance = float(declare("entry_yaw_accept_tolerance", p.entry_yaw_accept_tolerance))
+        p.entry_shift_accept_tolerance = float(declare("entry_shift_accept_tolerance", p.entry_shift_accept_tolerance))
         p.entry_row_min_confidence = float(declare("entry_row_min_confidence", p.entry_row_min_confidence))
         p.entry_row_stable_frames = int(declare("entry_row_stable_frames", p.entry_row_stable_frames))
         p.neighbor_reference_turn_enabled = bool(declare("neighbor_reference_turn_enabled", p.neighbor_reference_turn_enabled))
@@ -2950,6 +3016,8 @@ class MaizeNavigator(Node):
             f" | headland_enabled={self.p.headland_maneuver_enabled}"
             f" | headland_required_shift={self.mission.headland_required_shift:.3f}"
             f" | headland_measured_shift={self.mission.headland_measured_shift:.3f}"
+            f" | headland_pre_entry_target={self.mission._headland_pre_entry_shift_target():.3f}"
+            f" | headland_total_yaw_progress={self.mission._headland_total_yaw_progress(pose_map):.3f}"
             f" | entry_row_stable_frames={self.mission.entry_row_stable_frames}"
             f" | expected_target_offset={self.mission.expected_target_offset:.3f}"
             f" | detected_target_offset={self.mission.detected_target_offset:.3f}"
