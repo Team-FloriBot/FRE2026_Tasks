@@ -335,6 +335,9 @@ class MapRowDetector:
         self.last_expected_target_offset: float = 0.0
         self.last_detected_target_offset: float = 0.0
         self.last_target_offset_error: float = 0.0
+        self.last_reference_row_v: float = 0.0
+        self.last_target_row_v: float = 0.0
+        self.last_candidate_rows_text: str = ""
 
     def detect_lanes(self, grid: Optional[OccupancyGrid], pose: Pose2D) -> Tuple[List[MapLane], List[MapRowBand], str]:
         """Detect plant row lines from occupied SLAM-map cells and derive lane centerlines.
@@ -661,9 +664,22 @@ class MapRowDetector:
     def select_target_lane(
         self,
         lanes: List[MapLane],
+        row_bands: List[MapRowBand],
         direction: str,
         count: int,
     ) -> Optional[MapLane]:
+        """Select the target lane by counting fitted plant-row lines from the current side row.
+
+        This is deliberately row-line-relative, not absolute-lane-relative:
+        - nL counts plant rows to the left of the currently driven lane.
+        - nR counts plant rows to the right of the currently driven lane.
+
+        For 1L, the current left plant row and the next left plant row form the
+        target lane. For 2R, the second and third right-side row lines form the
+        target lane. If the SLAM map does not yet contain enough row lines, the
+        target is extrapolated from the nearest visible reference row instead of
+        choosing an arbitrary far-away lane.
+        """
         step = max(1, int(count))
         sign = 1 if direction.upper() == "L" else -1
         expected_offset = sign * step * self.p.expected_row_width
@@ -672,16 +688,113 @@ class MapRowDetector:
         self.last_expected_target_offset = float(expected_offset)
         self.last_detected_target_offset = 0.0
         self.last_target_offset_error = 0.0
+        self.last_reference_row_v = 0.0
+        self.last_target_row_v = 0.0
+        self.last_candidate_rows_text = ""
 
-        if len(lanes) == 0:
-            self.last_target_reason = "no map lanes available"
-            return None
+        width = clamp(
+            float(self.p.expected_row_width),
+            self.p.min_lane_width,
+            self.p.max_lane_width,
+        )
 
+        row_positions = sorted(
+            float(band.lateral_v)
+            for band in row_bands
+            if band.valid and math.isfinite(band.lateral_v)
+        )
+
+        if sign > 0:
+            side_rows = [v for v in row_positions if v > 0.0]
+            side_rows.sort(key=lambda value: value)
+        else:
+            side_rows = [v for v in row_positions if v < 0.0]
+            side_rows.sort(key=lambda value: -value)
+
+        self.last_candidate_rows_text = ",".join(f"{v:.3f}" for v in side_rows[:8])
+
+        # Primary mode: count fitted plant-row lines on the requested side.
+        # side_rows[0] is the current boundary row. The target lane for step k lies
+        # between side_rows[k-1] and side_rows[k].
+        if len(side_rows) >= step + 1:
+            inner_row_v = float(side_rows[step - 1])
+            outer_row_v = float(side_rows[step])
+            center_v = 0.5 * (inner_row_v + outer_row_v)
+            detected_offset = float(center_v)
+            error = abs(detected_offset - expected_offset)
+
+            self.last_reference_row_v = float(side_rows[0])
+            self.last_target_row_v = outer_row_v
+            self.last_detected_target_offset = detected_offset
+            self.last_target_offset_error = float(error)
+
+            # Reject row-line candidates only if they disagree strongly with the pattern.
+            # This prevents a sparse or distorted map from jumping from e.g. 1L to row 5.
+            if error <= tolerance:
+                measured_width = abs(outer_row_v - inner_row_v)
+                width = clamp(float(measured_width), self.p.min_lane_width, self.p.max_lane_width)
+                self.last_target_reason = (
+                    f"row-line counted target accepted: direction={direction.upper()}, "
+                    f"step={step}, reference_row={side_rows[0]:.3f}, "
+                    f"inner_row={inner_row_v:.3f}, outer_row={outer_row_v:.3f}, "
+                    f"center={center_v:.3f}, expected={expected_offset:.3f}, "
+                    f"error={error:.3f}, tolerance={tolerance:.3f}, "
+                    f"side_rows=[{self.last_candidate_rows_text}]"
+                )
+                return MapLane(
+                    valid=True,
+                    center_v=float(center_v),
+                    left_row_v=float(max(inner_row_v, outer_row_v)),
+                    right_row_v=float(min(inner_row_v, outer_row_v)),
+                    width=float(width),
+                    confidence=0.98,
+                    source="detected_reference_row_linefit",
+                )
+
+            self.last_target_reason = (
+                f"row-line counted target rejected: direction={direction.upper()}, "
+                f"step={step}, reference_row={side_rows[0]:.3f}, "
+                f"center={center_v:.3f}, expected={expected_offset:.3f}, "
+                f"error={error:.3f}, tolerance={tolerance:.3f}, "
+                f"side_rows=[{self.last_candidate_rows_text}]"
+            )
+
+        elif len(side_rows) >= 1:
+            # If only the current boundary row is known, extrapolate from it.
+            reference_row_v = float(side_rows[0])
+            center_v = reference_row_v + sign * (step - 0.5) * self.p.expected_row_width
+            error = abs(center_v - expected_offset)
+
+            self.last_reference_row_v = reference_row_v
+            self.last_target_row_v = reference_row_v + sign * step * self.p.expected_row_width
+            self.last_detected_target_offset = float(center_v)
+            self.last_target_offset_error = float(error)
+
+            self.last_target_reason = (
+                f"not enough fitted row lines on requested side; "
+                f"direction={direction.upper()}, step={step}, "
+                f"reference_row={reference_row_v:.3f}, side_rows=[{self.last_candidate_rows_text}]; "
+                f"using reference-row extrapolated lane center={center_v:.3f}"
+            )
+
+            return MapLane(
+                valid=True,
+                center_v=float(center_v),
+                left_row_v=float(center_v + 0.5 * width),
+                right_row_v=float(center_v - 0.5 * width),
+                width=float(width),
+                confidence=0.55,
+                source="extrapolated_from_reference_row",
+            )
+
+        else:
+            self.last_target_reason = (
+                f"no fitted reference row on requested side: direction={direction.upper()}, "
+                f"step={step}, rows={len(row_positions)}"
+            )
+
+        # Secondary fallback: use a fitted lane only if its relative offset matches the pattern.
         lanes_sorted = sorted(lanes, key=lambda lane: lane.center_v)
-
-        # Pattern-relative target selection:
-        # 1L -> lane around +expected_row_width, 2R -> around -2*expected_row_width.
-        # A farther detected lane is rejected and replaced by pattern-limited extrapolation.
         candidates = []
         for lane in lanes_sorted:
             detected_offset = float(lane.center_v)
@@ -697,23 +810,17 @@ class MapRowDetector:
             self.last_target_offset_error = float(best_error)
 
             if best_error <= tolerance:
-                best_lane.source = "detected_linefit"
-                self.last_target_reason = (
-                    f"linefit target lane accepted: expected={expected_offset:.3f}, "
-                    f"detected={best_lane.center_v:.3f}, error={best_error:.3f}, "
-                    f"tolerance={tolerance:.3f}"
+                best_lane.source = "detected_lane_fallback"
+                self.last_target_reason += (
+                    f"; fallback fitted lane accepted: expected={expected_offset:.3f}, "
+                    f"detected={best_lane.center_v:.3f}, error={best_error:.3f}"
                 )
                 return best_lane
 
-            self.last_target_reason = (
-                f"linefit target lane rejected: expected={expected_offset:.3f}, "
+            self.last_target_reason += (
+                f"; fallback fitted lane rejected: expected={expected_offset:.3f}, "
                 f"detected={best_lane.center_v:.3f}, error={best_error:.3f}, "
                 f"tolerance={tolerance:.3f}"
-            )
-        else:
-            self.last_target_reason = (
-                f"no fitted lane on requested side: expected={expected_offset:.3f}, "
-                f"direction={direction.upper()}, lanes={len(lanes_sorted)}"
             )
 
         if step > self.p.map_row_max_extrapolated_lanes:
@@ -723,22 +830,13 @@ class MapRowDetector:
             )
             return None
 
-        spacing = self.p.expected_row_width
-        if len(lanes_sorted) >= 2:
-            spacings = [
-                lanes_sorted[i + 1].center_v - lanes_sorted[i].center_v
-                for i in range(len(lanes_sorted) - 1)
-                if lanes_sorted[i + 1].center_v - lanes_sorted[i].center_v > 0.1
-            ]
-            if spacings:
-                spacing = float(np.median(spacings))
-
+        # Last resort: pure pattern-limited lane center. This never jumps beyond
+        # the requested count.
         center_v = expected_offset
-        width = clamp(float(spacing), self.p.min_lane_width, self.p.max_lane_width)
         self.last_detected_target_offset = float(center_v)
         self.last_target_offset_error = 0.0
         self.last_target_reason += (
-            f"; using pattern-limited extrapolated lane at {center_v:.3f} m"
+            f"; using pure pattern-limited extrapolated lane center={center_v:.3f} m"
         )
 
         return MapLane(
@@ -747,7 +845,7 @@ class MapRowDetector:
             left_row_v=float(center_v + 0.5 * width),
             right_row_v=float(center_v - 0.5 * width),
             width=float(width),
-            confidence=0.45,
+            confidence=0.40,
             source="extrapolated_pattern_limited",
         )
 
@@ -1650,6 +1748,9 @@ class MissionManager:
         self.expected_target_offset: float = 0.0
         self.detected_target_offset: float = 0.0
         self.target_offset_error: float = 0.0
+        self.reference_row_v: float = 0.0
+        self.target_row_v: float = 0.0
+        self.candidate_rows_text: str = ""
         self.pattern_steps: List[PatternStep] = []
         self.pattern_index = 0
         self.pattern_completed = False
@@ -1683,6 +1784,9 @@ class MissionManager:
         self.expected_target_offset = 0.0
         self.detected_target_offset = 0.0
         self.target_offset_error = 0.0
+        self.reference_row_v = 0.0
+        self.target_row_v = 0.0
+        self.candidate_rows_text = ""
         self.pattern_completed = False
         self.transition(MissionState.IDLE, "stop requested")
 
@@ -1837,6 +1941,7 @@ class MissionManager:
                     )
                     self.target_map_lane = map_detector.select_target_lane(
                         self.map_lanes,
+                        self.map_row_bands,
                         self.p.row_shift_direction,
                         self.p.row_shift_count,
                     )
@@ -1844,6 +1949,9 @@ class MissionManager:
                     self.expected_target_offset = map_detector.last_expected_target_offset
                     self.detected_target_offset = map_detector.last_detected_target_offset
                     self.target_offset_error = map_detector.last_target_offset_error
+                    self.reference_row_v = map_detector.last_reference_row_v
+                    self.target_row_v = map_detector.last_target_row_v
+                    self.candidate_rows_text = map_detector.last_candidate_rows_text
 
                     if self.target_map_lane is not None:
                         self.active_turn_path = planner.plan_turn_path_to_map_lane(
@@ -1865,7 +1973,7 @@ class MissionManager:
                             # Nur echte, in der SLAM-Map detektierte Zielgassen gelten als final.
                             # Extrapolierte Zielgassen werden gefahren, duerfen aber waehrend
                             # EXECUTE_TURN neu geplant werden, sobald die echte Zielgasse sichtbar wird.
-                            self.active_turn_uses_map_lane = (self.target_map_lane.source == "detected")
+                            self.active_turn_uses_map_lane = self.target_map_lane.source.startswith("detected")
                             self.turn_replan_attempts = 0
                             self.turn_replan_frame_counter = 0
                             self.node.get_logger().info(
@@ -1964,6 +2072,7 @@ class MissionManager:
                     )
                     replanning_target_lane = map_detector.select_target_lane(
                         self.map_lanes,
+                        self.map_row_bands,
                         self.p.row_shift_direction,
                         self.p.row_shift_count,
                     )
@@ -1971,10 +2080,13 @@ class MissionManager:
                     self.expected_target_offset = map_detector.last_expected_target_offset
                     self.detected_target_offset = map_detector.last_detected_target_offset
                     self.target_offset_error = map_detector.last_target_offset_error
+                    self.reference_row_v = map_detector.last_reference_row_v
+                    self.target_row_v = map_detector.last_target_row_v
+                    self.candidate_rows_text = map_detector.last_candidate_rows_text
 
                     if (
                         replanning_target_lane is not None
-                        and replanning_target_lane.source == "detected"
+                        and replanning_target_lane.source.startswith("detected")
                     ):
                         replanned_path = planner.plan_turn_path_to_map_lane(
                             pose_map,
@@ -2530,6 +2642,9 @@ class MaizeNavigator(Node):
             f" | detected_target_offset={self.mission.detected_target_offset:.3f}"
             f" | target_offset_error={self.mission.target_offset_error:.3f}"
             f" | target_lane_reason='{self.mission.last_target_lane_reason}'"
+            f" | reference_row_v={self.mission.reference_row_v:.3f}"
+            f" | target_row_v={self.mission.target_row_v:.3f}"
+            f" | candidate_rows_side='{self.mission.candidate_rows_text}'"
             f" | turn_local_row_stable_frames={self.mission.turn_local_row_stable_frames}"
             f" | turn_replan_attempts={self.mission.turn_replan_attempts}"
             f" | turn_replan_enabled={self.p.turn_replan_enabled}"
