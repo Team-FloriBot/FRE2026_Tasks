@@ -310,6 +310,11 @@ class NavigatorParams:
     # wird der Bogen abgebrochen. Das verhindert, dass 1L/1R eine weitere Reihe ueberspringt.
     headland_shift_overshoot_tolerance: float = 0.08
     headland_yaw_tolerance: float = 0.25
+    # HEADLAND_SHIFT wird in der Map parallel zum Reihenende ausgerichtet.
+    # Die Reihenrichtung wird aus der SLAM-Map per PCA auf belegten Pflanzenpunkten geschaetzt.
+    headland_use_map_row_heading: bool = True
+    headland_heading_kp: float = 1.4
+    headland_heading_max_yaw_error: float = 0.75
 
     entry_curve_speed: float = 0.16
     entry_curve_angular_speed: float = 0.427
@@ -324,6 +329,14 @@ class NavigatorParams:
     entry_shift_accept_tolerance: float = 0.12
     entry_row_min_confidence: float = 0.32
     entry_row_stable_frames: int = 10
+    # Eine lokal erkannte Zielgasse wird erst akzeptiert, wenn sie geometrisch
+    # plausibel ist: beide Begrenzungsreihen sichtbar, Gassenmitte nahe y=0,
+    # Breite passend und Reihenwinkel klein. Das verhindert Einfaedeln gegen
+    # eine einzelne Pflanzenreihe und hilft, mittiger in die neue Gasse zu fahren.
+    entry_require_full_lane: bool = True
+    entry_center_b_tolerance: float = 0.14
+    entry_lane_width_tolerance: float = 0.22
+    entry_row_yaw_tolerance: float = 0.35
 
     # Direkter Nachbargassenwechsel 1L/1R:
     # Beim Einfahren wird die lokale Zielreihe erst akzeptiert, wenn der
@@ -385,6 +398,8 @@ class MapRowDetector:
         self.last_reference_row_v: float = 0.0
         self.last_target_row_v: float = 0.0
         self.last_candidate_rows_text: str = ""
+        self.last_row_yaw_map: Optional[float] = None
+        self.last_row_yaw_confidence: float = 0.0
 
     def detect_lanes(self, grid: Optional[OccupancyGrid], pose: Pose2D) -> Tuple[List[MapLane], List[MapRowBand], str]:
         """Detect plant row lines from occupied SLAM-map cells and derive lane centerlines.
@@ -523,10 +538,48 @@ class MapRowDetector:
         dx = mx - pose.x
         dy = my - pose.y
 
-        cp = math.cos(pose.yaw)
-        sp = math.sin(pose.yaw)
+        # Die Linien der Maisreihen sollen in der SLAM-Map erkannt werden,
+        # auch wenn der Roboter im Vorgewende quer zu den Reihen steht.
+        # Deshalb wird die Reihenrichtung nicht aus pose.yaw abgeleitet,
+        # sondern aus den belegten Kartenpunkten per PCA geschaetzt.
+        row_yaw = pose.yaw
+        self.last_row_yaw_map = None
+        self.last_row_yaw_confidence = 0.0
 
-        # Robot-local map coordinates.
+        if self.p.map_row_use_pca_orientation:
+            radius = max(1.0, float(self.p.map_row_pca_radius))
+            near = (dx * dx + dy * dy) <= radius * radius
+            near_dx = dx[near]
+            near_dy = dy[near]
+
+            if len(near_dx) >= max(10, int(self.p.map_row_pca_min_points)):
+                x0 = near_dx - float(np.mean(near_dx))
+                y0 = near_dy - float(np.mean(near_dy))
+                cov_xx = float(np.mean(x0 * x0))
+                cov_yy = float(np.mean(y0 * y0))
+                cov_xy = float(np.mean(x0 * y0))
+                angle = 0.5 * math.atan2(2.0 * cov_xy, cov_xx - cov_yy)
+
+                # PCA liefert eine Achse ohne Richtung. Fuer konsistente u-Koordinaten
+                # wird die Achse so gewaehlt, dass sie moeglichst zur aktuellen oder
+                # entgegengesetzten Fahrtrichtung passt.
+                if abs(wrap_to_pi(angle + math.pi - pose.yaw)) < abs(wrap_to_pi(angle - pose.yaw)):
+                    angle = wrap_to_pi(angle + math.pi)
+
+                lambda_sum = cov_xx + cov_yy
+                lambda_diff = math.sqrt((cov_xx - cov_yy) ** 2 + 4.0 * cov_xy * cov_xy)
+                conf = clamp(lambda_diff / max(lambda_sum, 1e-6), 0.0, 1.0)
+
+                if conf >= 0.20:
+                    row_yaw = angle
+                    self.last_row_yaw_map = float(row_yaw)
+                    self.last_row_yaw_confidence = float(conf)
+
+        cp = math.cos(row_yaw)
+        sp = math.sin(row_yaw)
+
+        # Row-local map coordinates:
+        # u: entlang der Maisreihen, v: quer ueber die Reihen.
         u = cp * dx + sp * dy
         v = -sp * dx + cp * dy
 
@@ -540,7 +593,7 @@ class MapRowDetector:
         v = v[mask]
 
         if len(u) == 0:
-            return None, None, "no occupied cells inside local map window"
+            return None, None, "no occupied cells inside row-oriented map window"
 
         return u.astype(float), v.astype(float), "ok"
 
@@ -1505,6 +1558,31 @@ class LocalPlanner:
             points.append(PathPoint(float(x), 0.0, 0.0, float(v)))
         return LocalPath(points, True, "base_link", reason)
 
+    def plan_headland_shift_map_heading(
+        self,
+        pose: Pose2D,
+        desired_yaw: float,
+        speed: Optional[float] = None,
+        reason: str = "HEADLAND_SHIFT_MAP",
+    ) -> LocalPath:
+        """Map-frame straight segment used to keep the headland drive parallel to row ends."""
+        v = self.p.headland_shift_speed if speed is None else speed
+        v = clamp(abs(v), 0.0, self.p.max_linear_speed)
+        points: List[PathPoint] = []
+        c = math.cos(desired_yaw)
+        s = math.sin(desired_yaw)
+        for d in np.linspace(0.25, 1.80, 28):
+            dist = float(d)
+            points.append(
+                PathPoint(
+                    float(pose.x + c * dist),
+                    float(pose.y + s * dist),
+                    float(desired_yaw),
+                    float(v),
+                )
+            )
+        return LocalPath(points, True, self.p.map_frame, reason)
+
 
 class PathFollower:
     def __init__(self, params: NavigatorParams):
@@ -2106,6 +2184,50 @@ class MissionManager:
 
         return True
 
+    def _entry_row_geometry_ok(self, row: RowModel) -> bool:
+        if not self.p.entry_require_full_lane:
+            return True
+
+        if not row.valid:
+            return False
+
+        det = row.last_detection
+        if det is None:
+            return False
+
+        both_rows_visible = bool(det.left_valid and det.right_valid)
+        center_ok = abs(row.center_b) <= max(0.02, float(self.p.entry_center_b_tolerance))
+        yaw_ok = abs(row.row_yaw_base) <= max(0.02, float(self.p.entry_row_yaw_tolerance))
+
+        width_ok = True
+        if det.lane_width > 0.05:
+            width_ok = abs(det.lane_width - self.p.expected_row_width) <= max(0.05, float(self.p.entry_lane_width_tolerance))
+
+        return bool(both_rows_visible and center_ok and yaw_ok and width_ok)
+
+    def _desired_headland_shift_yaw(self, pose_map: Pose2D, map_detector: Optional[MapRowDetector]) -> Optional[float]:
+        if not self.p.headland_use_map_row_heading:
+            return None
+
+        if map_detector is None or map_detector.last_row_yaw_map is None:
+            return None
+
+        if map_detector.last_row_yaw_confidence < 0.20:
+            return None
+
+        row_yaw = float(map_detector.last_row_yaw_map)
+        desired = wrap_to_pi(row_yaw + self.headland_direction * math.pi / 2.0)
+
+        # Die Querfahrtrichtung besitzt zwei aequivalente Orientierungen. Waehle die,
+        # die naeher zur aktuellen Roboterausrichtung liegt.
+        if abs(wrap_to_pi(desired + math.pi - pose_map.yaw)) < abs(wrap_to_pi(desired - pose_map.yaw)):
+            desired = wrap_to_pi(desired + math.pi)
+
+        if abs(wrap_to_pi(desired - pose_map.yaw)) > max(0.1, float(self.p.headland_heading_max_yaw_error)):
+            return None
+
+        return desired
+
     def update(
         self,
         row: RowModel,
@@ -2272,6 +2394,14 @@ class MissionManager:
                     reason="ENTRY_CURVE",
                 )
 
+            desired_shift_yaw = self._desired_headland_shift_yaw(pose_map, map_detector)
+            if desired_shift_yaw is not None:
+                return planner.plan_headland_shift_map_heading(
+                    pose_map,
+                    desired_shift_yaw,
+                    reason="HEADLAND_SHIFT_MAP",
+                )
+
             return planner.plan_headland_shift_base_link(reason="HEADLAND_SHIFT")
 
         if self.state == MissionState.ENTRY_CURVE:
@@ -2305,6 +2435,7 @@ class MissionManager:
             self.entry_shift_ok = self._entry_shift_window_ok()
             self.entry_reference_side_ok = self._entry_reference_side_detected(row)
             entry_yaw_ok = self._entry_yaw_ok(pose_map)
+            entry_geometry_ok = self._entry_row_geometry_ok(row)
 
             if self.p.neighbor_reference_entry_requires_shift and self.p.row_shift_count == 1:
                 entry_shift_condition = self.entry_shift_ok
@@ -2320,6 +2451,7 @@ class MissionManager:
                 and entry_shift_condition
                 and entry_yaw_ok
                 and self.entry_reference_side_ok
+                and entry_geometry_ok
             ):
                 self.entry_row_stable_frames += 1
             else:
@@ -2332,7 +2464,7 @@ class MissionManager:
             yaw_progress = self.headland_direction * wrap_to_pi(pose_map.yaw - float(self.entry_curve_start_yaw))
             target_entry_yaw = self._effective_entry_curve_yaw_change()
             if yaw_progress >= target_entry_yaw:
-                self.transition(MissionState.ACQUIRE_ROW, "entry curve completed")
+                self.transition(MissionState.ACQUIRE_ROW, "entry curve completed; target lane not geometrically centered yet")
                 return planner.plan_acquire_row(row)
 
             return planner.plan_constant_curve_base_link(
@@ -2610,12 +2742,15 @@ class MissionManager:
                 yaw_ok_for_follow = self._entry_yaw_ok(pose_map)
                 reference_ok_for_follow = self._entry_reference_side_detected(row)
 
+            geometry_ok_for_follow = self._entry_row_geometry_ok(row) if self.p.headland_maneuver_enabled else True
+
             if (
                 row.valid
                 and row.confidence >= self.p.min_follow_confidence
                 and shift_ok_for_follow
                 and yaw_ok_for_follow
                 and reference_ok_for_follow
+                and geometry_ok_for_follow
             ):
                 self.enter_stable_frames += 1
             else:
@@ -2796,6 +2931,9 @@ class MaizeNavigator(Node):
         p.headland_shift_tolerance = float(declare("headland_shift_tolerance", p.headland_shift_tolerance))
         p.headland_shift_overshoot_tolerance = float(declare("headland_shift_overshoot_tolerance", p.headland_shift_overshoot_tolerance))
         p.headland_yaw_tolerance = float(declare("headland_yaw_tolerance", p.headland_yaw_tolerance))
+        p.headland_use_map_row_heading = bool(declare("headland_use_map_row_heading", p.headland_use_map_row_heading))
+        p.headland_heading_kp = float(declare("headland_heading_kp", p.headland_heading_kp))
+        p.headland_heading_max_yaw_error = float(declare("headland_heading_max_yaw_error", p.headland_heading_max_yaw_error))
         p.entry_curve_speed = float(declare("entry_curve_speed", p.entry_curve_speed))
         p.entry_curve_angular_speed = float(declare("entry_curve_angular_speed", p.entry_curve_angular_speed))
         p.headland_total_yaw_change = float(declare("headland_total_yaw_change", p.headland_total_yaw_change))
@@ -2804,6 +2942,10 @@ class MaizeNavigator(Node):
         p.entry_shift_accept_tolerance = float(declare("entry_shift_accept_tolerance", p.entry_shift_accept_tolerance))
         p.entry_row_min_confidence = float(declare("entry_row_min_confidence", p.entry_row_min_confidence))
         p.entry_row_stable_frames = int(declare("entry_row_stable_frames", p.entry_row_stable_frames))
+        p.entry_require_full_lane = bool(declare("entry_require_full_lane", p.entry_require_full_lane))
+        p.entry_center_b_tolerance = float(declare("entry_center_b_tolerance", p.entry_center_b_tolerance))
+        p.entry_lane_width_tolerance = float(declare("entry_lane_width_tolerance", p.entry_lane_width_tolerance))
+        p.entry_row_yaw_tolerance = float(declare("entry_row_yaw_tolerance", p.entry_row_yaw_tolerance))
         p.neighbor_reference_turn_enabled = bool(declare("neighbor_reference_turn_enabled", p.neighbor_reference_turn_enabled))
         p.neighbor_reference_entry_requires_shift = bool(declare("neighbor_reference_entry_requires_shift", p.neighbor_reference_entry_requires_shift))
         p.neighbor_reference_requires_same_side_row = bool(declare("neighbor_reference_requires_same_side_row", p.neighbor_reference_requires_same_side_row))
@@ -2813,6 +2955,9 @@ class MaizeNavigator(Node):
         p.map_row_search_x_forward = float(declare("map_row_search_x_forward", p.map_row_search_x_forward))
         p.map_row_search_x_backward = float(declare("map_row_search_x_backward", p.map_row_search_x_backward))
         p.map_row_search_y_side = float(declare("map_row_search_y_side", p.map_row_search_y_side))
+        p.map_row_use_pca_orientation = bool(declare("map_row_use_pca_orientation", p.map_row_use_pca_orientation))
+        p.map_row_pca_radius = float(declare("map_row_pca_radius", p.map_row_pca_radius))
+        p.map_row_pca_min_points = int(declare("map_row_pca_min_points", p.map_row_pca_min_points))
         p.map_row_lateral_bin = float(declare("map_row_lateral_bin", p.map_row_lateral_bin))
         p.map_row_min_band_points = int(declare("map_row_min_band_points", p.map_row_min_band_points))
         p.map_row_min_band_length = float(declare("map_row_min_band_length", p.map_row_min_band_length))
@@ -3111,6 +3256,8 @@ class MaizeNavigator(Node):
             f" | headland_exit_forward={self.mission.headland_exit_forward_distance:.3f}"
             f" | headland_pre_entry_target={self.mission._headland_pre_entry_shift_target():.3f}"
             f" | headland_total_yaw_progress={self.mission._headland_total_yaw_progress(pose_map):.3f}"
+            f" | map_row_yaw={self.map_detector.last_row_yaw_map if self.map_detector.last_row_yaw_map is not None else 'None'}"
+            f" | map_row_yaw_conf={self.map_detector.last_row_yaw_confidence:.3f}"
             f" | entry_row_stable_frames={self.mission.entry_row_stable_frames}"
             f" | expected_target_offset={self.mission.expected_target_offset:.3f}"
             f" | detected_target_offset={self.mission.detected_target_offset:.3f}"
@@ -3125,6 +3272,7 @@ class MaizeNavigator(Node):
             f" | turn_exit_on_local_row={self.p.turn_exit_on_local_row}"
             f" | entry_shift_ok={self.mission.entry_shift_ok}"
             f" | entry_reference_side_ok={self.mission.entry_reference_side_ok}"
+            f" | entry_geometry_ok={self.mission._entry_row_geometry_ok(row)}"
             f" | neighbor_reference_enabled={self.p.neighbor_reference_turn_enabled}"
         )
 
