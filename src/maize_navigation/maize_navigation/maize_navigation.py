@@ -261,6 +261,8 @@ class NavigatorParams:
     angular_rate_limit: float = 1.8
 
     lookahead_distance: float = 0.75
+    turn_lookahead_distance: float = 0.32
+    turn_min_angular_speed: float = 0.30
     path_goal_xy_tolerance: float = 0.20
     path_goal_yaw_tolerance: float = 0.40
 
@@ -986,7 +988,7 @@ class LocalPlanner:
                 )
             )
 
-        return LocalPath(odom_points, True, frame_id)
+        return LocalPath(odom_points, True, frame_id, "TURN_GEOMETRIC_UTURN")
 
 
     def plan_turn_path_to_map_lane(self, start: Pose2D, target_lane: MapLane) -> LocalPath:
@@ -1041,7 +1043,7 @@ class LocalPlanner:
             myaw = wrap_to_pi(start.yaw + p.yaw)
             map_points.append(PathPoint(float(mx), float(my), float(myaw), float(p.v)))
 
-        return LocalPath(map_points, True, self.p.map_frame)
+        return LocalPath(map_points, True, self.p.map_frame, "TURN_SLAM_LANE_UTURN")
 
 
 class PathFollower:
@@ -1108,7 +1110,17 @@ class PathFollower:
 
     def compute_cmd_odom(self, path: LocalPath, pose: Pose2D) -> Twist:
         cmd = Twist()
-        target = self.find_lookahead_odom(path.points, pose)
+
+        is_turn_path = path.reason.startswith("TURN")
+
+        if is_turn_path:
+            target = self.find_lookahead_odom(
+                path.points,
+                pose,
+                lookahead_distance=self.p.turn_lookahead_distance,
+            )
+        else:
+            target = self.find_lookahead_odom(path.points, pose)
 
         if target is None:
             return cmd
@@ -1151,18 +1163,35 @@ class PathFollower:
             )
             return cmd
 
-        curvature = 2.0 * math.sin(alpha) / max(self.p.lookahead_distance, 1e-3)
+        lookahead = self.p.turn_lookahead_distance if is_turn_path else self.p.lookahead_distance
+        curvature = 2.0 * math.sin(alpha) / max(lookahead, 1e-3)
 
         v = clamp(target.v, 0.0, self.p.max_linear_speed)
 
         abs_curvature = abs(curvature)
 
-        if abs_curvature > 1.5:
-            v *= 0.45
-        elif abs_curvature > 0.9:
-            v *= 0.65
+        if is_turn_path:
+            # Beim Vorgewende-U-Turn muss aktiv eingelenkt werden.
+            # Zu grosser Lookahead fuehrt sonst zu fast gerader Fahrt entlang des Reihenendes.
+            if abs_curvature > 1.5:
+                v *= 0.70
+            elif abs_curvature > 0.9:
+                v *= 0.85
+        else:
+            if abs_curvature > 1.5:
+                v *= 0.45
+            elif abs_curvature > 0.9:
+                v *= 0.65
 
         w = clamp(v * curvature, -self.p.turn_max_angular_speed, self.p.turn_max_angular_speed)
+
+        if is_turn_path and abs(w) > 1e-4:
+            w = math.copysign(
+                max(abs(w), self.p.turn_min_angular_speed),
+                w,
+            )
+            w = clamp(w, -self.p.turn_max_angular_speed, self.p.turn_max_angular_speed)
+
         w = self.rate_limit(w, self.last_w_odom)
         self.last_w_odom = w
 
@@ -1188,9 +1217,16 @@ class PathFollower:
         max_delta = self.p.angular_rate_limit / self.p.control_frequency
         return clamp(target_w, last_w - max_delta, last_w + max_delta)
 
-    def find_lookahead_odom(self, points: List[PathPoint], pose: Pose2D) -> Optional[PathPoint]:
+    def find_lookahead_odom(
+        self,
+        points: List[PathPoint],
+        pose: Pose2D,
+        lookahead_distance: Optional[float] = None,
+    ) -> Optional[PathPoint]:
         if not points:
             return None
+
+        follow_lookahead = self.p.lookahead_distance if lookahead_distance is None else lookahead_distance
 
         closest_idx = 0
         closest_dist = float("inf")
@@ -1209,7 +1245,7 @@ class PathFollower:
             segment = math.hypot(p1.x - p0.x, p1.y - p0.y)
             acc += segment
 
-            if acc >= self.p.lookahead_distance:
+            if acc >= follow_lookahead:
                 return p1
 
         return points[-1]
@@ -1338,6 +1374,7 @@ class MissionManager:
         self.last_map_row_reason: str = ""
         self.pattern_steps: List[PatternStep] = []
         self.pattern_index = 0
+        self.pattern_completed = False
 
         self.end_stable_frames = 0
         self.enter_stable_frames = 0
@@ -1349,6 +1386,7 @@ class MissionManager:
     def start(self) -> None:
         self.pattern_steps = self.load_pattern()
         self.pattern_index = 0
+        self.pattern_completed = False
         self.apply_current_pattern_step()
         self.started = True
         self.transition(MissionState.FOLLOW_ROW, "start requested")
@@ -1362,6 +1400,7 @@ class MissionManager:
         self.target_map_lane = None
         self.map_lanes = []
         self.map_row_bands = []
+        self.pattern_completed = False
         self.transition(MissionState.IDLE, "stop requested")
 
     def load_pattern(self) -> List[PatternStep]:
@@ -1448,6 +1487,10 @@ class MissionManager:
                 self.end_stable_frames = 0
 
             if self.end_stable_frames >= self.p.end_stable_frames_required:
+                if self.pattern_completed:
+                    self.transition(MissionState.FINISHED, "final row end detected by end_probability")
+                    return LocalPath([], False, "base_link", "pattern complete at final row end")
+
                 self.transition(MissionState.EXIT_ROW, "row end detected by end_probability")
                 return planner.plan_exit_row()
 
@@ -1462,6 +1505,14 @@ class MissionManager:
                 and row.missing_frames >= 18
                 and row.confidence < 0.03
             ):
+                if self.pattern_completed:
+                    self.node.get_logger().warn(
+                        "FOLLOW_ROW fallback: final row lost for several frames, "
+                        "interpreting as final row end and stopping"
+                    )
+                    self.transition(MissionState.FINISHED, "final row lost fallback")
+                    return LocalPath([], False, "base_link", "pattern complete at final row end")
+
                 self.node.get_logger().warn(
                     "FOLLOW_ROW fallback: row lost for several frames, "
                     "interpreting as row end and switching to EXIT_ROW"
@@ -1518,16 +1569,20 @@ class MissionManager:
                             self.active_turn_path = planner.plan_turn_path_map(pose_map)
                             self.target_map_lane = None
                         else:
-                            self.active_turn_uses_map_lane = True
+                            # Nur echte, in der SLAM-Map detektierte Zielgassen gelten als final.
+                            # Extrapolierte Zielgassen werden gefahren, duerfen aber waehrend
+                            # EXECUTE_TURN neu geplant werden, sobald die echte Zielgasse sichtbar wird.
+                            self.active_turn_uses_map_lane = (self.target_map_lane.source == "detected")
                             self.turn_replan_attempts = 0
                             self.turn_replan_frame_counter = 0
                             self.node.get_logger().info(
-                                f"PLAN_TURN ok: target SLAM-map lane v={self.target_map_lane.center_v:.3f} m, "
+                                f"PLAN_TURN ok: target lane v={self.target_map_lane.center_v:.3f} m, "
                                 f"width={self.target_map_lane.width:.3f} m, "
                                 f"source={self.target_map_lane.source}, "
+                                f"final_slam_lane={self.active_turn_uses_map_lane}, "
                                 f"path_points={len(self.active_turn_path.points)}"
                             )
-                            self.transition(MissionState.EXECUTE_TURN, "turn path planned to SLAM map lane")
+                            self.transition(MissionState.EXECUTE_TURN, "turn path planned to target lane")
                             return self.active_turn_path
                     else:
                         # Die Zielgasse kann erst dann aus der SLAM-Map erkannt werden,
@@ -1620,7 +1675,10 @@ class MissionManager:
                         self.p.row_shift_count,
                     )
 
-                    if replanning_target_lane is not None:
+                    if (
+                        replanning_target_lane is not None
+                        and replanning_target_lane.source == "detected"
+                    ):
                         replanned_path = planner.plan_turn_path_to_map_lane(
                             pose_map,
                             replanning_target_lane,
@@ -1692,8 +1750,15 @@ class MissionManager:
                     self.transition(MissionState.FOLLOW_ROW, "stable row following")
                     return planner.plan_follow_row(row)
 
-                self.transition(MissionState.FINISHED, "pattern complete")
-                return LocalPath([], False, "base_link", "pattern complete")
+                # Alle Pattern-Wechsel wurden ausgefuehrt.
+                # Wichtig: Die zuletzt erreichte Gasse wird jetzt noch komplett durchfahren.
+                # Gestoppt wird erst am Ende dieser finalen Gasse.
+                self.pattern_completed = True
+                self.node.get_logger().info(
+                    "All pattern transitions executed. Driving final row; will stop at next row end."
+                )
+                self.transition(MissionState.FOLLOW_ROW, "stable final row following")
+                return planner.plan_follow_row(row)
 
             return planner.plan_enter_row(row)
 
@@ -1831,6 +1896,8 @@ class MaizeNavigator(Node):
         p.angular_rate_limit = float(declare("angular_rate_limit", p.angular_rate_limit))
 
         p.lookahead_distance = float(declare("lookahead_distance", p.lookahead_distance))
+        p.turn_lookahead_distance = float(declare("turn_lookahead_distance", p.turn_lookahead_distance))
+        p.turn_min_angular_speed = float(declare("turn_min_angular_speed", p.turn_min_angular_speed))
         p.path_goal_xy_tolerance = float(declare("path_goal_xy_tolerance", p.path_goal_xy_tolerance))
         p.path_goal_yaw_tolerance = float(declare("path_goal_yaw_tolerance", p.path_goal_yaw_tolerance))
 
@@ -2119,6 +2186,8 @@ class MaizeNavigator(Node):
             f" | map_bands={len(self.mission.map_row_bands)}"
             f" | target_map_lane={target_lane_text}"
             f" | active_turn_uses_map_lane={self.mission.active_turn_uses_map_lane}"
+            f" | pattern_index={self.mission.pattern_index}"
+            f" | pattern_completed={self.mission.pattern_completed}"
             f" | turn_replan_attempts={self.mission.turn_replan_attempts}"
             f" | turn_replan_enabled={self.p.turn_replan_enabled}"
         )
