@@ -86,9 +86,30 @@ maize_navigator:
     map_row_min_band_length: 1.2
     map_row_max_extrapolated_lanes: 3
 
+    # SLAM-Reihenerkennung ueber Linienfit durch belegte Map-Zellen.
+    # Daraus werden Pflanzenreihen und anschliessend Gassenmittelpunkte berechnet.
+    map_row_line_ransac_iterations: 180
+    map_row_line_distance: 0.12
+    map_row_min_line_inliers: 18
+    map_row_min_line_length: 1.20
+    map_row_max_abs_line_slope: 0.70
+    map_row_max_lines: 12
+    map_row_line_merge_distance: 0.22
+
+    # SLAM darf die Zielgasse nur korrigieren, wenn sie zum Pattern passt.
+    # 1L erwartet ca. +0.75 m, 2R ca. -1.50 m, 3R ca. -2.25 m.
+    # Eine erkannte Lane bei z. B. +2.90 m wird fuer 1L verworfen.
+    map_lane_accept_tolerance: 0.45
+
     turn_replan_enabled: true
     turn_replan_period_frames: 5
     turn_replan_max_attempts: 60
+
+    # Wenn die neue Gasse lokal stabil erkannt ist, wird der globale Turn beendet.
+    # Dadurch faehrt der Roboter nicht an der Zielgasse vorbei.
+    turn_exit_on_local_row: true
+    turn_exit_min_confidence: 0.22
+    turn_exit_stable_frames: 5
 
     enable_safety: false
 
