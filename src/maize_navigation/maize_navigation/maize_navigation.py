@@ -337,6 +337,19 @@ class NavigatorParams:
     entry_center_b_tolerance: float = 0.14
     entry_lane_width_tolerance: float = 0.22
     entry_row_yaw_tolerance: float = 0.35
+    # Mehrreihige Einfahrt im Vorgewende: ein Teil des seitlichen Versatzes
+    # entsteht rechnerisch im ENTRY_CURVE. In asymmetrischen Reihenenden kann
+    # dieser Bogen aber zu frueh in die vordere Begrenzungsreihe schneiden.
+    # Fuer 2R/2L/... wird deshalb vor dem Einfahrbogen eine kleine zusaetzliche
+    # Querreserve aufgebaut. 1L/1R bleiben unveraendert, damit sie nicht die
+    # Nachbargasse ueberspringen.
+    multirow_entry_extra_shift: float = 0.18
+    # Wenn die per Reihenzaehlung erkannte Zielgasse bei 2R/2L nach innen
+    # gegenueber dem Pattern-Sollzentrum verschoben ist, wird sie nicht als
+    # Zielzentrum akzeptiert. Das tritt am Reihenende auf, wenn die vordere
+    # Pflanzenreihe in die Gasse hineinragt; dann bleibt das pattern-relative
+    # Zielzentrum massgebend.
+    map_counted_lane_inward_bias_tolerance: float = 0.08
 
     # Direkter Nachbargassenwechsel 1L/1R:
     # Beim Einfahren wird die lokale Zielreihe erst akzeptiert, wenn der
@@ -843,8 +856,16 @@ class MapRowDetector:
             width_min = max(0.05, float(self.p.min_lane_width))
             width_max = max(width_min, float(self.p.max_lane_width))
             width_ok = width_min <= measured_width <= width_max
+            # signed_outward_error > 0: counted lane is farther outward than the
+            # pattern target. signed_outward_error < 0: counted lane is shifted
+            # inward, i.e. back toward the currently driven lane. For multi-row
+            # turns this inward bias is dangerous at the headland because a
+            # protruding front row can pull the target center into the crop.
+            signed_outward_error = sign * (detected_offset - expected_offset)
+            inward_bias_limit = max(0.0, float(self.p.map_counted_lane_inward_bias_tolerance))
+            inward_bias_ok = not (step >= 2 and signed_outward_error < -inward_bias_limit)
 
-            if error <= tolerance and width_ok:
+            if error <= tolerance and width_ok and inward_bias_ok:
                 width = float(measured_width)
                 self.last_target_reason = (
                     f"row-line counted target accepted: direction={direction.upper()}, "
@@ -852,6 +873,7 @@ class MapRowDetector:
                     f"inner_row={inner_row_v:.3f}, outer_row={outer_row_v:.3f}, "
                     f"center={center_v:.3f}, expected={expected_offset:.3f}, "
                     f"error={error:.3f}, width={measured_width:.3f}, "
+                    f"signed_outward_error={signed_outward_error:.3f}, "
                     f"width_range=[{width_min:.3f},{width_max:.3f}], tolerance={tolerance:.3f}, "
                     f"side_rows=[{self.last_candidate_rows_text}]"
                 )
@@ -871,7 +893,9 @@ class MapRowDetector:
                 f"inner_row={inner_row_v:.3f}, outer_row={outer_row_v:.3f}, "
                 f"center={center_v:.3f}, expected={expected_offset:.3f}, "
                 f"error={error:.3f}, width={measured_width:.3f}, "
-                f"width_ok={width_ok}, width_range=[{width_min:.3f},{width_max:.3f}], "
+                f"width_ok={width_ok}, inward_bias_ok={inward_bias_ok}, "
+                f"signed_outward_error={signed_outward_error:.3f}, "
+                f"width_range=[{width_min:.3f},{width_max:.3f}], "
                 f"tolerance={tolerance:.3f}, side_rows=[{self.last_candidate_rows_text}]"
             )
 
@@ -2153,7 +2177,18 @@ class MissionManager:
     def _headland_pre_entry_shift_target(self) -> float:
         required = abs(self.headland_required_shift)
         predicted_entry = abs(self._predicted_entry_lateral_shift())
-        return max(0.0, required - predicted_entry)
+
+        # Bei 2R/2L und groesseren Spruengen darf der Einfahrbogen nicht schon
+        # direkt an der theoretischen Tangente beginnen. Die reale Feldkante ist
+        # am Vorgewende oft versetzt; die vordere Begrenzungsreihe kann in die
+        # neue Gasse hineinragen. Eine kleine Querreserve verlagert den
+        # Bogenbeginn nach aussen und verhindert das Hineinschneiden in diese
+        # Reihe. Direkte Nachbargassenwechsel bleiben ohne Zusatzreserve.
+        extra_shift = 0.0
+        if int(self.p.row_shift_count) >= 2:
+            extra_shift = max(0.0, float(self.p.multirow_entry_extra_shift))
+
+        return max(0.0, required - predicted_entry + extra_shift)
 
     def _headland_shift_reached(self) -> bool:
         required = self._headland_pre_entry_shift_target()
@@ -2440,10 +2475,15 @@ class MissionManager:
             # Gesamtversatz groesser ist als der Pattern-Sollversatz plus
             # Schutztoleranz, wird nicht weiter in die Kurve hineingefahren.
             # Danach wird langsam lokal gesucht, statt weiter seitlich abzudriften.
-            if abs(self.headland_measured_shift) > abs(self.headland_required_shift) + max(0.0, self.p.headland_shift_overshoot_tolerance):
+            overshoot_tolerance = max(0.0, float(self.p.headland_shift_overshoot_tolerance))
+            if int(self.p.row_shift_count) >= 2:
+                overshoot_tolerance += max(0.0, float(self.p.multirow_entry_extra_shift))
+
+            if abs(self.headland_measured_shift) > abs(self.headland_required_shift) + overshoot_tolerance:
                 self.node.get_logger().warn(
                     f"ENTRY_CURVE overshoot guard: measured_shift={self.headland_measured_shift:.3f}, "
-                    f"required_shift={self.headland_required_shift:.3f}. Switching to ACQUIRE_ROW."
+                    f"required_shift={self.headland_required_shift:.3f}, "
+                    f"tolerance={overshoot_tolerance:.3f}. Switching to ACQUIRE_ROW."
                 )
                 self.transition(MissionState.ACQUIRE_ROW, "entry curve overshoot guard")
                 return planner.plan_acquire_row(row)
@@ -3007,6 +3047,8 @@ class MaizeNavigator(Node):
         p.entry_center_b_tolerance = float(declare("entry_center_b_tolerance", p.entry_center_b_tolerance))
         p.entry_lane_width_tolerance = float(declare("entry_lane_width_tolerance", p.entry_lane_width_tolerance))
         p.entry_row_yaw_tolerance = float(declare("entry_row_yaw_tolerance", p.entry_row_yaw_tolerance))
+        p.multirow_entry_extra_shift = float(declare("multirow_entry_extra_shift", p.multirow_entry_extra_shift))
+        p.map_counted_lane_inward_bias_tolerance = float(declare("map_counted_lane_inward_bias_tolerance", p.map_counted_lane_inward_bias_tolerance))
         p.neighbor_reference_turn_enabled = bool(declare("neighbor_reference_turn_enabled", p.neighbor_reference_turn_enabled))
         p.neighbor_reference_entry_requires_shift = bool(declare("neighbor_reference_entry_requires_shift", p.neighbor_reference_entry_requires_shift))
         p.neighbor_reference_requires_same_side_row = bool(declare("neighbor_reference_requires_same_side_row", p.neighbor_reference_requires_same_side_row))
