@@ -350,8 +350,13 @@ class NavigatorParams:
     map_row_detection_enabled: bool = True
     map_row_occupancy_threshold: int = 50
     map_row_search_x_forward: float = 4.0
-    map_row_search_x_backward: float = 1.0
+    map_row_search_x_backward: float = 4.0
     map_row_search_y_side: float = 4.0
+    # Reihenrichtung aus belegten SLAM-Map-Punkten schaetzen.
+    # Wichtig im Vorgewende: dort ist die Roboter-Yaw nicht mehr parallel zur Reihenrichtung.
+    map_row_use_pca_orientation: bool = True
+    map_row_pca_radius: float = 5.0
+    map_row_pca_min_points: int = 80
     map_row_lateral_bin: float = 0.10
     map_row_min_band_points: int = 12
     map_row_min_band_length: float = 1.2
