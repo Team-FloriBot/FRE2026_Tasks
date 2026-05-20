@@ -50,15 +50,17 @@ maize_navigator:
     follow_speed: 0.35
     slow_speed: 0.12
     enter_speed: 0.22
-    turn_speed: 0.28
+    turn_speed: 0.24
 
     max_linear_speed: 0.45
-    max_angular_speed: 1.20
+    max_angular_speed: 1.40
     follow_max_angular_speed: 0.90
-    turn_max_angular_speed: 1.00
-    angular_rate_limit: 1.8
+    turn_max_angular_speed: 1.40
+    angular_rate_limit: 2.8
 
     lookahead_distance: 0.75
+    turn_lookahead_distance: 0.32
+    turn_min_angular_speed: 0.30
 
     path_goal_xy_tolerance: 0.20
     path_goal_yaw_tolerance: 0.40
@@ -68,7 +70,7 @@ maize_navigator:
     min_turn_radius: 0.38
     enter_distance: 0.90
 
-    pattern: "1L 2R 2L 3R"
+    pattern: "1L 2R 1L 3R"
 
     row_shift_count: 1
     row_shift_direction: "L"
@@ -76,9 +78,9 @@ maize_navigator:
 
     map_row_detection_enabled: true
     map_row_occupancy_threshold: 50
-    map_row_search_x_forward: 4.0
+    map_row_search_x_forward: 5.0
     map_row_search_x_backward: 1.0
-    map_row_search_y_side: 4.0
+    map_row_search_y_side: 5.0
     map_row_lateral_bin: 0.10
     map_row_min_band_points: 12
     map_row_min_band_length: 1.2
