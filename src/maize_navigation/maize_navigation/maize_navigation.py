@@ -357,6 +357,14 @@ class NavigatorParams:
     # Pflanzenreihe in die Gasse hineinragt; dann bleibt das pattern-relative
     # Zielzentrum massgebend.
     map_counted_lane_inward_bias_tolerance: float = 0.08
+    # Bei Mehrreihensprüngen ist die Map-Querposition am Einfahren weniger
+    # belastbar als die lokale Reihenhypothese: durch U-Turn-Geometrie,
+    # Schlupf und Reihenanfangs-Asymmetrie kann der gemessene Versatz um
+    # ungefähr eine Gassenbreite überschießen. Das darf ACQUIRE_ROW nicht
+    # blockieren, sobald die lokale Reihe stabil und gerade ist.
+    multirow_entry_shift_overshoot_rows: float = 1.50
+    multirow_local_takeover_min_yaw_progress: float = 2.00
+    multirow_local_takeover_min_confidence: float = 0.55
 
     # Direkter Nachbargassenwechsel 1L/1R:
     # Beim Einfahren wird die lokale Zielreihe erst akzeptiert, wenn der
@@ -2209,7 +2217,26 @@ class MissionManager:
         measured = abs(self.headland_measured_shift)
         if required <= 1e-6:
             return True
-        return abs(measured - required) <= max(0.0, self.p.entry_shift_accept_tolerance)
+
+        tolerance = max(0.0, float(self.p.entry_shift_accept_tolerance))
+
+        # Für direkte Nachbargassenwechsel muss die Querposition eng um das
+        # Sollzentrum liegen; sonst wird leicht eine Reihe übersprungen.
+        if int(self.p.row_shift_count) <= 1:
+            return abs(measured - required) <= tolerance
+
+        # Bei 2R/3R/... darf ein moderater Überschuss nicht dazu führen, dass
+        # ACQUIRE_ROW minutenlang geradeaus weiterfährt. Genau das erzeugte im
+        # 3R-Log den Drift: required=2.25 m, measured≈3.0 m, lokale Reihe stabil,
+        # aber entry_shift_ok blieb false. Mehrreihige Turns akzeptieren deshalb
+        # "Sollversatz erreicht" plus begrenzten Überschuss. Die Begrenzung
+        # verhindert, dass eine komplett falsche Gasse übernommen wird.
+        max_overshoot = max(
+            tolerance,
+            max(0.0, float(self.p.multirow_entry_shift_overshoot_rows))
+            * max(0.05, float(self.p.expected_row_width)),
+        )
+        return (measured >= required - tolerance) and (measured <= required + max_overshoot)
 
     def _headland_total_yaw_progress(self, pose_map: Optional[Pose2D]) -> float:
         if pose_map is None or self.exit_curve_start_yaw is None:
@@ -2289,16 +2316,61 @@ class MissionManager:
         yaw_ok = abs(row.row_yaw_base) <= max(0.02, float(self.p.entry_relaxed_row_yaw_tolerance))
         return bool(center_ok and yaw_ok)
 
+    def _entry_local_row_takeover_ok(self, row: RowModel, pose_map: Optional[Pose2D]) -> bool:
+        if int(self.p.row_shift_count) < 2:
+            return False
+
+        if not row.valid:
+            return False
+
+        min_conf = max(
+            float(self.p.entry_row_min_confidence),
+            float(self.p.multirow_local_takeover_min_confidence),
+        )
+        if row.confidence < min_conf:
+            return False
+
+        if not self._entry_row_relaxed_geometry_ok(row):
+            return False
+
+        progress = self._headland_total_yaw_progress(pose_map)
+        min_progress = max(0.0, float(self.p.multirow_local_takeover_min_yaw_progress))
+        return progress >= min_progress
+
+    def _entry_yaw_or_local_row_ok(self, row: RowModel, pose_map: Optional[Pose2D]) -> bool:
+        if self._entry_yaw_ok(pose_map):
+            return True
+
+        # Bei 3R war die lokale Reihe bereits mit hoher Konfidenz erfasst, der
+        # entrollte Gesamt-Gierfortschritt lag aber noch bei ca. 2.23 rad. Das
+        # blockierte ACQUIRE_ROW, obwohl das Weiterfahren ohne Reihenführung den
+        # Roboter quer aus der Gasse driften ließ. Eine stabile, mittige und
+        # gerade lokale Reihenhypothese darf deshalb den restlichen Yaw-Fehler
+        # übernehmen.
+        return self._entry_local_row_takeover_ok(row, pose_map)
+
+    def _multirow_safe_acquire_steering_ok(self, row: RowModel, shift_ok: bool) -> bool:
+        if int(self.p.row_shift_count) < 2:
+            return False
+        if not shift_ok:
+            return False
+        if not row.valid:
+            return False
+        return row.confidence >= max(
+            float(self.p.entry_row_min_confidence),
+            float(self.p.multirow_local_takeover_min_confidence),
+        )
+
     def _entry_geometry_accept_ok(self, row: RowModel, shift_ok: bool, yaw_ok: bool) -> bool:
         if self._entry_row_geometry_ok(row):
             return True
 
         # Fuer 2R/2L und groessere Spruenge verhindert die volle Gassenpruefung
         # das fruehe Einhaken in eine einzelne Reihe. Sobald der pattern-relative
-        # Versatz und die U-Turn-Ausrichtung aber erreicht sind, darf eine
-        # plausible lokale Reihenhypothese die Uebergabe ausloesen. Sonst bleibt
-        # ACQUIRE_ROW am Reihenanfang stehen, wenn nur eine Begrenzungsreihe im
-        # Sichtfeld liegt.
+        # Versatz und die U-Turn-Ausrichtung bzw. eine stabile lokale
+        # Reihenhypothese erreicht sind, darf die Uebergabe ausloesen. Sonst
+        # bleibt ACQUIRE_ROW am Reihenanfang stehen, wenn nur eine Begrenzungsreihe
+        # im Sichtfeld liegt.
         if int(self.p.row_shift_count) >= 2 and shift_ok and yaw_ok:
             return self._entry_row_relaxed_geometry_ok(row)
 
@@ -2538,7 +2610,7 @@ class MissionManager:
 
             self.entry_shift_ok = self._entry_shift_window_ok()
             self.entry_reference_side_ok = self._entry_reference_side_detected(row)
-            entry_yaw_ok = self._entry_yaw_ok(pose_map)
+            entry_yaw_ok = self._entry_yaw_or_local_row_ok(row, pose_map)
             entry_geometry_ok = self._entry_geometry_accept_ok(row, self.entry_shift_ok, entry_yaw_ok)
 
             if self.p.neighbor_reference_entry_requires_shift and self.p.row_shift_count == 1:
@@ -2820,7 +2892,7 @@ class MissionManager:
                 if pose_map is not None and self.headland_start_pose_map is not None:
                     self._update_headland_measured_shift(pose_map)
                 acquire_shift_ok = self._entry_shift_window_ok()
-                acquire_yaw_ok = self._entry_yaw_ok(pose_map)
+                acquire_yaw_ok = self._entry_yaw_or_local_row_ok(row, pose_map)
                 acquire_reference_ok = self._entry_reference_side_detected(row)
                 acquire_geometry_ok = self._entry_geometry_accept_ok(row, acquire_shift_ok, acquire_yaw_ok)
 
@@ -2854,11 +2926,15 @@ class MissionManager:
                     self.acquire_start_time = self.node.get_clock().now()
 
             # Critical safety guard: do not let ACQUIRE_ROW follow a single or
-            # geometrically invalid row. In the 2R logs entry_geometry_ok=False
-            # while row_confidence was already 1.0; following that model steers
-            # directly onto the plant row. Drive slowly straight until a full,
-            # centered lane is visible.
+            # geometrically invalid row too early. Bei 3R war der Sollversatz
+            # jedoch bereits erreicht/überschritten und die lokale Reihe stabil;
+            # weiteres Geradeausfahren ohne Reihenregelung ließ den Roboter aus
+            # der Gasse driften. Für Mehrreihensprünge wird dann langsam mit der
+            # lokalen Reihenhypothese nachgeführt, statt stur geradeaus weiter zu
+            # fahren.
             if self.p.headland_maneuver_enabled and self.headland_required_shift != 0.0 and not acquire_row_ok:
+                if self._multirow_safe_acquire_steering_ok(row, acquire_shift_ok):
+                    return planner.plan_acquire_row(row)
                 return planner.plan_headland_shift_base_link(
                     speed=min(self.p.enter_speed, self.p.slow_speed),
                     reason="ACQUIRE_ROW_WAIT_FULL_LANE",
@@ -2876,7 +2952,7 @@ class MissionManager:
 
             if self.p.headland_maneuver_enabled and self.headland_required_shift != 0.0:
                 shift_ok_for_follow = self._entry_shift_window_ok()
-                yaw_ok_for_follow = self._entry_yaw_ok(pose_map)
+                yaw_ok_for_follow = self._entry_yaw_or_local_row_ok(row, pose_map)
                 reference_ok_for_follow = self._entry_reference_side_detected(row)
 
             geometry_ok_for_follow = (
@@ -2914,11 +2990,13 @@ class MissionManager:
                 self.transition(MissionState.FOLLOW_ROW, "stable final row following")
                 return planner.plan_follow_row(row)
 
-            # Same guard as ACQUIRE_ROW: while the target lane is not a full,
-            # centered, plausible lane, do not use the row model as steering
-            # reference. Otherwise the robot can lock onto one crop row and drive
-            # over it during 2R.
+            # Same guard as ACQUIRE_ROW. Bei Mehrreihensprüngen darf eine stabile
+            # lokale Reihe nach erreichtem Sollversatz weiter als Lenkreferenz
+            # dienen, auch wenn die vollständige Gassengeometrie noch nicht
+            # bestätigt ist.
             if self.p.headland_maneuver_enabled and self.headland_required_shift != 0.0 and not enter_guards_ok:
+                if self._multirow_safe_acquire_steering_ok(row, shift_ok_for_follow):
+                    return planner.plan_enter_row(row)
                 return planner.plan_headland_shift_base_link(
                     speed=min(self.p.enter_speed, self.p.slow_speed),
                     reason="ENTER_ROW_WAIT_FULL_LANE",
@@ -3103,6 +3181,9 @@ class MaizeNavigator(Node):
         p.entry_relaxed_center_b_tolerance = float(declare("entry_relaxed_center_b_tolerance", p.entry_relaxed_center_b_tolerance))
         p.entry_relaxed_row_yaw_tolerance = float(declare("entry_relaxed_row_yaw_tolerance", p.entry_relaxed_row_yaw_tolerance))
         p.multirow_entry_extra_shift = float(declare("multirow_entry_extra_shift", p.multirow_entry_extra_shift))
+        p.multirow_entry_shift_overshoot_rows = float(declare("multirow_entry_shift_overshoot_rows", p.multirow_entry_shift_overshoot_rows))
+        p.multirow_local_takeover_min_yaw_progress = float(declare("multirow_local_takeover_min_yaw_progress", p.multirow_local_takeover_min_yaw_progress))
+        p.multirow_local_takeover_min_confidence = float(declare("multirow_local_takeover_min_confidence", p.multirow_local_takeover_min_confidence))
         p.map_counted_lane_inward_bias_tolerance = float(declare("map_counted_lane_inward_bias_tolerance", p.map_counted_lane_inward_bias_tolerance))
         p.neighbor_reference_turn_enabled = bool(declare("neighbor_reference_turn_enabled", p.neighbor_reference_turn_enabled))
         p.neighbor_reference_entry_requires_shift = bool(declare("neighbor_reference_entry_requires_shift", p.neighbor_reference_entry_requires_shift))
