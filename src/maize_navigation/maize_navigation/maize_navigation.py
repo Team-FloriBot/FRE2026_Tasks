@@ -301,14 +301,23 @@ class NavigatorParams:
     exit_curve_yaw_change: float = 1.35
 
     headland_shift_speed: float = 0.22
-    headland_shift_tolerance: float = 0.12
+    headland_shift_tolerance: float = 0.05
     headland_yaw_tolerance: float = 0.25
 
     entry_curve_speed: float = 0.16
     entry_curve_angular_speed: float = 0.50
     entry_curve_yaw_change: float = 1.35
-    entry_row_min_confidence: float = 0.22
-    entry_row_stable_frames: int = 5
+    entry_row_min_confidence: float = 0.32
+    entry_row_stable_frames: int = 10
+
+    # Direkter Nachbargassenwechsel 1L/1R:
+    # Beim Einfahren wird die lokale Zielreihe erst akzeptiert, wenn der
+    # pattern-relative Versatz wirklich erreicht ist und die Maisreihe auf
+    # der erwarteten Seite sichtbar ist. Dadurch wird verhindert, dass 1L/1R
+    # eine Reihe zu weit springt.
+    neighbor_reference_turn_enabled: bool = True
+    neighbor_reference_entry_requires_shift: bool = True
+    neighbor_reference_requires_same_side_row: bool = True
 
     map_row_detection_enabled: bool = True
     map_row_occupancy_threshold: int = 50
@@ -340,8 +349,8 @@ class NavigatorParams:
     # Wenn die neue Gasse lokal mit LiDAR stabil erkannt wird, wird EXECUTE_TURN beendet.
     # Dadurch faehrt der Roboter nicht an der richtigen Gasse vorbei.
     turn_exit_on_local_row: bool = True
-    turn_exit_min_confidence: float = 0.22
-    turn_exit_stable_frames: int = 5
+    turn_exit_min_confidence: float = 0.32
+    turn_exit_stable_frames: int = 10
 
     enable_safety: bool = False
 
@@ -1814,6 +1823,8 @@ class MissionManager:
         self.headland_required_shift: float = 0.0
         self.headland_measured_shift: float = 0.0
         self.entry_row_stable_frames: int = 0
+        self.entry_reference_side_ok: bool = False
+        self.entry_shift_ok: bool = False
 
         self.map_lanes: List[MapLane] = []
         self.map_row_bands: List[MapRowBand] = []
@@ -1859,6 +1870,8 @@ class MissionManager:
         self.headland_required_shift = 0.0
         self.headland_measured_shift = 0.0
         self.entry_row_stable_frames = 0
+        self.entry_reference_side_ok = False
+        self.entry_shift_ok = False
         self.target_map_lane = None
         self.map_lanes = []
         self.map_row_bands = []
@@ -1943,6 +1956,8 @@ class MissionManager:
         if new_state == MissionState.ENTRY_CURVE:
             self.entry_curve_start_yaw = None
             self.entry_row_stable_frames = 0
+            self.entry_reference_side_ok = False
+            self.entry_shift_ok = False
 
         if new_state == MissionState.ACQUIRE_ROW:
             self.acquire_start_time = self.node.get_clock().now()
@@ -1961,6 +1976,35 @@ class MissionManager:
 
         if new_state == MissionState.ENTER_ROW:
             self.turn_local_row_stable_frames = 0
+
+    def _headland_shift_reached(self) -> bool:
+        required = abs(self.headland_required_shift)
+        measured = abs(self.headland_measured_shift)
+        if required <= 1e-6:
+            return True
+        return measured >= required - max(0.0, self.p.headland_shift_tolerance)
+
+    def _entry_reference_side_detected(self, row: RowModel) -> bool:
+        if not self.p.neighbor_reference_turn_enabled:
+            return True
+
+        if self.p.row_shift_count != 1:
+            return True
+
+        if not self.p.neighbor_reference_requires_same_side_row:
+            return True
+
+        det = row.last_detection
+        if det is None:
+            return False
+
+        direction = self.p.row_shift_direction.upper()
+        if direction == "L":
+            return bool(det.left_valid)
+        if direction == "R":
+            return bool(det.right_valid)
+
+        return True
 
     def update(
         self,
@@ -2125,15 +2169,31 @@ class MissionManager:
                 self.entry_row_stable_frames = 0
 
             # Sobald die Zielgasse lokal stabil sichtbar ist, uebernimmt die
-            # vorhandene gute Einfahr-/Reihenfuehrung. Dadurch faehrt der Roboter
-            # nicht an der richtigen Gasse vorbei.
-            if row.valid and row.confidence >= self.p.entry_row_min_confidence:
+            # vorhandene gute Einfahr-/Reihenfuehrung.
+            # Fuer direkte Nachbargassenwechsel 1L/1R wird die lokale Reihe aber
+            # erst akzeptiert, wenn der geforderte seitliche Versatz erreicht ist
+            # und die Maisreihe auf der erwarteten Seite sichtbar ist. Das verhindert,
+            # dass eine frueh erkannte falsche Struktur als Zielgasse genommen wird.
+            self.entry_shift_ok = self._headland_shift_reached()
+            self.entry_reference_side_ok = self._entry_reference_side_detected(row)
+
+            if self.p.neighbor_reference_entry_requires_shift and self.p.row_shift_count == 1:
+                entry_shift_condition = self.entry_shift_ok
+            else:
+                entry_shift_condition = True
+
+            if (
+                row.valid
+                and row.confidence >= self.p.entry_row_min_confidence
+                and entry_shift_condition
+                and self.entry_reference_side_ok
+            ):
                 self.entry_row_stable_frames += 1
             else:
                 self.entry_row_stable_frames = 0
 
             if self.entry_row_stable_frames >= max(1, self.p.entry_row_stable_frames):
-                self.transition(MissionState.ENTER_ROW, "target row detected during entry curve")
+                self.transition(MissionState.ENTER_ROW, "target row detected during entry curve with reference-side check")
                 return planner.plan_enter_row(row)
 
             yaw_progress = self.headland_direction * wrap_to_pi(pose_map.yaw - float(self.entry_curve_start_yaw))
@@ -2586,6 +2646,9 @@ class MaizeNavigator(Node):
         p.entry_curve_yaw_change = float(declare("entry_curve_yaw_change", p.entry_curve_yaw_change))
         p.entry_row_min_confidence = float(declare("entry_row_min_confidence", p.entry_row_min_confidence))
         p.entry_row_stable_frames = int(declare("entry_row_stable_frames", p.entry_row_stable_frames))
+        p.neighbor_reference_turn_enabled = bool(declare("neighbor_reference_turn_enabled", p.neighbor_reference_turn_enabled))
+        p.neighbor_reference_entry_requires_shift = bool(declare("neighbor_reference_entry_requires_shift", p.neighbor_reference_entry_requires_shift))
+        p.neighbor_reference_requires_same_side_row = bool(declare("neighbor_reference_requires_same_side_row", p.neighbor_reference_requires_same_side_row))
 
         p.map_row_detection_enabled = bool(declare("map_row_detection_enabled", p.map_row_detection_enabled))
         p.map_row_occupancy_threshold = int(declare("map_row_occupancy_threshold", p.map_row_occupancy_threshold))
@@ -2899,6 +2962,9 @@ class MaizeNavigator(Node):
             f" | turn_replan_attempts={self.mission.turn_replan_attempts}"
             f" | turn_replan_enabled={self.p.turn_replan_enabled}"
             f" | turn_exit_on_local_row={self.p.turn_exit_on_local_row}"
+            f" | entry_shift_ok={self.mission.entry_shift_ok}"
+            f" | entry_reference_side_ok={self.mission.entry_reference_side_ok}"
+            f" | neighbor_reference_enabled={self.p.neighbor_reference_turn_enabled}"
         )
 
         msg = String()
