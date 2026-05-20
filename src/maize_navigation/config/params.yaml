@@ -99,6 +99,9 @@ maize_navigator:
     # SLAM darf die Zielgasse nur korrigieren, wenn sie zum Pattern passt.
     # 1L erwartet ca. +0.75 m, 2R ca. -1.50 m, 3R ca. -2.25 m.
     # Eine erkannte Lane bei z. B. +2.90 m wird fuer 1L verworfen.
+    # Toleranz fuer pattern-relatives Zählen der SLAM-Reihenlinien.
+    # Beispiel 2R: Zielzentrum ca. -1.50 m relativ zur aktuellen Gasse.
+    # Eine weiter entfernte Linie/Gasse wird verworfen und nicht als Ziel akzeptiert.
     map_lane_accept_tolerance: 0.45
 
     turn_replan_enabled: true
