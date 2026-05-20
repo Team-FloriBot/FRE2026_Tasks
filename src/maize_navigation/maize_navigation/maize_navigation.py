@@ -146,6 +146,18 @@ class MapRowBand:
 
 
 @dataclass
+class MapRowLine:
+    valid: bool = False
+    a: float = 0.0
+    b: float = 0.0
+    yaw: float = 0.0
+    inliers: int = 0
+    length: float = 0.0
+    lateral_v: float = 0.0
+    confidence: float = 0.0
+
+
+@dataclass
 class MapLane:
     valid: bool = False
     center_v: float = 0.0
@@ -285,9 +297,28 @@ class NavigatorParams:
     map_row_min_band_length: float = 1.2
     map_row_max_extrapolated_lanes: int = 3
 
+    # SLAM-Reihenerkennung ueber Linienfit durch belegte Map-Zellen.
+    map_row_line_ransac_iterations: int = 180
+    map_row_line_distance: float = 0.12
+    map_row_min_line_inliers: int = 18
+    map_row_min_line_length: float = 1.20
+    map_row_max_abs_line_slope: float = 0.70
+    map_row_max_lines: int = 12
+    map_row_line_merge_distance: float = 0.22
+
+    # SLAM-Zielgassen duerfen das Pattern nur korrigieren, nicht beliebig weit ueberschreiben.
+    # Beispiel: 1L erwartet ca. +expected_row_width. Eine erkannte Lane bei +3 m wird verworfen.
+    map_lane_accept_tolerance: float = 0.45
+
     turn_replan_enabled: bool = True
     turn_replan_period_frames: int = 5
     turn_replan_max_attempts: int = 60
+
+    # Wenn die neue Gasse lokal mit LiDAR stabil erkannt wird, wird EXECUTE_TURN beendet.
+    # Dadurch faehrt der Roboter nicht an der richtigen Gasse vorbei.
+    turn_exit_on_local_row: bool = True
+    turn_exit_min_confidence: float = 0.22
+    turn_exit_stable_frames: int = 5
 
     enable_safety: bool = False
 
@@ -300,39 +331,138 @@ class NavigatorParams:
 class MapRowDetector:
     def __init__(self, params: NavigatorParams):
         self.p = params
+        self.last_target_reason: str = "not evaluated"
+        self.last_expected_target_offset: float = 0.0
+        self.last_detected_target_offset: float = 0.0
+        self.last_target_offset_error: float = 0.0
 
     def detect_lanes(self, grid: Optional[OccupancyGrid], pose: Pose2D) -> Tuple[List[MapLane], List[MapRowBand], str]:
+        """Detect plant row lines from occupied SLAM-map cells and derive lane centerlines.
+
+        The map is transformed into the robot-local frame:
+        u = forward along the currently driven row direction,
+        v = left/right across the rows.
+
+        We do not search for free space. We fit lines through occupied plant cells.
+        Neighboring plant-row lines form a lane. The lane center_v is therefore
+        the center between two fitted plant rows.
+        """
         if grid is None:
             return [], [], "no OccupancyGrid"
 
         if not self.p.map_row_detection_enabled:
             return [], [], "map row detection disabled"
 
+        u, v, reason = self._occupied_points_local(grid, pose)
+        if u is None or v is None:
+            return [], [], reason
+
+        if len(u) < self.p.map_row_min_line_inliers:
+            return [], [], f"not enough occupied cells in local map window: {len(u)}"
+
+        row_lines = self._fit_row_lines(u, v)
+        row_lines = self._merge_row_lines(row_lines)
+        row_lines.sort(key=lambda line: line.lateral_v)
+
+        # Keep MapRowBand for existing diagnostics/visual language. Each band now
+        # represents one fitted plant-row line, not a pure lateral histogram band.
+        bands = [
+            MapRowBand(
+                valid=True,
+                lateral_v=float(line.lateral_v),
+                u_min=-0.5 * float(line.length),
+                u_max=0.5 * float(line.length),
+                points=int(line.inliers),
+            )
+            for line in row_lines
+        ]
+
+        if len(row_lines) < 2:
+            return [], bands, f"not enough row lines fitted: {len(row_lines)}"
+
+        lanes: List[MapLane] = []
+
+        for right, left in zip(row_lines[:-1], row_lines[1:]):
+            width_v = left.lateral_v - right.lateral_v
+
+            if not (self.p.min_lane_width <= width_v <= self.p.max_lane_width):
+                continue
+
+            slope_error = abs(left.a - right.a)
+            parallel_score = clamp(1.0 - slope_error / 0.35, 0.0, 1.0)
+
+            width_error = abs(width_v - self.p.expected_row_width)
+            width_score = clamp(1.0 - width_error / max(self.p.expected_row_width, 1e-3), 0.0, 1.0)
+
+            length_score = clamp(
+                min(left.length, right.length) / max(self.p.map_row_min_line_length, 1e-3),
+                0.0,
+                1.0,
+            )
+
+            inlier_score = clamp(
+                min(left.inliers, right.inliers) / max(float(self.p.map_row_min_line_inliers), 1.0),
+                0.0,
+                1.0,
+            )
+
+            confidence = clamp(
+                0.30 * parallel_score
+                + 0.30 * width_score
+                + 0.25 * length_score
+                + 0.15 * inlier_score,
+                0.0,
+                1.0,
+            )
+
+            lanes.append(
+                MapLane(
+                    valid=True,
+                    center_v=0.5 * (right.lateral_v + left.lateral_v),
+                    left_row_v=left.lateral_v,
+                    right_row_v=right.lateral_v,
+                    width=width_v,
+                    confidence=confidence,
+                    source="detected_linefit",
+                )
+            )
+
+        lanes.sort(key=lambda lane: lane.center_v)
+
+        if len(lanes) == 0:
+            return [], bands, f"row lines fitted, but no valid lane gap: lines={len(row_lines)}"
+
+        return lanes, bands, f"ok: linefit rows={len(row_lines)}, lanes={len(lanes)}"
+
+    def _occupied_points_local(
+        self,
+        grid: OccupancyGrid,
+        pose: Pose2D,
+    ) -> Tuple[Optional[np.ndarray], Optional[np.ndarray], str]:
         width = int(grid.info.width)
         height = int(grid.info.height)
         resolution = float(grid.info.resolution)
 
         if width <= 0 or height <= 0 or resolution <= 0.0:
-            return [], [], "invalid OccupancyGrid metadata"
+            return None, None, "invalid OccupancyGrid metadata"
 
         data = np.asarray(grid.data, dtype=np.int16).reshape((height, width))
         occ_r, occ_c = np.where(data >= int(self.p.map_row_occupancy_threshold))
 
         if len(occ_r) == 0:
-            return [], [], "no occupied map cells"
+            return None, None, "no occupied map cells"
+
+        # Deterministic downsampling for real-time behavior on large maps.
+        max_cells = 35000
+        if len(occ_r) > max_cells:
+            idx = np.linspace(0, len(occ_r) - 1, max_cells).astype(int)
+            occ_r = occ_r[idx]
+            occ_c = occ_c[idx]
 
         origin = grid.info.origin
         origin_yaw = yaw_from_quaternion(origin.orientation)
         co = math.cos(origin_yaw)
         so = math.sin(origin_yaw)
-
-        # Begrenze die Punktzahl deterministisch, damit die Erkennung auch bei grossen Maps
-        # in Echtzeit bleibt. Die Auswahl ist gleichmaessig ueber die belegten Zellen verteilt.
-        max_cells = 25000
-        if len(occ_r) > max_cells:
-            idx = np.linspace(0, len(occ_r) - 1, max_cells).astype(int)
-            occ_r = occ_r[idx]
-            occ_c = occ_c[idx]
 
         gx = (occ_c.astype(float) + 0.5) * resolution
         gy = (occ_r.astype(float) + 0.5) * resolution
@@ -346,9 +476,7 @@ class MapRowDetector:
         cp = math.cos(pose.yaw)
         sp = math.sin(pose.yaw)
 
-        # Lokales Koordinatensystem am Roboter:
-        # u = vorwaerts entlang aktueller Reihenrichtung
-        # v = links quer zur Reihenrichtung
+        # Robot-local map coordinates.
         u = cp * dx + sp * dy
         v = -sp * dx + cp * dy
 
@@ -361,64 +489,164 @@ class MapRowDetector:
         u = u[mask]
         v = v[mask]
 
-        if len(u) < self.p.map_row_min_band_points:
-            return [], [], f"not enough occupied cells in local map window: {len(u)}"
+        if len(u) == 0:
+            return None, None, "no occupied cells inside local map window"
 
-        order = np.argsort(v)
-        u_sorted = u[order]
-        v_sorted = v[order]
+        return u.astype(float), v.astype(float), "ok"
 
-        raw_bands: List[MapRowBand] = []
-        start = 0
-        merge_gap = max(self.p.map_row_lateral_bin, 0.03)
+    def _fit_row_lines(self, u: np.ndarray, v: np.ndarray) -> List[MapRowLine]:
+        lines: List[MapRowLine] = []
 
-        for i in range(1, len(v_sorted)):
-            if abs(float(v_sorted[i] - v_sorted[i - 1])) > merge_gap:
-                raw_bands.append(self._make_band(u_sorted[start:i], v_sorted[start:i]))
-                start = i
+        remaining_u = np.asarray(u, dtype=float)
+        remaining_v = np.asarray(v, dtype=float)
 
-        raw_bands.append(self._make_band(u_sorted[start:], v_sorted[start:]))
+        rng = random.Random(42)
+        max_lines = max(1, int(self.p.map_row_max_lines))
 
-        bands = [
-            b for b in raw_bands
-            if b.valid
-            and b.points >= self.p.map_row_min_band_points
-            and (b.u_max - b.u_min) >= self.p.map_row_min_band_length
-        ]
-        bands.sort(key=lambda b: b.lateral_v)
+        for _ in range(max_lines):
+            if len(remaining_u) < self.p.map_row_min_line_inliers:
+                break
 
-        if len(bands) < 2:
-            return [], bands, f"not enough row bands detected: {len(bands)}"
+            line, inlier_mask = self._fit_one_line_ransac(remaining_u, remaining_v, rng)
 
-        lanes: List[MapLane] = []
+            if not line.valid or inlier_mask is None:
+                break
 
-        for right, left in zip(bands[:-1], bands[1:]):
-            width_v = left.lateral_v - right.lateral_v
-            if self.p.min_lane_width <= width_v <= self.p.max_lane_width:
-                overlap = max(0.0, min(right.u_max, left.u_max) - max(right.u_min, left.u_min))
-                length_score = clamp(overlap / max(self.p.map_row_min_band_length, 1e-3), 0.0, 1.0)
-                width_error = abs(width_v - self.p.expected_row_width)
-                width_score = clamp(1.0 - width_error / max(self.p.expected_row_width, 1e-3), 0.0, 1.0)
-                confidence = clamp(0.55 * length_score + 0.45 * width_score, 0.0, 1.0)
-                lanes.append(
-                    MapLane(
-                        valid=True,
-                        center_v=0.5 * (right.lateral_v + left.lateral_v),
-                        left_row_v=left.lateral_v,
-                        right_row_v=right.lateral_v,
-                        width=width_v,
-                        confidence=confidence,
-                        source="detected",
-                    )
+            lines.append(line)
+
+            keep = ~inlier_mask
+            remaining_u = remaining_u[keep]
+            remaining_v = remaining_v[keep]
+
+        return lines
+
+    def _fit_one_line_ransac(
+        self,
+        u: np.ndarray,
+        v: np.ndarray,
+        rng: random.Random,
+    ) -> Tuple[MapRowLine, Optional[np.ndarray]]:
+        n = len(u)
+        if n < self.p.map_row_min_line_inliers:
+            return MapRowLine(valid=False), None
+
+        best_mask: Optional[np.ndarray] = None
+        best_count = 0
+        best_a = 0.0
+        best_b = 0.0
+
+        iterations = max(1, int(self.p.map_row_line_ransac_iterations))
+        distance_threshold = max(0.02, float(self.p.map_row_line_distance))
+        max_slope = max(0.05, float(self.p.map_row_max_abs_line_slope))
+
+        indices = list(range(n))
+
+        for _ in range(iterations):
+            i1, i2 = rng.sample(indices, 2)
+            du = float(u[i2] - u[i1])
+            if abs(du) < 1e-3:
+                continue
+
+            a = float((v[i2] - v[i1]) / du)
+            if abs(a) > max_slope:
+                continue
+
+            b = float(v[i1] - a * u[i1])
+            denom = math.sqrt(a * a + 1.0)
+            distances = np.abs(a * u - v + b) / denom
+            mask = distances <= distance_threshold
+            count = int(np.count_nonzero(mask))
+
+            if count > best_count:
+                best_count = count
+                best_mask = mask
+                best_a = a
+                best_b = b
+
+        if best_mask is None or best_count < self.p.map_row_min_line_inliers:
+            return MapRowLine(valid=False), None
+
+        inlier_u = u[best_mask]
+        inlier_v = v[best_mask]
+
+        if len(inlier_u) < self.p.map_row_min_line_inliers:
+            return MapRowLine(valid=False), None
+
+        try:
+            a, b = np.polyfit(inlier_u, inlier_v, 1)
+            a = float(a)
+            b = float(b)
+        except Exception:
+            a = best_a
+            b = best_b
+
+        if abs(a) > max_slope:
+            return MapRowLine(valid=False), None
+
+        length = float(max(inlier_u) - min(inlier_u)) if len(inlier_u) else 0.0
+        if length < self.p.map_row_min_line_length:
+            return MapRowLine(valid=False), None
+
+        yaw = math.atan(a)
+        confidence = clamp(
+            0.55 * (best_count / max(float(self.p.map_row_min_line_inliers), 1.0))
+            + 0.45 * (length / max(float(self.p.map_row_min_line_length), 1e-3)),
+            0.0,
+            1.0,
+        )
+
+        return (
+            MapRowLine(
+                valid=True,
+                a=float(a),
+                b=float(b),
+                yaw=float(yaw),
+                inliers=int(best_count),
+                length=float(length),
+                lateral_v=float(b),
+                confidence=float(confidence),
+            ),
+            best_mask,
+        )
+
+    def _merge_row_lines(self, lines: List[MapRowLine]) -> List[MapRowLine]:
+        valid_lines = [line for line in lines if line.valid]
+        valid_lines.sort(key=lambda line: line.lateral_v)
+
+        if not valid_lines:
+            return []
+
+        merge_distance = max(0.05, float(self.p.map_row_line_merge_distance))
+        merged: List[MapRowLine] = []
+
+        for line in valid_lines:
+            if not merged:
+                merged.append(line)
+                continue
+
+            prev = merged[-1]
+            if abs(line.lateral_v - prev.lateral_v) <= merge_distance:
+                total = max(prev.inliers + line.inliers, 1)
+                w_prev = prev.inliers / total
+                w_line = line.inliers / total
+
+                merged[-1] = MapRowLine(
+                    valid=True,
+                    a=w_prev * prev.a + w_line * line.a,
+                    b=w_prev * prev.b + w_line * line.b,
+                    yaw=w_prev * prev.yaw + w_line * line.yaw,
+                    inliers=prev.inliers + line.inliers,
+                    length=max(prev.length, line.length),
+                    lateral_v=w_prev * prev.lateral_v + w_line * line.lateral_v,
+                    confidence=max(prev.confidence, line.confidence),
                 )
+            else:
+                merged.append(line)
 
-        if len(lanes) == 0:
-            return [], bands, "row bands detected, but no valid lane gap"
-
-        lanes.sort(key=lambda lane: lane.center_v)
-        return lanes, bands, "ok"
+        return merged
 
     def _make_band(self, u_values: np.ndarray, v_values: np.ndarray) -> MapRowBand:
+        # Kept for compatibility with older debug semantics.
         if len(u_values) == 0:
             return MapRowBand(valid=False)
 
@@ -436,46 +664,91 @@ class MapRowDetector:
         direction: str,
         count: int,
     ) -> Optional[MapLane]:
+        step = max(1, int(count))
+        sign = 1 if direction.upper() == "L" else -1
+        expected_offset = sign * step * self.p.expected_row_width
+        tolerance = max(0.05, float(self.p.map_lane_accept_tolerance))
+
+        self.last_expected_target_offset = float(expected_offset)
+        self.last_detected_target_offset = 0.0
+        self.last_target_offset_error = 0.0
+
         if len(lanes) == 0:
+            self.last_target_reason = "no map lanes available"
             return None
 
         lanes_sorted = sorted(lanes, key=lambda lane: lane.center_v)
-        current_idx = min(range(len(lanes_sorted)), key=lambda i: abs(lanes_sorted[i].center_v))
 
-        step = max(1, int(count))
-        sign = 1 if direction.upper() == "L" else -1
-        target_idx = current_idx + sign * step
+        # Pattern-relative target selection:
+        # 1L -> lane around +expected_row_width, 2R -> around -2*expected_row_width.
+        # A farther detected lane is rejected and replaced by pattern-limited extrapolation.
+        candidates = []
+        for lane in lanes_sorted:
+            detected_offset = float(lane.center_v)
+            error = abs(detected_offset - expected_offset)
+            same_side = (sign > 0 and detected_offset > 0.0) or (sign < 0 and detected_offset < 0.0)
+            if same_side:
+                candidates.append((error, lane))
 
-        if 0 <= target_idx < len(lanes_sorted):
-            lane = lanes_sorted[target_idx]
-            lane.source = "detected"
-            return lane
+        if candidates:
+            candidates.sort(key=lambda item: item[0])
+            best_error, best_lane = candidates[0]
+            self.last_detected_target_offset = float(best_lane.center_v)
+            self.last_target_offset_error = float(best_error)
 
-        # Wenn die Zielgasse im aktuellen Kartenfenster nicht komplett sichtbar ist,
-        # extrapolieren wir aus den in der SLAM-Map erkannten Gassenabstaenden.
+            if best_error <= tolerance:
+                best_lane.source = "detected_linefit"
+                self.last_target_reason = (
+                    f"linefit target lane accepted: expected={expected_offset:.3f}, "
+                    f"detected={best_lane.center_v:.3f}, error={best_error:.3f}, "
+                    f"tolerance={tolerance:.3f}"
+                )
+                return best_lane
+
+            self.last_target_reason = (
+                f"linefit target lane rejected: expected={expected_offset:.3f}, "
+                f"detected={best_lane.center_v:.3f}, error={best_error:.3f}, "
+                f"tolerance={tolerance:.3f}"
+            )
+        else:
+            self.last_target_reason = (
+                f"no fitted lane on requested side: expected={expected_offset:.3f}, "
+                f"direction={direction.upper()}, lanes={len(lanes_sorted)}"
+            )
+
+        if step > self.p.map_row_max_extrapolated_lanes:
+            self.last_target_reason += (
+                f"; no extrapolation because requested step {step} exceeds "
+                f"map_row_max_extrapolated_lanes={self.p.map_row_max_extrapolated_lanes}"
+            )
+            return None
+
+        spacing = self.p.expected_row_width
         if len(lanes_sorted) >= 2:
             spacings = [
                 lanes_sorted[i + 1].center_v - lanes_sorted[i].center_v
                 for i in range(len(lanes_sorted) - 1)
+                if lanes_sorted[i + 1].center_v - lanes_sorted[i].center_v > 0.1
             ]
-            spacing = float(np.median(spacings))
-        else:
-            spacing = self.p.expected_row_width
+            if spacings:
+                spacing = float(np.median(spacings))
 
-        requested_shift = sign * step * spacing
-        center_v = lanes_sorted[current_idx].center_v + requested_shift
-
-        if abs(target_idx - current_idx) > self.p.map_row_max_extrapolated_lanes:
-            return None
+        center_v = expected_offset
+        width = clamp(float(spacing), self.p.min_lane_width, self.p.max_lane_width)
+        self.last_detected_target_offset = float(center_v)
+        self.last_target_offset_error = 0.0
+        self.last_target_reason += (
+            f"; using pattern-limited extrapolated lane at {center_v:.3f} m"
+        )
 
         return MapLane(
             valid=True,
             center_v=float(center_v),
-            left_row_v=float(center_v + 0.5 * spacing),
-            right_row_v=float(center_v - 0.5 * spacing),
-            width=float(spacing),
+            left_row_v=float(center_v + 0.5 * width),
+            right_row_v=float(center_v - 0.5 * width),
+            width=float(width),
             confidence=0.45,
-            source="extrapolated_from_map_lanes",
+            source="extrapolated_pattern_limited",
         )
 
 
@@ -1368,10 +1641,15 @@ class MissionManager:
         self.active_turn_uses_map_lane = False
         self.turn_replan_attempts = 0
         self.turn_replan_frame_counter = 0
+        self.turn_local_row_stable_frames = 0
         self.map_lanes: List[MapLane] = []
         self.map_row_bands: List[MapRowBand] = []
         self.target_map_lane: Optional[MapLane] = None
         self.last_map_row_reason: str = ""
+        self.last_target_lane_reason: str = "not evaluated"
+        self.expected_target_offset: float = 0.0
+        self.detected_target_offset: float = 0.0
+        self.target_offset_error: float = 0.0
         self.pattern_steps: List[PatternStep] = []
         self.pattern_index = 0
         self.pattern_completed = False
@@ -1397,9 +1675,14 @@ class MissionManager:
         self.active_turn_uses_map_lane = False
         self.turn_replan_attempts = 0
         self.turn_replan_frame_counter = 0
+        self.turn_local_row_stable_frames = 0
         self.target_map_lane = None
         self.map_lanes = []
         self.map_row_bands = []
+        self.last_target_lane_reason = "not evaluated"
+        self.expected_target_offset = 0.0
+        self.detected_target_offset = 0.0
+        self.target_offset_error = 0.0
         self.pattern_completed = False
         self.transition(MissionState.IDLE, "stop requested")
 
@@ -1452,6 +1735,7 @@ class MissionManager:
             self.active_turn_uses_map_lane = False
             self.turn_replan_attempts = 0
             self.turn_replan_frame_counter = 0
+            self.turn_local_row_stable_frames = 0
 
         if new_state == MissionState.ACQUIRE_ROW:
             self.acquire_start_time = self.node.get_clock().now()
@@ -1459,12 +1743,17 @@ class MissionManager:
             self.active_turn_uses_map_lane = False
             self.turn_replan_attempts = 0
             self.turn_replan_frame_counter = 0
+            self.turn_local_row_stable_frames = 0
 
         if new_state == MissionState.FOLLOW_ROW:
             self.end_stable_frames = 0
             self.active_turn_uses_map_lane = False
             self.turn_replan_attempts = 0
             self.turn_replan_frame_counter = 0
+            self.turn_local_row_stable_frames = 0
+
+        if new_state == MissionState.ENTER_ROW:
+            self.turn_local_row_stable_frames = 0
 
     def update(
         self,
@@ -1551,6 +1840,10 @@ class MissionManager:
                         self.p.row_shift_direction,
                         self.p.row_shift_count,
                     )
+                    self.last_target_lane_reason = map_detector.last_target_reason
+                    self.expected_target_offset = map_detector.last_expected_target_offset
+                    self.detected_target_offset = map_detector.last_detected_target_offset
+                    self.target_offset_error = map_detector.last_target_offset_error
 
                     if self.target_map_lane is not None:
                         self.active_turn_path = planner.plan_turn_path_to_map_lane(
@@ -1674,6 +1967,10 @@ class MissionManager:
                         self.p.row_shift_direction,
                         self.p.row_shift_count,
                     )
+                    self.last_target_lane_reason = map_detector.last_target_reason
+                    self.expected_target_offset = map_detector.last_expected_target_offset
+                    self.detected_target_offset = map_detector.last_detected_target_offset
+                    self.target_offset_error = map_detector.last_target_offset_error
 
                     if (
                         replanning_target_lane is not None
@@ -1708,6 +2005,28 @@ class MissionManager:
                         )
 
             active_pose = pose_map if self.active_turn_path.frame_id == self.p.map_frame else pose_odom
+
+            # Frueher Ausstieg aus dem globalen Turn:
+            # Wenn die Zielgasse lokal mit LiDAR stabil erkannt wird, wird der globale
+            # Turn-Pfad verlassen. Sonst kann der Roboter trotz richtiger lokaler
+            # Erkennung an der Zielgasse vorbei bis zu einer spaeteren Reihe fahren.
+            if self.p.turn_exit_on_local_row:
+                if row.valid and row.confidence >= self.p.turn_exit_min_confidence:
+                    self.turn_local_row_stable_frames += 1
+                else:
+                    self.turn_local_row_stable_frames = 0
+
+                if self.turn_local_row_stable_frames >= max(1, self.p.turn_exit_stable_frames):
+                    self.node.get_logger().warn(
+                        "EXECUTE_TURN early exit: target row detected locally. "
+                        f"row_conf={row.confidence:.3f}, stable_frames={self.turn_local_row_stable_frames}. "
+                        "Switching to ENTER_ROW before global turn path goal."
+                    )
+                    self.active_turn_path = None
+                    self.active_turn_uses_map_lane = False
+                    self.transition(MissionState.ENTER_ROW, "target row detected during turn")
+                    return planner.plan_enter_row(row)
+
             if active_pose is not None and controller.path_goal_reached(self.active_turn_path, active_pose):
                 self.active_turn_path = None
                 self.active_turn_uses_map_lane = False
@@ -1919,10 +2238,21 @@ class MaizeNavigator(Node):
         p.map_row_min_band_points = int(declare("map_row_min_band_points", p.map_row_min_band_points))
         p.map_row_min_band_length = float(declare("map_row_min_band_length", p.map_row_min_band_length))
         p.map_row_max_extrapolated_lanes = int(declare("map_row_max_extrapolated_lanes", p.map_row_max_extrapolated_lanes))
+        p.map_row_line_ransac_iterations = int(declare("map_row_line_ransac_iterations", p.map_row_line_ransac_iterations))
+        p.map_row_line_distance = float(declare("map_row_line_distance", p.map_row_line_distance))
+        p.map_row_min_line_inliers = int(declare("map_row_min_line_inliers", p.map_row_min_line_inliers))
+        p.map_row_min_line_length = float(declare("map_row_min_line_length", p.map_row_min_line_length))
+        p.map_row_max_abs_line_slope = float(declare("map_row_max_abs_line_slope", p.map_row_max_abs_line_slope))
+        p.map_row_max_lines = int(declare("map_row_max_lines", p.map_row_max_lines))
+        p.map_row_line_merge_distance = float(declare("map_row_line_merge_distance", p.map_row_line_merge_distance))
+        p.map_lane_accept_tolerance = float(declare("map_lane_accept_tolerance", p.map_lane_accept_tolerance))
 
         p.turn_replan_enabled = bool(declare("turn_replan_enabled", p.turn_replan_enabled))
         p.turn_replan_period_frames = int(declare("turn_replan_period_frames", p.turn_replan_period_frames))
         p.turn_replan_max_attempts = int(declare("turn_replan_max_attempts", p.turn_replan_max_attempts))
+        p.turn_exit_on_local_row = bool(declare("turn_exit_on_local_row", p.turn_exit_on_local_row))
+        p.turn_exit_min_confidence = float(declare("turn_exit_min_confidence", p.turn_exit_min_confidence))
+        p.turn_exit_stable_frames = int(declare("turn_exit_stable_frames", p.turn_exit_stable_frames))
 
         p.enable_safety = bool(declare("enable_safety", p.enable_safety))
         p.obstacle_stop_distance = float(declare("obstacle_stop_distance", p.obstacle_stop_distance))
@@ -2149,6 +2479,14 @@ class MaizeNavigator(Node):
             else:
                 reasons.append("turn_source=geometric_map_fallback")
 
+        if state in (MissionState.PLAN_TURN, MissionState.EXECUTE_TURN):
+            reasons.append(
+                f"target_offset_expected={self.mission.expected_target_offset:.3f}, "
+                f"detected={self.mission.detected_target_offset:.3f}, "
+                f"error={self.mission.target_offset_error:.3f}, "
+                f"reason={self.mission.last_target_lane_reason}"
+            )
+
         target_lane = self.mission.target_map_lane
         if target_lane is not None:
             target_lane_text = (
@@ -2188,8 +2526,14 @@ class MaizeNavigator(Node):
             f" | active_turn_uses_map_lane={self.mission.active_turn_uses_map_lane}"
             f" | pattern_index={self.mission.pattern_index}"
             f" | pattern_completed={self.mission.pattern_completed}"
+            f" | expected_target_offset={self.mission.expected_target_offset:.3f}"
+            f" | detected_target_offset={self.mission.detected_target_offset:.3f}"
+            f" | target_offset_error={self.mission.target_offset_error:.3f}"
+            f" | target_lane_reason='{self.mission.last_target_lane_reason}'"
+            f" | turn_local_row_stable_frames={self.mission.turn_local_row_stable_frames}"
             f" | turn_replan_attempts={self.mission.turn_replan_attempts}"
             f" | turn_replan_enabled={self.p.turn_replan_enabled}"
+            f" | turn_exit_on_local_row={self.p.turn_exit_on_local_row}"
         )
 
         msg = String()
