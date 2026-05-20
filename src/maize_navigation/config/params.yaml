@@ -85,12 +85,16 @@ maize_navigator:
     exit_curve_yaw_change: 1.35
 
     headland_shift_speed: 0.22
-    headland_shift_tolerance: 0.05
+    headland_shift_tolerance: 0.04
     headland_yaw_tolerance: 0.25
 
     entry_curve_speed: 0.16
     entry_curve_angular_speed: 0.50
-    entry_curve_yaw_change: 1.35
+    # Automatisch: pi - exit_curve_yaw_change, damit die Wende wirklich ~180 Grad erreicht.
+    headland_total_yaw_change: 3.141592653589793
+    entry_curve_yaw_change: -1.0
+    entry_yaw_accept_tolerance: 0.35
+    entry_shift_accept_tolerance: 0.10
     entry_row_min_confidence: 0.32
     entry_row_stable_frames: 10
 
