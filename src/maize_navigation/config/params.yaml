@@ -90,6 +90,9 @@ maize_navigator:
     headland_shift_tolerance: 0.04
     headland_shift_overshoot_tolerance: 0.08
     headland_yaw_tolerance: 0.25
+    headland_use_map_row_heading: true
+    headland_heading_kp: 1.4
+    headland_heading_max_yaw_error: 0.75
 
     entry_curve_speed: 0.16
     entry_curve_angular_speed: 0.427
@@ -100,6 +103,10 @@ maize_navigator:
     entry_shift_accept_tolerance: 0.10
     entry_row_min_confidence: 0.32
     entry_row_stable_frames: 10
+    entry_require_full_lane: true
+    entry_center_b_tolerance: 0.14
+    entry_lane_width_tolerance: 0.22
+    entry_row_yaw_tolerance: 0.35
 
     # Direkter Nachbargassenwechsel 1L/1R:
     # Zielreihe erst akzeptieren, wenn der Versatz erreicht ist und
@@ -111,8 +118,11 @@ maize_navigator:
     map_row_detection_enabled: true
     map_row_occupancy_threshold: 50
     map_row_search_x_forward: 5.0
-    map_row_search_x_backward: 1.0
+    map_row_search_x_backward: 4.0
     map_row_search_y_side: 5.0
+    map_row_use_pca_orientation: true
+    map_row_pca_radius: 5.0
+    map_row_pca_min_points: 80
     map_row_lateral_bin: 0.10
     map_row_min_band_points: 12
     map_row_min_band_length: 1.2
