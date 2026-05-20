@@ -80,6 +80,8 @@ maize_navigator:
     # Rausbogen -> pattern-relativer Versatz -> Reinbogen.
     # Die normale Reihenfahrt bleibt unveraendert.
     headland_maneuver_enabled: true
+    headland_exit_straight_distance: 0.45
+    headland_exit_straight_speed: 0.18
     exit_curve_speed: 0.18
     exit_curve_angular_speed: 0.48
     exit_curve_yaw_change: 1.35
