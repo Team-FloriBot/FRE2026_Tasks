@@ -297,15 +297,18 @@ class NavigatorParams:
     # Die Reihenfahrt selbst bleibt davon unberuehrt.
     headland_maneuver_enabled: bool = True
     exit_curve_speed: float = 0.18
-    exit_curve_angular_speed: float = 0.55
+    exit_curve_angular_speed: float = 0.48
     exit_curve_yaw_change: float = 1.35
 
     headland_shift_speed: float = 0.22
-    headland_shift_tolerance: float = 0.05
+    headland_shift_tolerance: float = 0.04
+    # Schutztoleranz: Wenn der seitliche Versatz beim Einfahrbogen darueber hinausgeht,
+    # wird der Bogen abgebrochen. Das verhindert, dass 1L/1R eine weitere Reihe ueberspringt.
+    headland_shift_overshoot_tolerance: float = 0.08
     headland_yaw_tolerance: float = 0.25
 
     entry_curve_speed: float = 0.16
-    entry_curve_angular_speed: float = 0.50
+    entry_curve_angular_speed: float = 0.427
     # Gesamt-Drehwinkel des Vorgewende-Manoevers. Fuer U-Turns muss die
     # Endausrichtung der Gegenrichtung entsprechen.
     headland_total_yaw_change: float = math.pi
@@ -1531,6 +1534,27 @@ class PathFollower:
         if target is None:
             return cmd
 
+        # Vorgewende-Kurven werden als direktes Geschwindigkeitskommando gefahren,
+        # nicht mit Pure Pursuit. Dadurch ergibt sich ein reproduzierbarer Radius:
+        # R = v / omega. Mit den Defaultwerten liegt R bei ca. 0.375 m.
+        if path.reason in ("EXIT_CURVE", "ENTRY_CURVE"):
+            direction = 1.0
+            if len(path.points) > 0 and (path.points[-1].yaw < 0.0 or path.points[-1].y < 0.0):
+                direction = -1.0
+
+            if path.reason == "EXIT_CURVE":
+                v_cmd = clamp(abs(self.p.exit_curve_speed), 0.0, self.p.max_linear_speed)
+                w_cmd = direction * min(abs(self.p.exit_curve_angular_speed), self.p.turn_max_angular_speed)
+            else:
+                v_cmd = clamp(abs(self.p.entry_curve_speed), 0.0, self.p.max_linear_speed)
+                w_cmd = direction * min(abs(self.p.entry_curve_angular_speed), self.p.turn_max_angular_speed)
+
+            w_cmd = self.rate_limit(w_cmd, self.last_w_base)
+            self.last_w_base = w_cmd
+            cmd.linear.x = v_cmd
+            cmd.angular.z = w_cmd
+            return cmd
+
         alpha = math.atan2(target.y, target.x)
         curvature = 2.0 * math.sin(alpha) / max(self.p.lookahead_distance, 1e-3)
 
@@ -1946,6 +1970,7 @@ class MissionManager:
 
         if new_state == MissionState.EXIT_CURVE:
             self.active_turn_path = None
+            self.headland_start_pose_map = None
             self.active_turn_uses_map_lane = False
             self.turn_replan_attempts = 0
             self.turn_replan_frame_counter = 0
@@ -2147,7 +2172,7 @@ class MissionManager:
             if pose_map is None:
                 return LocalPath([], False, self.p.map_frame, "EXIT_CURVE blocked: no map pose")
 
-            if self.headland_start_pose_map is None:
+            if self.headland_start_pose_map is None or self.exit_curve_start_yaw is None:
                 self.headland_start_pose_map = pose_map
                 self.exit_curve_start_yaw = pose_map.yaw
                 self.headland_direction = 1.0 if self.p.row_shift_direction.upper() == "L" else -1.0
@@ -2231,6 +2256,19 @@ class MissionManager:
             # und die Maisreihe auf der erwarteten Seite sichtbar ist. Das verhindert,
             # dass eine frueh erkannte falsche Struktur als Zielgasse genommen wird.
             self._update_headland_measured_shift(pose_map)
+
+            # Harte Begrenzung gegen Ueberspringen: Wenn der seitliche
+            # Gesamtversatz groesser ist als der Pattern-Sollversatz plus
+            # Schutztoleranz, wird nicht weiter in die Kurve hineingefahren.
+            # Danach wird langsam lokal gesucht, statt weiter seitlich abzudriften.
+            if abs(self.headland_measured_shift) > abs(self.headland_required_shift) + max(0.0, self.p.headland_shift_overshoot_tolerance):
+                self.node.get_logger().warn(
+                    f"ENTRY_CURVE overshoot guard: measured_shift={self.headland_measured_shift:.3f}, "
+                    f"required_shift={self.headland_required_shift:.3f}. Switching to ACQUIRE_ROW."
+                )
+                self.transition(MissionState.ACQUIRE_ROW, "entry curve overshoot guard")
+                return planner.plan_acquire_row(row)
+
             self.entry_shift_ok = self._entry_shift_window_ok()
             self.entry_reference_side_ok = self._entry_reference_side_detected(row)
             entry_yaw_ok = self._entry_yaw_ok(pose_map)
@@ -2527,7 +2565,25 @@ class MissionManager:
             return planner.plan_acquire_row(row)
 
         if self.state == MissionState.ENTER_ROW:
-            if row.valid and row.confidence >= self.p.min_follow_confidence:
+            if pose_map is not None and self.headland_start_pose_map is not None:
+                self._update_headland_measured_shift(pose_map)
+
+            shift_ok_for_follow = True
+            yaw_ok_for_follow = True
+            reference_ok_for_follow = True
+
+            if self.p.headland_maneuver_enabled and self.headland_required_shift != 0.0:
+                shift_ok_for_follow = self._entry_shift_window_ok()
+                yaw_ok_for_follow = self._entry_yaw_ok(pose_map)
+                reference_ok_for_follow = self._entry_reference_side_detected(row)
+
+            if (
+                row.valid
+                and row.confidence >= self.p.min_follow_confidence
+                and shift_ok_for_follow
+                and yaw_ok_for_follow
+                and reference_ok_for_follow
+            ):
                 self.enter_stable_frames += 1
             else:
                 self.enter_stable_frames = 0
@@ -2703,6 +2759,7 @@ class MaizeNavigator(Node):
         p.exit_curve_yaw_change = float(declare("exit_curve_yaw_change", p.exit_curve_yaw_change))
         p.headland_shift_speed = float(declare("headland_shift_speed", p.headland_shift_speed))
         p.headland_shift_tolerance = float(declare("headland_shift_tolerance", p.headland_shift_tolerance))
+        p.headland_shift_overshoot_tolerance = float(declare("headland_shift_overshoot_tolerance", p.headland_shift_overshoot_tolerance))
         p.headland_yaw_tolerance = float(declare("headland_yaw_tolerance", p.headland_yaw_tolerance))
         p.entry_curve_speed = float(declare("entry_curve_speed", p.entry_curve_speed))
         p.entry_curve_angular_speed = float(declare("entry_curve_angular_speed", p.entry_curve_angular_speed))
