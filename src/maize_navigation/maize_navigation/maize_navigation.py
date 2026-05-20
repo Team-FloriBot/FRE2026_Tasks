@@ -315,6 +315,10 @@ class NavigatorParams:
     headland_use_map_row_heading: bool = True
     headland_heading_kp: float = 1.4
     headland_heading_max_yaw_error: float = 0.75
+    # Wenn die Reihenrichtung aus der SLAM-Map vorliegt, wird die Vorgewende-
+    # Querfahrt hart auf die dazu senkrechte Richtung gelegt. Der Wert ist nur
+    # noch ein Fallback-Grenzwert fuer sehr schlechte Map-Yaw-Schaetzungen.
+    headland_map_heading_min_confidence: float = 0.20
 
     entry_curve_speed: float = 0.16
     entry_curve_angular_speed: float = 0.427
@@ -1992,6 +1996,7 @@ class MissionManager:
         self.headland_required_shift: float = 0.0
         self.headland_measured_shift: float = 0.0
         self.headland_exit_forward_distance: float = 0.0
+        self.headland_reference_row_yaw_map: Optional[float] = None
         self.entry_row_stable_frames: int = 0
         self.entry_reference_side_ok: bool = False
         self.entry_shift_ok: bool = False
@@ -2040,6 +2045,7 @@ class MissionManager:
         self.headland_required_shift = 0.0
         self.headland_measured_shift = 0.0
         self.headland_exit_forward_distance = 0.0
+        self.headland_reference_row_yaw_map = None
         self.entry_row_stable_frames = 0
         self.entry_reference_side_ok = False
         self.entry_shift_ok = False
@@ -2121,6 +2127,7 @@ class MissionManager:
             self.headland_required_shift = self.headland_direction * self.p.row_shift_count * self.p.expected_row_width
             self.headland_measured_shift = 0.0
             self.headland_exit_forward_distance = 0.0
+            self.headland_reference_row_yaw_map = None
 
         if new_state == MissionState.HEADLAND_SHIFT:
             self.entry_curve_start_yaw = None
@@ -2156,8 +2163,14 @@ class MissionManager:
 
         dx = pose_map.x - self.headland_start_pose_map.x
         dy = pose_map.y - self.headland_start_pose_map.y
-        yaw0 = self.headland_start_pose_map.yaw
-        self.headland_measured_shift = -math.sin(yaw0) * dx + math.cos(yaw0) * dy
+        # Fuer Vorgewende-Manoever wird der Quer-Versatz in der Map-
+        # Reihenbasis gemessen, sobald diese verfuegbar ist. Damit haengt der
+        # Versatz nicht mehr davon ab, ob der Roboter beim Reihenende schon
+        # leicht schraeg stand.
+        yaw0 = self.headland_reference_row_yaw_map
+        if yaw0 is None:
+            yaw0 = self.headland_start_pose_map.yaw
+        self.headland_measured_shift = -math.sin(float(yaw0)) * dx + math.cos(float(yaw0)) * dy
 
     def _update_headland_exit_forward_distance(self, pose_map: Optional[Pose2D]) -> None:
         if pose_map is None or self.headland_start_pose_map is None:
@@ -2257,9 +2270,13 @@ class MissionManager:
         return progress
 
     def _entry_yaw_ok(self, pose_map: Optional[Pose2D]) -> bool:
+        tolerance = max(0.0, float(self.p.entry_yaw_accept_tolerance))
+        map_target_yaw = self._target_entry_row_yaw_from_map(pose_map, None)
+        if pose_map is not None and map_target_yaw is not None:
+            return abs(wrap_to_pi(float(map_target_yaw) - pose_map.yaw)) <= tolerance
+
         progress = self._headland_total_yaw_progress(pose_map)
         target = max(0.0, float(self.p.headland_total_yaw_change))
-        tolerance = max(0.0, float(self.p.entry_yaw_accept_tolerance))
         return progress >= target - tolerance
 
     def _entry_reference_side_detected(self, row: RowModel) -> bool:
@@ -2376,28 +2393,63 @@ class MissionManager:
 
         return False
 
+    def _capture_headland_reference_row_yaw(self, map_detector: Optional[MapRowDetector]) -> None:
+        """Latch the map row axis for the whole headland maneuver.
+
+        PCA yaw is axial and can flip by pi between frames. Latching one
+        orientation prevents sign changes in the lateral shift calculation and
+        keeps the headland path exactly perpendicular to the map rows.
+        """
+        if not self.p.headland_use_map_row_heading:
+            return
+        if self.headland_reference_row_yaw_map is not None:
+            return
+        if map_detector is None or map_detector.last_row_yaw_map is None:
+            return
+        if map_detector.last_row_yaw_confidence < max(0.0, float(self.p.headland_map_heading_min_confidence)):
+            return
+
+        row_yaw = float(map_detector.last_row_yaw_map)
+        if self.headland_start_pose_map is not None:
+            # PCA has no direction. Use the orientation closest to the row yaw at
+            # the moment the robot left the previous row.
+            if abs(wrap_to_pi(row_yaw + math.pi - self.headland_start_pose_map.yaw)) < abs(wrap_to_pi(row_yaw - self.headland_start_pose_map.yaw)):
+                row_yaw = wrap_to_pi(row_yaw + math.pi)
+
+        self.headland_reference_row_yaw_map = row_yaw
+
     def _desired_headland_shift_yaw(self, pose_map: Pose2D, map_detector: Optional[MapRowDetector]) -> Optional[float]:
         if not self.p.headland_use_map_row_heading:
             return None
 
-        if map_detector is None or map_detector.last_row_yaw_map is None:
+        self._capture_headland_reference_row_yaw(map_detector)
+        if self.headland_reference_row_yaw_map is None:
             return None
 
-        if map_detector.last_row_yaw_confidence < 0.20:
-            return None
-
-        row_yaw = float(map_detector.last_row_yaw_map)
+        # Querfahrt im Vorgewende: exakt senkrecht zur aus der Map bekannten
+        # Reihenrichtung. Fuer L ist das die positive v-Achse, fuer R die
+        # negative v-Achse. Kein Umschalten auf die jeweils naehere Gegenrichtung,
+        # denn das kann bei 3R die physikalisch falsche Seite waehlen.
+        row_yaw = float(self.headland_reference_row_yaw_map)
         desired = wrap_to_pi(row_yaw + self.headland_direction * math.pi / 2.0)
+        return desired
 
-        # Die Querfahrtrichtung besitzt zwei aequivalente Orientierungen. Waehle die,
-        # die naeher zur aktuellen Roboterausrichtung liegt.
-        if abs(wrap_to_pi(desired + math.pi - pose_map.yaw)) < abs(wrap_to_pi(desired - pose_map.yaw)):
-            desired = wrap_to_pi(desired + math.pi)
-
-        if abs(wrap_to_pi(desired - pose_map.yaw)) > max(0.1, float(self.p.headland_heading_max_yaw_error)):
+    def _target_entry_row_yaw_from_map(self, pose_map: Optional[Pose2D], map_detector: Optional[MapRowDetector]) -> Optional[float]:
+        if pose_map is None or not self.p.headland_use_map_row_heading:
             return None
 
-        return desired
+        self._capture_headland_reference_row_yaw(map_detector)
+        if self.headland_reference_row_yaw_map is None:
+            return None
+
+        row_yaw = float(self.headland_reference_row_yaw_map)
+        if self.exit_curve_start_yaw is not None:
+            nominal = wrap_to_pi(float(self.exit_curve_start_yaw) + self.headland_direction * max(0.0, float(self.p.headland_total_yaw_change)))
+        else:
+            nominal = wrap_to_pi(pose_map.yaw + self.headland_direction * max(0.0, float(self.p.headland_total_yaw_change)))
+
+        candidates = [wrap_to_pi(row_yaw), wrap_to_pi(row_yaw + math.pi)]
+        return min(candidates, key=lambda yaw: abs(wrap_to_pi(yaw - nominal)))
 
     def update(
         self,
@@ -2555,6 +2607,9 @@ class MissionManager:
                 self.reference_row_v = map_detector.last_reference_row_v
                 self.target_row_v = map_detector.last_target_row_v
                 self.candidate_rows_text = map_detector.last_candidate_rows_text
+                self._capture_headland_reference_row_yaw(map_detector)
+                self._update_headland_measured_shift(pose_map)
+                remaining = self._headland_pre_entry_shift_target() - abs(self.headland_measured_shift)
 
             if remaining <= self.p.headland_shift_tolerance:
                 self.transition(MissionState.ENTRY_CURVE, "required headland shift reached")
@@ -2636,6 +2691,13 @@ class MissionManager:
             if self.entry_row_stable_frames >= max(1, self.p.entry_row_stable_frames):
                 self.transition(MissionState.ENTER_ROW, "target row detected during entry curve with yaw/shift/reference checks")
                 return planner.plan_enter_row(row)
+
+            map_target_yaw = self._target_entry_row_yaw_from_map(pose_map, map_detector)
+            if map_target_yaw is not None:
+                yaw_error_to_map_row = abs(wrap_to_pi(float(map_target_yaw) - pose_map.yaw))
+                if yaw_error_to_map_row <= max(0.0, float(self.p.entry_yaw_accept_tolerance)):
+                    self.transition(MissionState.ACQUIRE_ROW, "entry curve aligned to map row yaw; target lane not geometrically centered yet")
+                    return planner.plan_acquire_row(row)
 
             yaw_progress = self.headland_direction * wrap_to_pi(pose_map.yaw - float(self.entry_curve_start_yaw))
             target_entry_yaw = self._effective_entry_curve_yaw_change()
@@ -3165,6 +3227,7 @@ class MaizeNavigator(Node):
         p.headland_use_map_row_heading = bool(declare("headland_use_map_row_heading", p.headland_use_map_row_heading))
         p.headland_heading_kp = float(declare("headland_heading_kp", p.headland_heading_kp))
         p.headland_heading_max_yaw_error = float(declare("headland_heading_max_yaw_error", p.headland_heading_max_yaw_error))
+        p.headland_map_heading_min_confidence = float(declare("headland_map_heading_min_confidence", p.headland_map_heading_min_confidence))
         p.entry_curve_speed = float(declare("entry_curve_speed", p.entry_curve_speed))
         p.entry_curve_angular_speed = float(declare("entry_curve_angular_speed", p.entry_curve_angular_speed))
         p.headland_total_yaw_change = float(declare("headland_total_yaw_change", p.headland_total_yaw_change))
