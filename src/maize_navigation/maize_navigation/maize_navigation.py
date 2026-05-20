@@ -211,6 +211,12 @@ class MissionState(Enum):
     ENTER_ROW = 6
     FINISHED = 7
 
+    # Vorgewende-Manoever fuer robusten Gassenwechsel:
+    # gesteuerter Bogen raus -> relativer Versatz -> gesteuerter Bogen rein.
+    EXIT_CURVE = 8
+    HEADLAND_SHIFT = 9
+    ENTRY_CURVE = 10
+
 
 @dataclass
 class NavigatorParams:
@@ -286,6 +292,23 @@ class NavigatorParams:
     row_shift_count: int = 1
     row_shift_direction: str = "L"
     turn_180: bool = True
+
+    # Robuster Gassenwechsel im Vorgewende.
+    # Die Reihenfahrt selbst bleibt davon unberuehrt.
+    headland_maneuver_enabled: bool = True
+    exit_curve_speed: float = 0.18
+    exit_curve_angular_speed: float = 0.55
+    exit_curve_yaw_change: float = 1.35
+
+    headland_shift_speed: float = 0.22
+    headland_shift_tolerance: float = 0.12
+    headland_yaw_tolerance: float = 0.25
+
+    entry_curve_speed: float = 0.16
+    entry_curve_angular_speed: float = 0.50
+    entry_curve_yaw_change: float = 1.35
+    entry_row_min_confidence: float = 0.22
+    entry_row_stable_frames: int = 5
 
     map_row_detection_enabled: bool = True
     map_row_occupancy_threshold: int = 50
@@ -1417,6 +1440,48 @@ class LocalPlanner:
         return LocalPath(map_points, True, self.p.map_frame, "TURN_SLAM_LANE_UTURN")
 
 
+    def plan_constant_curve_base_link(
+        self,
+        direction: float,
+        speed: float,
+        angular_speed: float,
+        duration_hint: float = 3.0,
+        reason: str = "MANEUVER_CURVE",
+    ) -> LocalPath:
+        """Generate a short base_link arc used as a commanded forward curve.
+
+        This does not replace row following. It is only used in the headland
+        maneuver where a controlled left/right arc is desired.
+        """
+        direction = 1.0 if direction >= 0.0 else -1.0
+        v = clamp(abs(speed), 0.0, self.p.max_linear_speed)
+        w = max(abs(angular_speed), 1e-3)
+        radius = max(v / w, 0.05)
+        total_angle = min(abs(w * max(duration_hint, 0.5)), 1.6)
+
+        points: List[PathPoint] = []
+        for phi in np.linspace(0.05, total_angle, 36):
+            x = radius * math.sin(float(phi))
+            y = direction * radius * (1.0 - math.cos(float(phi)))
+            yaw = direction * float(phi)
+            points.append(PathPoint(float(x), float(y), float(yaw), float(v)))
+
+        return LocalPath(points, True, "base_link", reason)
+
+    def plan_headland_shift_base_link(
+        self,
+        speed: Optional[float] = None,
+        reason: str = "HEADLAND_SHIFT",
+    ) -> LocalPath:
+        """Drive forward in the current heading during the headland lateral shift."""
+        v = self.p.headland_shift_speed if speed is None else speed
+        v = clamp(abs(v), 0.0, self.p.max_linear_speed)
+        points: List[PathPoint] = []
+        for x in np.linspace(0.20, 1.60, 24):
+            points.append(PathPoint(float(x), 0.0, 0.0, float(v)))
+        return LocalPath(points, True, "base_link", reason)
+
+
 class PathFollower:
     def __init__(self, params: NavigatorParams):
         self.p = params
@@ -1740,6 +1805,16 @@ class MissionManager:
         self.turn_replan_attempts = 0
         self.turn_replan_frame_counter = 0
         self.turn_local_row_stable_frames = 0
+
+        # Vorgewende-Manoever-Zustand.
+        self.headland_start_pose_map: Optional[Pose2D] = None
+        self.exit_curve_start_yaw: Optional[float] = None
+        self.entry_curve_start_yaw: Optional[float] = None
+        self.headland_direction: float = 1.0
+        self.headland_required_shift: float = 0.0
+        self.headland_measured_shift: float = 0.0
+        self.entry_row_stable_frames: int = 0
+
         self.map_lanes: List[MapLane] = []
         self.map_row_bands: List[MapRowBand] = []
         self.target_map_lane: Optional[MapLane] = None
@@ -1777,6 +1852,13 @@ class MissionManager:
         self.turn_replan_attempts = 0
         self.turn_replan_frame_counter = 0
         self.turn_local_row_stable_frames = 0
+        self.headland_start_pose_map = None
+        self.exit_curve_start_yaw = None
+        self.entry_curve_start_yaw = None
+        self.headland_direction = 1.0
+        self.headland_required_shift = 0.0
+        self.headland_measured_shift = 0.0
+        self.entry_row_stable_frames = 0
         self.target_map_lane = None
         self.map_lanes = []
         self.map_row_bands = []
@@ -1841,6 +1923,27 @@ class MissionManager:
             self.turn_replan_frame_counter = 0
             self.turn_local_row_stable_frames = 0
 
+        if new_state == MissionState.EXIT_CURVE:
+            self.active_turn_path = None
+            self.active_turn_uses_map_lane = False
+            self.turn_replan_attempts = 0
+            self.turn_replan_frame_counter = 0
+            self.turn_local_row_stable_frames = 0
+            self.exit_curve_start_yaw = None
+            self.entry_curve_start_yaw = None
+            self.entry_row_stable_frames = 0
+            self.headland_direction = 1.0 if self.p.row_shift_direction.upper() == "L" else -1.0
+            self.headland_required_shift = self.headland_direction * self.p.row_shift_count * self.p.expected_row_width
+            self.headland_measured_shift = 0.0
+
+        if new_state == MissionState.HEADLAND_SHIFT:
+            self.entry_curve_start_yaw = None
+            self.entry_row_stable_frames = 0
+
+        if new_state == MissionState.ENTRY_CURVE:
+            self.entry_curve_start_yaw = None
+            self.entry_row_stable_frames = 0
+
         if new_state == MissionState.ACQUIRE_ROW:
             self.acquire_start_time = self.node.get_clock().now()
             self.enter_stable_frames = 0
@@ -1884,6 +1987,15 @@ class MissionManager:
                     self.transition(MissionState.FINISHED, "final row end detected by end_probability")
                     return LocalPath([], False, "base_link", "pattern complete at final row end")
 
+                if self.p.headland_maneuver_enabled:
+                    self.transition(MissionState.EXIT_CURVE, "row end detected; starting headland maneuver")
+                    return planner.plan_constant_curve_base_link(
+                        1.0 if self.p.row_shift_direction.upper() == "L" else -1.0,
+                        self.p.exit_curve_speed,
+                        self.p.exit_curve_angular_speed,
+                        reason="EXIT_CURVE",
+                    )
+
                 self.transition(MissionState.EXIT_ROW, "row end detected by end_probability")
                 return planner.plan_exit_row()
 
@@ -1910,10 +2022,131 @@ class MissionManager:
                     "FOLLOW_ROW fallback: row lost for several frames, "
                     "interpreting as row end and switching to EXIT_ROW"
                 )
+                if self.p.headland_maneuver_enabled:
+                    self.transition(MissionState.EXIT_CURVE, "row lost fallback; starting headland maneuver")
+                    return planner.plan_constant_curve_base_link(
+                        1.0 if self.p.row_shift_direction.upper() == "L" else -1.0,
+                        self.p.exit_curve_speed,
+                        self.p.exit_curve_angular_speed,
+                        reason="EXIT_CURVE",
+                    )
+
                 self.transition(MissionState.EXIT_ROW, "row lost fallback")
                 return planner.plan_exit_row()
 
             return planner.plan_follow_row(row)
+
+
+        if self.state == MissionState.EXIT_CURVE:
+            if not self.p.use_slam_map or not self.p.require_map_for_turns:
+                return LocalPath([], False, self.p.map_frame, "headland maneuver requires map pose")
+
+            if pose_map is None:
+                return LocalPath([], False, self.p.map_frame, "EXIT_CURVE blocked: no map pose")
+
+            if self.headland_start_pose_map is None:
+                self.headland_start_pose_map = pose_map
+                self.exit_curve_start_yaw = pose_map.yaw
+                self.headland_direction = 1.0 if self.p.row_shift_direction.upper() == "L" else -1.0
+                self.headland_required_shift = self.headland_direction * self.p.row_shift_count * self.p.expected_row_width
+                self.headland_measured_shift = 0.0
+                self.node.get_logger().info(
+                    f"EXIT_CURVE start: direction={self.p.row_shift_direction}, "
+                    f"count={self.p.row_shift_count}, required_shift={self.headland_required_shift:.3f} m"
+                )
+
+            yaw_progress = self.headland_direction * wrap_to_pi(pose_map.yaw - float(self.exit_curve_start_yaw))
+            if yaw_progress >= self.p.exit_curve_yaw_change:
+                self.transition(MissionState.HEADLAND_SHIFT, "exit curve yaw reached")
+                return planner.plan_headland_shift_base_link(reason="HEADLAND_SHIFT")
+
+            return planner.plan_constant_curve_base_link(
+                self.headland_direction,
+                self.p.exit_curve_speed,
+                self.p.exit_curve_angular_speed,
+                reason="EXIT_CURVE",
+            )
+
+        if self.state == MissionState.HEADLAND_SHIFT:
+            if pose_map is None:
+                return LocalPath([], False, self.p.map_frame, "HEADLAND_SHIFT blocked: no map pose")
+
+            if self.headland_start_pose_map is None:
+                self.headland_start_pose_map = pose_map
+                self.headland_direction = 1.0 if self.p.row_shift_direction.upper() == "L" else -1.0
+                self.headland_required_shift = self.headland_direction * self.p.row_shift_count * self.p.expected_row_width
+
+            dx = pose_map.x - self.headland_start_pose_map.x
+            dy = pose_map.y - self.headland_start_pose_map.y
+            yaw0 = self.headland_start_pose_map.yaw
+            self.headland_measured_shift = -math.sin(yaw0) * dx + math.cos(yaw0) * dy
+
+            remaining = abs(self.headland_required_shift) - abs(self.headland_measured_shift)
+
+            # SLAM-Reihenlinien weiterhin auswerten, aber hier nur fuer Diagnose und
+            # Plausibilisierung. Das Manoever faehrt nicht beliebig zu einer absoluten
+            # Map-Lane, sondern nur den pattern-relativen Sollversatz.
+            if self.p.map_row_detection_enabled and latest_map is not None and map_detector is not None:
+                self.map_lanes, self.map_row_bands, self.last_map_row_reason = map_detector.detect_lanes(
+                    latest_map,
+                    pose_map,
+                )
+                _ = map_detector.select_target_lane(
+                    self.map_lanes,
+                    self.map_row_bands,
+                    self.p.row_shift_direction,
+                    self.p.row_shift_count,
+                )
+                self.last_target_lane_reason = map_detector.last_target_reason
+                self.expected_target_offset = map_detector.last_expected_target_offset
+                self.detected_target_offset = map_detector.last_detected_target_offset
+                self.target_offset_error = map_detector.last_target_offset_error
+                self.reference_row_v = map_detector.last_reference_row_v
+                self.target_row_v = map_detector.last_target_row_v
+                self.candidate_rows_text = map_detector.last_candidate_rows_text
+
+            if remaining <= self.p.headland_shift_tolerance:
+                self.transition(MissionState.ENTRY_CURVE, "required headland shift reached")
+                return planner.plan_constant_curve_base_link(
+                    self.headland_direction,
+                    self.p.entry_curve_speed,
+                    self.p.entry_curve_angular_speed,
+                    reason="ENTRY_CURVE",
+                )
+
+            return planner.plan_headland_shift_base_link(reason="HEADLAND_SHIFT")
+
+        if self.state == MissionState.ENTRY_CURVE:
+            if pose_map is None:
+                return LocalPath([], False, self.p.map_frame, "ENTRY_CURVE blocked: no map pose")
+
+            if self.entry_curve_start_yaw is None:
+                self.entry_curve_start_yaw = pose_map.yaw
+                self.entry_row_stable_frames = 0
+
+            # Sobald die Zielgasse lokal stabil sichtbar ist, uebernimmt die
+            # vorhandene gute Einfahr-/Reihenfuehrung. Dadurch faehrt der Roboter
+            # nicht an der richtigen Gasse vorbei.
+            if row.valid and row.confidence >= self.p.entry_row_min_confidence:
+                self.entry_row_stable_frames += 1
+            else:
+                self.entry_row_stable_frames = 0
+
+            if self.entry_row_stable_frames >= max(1, self.p.entry_row_stable_frames):
+                self.transition(MissionState.ENTER_ROW, "target row detected during entry curve")
+                return planner.plan_enter_row(row)
+
+            yaw_progress = self.headland_direction * wrap_to_pi(pose_map.yaw - float(self.entry_curve_start_yaw))
+            if yaw_progress >= self.p.entry_curve_yaw_change:
+                self.transition(MissionState.ACQUIRE_ROW, "entry curve completed")
+                return planner.plan_acquire_row(row)
+
+            return planner.plan_constant_curve_base_link(
+                self.headland_direction,
+                self.p.entry_curve_speed,
+                self.p.entry_curve_angular_speed,
+                reason="ENTRY_CURVE",
+            )
 
         if self.state == MissionState.EXIT_ROW:
             self.transition(MissionState.PLAN_TURN, "exit row complete")
@@ -2341,6 +2574,19 @@ class MaizeNavigator(Node):
         p.row_shift_direction = str(declare("row_shift_direction", p.row_shift_direction))
         p.turn_180 = bool(declare("turn_180", p.turn_180))
 
+        p.headland_maneuver_enabled = bool(declare("headland_maneuver_enabled", p.headland_maneuver_enabled))
+        p.exit_curve_speed = float(declare("exit_curve_speed", p.exit_curve_speed))
+        p.exit_curve_angular_speed = float(declare("exit_curve_angular_speed", p.exit_curve_angular_speed))
+        p.exit_curve_yaw_change = float(declare("exit_curve_yaw_change", p.exit_curve_yaw_change))
+        p.headland_shift_speed = float(declare("headland_shift_speed", p.headland_shift_speed))
+        p.headland_shift_tolerance = float(declare("headland_shift_tolerance", p.headland_shift_tolerance))
+        p.headland_yaw_tolerance = float(declare("headland_yaw_tolerance", p.headland_yaw_tolerance))
+        p.entry_curve_speed = float(declare("entry_curve_speed", p.entry_curve_speed))
+        p.entry_curve_angular_speed = float(declare("entry_curve_angular_speed", p.entry_curve_angular_speed))
+        p.entry_curve_yaw_change = float(declare("entry_curve_yaw_change", p.entry_curve_yaw_change))
+        p.entry_row_min_confidence = float(declare("entry_row_min_confidence", p.entry_row_min_confidence))
+        p.entry_row_stable_frames = int(declare("entry_row_stable_frames", p.entry_row_stable_frames))
+
         p.map_row_detection_enabled = bool(declare("map_row_detection_enabled", p.map_row_detection_enabled))
         p.map_row_occupancy_threshold = int(declare("map_row_occupancy_threshold", p.map_row_occupancy_threshold))
         p.map_row_search_x_forward = float(declare("map_row_search_x_forward", p.map_row_search_x_forward))
@@ -2638,6 +2884,10 @@ class MaizeNavigator(Node):
             f" | active_turn_uses_map_lane={self.mission.active_turn_uses_map_lane}"
             f" | pattern_index={self.mission.pattern_index}"
             f" | pattern_completed={self.mission.pattern_completed}"
+            f" | headland_enabled={self.p.headland_maneuver_enabled}"
+            f" | headland_required_shift={self.mission.headland_required_shift:.3f}"
+            f" | headland_measured_shift={self.mission.headland_measured_shift:.3f}"
+            f" | entry_row_stable_frames={self.mission.entry_row_stable_frames}"
             f" | expected_target_offset={self.mission.expected_target_offset:.3f}"
             f" | detected_target_offset={self.mission.detected_target_offset:.3f}"
             f" | target_offset_error={self.mission.target_offset_error:.3f}"
