@@ -76,6 +76,24 @@ maize_navigator:
     row_shift_direction: "L"
     turn_180: true
 
+    # Vorgewende-Gassenwechsel:
+    # Rausbogen -> pattern-relativer Versatz -> Reinbogen.
+    # Die normale Reihenfahrt bleibt unveraendert.
+    headland_maneuver_enabled: true
+    exit_curve_speed: 0.18
+    exit_curve_angular_speed: 0.55
+    exit_curve_yaw_change: 1.35
+
+    headland_shift_speed: 0.22
+    headland_shift_tolerance: 0.12
+    headland_yaw_tolerance: 0.25
+
+    entry_curve_speed: 0.16
+    entry_curve_angular_speed: 0.50
+    entry_curve_yaw_change: 1.35
+    entry_row_min_confidence: 0.22
+    entry_row_stable_frames: 5
+
     map_row_detection_enabled: true
     map_row_occupancy_threshold: 50
     map_row_search_x_forward: 5.0
