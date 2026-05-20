@@ -833,17 +833,26 @@ class MapRowDetector:
             self.last_detected_target_offset = detected_offset
             self.last_target_offset_error = float(error)
 
-            # Reject row-line candidates only if they disagree strongly with the pattern.
-            # This prevents a sparse or distorted map from jumping from e.g. 1L to row 5.
-            if error <= tolerance:
-                measured_width = abs(outer_row_v - inner_row_v)
-                width = clamp(float(measured_width), self.p.min_lane_width, self.p.max_lane_width)
+            # A counted target is only valid if both the pattern-relative center
+            # and the row spacing are plausible. The previous version accepted
+            # row pairs with only ~0.25...0.43 m separation for a 0.75 m crop row.
+            # That creates a false "lane" on a plant row and makes 2R drive into
+            # the crop. Narrow row pairs are rejected and the deterministic
+            # pattern-limited center is used instead.
+            measured_width = abs(outer_row_v - inner_row_v)
+            width_min = max(0.05, float(self.p.min_lane_width))
+            width_max = max(width_min, float(self.p.max_lane_width))
+            width_ok = width_min <= measured_width <= width_max
+
+            if error <= tolerance and width_ok:
+                width = float(measured_width)
                 self.last_target_reason = (
                     f"row-line counted target accepted: direction={direction.upper()}, "
                     f"step={step}, reference_row={side_rows[0]:.3f}, "
                     f"inner_row={inner_row_v:.3f}, outer_row={outer_row_v:.3f}, "
                     f"center={center_v:.3f}, expected={expected_offset:.3f}, "
-                    f"error={error:.3f}, tolerance={tolerance:.3f}, "
+                    f"error={error:.3f}, width={measured_width:.3f}, "
+                    f"width_range=[{width_min:.3f},{width_max:.3f}], tolerance={tolerance:.3f}, "
                     f"side_rows=[{self.last_candidate_rows_text}]"
                 )
                 return MapLane(
@@ -859,9 +868,11 @@ class MapRowDetector:
             self.last_target_reason = (
                 f"row-line counted target rejected: direction={direction.upper()}, "
                 f"step={step}, reference_row={side_rows[0]:.3f}, "
+                f"inner_row={inner_row_v:.3f}, outer_row={outer_row_v:.3f}, "
                 f"center={center_v:.3f}, expected={expected_offset:.3f}, "
-                f"error={error:.3f}, tolerance={tolerance:.3f}, "
-                f"side_rows=[{self.last_candidate_rows_text}]"
+                f"error={error:.3f}, width={measured_width:.3f}, "
+                f"width_ok={width_ok}, width_range=[{width_min:.3f},{width_max:.3f}], "
+                f"tolerance={tolerance:.3f}, side_rows=[{self.last_candidate_rows_text}]"
             )
 
         elif len(side_rows) >= 1:
@@ -2712,13 +2723,35 @@ class MissionManager:
             return self.active_turn_path
 
         if self.state == MissionState.ACQUIRE_ROW:
-            if row.valid and row.confidence >= self.p.min_enter_confidence:
+            acquire_shift_ok = True
+            acquire_yaw_ok = True
+            acquire_reference_ok = True
+            acquire_geometry_ok = True
+
+            if self.p.headland_maneuver_enabled and self.headland_required_shift != 0.0:
+                if pose_map is not None and self.headland_start_pose_map is not None:
+                    self._update_headland_measured_shift(pose_map)
+                acquire_shift_ok = self._entry_shift_window_ok()
+                acquire_yaw_ok = self._entry_yaw_ok(pose_map)
+                acquire_reference_ok = self._entry_reference_side_detected(row)
+                acquire_geometry_ok = self._entry_row_geometry_ok(row)
+
+            acquire_row_ok = (
+                row.valid
+                and row.confidence >= self.p.min_enter_confidence
+                and acquire_shift_ok
+                and acquire_yaw_ok
+                and acquire_reference_ok
+                and acquire_geometry_ok
+            )
+
+            if acquire_row_ok:
                 self.enter_stable_frames += 1
             else:
                 self.enter_stable_frames = 0
 
             if self.enter_stable_frames >= self.p.enter_stable_frames_required:
-                self.transition(MissionState.ENTER_ROW, "target row acquired")
+                self.transition(MissionState.ENTER_ROW, "target row acquired with shift/yaw/reference/geometry guards")
                 return planner.plan_enter_row(row)
 
             if self.acquire_start_time is not None:
@@ -2731,6 +2764,17 @@ class MissionManager:
                         "ACQUIRE_ROW timeout: still searching. Check ROI, turn yaw, row_shift_direction and row markers."
                     )
                     self.acquire_start_time = self.node.get_clock().now()
+
+            # Critical safety guard: do not let ACQUIRE_ROW follow a single or
+            # geometrically invalid row. In the 2R logs entry_geometry_ok=False
+            # while row_confidence was already 1.0; following that model steers
+            # directly onto the plant row. Drive slowly straight until a full,
+            # centered lane is visible.
+            if self.p.headland_maneuver_enabled and self.headland_required_shift != 0.0 and not acquire_row_ok:
+                return planner.plan_headland_shift_base_link(
+                    speed=min(self.p.enter_speed, self.p.slow_speed),
+                    reason="ACQUIRE_ROW_WAIT_FULL_LANE",
+                )
 
             return planner.plan_acquire_row(row)
 
@@ -2749,14 +2793,16 @@ class MissionManager:
 
             geometry_ok_for_follow = self._entry_row_geometry_ok(row) if self.p.headland_maneuver_enabled else True
 
-            if (
+            enter_guards_ok = (
                 row.valid
                 and row.confidence >= self.p.min_follow_confidence
                 and shift_ok_for_follow
                 and yaw_ok_for_follow
                 and reference_ok_for_follow
                 and geometry_ok_for_follow
-            ):
+            )
+
+            if enter_guards_ok:
                 self.enter_stable_frames += 1
             else:
                 self.enter_stable_frames = 0
@@ -2775,6 +2821,16 @@ class MissionManager:
                 )
                 self.transition(MissionState.FOLLOW_ROW, "stable final row following")
                 return planner.plan_follow_row(row)
+
+            # Same guard as ACQUIRE_ROW: while the target lane is not a full,
+            # centered, plausible lane, do not use the row model as steering
+            # reference. Otherwise the robot can lock onto one crop row and drive
+            # over it during 2R.
+            if self.p.headland_maneuver_enabled and self.headland_required_shift != 0.0 and not enter_guards_ok:
+                return planner.plan_headland_shift_base_link(
+                    speed=min(self.p.enter_speed, self.p.slow_speed),
+                    reason="ENTER_ROW_WAIT_FULL_LANE",
+                )
 
             return planner.plan_enter_row(row)
 
