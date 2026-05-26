@@ -1,1 +1,8 @@
-
+string pattern
+---
+bool success
+string message
+string accepted_pattern
+string mission_state
+bool can_start
+bool can_resume
