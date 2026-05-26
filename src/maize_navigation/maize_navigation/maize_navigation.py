@@ -230,6 +230,7 @@ class MissionState(Enum):
     EXIT_CURVE = 8
     HEADLAND_SHIFT = 9
     ENTRY_CURVE = 10
+    PAUSED = 11
 
 
 @dataclass
@@ -2038,6 +2039,7 @@ class MissionManager:
         self.acquire_start_time = None
 
         self.started = False
+        self.resume_state: Optional[MissionState] = None
 
     def has_loaded_pattern(self) -> bool:
         return bool(self.pattern_steps)
@@ -2087,10 +2089,32 @@ class MissionManager:
         self.pattern_completed = False
         self.apply_current_pattern_step()
         self.started = True
+        self.resume_state = None
         self.transition(MissionState.FOLLOW_ROW, "start requested")
+
+    def pause(self) -> None:
+        if not self.started or self.state in (MissionState.IDLE, MissionState.FINISHED):
+            raise ValueError("Navigation ist nicht aktiv.")
+        if self.state == MissionState.PAUSED:
+            raise ValueError("Navigation ist bereits pausiert.")
+
+        self.resume_state = self.state
+        self.transition(MissionState.PAUSED, "pause requested")
+
+    def resume(self) -> None:
+        if self.state != MissionState.PAUSED or self.resume_state is None:
+            raise ValueError("Navigation ist nicht pausiert.")
+
+        resumed_state = self.resume_state
+        self.resume_state = None
+        self.node.get_logger().info(
+            f"State transition: {self.state.name} -> {resumed_state.name} (resume requested)"
+        )
+        self.state = resumed_state
 
     def stop(self) -> None:
         self.started = False
+        self.resume_state = None
         self.active_turn_path = None
         self.active_turn_uses_map_lane = False
         self.turn_replan_attempts = 0
@@ -2507,6 +2531,9 @@ class MissionManager:
     ) -> LocalPath:
         if not self.started or self.state == MissionState.IDLE:
             return LocalPath([], False, "base_link", "idle")
+
+        if self.state == MissionState.PAUSED:
+            return LocalPath([], False, "base_link", "paused")
 
         if self.state == MissionState.FOLLOW_ROW:
             # Normale Reihenende-Erkennung ueber end_probability.
@@ -3179,6 +3206,8 @@ class MaizeNavigator(Node):
         )
         self.start_srv = self.create_service(Trigger, "/start_navigation", self.start_cb)
         self.stop_srv = self.create_service(Trigger, "/stop_navigation", self.stop_cb)
+        self.pause_srv = self.create_service(Trigger, "/pause_navigation", self.pause_cb)
+        self.resume_srv = self.create_service(Trigger, "/resume_navigation", self.resume_cb)
 
         period = 1.0 / max(self.p.control_frequency, 1.0)
         self.timer = self.create_timer(period, self.control_loop)
@@ -3359,8 +3388,12 @@ class MaizeNavigator(Node):
         response.active_step = self.mission.active_pattern_step_text()
         response.can_set_pattern = can_set_pattern
         response.can_start = can_start
-        response.can_pause = False
-        response.can_resume = False
+        response.can_pause = self.mission.state not in (
+            MissionState.IDLE,
+            MissionState.FINISHED,
+            MissionState.PAUSED,
+        )
+        response.can_resume = self.mission.state == MissionState.PAUSED
         response.can_abort = can_abort
         return response
 
@@ -3379,7 +3412,7 @@ class MaizeNavigator(Node):
             self.mission.state == MissionState.IDLE
             and self.mission.has_loaded_pattern()
         )
-        response.can_resume = False
+        response.can_resume = self.mission.state == MissionState.PAUSED
         return response
 
     def get_navigation_status_cb(self, request, response):
@@ -3392,6 +3425,8 @@ class MaizeNavigator(Node):
             )
         elif self.mission.state == MissionState.FINISHED:
             response.message = "Mission beendet."
+        elif self.mission.state == MissionState.PAUSED:
+            response.message = "Mission pausiert."
         else:
             response.message = "Mission aktiv."
         return self.fill_navigation_status(response)
@@ -3413,6 +3448,27 @@ class MaizeNavigator(Node):
         self.publish_stop()
         response.success = True
         response.message = "Navigation abgebrochen. Geladenes Pattern wurde verworfen."
+        return response
+
+    def pause_cb(self, request, response):
+        try:
+            self.mission.pause()
+            self.publish_stop()
+            response.success = True
+            response.message = "Navigation pausiert."
+        except ValueError as exc:
+            response.success = False
+            response.message = str(exc)
+        return response
+
+    def resume_cb(self, request, response):
+        try:
+            self.mission.resume()
+            response.success = True
+            response.message = "Navigation fortgesetzt."
+        except ValueError as exc:
+            response.success = False
+            response.message = str(exc)
         return response
 
     def control_loop(self) -> None:
@@ -3460,7 +3516,11 @@ class MaizeNavigator(Node):
             self.mission.state,
         )
 
-        if self.mission.state in (MissionState.IDLE, MissionState.FINISHED):
+        if self.mission.state in (
+            MissionState.IDLE,
+            MissionState.FINISHED,
+            MissionState.PAUSED,
+        ):
             safe_cmd = Twist()
 
         self.publish_navigation_diagnostics(
@@ -3584,7 +3644,7 @@ class MaizeNavigator(Node):
         if state == MissionState.EXECUTE_TURN and self.mission.active_turn_path is None:
             reasons.append("EXECUTE_TURN but active_turn_path is None")
 
-        if raw_cmd_zero and state not in (MissionState.IDLE, MissionState.FINISHED):
+        if raw_cmd_zero and state not in (MissionState.IDLE, MissionState.FINISHED, MissionState.PAUSED):
             reasons.append("controller output is zero")
 
         if command_changed:
@@ -3596,6 +3656,7 @@ class MaizeNavigator(Node):
         if final_cmd_zero and not raw_cmd_zero and state not in (
             MissionState.IDLE,
             MissionState.FINISHED,
+            MissionState.PAUSED,
         ):
             reasons.append("final command is zero although controller command was nonzero")
 
