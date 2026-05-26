@@ -187,6 +187,10 @@ class MapLane:
     width: float = 0.0
     confidence: float = 0.0
     source: str = ""
+    # Optional explicit entrance point computed from spline starts (map frame)
+    entrance_x: Optional[float] = None
+    entrance_y: Optional[float] = None
+    entrance_yaw: Optional[float] = None
 
 
 def parse_pattern(pattern: str) -> List[PatternStep]:
@@ -1002,6 +1006,86 @@ class MapRowDetector:
             points=int(len(u_values)),
         )
 
+        def select_target_from_splines(
+            self,
+            curves: List[MapRowCurve],
+            direction: str,
+            count: int,
+        ) -> Optional[MapLane]:
+            """Select target lane by using the starts of fitted row splines.
+
+            The entrance point is computed as the midpoint between the spline
+            starts (first sample or seed) of the two bounding rows that form the
+            desired lane.
+            """
+            if not curves or len(curves) < 2:
+                return None
+
+            # Use only valid curves
+            valid_curves = [c for c in curves if c.valid]
+            if len(valid_curves) < 2:
+                return None
+
+            # Sort by lateral position (row_v). Ascending matches MapRowDetector convention.
+            valid_curves.sort(key=lambda c: float(c.row_v))
+
+            # Build lane centers between consecutive curves
+            lane_centers = [0.5 * (valid_curves[i].row_v + valid_curves[i + 1].row_v) for i in range(len(valid_curves) - 1)]
+
+            # Find current lane index as the lane whose center is closest to v==0
+            current_idx = 0
+            if lane_centers:
+                abs_centers = [abs(float(v)) for v in lane_centers]
+                current_idx = int(min(range(len(abs_centers)), key=lambda i: abs_centers[i]))
+
+            sign = 1 if direction.upper() == "L" else -1
+            target_idx = current_idx + sign * int(max(1, count))
+
+            # Bounds check: lane index valid range is [0, len(valid_curves)-2]
+            if target_idx < 0 or target_idx > len(valid_curves) - 2:
+                return None
+
+            right_curve = valid_curves[target_idx]
+            left_curve = valid_curves[target_idx + 1]
+
+            # Helper to get spline start point in map frame
+            def _start_point(curve: MapRowCurve) -> Optional[Tuple[float, float]]:
+                if curve.points and len(curve.points) > 0:
+                    p = curve.points[0]
+                    return (float(p.x), float(p.y))
+                if curve.seeds and len(curve.seeds) > 0:
+                    s = curve.seeds[0]
+                    return (float(s.x), float(s.y))
+                return None
+
+            p_r = _start_point(right_curve)
+            p_l = _start_point(left_curve)
+            if p_r is None or p_l is None:
+                return None
+
+            entrance_x = 0.5 * (p_r[0] + p_l[0])
+            entrance_y = 0.5 * (p_r[1] + p_l[1])
+
+            # Use average row_yaw as entrance yaw (map-frame)
+            entrance_yaw = 0.5 * (float(right_curve.row_yaw) + float(left_curve.row_yaw))
+
+            center_v = 0.5 * (float(right_curve.row_v) + float(left_curve.row_v))
+            width = float(left_curve.row_v) - float(right_curve.row_v)
+            confidence = clamp(0.5 * float(right_curve.confidence) + 0.5 * float(left_curve.confidence), 0.0, 1.0)
+
+            return MapLane(
+                valid=True,
+                center_v=float(center_v),
+                left_row_v=float(left_curve.row_v),
+                right_row_v=float(right_curve.row_v),
+                width=float(width),
+                confidence=float(confidence),
+                source="detected_spline_pair",
+                entrance_x=float(entrance_x),
+                entrance_y=float(entrance_y),
+                entrance_yaw=float(entrance_yaw),
+            )
+
     def select_target_lane(
         self,
         lanes: List[MapLane],
@@ -1733,13 +1817,78 @@ class LocalPlanner:
     ) -> LocalPath:
         if not target_lane.valid:
             return LocalPath([], False, self.p.map_frame, "invalid target map lane")
+        # If an explicit entrance point is available from spline selection,
+        # transform it into the start-local frame and build a smooth curve to it.
+        local: List[PathPoint] = []
 
+        if target_lane.entrance_x is not None and target_lane.entrance_y is not None:
+            # transform entrance map-point into the start-local frame
+            dx = float(target_lane.entrance_x) - start.x
+            dy = float(target_lane.entrance_y) - start.y
+            c = math.cos(start.yaw)
+            s = math.sin(start.yaw)
+            local_tx = c * dx + s * dy
+            local_ty = -s * dx + c * dy
+
+            if local_tx < 0.05:
+                # entrance is behind or too close in front; reject as invalid
+                return LocalPath([], False, self.p.map_frame, "entrance point behind start or too close")
+
+            # initial straight clearance
+            if self.p.exit_distance > 0.01:
+                for x in np.linspace(0.0, self.p.exit_distance, 12):
+                    local.append(PathPoint(float(x), 0.0, 0.0, self.p.slow_speed))
+
+            x_offset = self.p.exit_distance
+
+            curve_length = max(
+                float(self.p.turn_forward_distance),
+                abs(local_ty) * 1.6,
+                2.5 * float(self.p.min_turn_radius),
+                0.60,
+            )
+            curve_length = min(curve_length, 4.0)
+            curve_start_x = x_offset
+            curve_end_x = x_offset - curve_length
+
+            # desired final yaw in map frame, if provided
+            target_yaw = float(target_lane.entrance_yaw) if target_lane.entrance_yaw is not None else (row_yaw if row_yaw is not None else start.yaw)
+            yaw_delta = wrap_to_pi(target_yaw - start.yaw)
+
+            for step in np.linspace(0.0, 1.0, 56):
+                sstep = step * step * (3.0 - 2.0 * step)
+                x = curve_start_x + (curve_end_x - curve_start_x) * sstep
+                y = local_ty * sstep
+                yaw = yaw_delta * sstep
+                local.append(PathPoint(float(x), float(y), float(yaw), self.p.turn_speed))
+
+            # short approach segment to the exact entrance local x
+            end_y = local_ty
+            if self.p.enter_distance > 0.01:
+                for s2 in np.linspace(0.0, min(self.p.enter_distance, max(0.05, local_tx - (curve_end_x - self.p.enter_distance))), 20):
+                    x = curve_end_x - float(s2)
+                    y = end_y
+                    yaw = yaw_delta
+                    local.append(PathPoint(float(x), float(y), float(yaw), self.p.enter_speed))
+
+            # Transform local path to map frame
+            map_points: List[PathPoint] = []
+            c = math.cos(start.yaw)
+            s = math.sin(start.yaw)
+            for p in local:
+                mx = start.x + c * p.x - s * p.y
+                my = start.y + s * p.x + c * p.y
+                myaw = wrap_to_pi(start.yaw + p.yaw)
+                map_points.append(PathPoint(float(mx), float(my), float(myaw), float(p.v)))
+
+            reason = "TURN_SPLINE_ENTRANCE"
+            return LocalPath(map_points, True, self.p.map_frame, reason)
+
+        # Fallback: original center_v based turn
         row_shift = float(target_lane.center_v)
 
         if abs(row_shift) < 0.10:
             return LocalPath([], False, self.p.map_frame, "target map lane too close to current lane")
-
-        local: List[PathPoint] = []
 
         if self.p.exit_distance > 0.01:
             for x in np.linspace(0.0, self.p.exit_distance, 12):
@@ -2257,12 +2406,25 @@ class MissionManager:
 
         target_lane: Optional[MapLane] = None
         if select_target:
-            target_lane = map_detector.select_target_lane(
-                self.map_lanes,
-                self.map_row_bands,
-                self.p.row_shift_direction,
-                self.p.row_shift_count,
-            )
+            # Prefer spline-based entrance selection when available.
+            try:
+                if map_detector is not None and map_detector.last_row_curves:
+                    target_lane = map_detector.select_target_from_splines(
+                        map_detector.last_row_curves,
+                        self.p.row_shift_direction,
+                        self.p.row_shift_count,
+                    )
+            except Exception:
+                target_lane = None
+
+            # Fallback to original lane selection if splines unavailable.
+            if target_lane is None:
+                target_lane = map_detector.select_target_lane(
+                    self.map_lanes,
+                    self.map_row_bands,
+                    self.p.row_shift_direction,
+                    self.p.row_shift_count,
+                )
 
         self.last_target_lane_reason = map_detector.last_target_reason
         self.expected_target_offset = map_detector.last_expected_target_offset
