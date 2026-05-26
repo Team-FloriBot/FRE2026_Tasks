@@ -25,6 +25,7 @@
   <depend>laser_scan_merger</depend>
   <depend>slam_toolbox</depend>
 
+  <exec_depend>fields2cover</exec_depend>
   <exec_depend>ros-jazzy-tf-transformations</exec_depend>
 
   <test_depend>ament_lint_auto</test_depend>

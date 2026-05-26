@@ -44,38 +44,38 @@ def generate_launch_description():
     )
 
     # ==================== Marker Detector Node ====================
-    marker_detector_node = Node(
-        package="task4",
-        executable="marker_detector",
-        name="marker_detector",
-        output="screen",
-        parameters=[
-            PathJoinSubstitution([task4_pkg, "config", "marker_detector.yaml"])
-        ],
-        remappings=[
-            ("camera/image_raw", "/sensors/camera/image_raw"),
-            ("camera/camera_info", "/sensors/camera/camera_info"),
-            ("detected_marker", "/detected_marker"),
-        ],
-        arguments=["--ros-args", "--log-level", "info"],
-    )
+    # marker_detector_node = Node(
+    #     package="task4",
+    #     executable="marker_detector",
+    #     name="marker_detector",
+    #     output="screen",
+    #     parameters=[
+    #         PathJoinSubstitution([task4_pkg, "config", "marker_detector.yaml"])
+    #     ],
+    #     remappings=[
+    #         ("camera/image_raw", "/sensors/camera/image_raw"),
+    #         ("camera/camera_info", "/sensors/camera/camera_info"),
+    #         ("detected_marker", "/detected_marker"),
+    #     ],
+    #     arguments=["--ros-args", "--log-level", "info"],
+    # )
 
     # ==================== Global Marker Map Node ====================
-    global_marker_map_node = Node(
-        package="task4",
-        executable="global_marker_map",
-        name="global_marker_map",
-        output="screen",
-        parameters=[
-            PathJoinSubstitution([task4_pkg, "config", "global_marker_map.yaml"])
-        ],
-        remappings=[
-            ("detected_marker", "/detected_marker"),
-            ("detected_markers", "/detected_markers"),
-            ("active_markers", "/active_markers"),
-        ],
-        arguments=["--ros-args", "--log-level", "info"],
-    )
+    # global_marker_map_node = Node(
+    #     package="task4",
+    #     executable="global_marker_map",
+    #     name="global_marker_map",
+    #     output="screen",
+    #     parameters=[
+    #         PathJoinSubstitution([task4_pkg, "config", "global_marker_map.yaml"])
+    #     ],
+    #     remappings=[
+    #         ("detected_marker", "/detected_marker"),
+    #         ("detected_markers", "/detected_markers"),
+    #         ("active_markers", "/active_markers"),
+    #     ],
+    #     arguments=["--ros-args", "--log-level", "info"],
+    # )
 
     # ==================== Coverage Planner Node ====================
     coverage_planner_node = Node(
@@ -89,38 +89,21 @@ def generate_launch_description():
         remappings=[
             ("global_plan", "/plan"),
             ("local_plan", "/local_plan"),
-            ("detected_markers", "/detected_markers"),
             ("field_boundary", "/field_boundary"),
             ("target", "/target"),
         ],
         arguments=["--ros-args", "--log-level", "info"],
     )
 
-    # ==================== Nav2 Stack ====================
-    # Nav2 is started via include launch description
-    nav2_bringup_launch = IncludeLaunchDescription(
-        PythonLaunchDescriptionSource(
-            PathJoinSubstitution(
-                [FindPackageShare("nav2_bringup"), "launch", "nav2_bringup_launch.py"]
-            )
-        ),
-        launch_arguments={
-            "use_sim_time": use_sim_time,
-            "params_file": PathJoinSubstitution(
-                [task4_pkg, "config", "nav2_params.yaml"]
-            ),
-            "autostart": "true",
-        }.items(),
-    )
-
     # ==================== Build Launch Description ====================
+    # Note: For isolated testing of coverage_planner, only the coverage_planner_node is included.
+    # The Nav2 stack and other nodes are commented out. Uncomment as needed for full integration.
     ld = LaunchDescription([
         arg_robotname,
         arg_use_sim_time,
-        marker_detector_node,
-        global_marker_map_node,
-        coverage_planner_node,
-        nav2_bringup_launch
+        # marker_detector_node,
+        # global_marker_map_node,
+        coverage_planner_node
     ])
 
     return ld
