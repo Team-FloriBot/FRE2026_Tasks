@@ -1006,107 +1006,108 @@ class MapRowDetector:
             points=int(len(u_values)),
         )
 
-        def select_target_from_splines(
-            self,
-            curves: List[MapRowCurve],
-            direction: str,
-            count: int,
-        ) -> Optional[MapLane]:
-            """Select target lane by using the starts of fitted row splines.
+    def select_target_from_splines(
+        self,
+        curves: List[MapRowCurve],
+        direction: str,
+        count: int,
+    ) -> Optional[MapLane]:
+        """Select target lane by using the starts of fitted row splines.
 
-            The entrance point is computed as the midpoint between the spline
-            starts (first sample or seed) of the two bounding rows that form the
-            desired lane.
-            """
-            if not curves or len(curves) < 2:
-                return None
+        The entrance point is computed as the midpoint between the spline
+        starts (first sample or seed) of the two bounding rows that form the
+        desired lane.
+        """
+        if not curves or len(curves) < 2:
+            return None
 
-            # Use only valid curves
-            valid_curves = [c for c in curves if c.valid]
-            if len(valid_curves) < 2:
-                return None
+        valid_curves = [c for c in curves if c.valid]
+        if len(valid_curves) < 2:
+            return None
 
-            # Sort by lateral position (row_v). Ascending matches MapRowDetector convention.
-            valid_curves.sort(key=lambda c: float(c.row_v))
+        valid_curves.sort(key=lambda c: float(c.row_v))
+        lane_centers = [0.5 * (valid_curves[i].row_v + valid_curves[i + 1].row_v) for i in range(len(valid_curves) - 1)]
 
-            # Build lane centers between consecutive curves
-            lane_centers = [0.5 * (valid_curves[i].row_v + valid_curves[i + 1].row_v) for i in range(len(valid_curves) - 1)]
+        current_idx = 0
+        if lane_centers:
+            abs_centers = [abs(float(v)) for v in lane_centers]
+            current_idx = int(min(range(len(abs_centers)), key=lambda i: abs_centers[i]))
 
-            # Find current lane index as the lane whose center is closest to v==0
-            current_idx = 0
-            if lane_centers:
-                abs_centers = [abs(float(v)) for v in lane_centers]
-                current_idx = int(min(range(len(abs_centers)), key=lambda i: abs_centers[i]))
+        sign = 1 if direction.upper() == "L" else -1
+        target_idx = current_idx + sign * int(max(1, count))
 
-            sign = 1 if direction.upper() == "L" else -1
-            target_idx = current_idx + sign * int(max(1, count))
+        if target_idx < 0 or target_idx > len(valid_curves) - 2:
+            return None
 
-            # Bounds check: lane index valid range is [0, len(valid_curves)-2]
-            if target_idx < 0 or target_idx > len(valid_curves) - 2:
-                return None
+        right_curve = valid_curves[target_idx]
+        left_curve = valid_curves[target_idx + 1]
 
-            right_curve = valid_curves[target_idx]
-            left_curve = valid_curves[target_idx + 1]
+        def _start_point(curve: MapRowCurve) -> Optional[Tuple[float, float]]:
+            if curve.points and len(curve.points) > 0:
+                p = curve.points[0]
+                return (float(p.x), float(p.y))
+            if curve.seeds and len(curve.seeds) > 0:
+                s = curve.seeds[0]
+                return (float(s.x), float(s.y))
+            return None
 
-            # Helper to get spline start point in map frame
-            def _start_point(curve: MapRowCurve) -> Optional[Tuple[float, float]]:
-                if curve.points and len(curve.points) > 0:
-                    p = curve.points[0]
-                    return (float(p.x), float(p.y))
-                if curve.seeds and len(curve.seeds) > 0:
-                    s = curve.seeds[0]
-                    return (float(s.x), float(s.y))
-                return None
+        p_r = _start_point(right_curve)
+        p_l = _start_point(left_curve)
+        if p_r is None or p_l is None:
+            return None
 
-            p_r = _start_point(right_curve)
-            p_l = _start_point(left_curve)
-            if p_r is None or p_l is None:
-                return None
+        entrance_x = 0.5 * (p_r[0] + p_l[0])
+        entrance_y = 0.5 * (p_r[1] + p_l[1])
 
-            entrance_x = 0.5 * (p_r[0] + p_l[0])
-            entrance_y = 0.5 * (p_r[1] + p_l[1])
+        dx = p_l[0] - p_r[0]
+        dy = p_l[1] - p_r[1]
+        perp = math.atan2(dy, dx) + math.pi / 2.0
 
-            # Compute entrance yaw from vector between the two spline starts.
-            # The row direction is approximately perpendicular to that vector.
-            dx = p_l[0] - p_r[0]
-            dy = p_l[1] - p_r[1]
-            perp = math.atan2(dy, dx) + math.pi / 2.0
+        entrance_yaw = wrap_to_pi(perp)
+        if self.last_row_yaw_map is not None:
+            cand = wrap_to_pi(perp)
+            cand_alt = wrap_to_pi(perp + math.pi)
+            ref = float(self.last_row_yaw_map)
+            if abs(wrap_to_pi(cand - ref)) <= abs(wrap_to_pi(cand_alt - ref)):
+                entrance_yaw = cand
+            else:
+                entrance_yaw = cand_alt
 
-            # Choose yaw that is consistent with latched map row yaw if available
-            entrance_yaw = wrap_to_pi(perp)
-            if self.last_row_yaw_map is not None:
-                cand = wrap_to_pi(perp)
-                cand_alt = wrap_to_pi(perp + math.pi)
-                ref = float(self.last_row_yaw_map)
-                if abs(wrap_to_pi(cand - ref)) <= abs(wrap_to_pi(cand_alt - ref)):
-                    entrance_yaw = cand
-                else:
-                    entrance_yaw = cand_alt
+        center_v = 0.5 * (float(right_curve.row_v) + float(left_curve.row_v))
+        width = float(left_curve.row_v) - float(right_curve.row_v)
+        confidence = clamp(0.5 * float(right_curve.confidence) + 0.5 * float(left_curve.confidence), 0.0, 1.0)
 
-            center_v = 0.5 * (float(right_curve.row_v) + float(left_curve.row_v))
-            width = float(left_curve.row_v) - float(right_curve.row_v)
-            confidence = clamp(0.5 * float(right_curve.confidence) + 0.5 * float(left_curve.confidence), 0.0, 1.0)
+        current_row_number = current_idx + 1
+        target_row_number = target_idx + 1
 
-            # Update diagnostic candidate rows text for consumers (MissionManager)
-            try:
-                rows_text = ",".join(f"{float(c.row_v):.3f}" for c in valid_curves[:12])
-                cur_lane_text = f"cur_idx={current_idx}, target_idx={target_idx}, lanes={len(lane_centers)}"
-                self.last_candidate_rows_text = f"{rows_text};{cur_lane_text}"
-            except Exception:
-                self.last_candidate_rows_text = ""
-
-            return MapLane(
-                valid=True,
-                center_v=float(center_v),
-                left_row_v=float(left_curve.row_v),
-                right_row_v=float(right_curve.row_v),
-                width=float(width),
-                confidence=float(confidence),
-                source="detected_spline_pair",
-                entrance_x=float(entrance_x),
-                entrance_y=float(entrance_y),
-                entrance_yaw=float(entrance_yaw),
+        try:
+            rows_text = ",".join(f"{float(c.row_v):.3f}" for c in valid_curves[:12])
+            lane_text = (
+                f"cur_row={current_row_number},target_row={target_row_number},"
+                f"cur_idx={current_idx},target_idx={target_idx},lanes={len(lane_centers)}"
             )
+            self.last_candidate_rows_text = f"{rows_text};{lane_text}"
+            self.last_target_reason = (
+                f"spline lane selected: direction={direction.upper()}, count={count}, "
+                f"cur_row={current_row_number}, target_row={target_row_number}, "
+                f"left_row_v={left_curve.row_v:.3f}, right_row_v={right_curve.row_v:.3f}, "
+                f"entrance=({entrance_x:.3f},{entrance_y:.3f}), yaw={entrance_yaw:.3f}"
+            )
+        except Exception:
+            self.last_candidate_rows_text = ""
+
+        return MapLane(
+            valid=True,
+            center_v=float(center_v),
+            left_row_v=float(left_curve.row_v),
+            right_row_v=float(right_curve.row_v),
+            width=float(width),
+            confidence=float(confidence),
+            source="detected_spline_pair",
+            entrance_x=float(entrance_x),
+            entrance_y=float(entrance_y),
+            entrance_yaw=float(entrance_yaw),
+        )
 
     def select_target_lane(
         self,
@@ -3917,7 +3918,8 @@ class MaizeNavigator(Node):
                 f"v={target_lane.center_v:.3f},"
                 f"width={target_lane.width:.3f},"
                 f"conf={target_lane.confidence:.3f},"
-                f"source={target_lane.source}"
+                f"source={target_lane.source},"
+                f"entrance=({target_lane.entrance_x:.3f},{target_lane.entrance_y:.3f})" if target_lane.entrance_x is not None and target_lane.entrance_y is not None else "entrance=None"
             )
         else:
             target_lane_text = "None"
@@ -3949,6 +3951,7 @@ class MaizeNavigator(Node):
             f" | map_lanes={len(self.mission.map_lanes)}"
             f" | map_bands={len(self.mission.map_row_bands)}"
             f" | target_map_lane={target_lane_text}"
+            f" | current_spline_rows={self.mission.candidate_rows_text}"
             f" | active_turn_uses_map_lane={self.mission.active_turn_uses_map_lane}"
             f" | pattern_index={self.mission.pattern_index}"
             f" | pattern_completed={self.mission.pattern_completed}"
@@ -4136,6 +4139,28 @@ class MaizeNavigator(Node):
                     marker.points.append(pt)
 
                 markers.markers.append(marker)
+
+        target_lane = self.mission.target_map_lane
+        if target_lane is not None and target_lane.entrance_x is not None and target_lane.entrance_y is not None:
+            entrance_marker = Marker()
+            entrance_marker.header.stamp = self.get_clock().now().to_msg()
+            entrance_marker.header.frame_id = self.p.map_frame
+            entrance_marker.ns = "map_target_entrance"
+            entrance_marker.id = 60
+            entrance_marker.type = Marker.SPHERE
+            entrance_marker.action = Marker.ADD
+            entrance_marker.pose.position.x = float(target_lane.entrance_x)
+            entrance_marker.pose.position.y = float(target_lane.entrance_y)
+            entrance_marker.pose.position.z = 0.08
+            entrance_marker.pose.orientation.w = 1.0
+            entrance_marker.scale.x = 0.18
+            entrance_marker.scale.y = 0.18
+            entrance_marker.scale.z = 0.18
+            entrance_marker.color.r = 1.0
+            entrance_marker.color.g = 0.9
+            entrance_marker.color.b = 0.1
+            entrance_marker.color.a = 1.0
+            markers.markers.append(entrance_marker)
 
         self.marker_pub.publish(markers)
 
