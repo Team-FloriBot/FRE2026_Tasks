@@ -1,0 +1,14 @@
+<?xml version="1.0"?>
+<root main_tree_to_execute="MainTree">
+  <BehaviorTree ID="MainTree">
+    <RecoveryNode number_retries="3" name="RecoveryNode">
+      <PipelineSequence name="NavigateWithRecovery">
+        <ComputePathToPose name="ComputePathToPose" goal="{goal}" path="{path}" planner_id="GridBased"/>
+        <FollowPath name="FollowPath" path="{path}" controller_id="FollowPath"/>
+      </PipelineSequence>
+      <RecoveryAction name="Spin" failure_recovery="true"/>
+      <RecoveryAction name="BackUp" failure_recovery="true"/>
+      <RecoveryAction name="Wait" failure_recovery="true"/>
+    </RecoveryNode>
+  </BehaviorTree>
+</root>

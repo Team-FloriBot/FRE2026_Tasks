@@ -1,0 +1,31 @@
+marker_detector:
+  ros__parameters:
+    # Camera settings
+    camera_topic: "/sensors/camera/image_raw"
+    camera_info_topic: "/sensors/camera/camera_info"
+    
+    # Marker detection settings
+    marker_diameter_m: 0.05  # 5cm diameter markers
+    marker_color_hsv_min: [30, 100, 100]  # HSV minimum values (green markers)
+    marker_color_hsv_max: [90, 255, 255]  # HSV maximum values (green markers)
+    
+    # Camera calibration (adjust based on actual camera)
+    camera_height_m: 0.5  # Camera height above ground
+    camera_pitch_rad: 0.52  # ~30 degrees pitch angle
+    
+    # Detection thresholds
+    min_contour_area: 10.0
+    max_contour_area: 500.0
+    hough_circle_param1: 50.0
+    hough_circle_param2: 30.0
+    hough_circle_min_radius: 5
+    hough_circle_max_radius: 25
+    
+    # Output settings
+    publish_markers: true
+    marker_frame: "camera_frame"
+    output_topic: "/detected_marker"
+    
+    # Debug settings
+    debug_visualization: false
+    debug_topic: "/marker_detector/debug"

@@ -1,0 +1,25 @@
+global_marker_map:
+  ros__parameters:
+    # Input settings
+    detected_marker_topic: "/detected_marker"
+    tf_frame: "map"
+    
+    # Marker database settings
+    duplicate_distance_threshold: 0.20  # 20cm - distance to consider markers as duplicates
+    
+    # Output settings
+    detected_markers_topic: "/detected_markers"
+    active_markers_topic: "/active_markers"
+    marker_frame: "map"
+    
+    # Processing settings
+    publish_rate: 10.0  # Hz
+    max_markers: 100  # Maximum number of markers to store
+    
+    # Marker properties
+    marker_diameter_m: 0.05  # 5cm diameter
+    marker_color: [0.0, 1.0, 0.0]  # Green color for visualization
+    
+    # TF settings
+    tf_lookup_timeout_ms: 100
+    tf_cache_time_sec: 10.0

@@ -1,0 +1,32 @@
+coverage_planner:
+  ros__parameters:
+    # Field settings
+    field_boundary_topic: "/field_boundary"
+    detected_markers_topic: "/detected_markers"
+    
+    # Coverage planning settings
+    working_width_m: 0.75  # Working width (spur width) - configurable parameter
+    safety_margin_m: 0.15  # Safety margin to field boundary - configurable parameter
+    overlap_m: 0.10  # Overlap between passes
+    
+    # Path planning settings
+    min_turn_radius: 0.5  # Minimum turn radius for the robot
+    max_path_length: 1000  # Maximum number of path points
+    
+    # Output settings
+    global_plan_topic: "/plan"
+    local_plan_topic: "/local_plan"
+    target_topic: "/target"
+    field_boundary_topic_out: "/field_boundary_visual"
+    
+    # Robot settings
+    base_frame: "base_link"
+    map_frame: "map"
+    
+    # Processing settings
+    update_rate: 5.0  # Hz
+    replan_distance: 2.0  # Replan when robot is this far from planned path
+    
+    # Fields2Cover integration settings
+    f2c_algorithm: "HillClimbing"  # Algorithm: Greedy, HillClimbing, Random
+    f2c_max_turns: 10  # Maximum number of turns for some algorithms
