@@ -3,8 +3,7 @@
 Coverage Planner Node with Fields2Cover Integration
 
 This node implements coverage path planning for autonomous field operations.
-It uses the Fields2Cover library for optimal coverage patterns and provides
-a fallback implementation if Fields2Cover is not available.
+It uses the Fields2Cover library for optimal coverage patterns.
 
 Key features:
 - Systematic coverage patterns (e.g., boustrophedon, spiral)
@@ -27,7 +26,6 @@ from rclpy.parameter import Parameter
 
 from geometry_msgs.msg import PoseStamped, Point
 from nav_msgs.msg import Path
-from sensor_msgs.msg import PointCloud2
 from visualization_msgs.msg import Marker, MarkerArray
 from std_msgs.msg import Header
 
@@ -38,31 +36,32 @@ class CoveragePlanner(Node):
     def __init__(self) -> None:
         super().__init__("coverage_planner")
 
-        # Try to import Fields2Cover
-        self.f2c_available = False
+        # Import Fields2Cover - mandatory, node will crash if not available
         try:
             from f2c import (
                 F2CField,
                 F2CFieldGenerator,
                 F2CPathGenerator,
                 F2CPathOptimizer,
+                F2CPoint,
+                F2CLinearRing,
+                F2CPolygon,
+                F2CCells,
             )
 
             self.f2c = True
             self.f2c_field = None
             self.f2c_path_generator = None
             self.get_logger().info("Fields2Cover imported successfully")
-        except ImportError:
-            self.get_logger().warn(
-                "Fields2Cover not available, using fallback implementation"
-            )
+        except ImportError as e:
+            self.get_logger().error(f"Fields2Cover import failed: {e}")
+            raise RuntimeError("Fields2Cover is required but not available. Please install the f2c package.") from e
 
         # Declare and get parameters
         self.declare_parameters(
             namespace="",
             parameters=[
-                ("field_boundary_topic", "/field_boundary"),
-                ("detected_markers_topic", "/detected_markers"),
+                ("field_boundary_posts", []),
                 ("working_width_m", 0.75),
                 ("safety_margin_m", 0.15),
                 ("overlap_m", 0.10),
@@ -82,8 +81,7 @@ class CoveragePlanner(Node):
         )
 
         # Get parameters
-        self.field_boundary_topic = self.get_parameter("field_boundary_topic").value
-        self.detected_markers_topic = self.get_parameter("detected_markers_topic").value
+        self.field_boundary_posts_raw = self.get_parameter("field_boundary_posts").value
         self.working_width_m = self.get_parameter("working_width_m").value
         self.safety_margin_m = self.get_parameter("safety_margin_m").value
         self.overlap_m = self.get_parameter("overlap_m").value
@@ -102,18 +100,25 @@ class CoveragePlanner(Node):
         self.f2c_algorithm = self.get_parameter("f2c_algorithm").value
         self.f2c_max_turns = self.get_parameter("f2c_max_turns").value
 
-        # Initialize state
-        self.field_boundary: list[dict] = []
-        self.detected_markers: list[dict] = []
-        self.current_path: list[dict] = []
-        self.last_replan_position: Optional[dict] = None
+        # Convert raw field boundary posts to list of points
+        self.field_boundary: list[dict] = self._convert_field_boundary_posts(
+            self.field_boundary_posts_raw
+        )
+
+        # Log field boundary information
+        if self.field_boundary:
+            self.get_logger().info(
+                f"Field boundary loaded: {len(self.field_boundary)} posts "
+                f"({self.field_boundary_posts_raw})"
+            )
+        else:
+            self.get_logger().warn(
+                "Field boundary is empty. Please set the 'field_boundary_posts' parameter."
+            )
 
         # Create subscribers
         self.field_boundary_sub = self.create_subscription(
             MarkerArray, self.field_boundary_topic, self.field_boundary_callback, 10
-        )
-        self.detected_markers_sub = self.create_subscription(
-            PointCloud2, self.detected_markers_topic, self.detected_markers_callback, 10
         )
 
         # Create publishers
@@ -135,6 +140,49 @@ class CoveragePlanner(Node):
         self.get_logger().info(f"Overlap: {self.overlap_m} m")
         self.get_logger().info(f"Algorithm: {self.f2c_algorithm}")
 
+    def _convert_field_boundary_posts(self, raw_posts: list[float]) -> list[dict]:
+        """
+        Convert flat list of floats to list of point dictionaries.
+        
+        Args:
+            raw_posts: Flat list of floats [x1, y1, x2, y2, x3, y3, ...]
+            
+        Returns:
+            List of point dictionaries with 'x', 'y', 'z' keys
+            
+        Raises:
+            RuntimeError: If the input list has invalid length
+        """
+        if not raw_posts:
+            self.get_logger().warn("Field boundary posts parameter is empty")
+            return []
+
+        # Validate that the list has even length (pairs of x, y)
+        if len(raw_posts) % 2 != 0:
+            raise RuntimeError(
+                f"Field boundary posts must have even length (pairs of x,y coordinates), "
+                f"got {len(raw_posts)} values"
+            )
+
+        # Validate minimum number of points (at least 3 for a polygon)
+        num_points = len(raw_posts) // 2
+        if num_points < 3:
+            raise RuntimeError(
+                f"Field boundary requires at least 3 points (6 coordinates), "
+                f"got {num_points} points"
+            )
+
+        # Convert to list of dictionaries
+        points = []
+        for i in range(num_points):
+            points.append({
+                "x": raw_posts[i * 2],
+                "y": raw_posts[i * 2 + 1],
+                "z": 0.0,
+            })
+
+        return points
+
     def field_boundary_callback(self, msg: MarkerArray) -> None:
         """Callback for field boundary markers."""
         self.field_boundary = []
@@ -147,36 +195,10 @@ class CoveragePlanner(Node):
 
         self.get_logger().debug(f"Field boundary updated: {len(self.field_boundary)} points")
 
-    def detected_markers_callback(self, msg: PointCloud2) -> None:
-        """Callback for detected markers point cloud."""
-        self.detected_markers = []
-
-        # Parse PointCloud2 data
-        point_step = msg.point_step
-        num_points = len(msg.data) // point_step
-
-        for i in range(num_points):
-            offset = i * point_step
-            x = np.frombuffer(msg.data[offset : offset + 4], dtype=np.float32)[0]
-            y = np.frombuffer(msg.data[offset + 4 : offset + 8], dtype=np.float32)[0]
-            z = np.frombuffer(msg.data[offset + 8 : offset + 12], dtype=np.float32)[0]
-
-            self.detected_markers.append({
-                "x": x,
-                "y": y,
-                "z": z,
-            })
-
-        self.get_logger().debug(f"Detected markers updated: {len(self.detected_markers)} markers")
-
     def update_plan(self) -> None:
         """Update the coverage plan periodically."""
         if len(self.field_boundary) < 3:
             self.get_logger().debug("Not enough field boundary points")
-            return
-
-        if len(self.detected_markers) == 0:
-            self.get_logger().debug("No detected markers")
             return
 
         # Calculate coverage path
@@ -197,25 +219,41 @@ class CoveragePlanner(Node):
             self.publish_target(path[0])
 
     def generate_coverage_path(self) -> Optional[list[dict]]:
-        """Generate coverage path using Fields2Cover or fallback."""
-        if self.f2c:
-            return self.generate_coverage_path_f2c()
-        else:
-            return self.generate_coverage_path_fallback()
+        """Generate coverage path using Fields2Cover."""
+        return self.generate_coverage_path_f2c()
 
     def generate_coverage_path_f2c(self) -> Optional[list[dict]]:
-        """Generate coverage path using Fields2Cover."""
+        """Generate coverage path using Fields2Cover with actual polygon geometry."""
+        if not self.field_boundary or len(self.field_boundary) < 3:
+            self.get_logger().error("Cannot generate path: insufficient field boundary points")
+            return None
+
         try:
-            # Create field from boundary
+            # Create F2C points from boundary posts
+            f2c_points = []
+            for point in self.field_boundary:
+                f2c_points.append(F2CPoint(point["x"], point["y"]))
+
+            # Create a closed linear ring (first point must be repeated at the end)
+            # F2CLinearRing expects a closed loop
+            linear_ring = F2CLinearRing()
+            for point in f2c_points:
+                linear_ring.add(point)
+            # Close the ring by adding the first point again
+            if len(f2c_points) > 0:
+                linear_ring.add(f2c_points[0])
+
+            # Create polygon from the linear ring
+            polygon = F2CPolygon()
+            polygon.add(linear_ring)
+
+            # Create F2CCells container
+            cells = F2CCells()
+            cells.add(polygon)
+
+            # Create field with the polygon
             field = F2CField()
-            boundary = F2CFieldGenerator().generateRectangularField(
-                self.field_boundary[0]["x"],
-                self.field_boundary[0]["y"],
-                10.0,  # width
-                10.0,  # height
-                0.0,   # angle
-            )
-            field.setField(boundary)
+            field.setField(cells)
 
             # Create path generator
             path_generator = F2CPathGenerator()
@@ -251,72 +289,12 @@ class CoveragePlanner(Node):
                     "yaw": pose.getYaw(),
                 })
 
+            self.get_logger().info(f"Generated coverage path with {len(path_points)} points")
             return path_points
 
         except Exception as e:
             self.get_logger().error(f"Fields2Cover path generation failed: {e}")
             return None
-
-    def generate_coverage_path_fallback(self) -> Optional[list[dict]]:
-        """Generate coverage path using fallback implementation."""
-        if len(self.field_boundary) < 3:
-            return None
-
-        # Calculate field centroid
-        centroid_x = sum(p["x"] for p in self.field_boundary) / len(self.field_boundary)
-        centroid_y = sum(p["y"] for p in self.field_boundary) / len(self.field_boundary)
-
-        # Calculate field extent
-        min_x = min(p["x"] for p in self.field_boundary)
-        max_x = max(p["x"] for p in self.field_boundary)
-        min_y = min(p["y"] for p in self.field_boundary)
-        max_y = max(p["y"] for p in self.field_boundary)
-
-        field_width = max_x - min_x
-        field_height = max_y - min_y
-
-        # Generate boustrophedon (back-and-forth) pattern
-        path_points = []
-        num_rows = int(field_height / (self.working_width_m - self.overlap_m))
-
-        for row in range(num_rows):
-            # Calculate row position
-            row_y = min_y + row * (self.working_width_m - self.overlap_m)
-
-            # Alternate direction for each row
-            if row % 2 == 0:
-                # Left to right
-                x_start = min_x
-                x_end = max_x
-                x_step = self.working_width_m / 10  # 10 points per row
-            else:
-                # Right to left
-                x_start = max_x
-                x_end = min_x
-                x_step = -self.working_width_m / 10
-
-            # Generate points for this row
-            x = x_start
-            while (x_step > 0 and x <= x_end) or (x_step < 0 and x >= x_end):
-                path_points.append({
-                    "x": x,
-                    "y": row_y,
-                    "z": 0.0,
-                    "yaw": 0.0 if row % 2 == 0 else math.pi,
-                })
-                x += x_step
-
-            # Add turn point at end of row
-            turn_y = row_y + (self.working_width_m - self.overlap_m) / 2
-            if turn_y < max_y:
-                path_points.append({
-                    "x": x_end,
-                    "y": turn_y,
-                    "z": 0.0,
-                    "yaw": math.pi / 2 if row % 2 == 0 else -math.pi / 2,
-                })
-
-        return path_points
 
     def publish_global_plan(self, path: list[dict]) -> None:
         """Publish global plan as Path message."""
