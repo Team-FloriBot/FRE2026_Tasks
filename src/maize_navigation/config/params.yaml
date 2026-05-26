@@ -1,7 +1,7 @@
 maize_navigator:
   ros__parameters:
     scan_topic: "/sensors/merged_scan"
-    cmd_vel_topic: "/cmd_vel"
+    cmd_vel_topic: "/cmd_vel/task1"
     base_frame: "base_link"
     odom_frame: "odom"
     map_topic: "/map"
@@ -70,10 +70,6 @@ maize_navigator:
     min_turn_radius: 0.38
     enter_distance: 0.90
 
-    pattern: "1L 2R 1L 3R"
-
-    row_shift_count: 1
-    row_shift_direction: "L"
     turn_180: true
 
     # Vorgewende-Gassenwechsel:
