@@ -489,6 +489,8 @@ class MapRowDetector:
         if len(u) < self.p.map_row_min_line_inliers:
             return [], [], f"not enough occupied cells in local map window: {len(u)}"
 
+        row_yaw = self.last_row_yaw_map if self.last_row_yaw_map is not None else pose.yaw
+
         row_lines = self._fit_row_lines(u, v)
         row_lines = self._merge_row_lines(row_lines)
         row_lines.sort(key=lambda line: line.lateral_v)
