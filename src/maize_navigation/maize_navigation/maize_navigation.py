@@ -462,6 +462,7 @@ class MapRowDetector:
         self.last_target_offset_error: float = 0.0
         self.last_reference_row_v: float = 0.0
         self.last_target_row_v: float = 0.0
+        self.last_spline_rows_text: str = ""
         self.last_candidate_rows_text: str = ""
         self.last_row_yaw_map: Optional[float] = None
         self.last_row_yaw_confidence: float = 0.0
@@ -566,6 +567,11 @@ class MapRowDetector:
         lanes.sort(key=lambda lane: lane.center_v)
 
         self.last_row_seeds, self.last_row_curves = self._build_row_curves(u, v, pose, row_yaw, row_lines)
+        self.last_spline_rows_text = ",".join(
+            f"{float(curve.row_v):.3f}"
+            for curve in self.last_row_curves[:12]
+            if curve.valid
+        )
 
         if len(lanes) == 0:
             return [], bands, f"row lines fitted, but no valid lane gap: lines={len(row_lines)}"
@@ -2400,6 +2406,7 @@ class MissionManager:
         self.target_offset_error: float = 0.0
         self.reference_row_v: float = 0.0
         self.target_row_v: float = 0.0
+        self.spline_rows_text: str = ""
         self.candidate_rows_text: str = ""
         self.pattern_steps: List[PatternStep] = []
         self.pattern_index = 0
@@ -2428,6 +2435,7 @@ class MissionManager:
         )
 
         target_lane: Optional[MapLane] = None
+        target_mode = "analysis"
         if select_target:
             # Prefer spline-based entrance selection when available.
             try:
@@ -2449,13 +2457,19 @@ class MissionManager:
                     self.p.row_shift_count,
                 )
 
+            if target_lane is not None:
+                target_mode = target_lane.source
+
         self.last_target_lane_reason = map_detector.last_target_reason
         self.expected_target_offset = map_detector.last_expected_target_offset
         self.detected_target_offset = map_detector.last_detected_target_offset
         self.target_offset_error = map_detector.last_target_offset_error
         self.reference_row_v = map_detector.last_reference_row_v
         self.target_row_v = map_detector.last_target_row_v
-        self.candidate_rows_text = map_detector.last_candidate_rows_text
+        spline_text = map_detector.last_spline_rows_text or "none"
+        fallback_text = map_detector.last_candidate_rows_text or "none"
+        self.spline_rows_text = f"spline={spline_text};fallback={fallback_text};mode={target_mode}"
+        self.candidate_rows_text = fallback_text if target_mode == "analysis" else map_detector.last_candidate_rows_text or map_detector.last_spline_rows_text
 
         return target_lane
 
@@ -2494,6 +2508,7 @@ class MissionManager:
         self.target_offset_error = 0.0
         self.reference_row_v = 0.0
         self.target_row_v = 0.0
+        self.spline_rows_text = ""
         self.candidate_rows_text = ""
         self.pattern_completed = False
         self.transition(MissionState.IDLE, "stop requested")
@@ -3951,7 +3966,7 @@ class MaizeNavigator(Node):
             f" | map_lanes={len(self.mission.map_lanes)}"
             f" | map_bands={len(self.mission.map_row_bands)}"
             f" | target_map_lane={target_lane_text}"
-            f" | current_spline_rows={self.mission.candidate_rows_text}"
+            f" | current_spline_rows={self.mission.spline_rows_text}"
             f" | active_turn_uses_map_lane={self.mission.active_turn_uses_map_lane}"
             f" | pattern_index={self.mission.pattern_index}"
             f" | pattern_completed={self.mission.pattern_completed}"
