@@ -1,1 +1,14 @@
-
+---
+bool success
+string message
+string mission_state
+bool pattern_loaded
+string active_pattern
+uint32 active_step_index
+uint32 total_steps
+string active_step
+bool can_set_pattern
+bool can_start
+bool can_pause
+bool can_resume
+bool can_abort
