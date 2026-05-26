@@ -2818,12 +2818,17 @@ class MissionManager:
         return self._entry_local_row_takeover_ok(row, pose_map)
 
     def _multirow_safe_acquire_steering_ok(self, row: RowModel, shift_ok: bool) -> bool:
-        if int(self.p.row_shift_count) < 2:
-            return False
         if not shift_ok:
             return False
         if not row.valid:
             return False
+
+        if int(self.p.row_shift_count) < 2:
+            return self._headland_shift_reached() and row.confidence >= max(
+                float(self.p.entry_row_min_confidence),
+                float(self.p.multirow_local_takeover_min_confidence),
+            )
+
         return row.confidence >= max(
             float(self.p.entry_row_min_confidence),
             float(self.p.multirow_local_takeover_min_confidence),
