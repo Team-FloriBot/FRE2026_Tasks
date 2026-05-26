@@ -158,27 +158,6 @@ class MapRowLine:
 
 
 @dataclass
-class MapRowSeed:
-    u: float = 0.0
-    v: float = 0.0
-    x: float = 0.0
-    y: float = 0.0
-    points: int = 0
-
-
-@dataclass
-class MapRowCurve:
-    valid: bool = False
-    row_index: int = 0
-    row_v: float = 0.0
-    row_yaw: float = 0.0
-    confidence: float = 0.0
-    source: str = ""
-    seeds: List[MapRowSeed] = field(default_factory=list)
-    points: List[ScanPoint] = field(default_factory=list)
-
-
-@dataclass
 class MapLane:
     valid: bool = False
     center_v: float = 0.0
@@ -423,9 +402,6 @@ class NavigatorParams:
     map_row_max_abs_line_slope: float = 0.70
     map_row_max_lines: int = 12
     map_row_line_merge_distance: float = 0.22
-    map_row_seed_bin_size: float = 0.25
-    map_row_seed_min_points: int = 8
-    map_row_curve_sample_count: int = 24
 
     # SLAM-Zielgassen duerfen das Pattern nur korrigieren, nicht beliebig weit ueberschreiben.
     # Beispiel: 1L erwartet ca. +expected_row_width. Eine erkannte Lane bei +3 m wird verworfen.
@@ -461,9 +437,6 @@ class MapRowDetector:
         self.last_candidate_rows_text: str = ""
         self.last_row_yaw_map: Optional[float] = None
         self.last_row_yaw_confidence: float = 0.0
-        self.last_row_lines: List[MapRowLine] = []
-        self.last_row_seeds: List[MapRowSeed] = []
-        self.last_row_curves: List[MapRowCurve] = []
 
     def detect_lanes(self, grid: Optional[OccupancyGrid], pose: Pose2D) -> Tuple[List[MapLane], List[MapRowBand], str]:
         """Detect plant row lines from occupied SLAM-map cells and derive lane centerlines.
@@ -492,7 +465,6 @@ class MapRowDetector:
         row_lines = self._fit_row_lines(u, v)
         row_lines = self._merge_row_lines(row_lines)
         row_lines.sort(key=lambda line: line.lateral_v)
-        self.last_row_lines = row_lines
 
         # Keep MapRowBand for existing diagnostics/visual language. Each band now
         # represents one fitted plant-row line, not a pure lateral histogram band.
@@ -559,184 +531,10 @@ class MapRowDetector:
 
         lanes.sort(key=lambda lane: lane.center_v)
 
-        self.last_row_seeds, self.last_row_curves = self._build_row_curves(u, v, pose, row_yaw, row_lines)
-
         if len(lanes) == 0:
             return [], bands, f"row lines fitted, but no valid lane gap: lines={len(row_lines)}"
 
         return lanes, bands, f"ok: linefit rows={len(row_lines)}, lanes={len(lanes)}"
-
-    def _build_row_curves(
-        self,
-        u: np.ndarray,
-        v: np.ndarray,
-        pose: Pose2D,
-        row_yaw: float,
-        row_lines: List[MapRowLine],
-    ) -> Tuple[List[MapRowSeed], List[MapRowCurve]]:
-        seeds: List[MapRowSeed] = []
-        curves: List[MapRowCurve] = []
-
-        if len(u) == 0 or len(v) == 0 or len(row_lines) == 0:
-            return seeds, curves
-
-        bin_size = max(0.08, float(self.p.map_row_seed_bin_size))
-        min_points = max(3, int(self.p.map_row_seed_min_points))
-        sample_count = max(8, int(self.p.map_row_curve_sample_count))
-        cp = math.cos(row_yaw)
-        sp = math.sin(row_yaw)
-
-        for row_index, line in enumerate(row_lines):
-            band = max(self.p.map_row_line_distance * 1.8, 0.12)
-            row_mask = np.abs(v - (line.a * u + line.b)) <= band
-            u_row = u[row_mask]
-            v_row = v[row_mask]
-
-            if len(u_row) < min_points:
-                continue
-
-            u_min = float(np.min(u_row))
-            u_max = float(np.max(u_row))
-            if u_max - u_min < bin_size:
-                continue
-
-            edges = np.arange(u_min, u_max + bin_size, bin_size)
-            row_seeds: List[MapRowSeed] = []
-
-            for left_edge, right_edge in zip(edges[:-1], edges[1:]):
-                mask = (u_row >= left_edge) & (u_row < right_edge)
-                if int(np.count_nonzero(mask)) < min_points:
-                    continue
-
-                seed_u = float(np.median(u_row[mask]))
-                seed_v = float(np.median(v_row[mask]))
-                mx = pose.x + cp * seed_u - sp * seed_v
-                my = pose.y + sp * seed_u + cp * seed_v
-
-                seed = MapRowSeed(
-                    u=seed_u,
-                    v=seed_v,
-                    x=float(mx),
-                    y=float(my),
-                    points=int(np.count_nonzero(mask)),
-                )
-                row_seeds.append(seed)
-                seeds.append(seed)
-
-            if len(row_seeds) < 2:
-                continue
-
-            row_seeds.sort(key=lambda item: item.u)
-            sample_u = np.linspace(row_seeds[0].u, row_seeds[-1].u, sample_count)
-            seed_u_values = np.array([seed.u for seed in row_seeds], dtype=float)
-            seed_v_values = np.array([seed.v for seed in row_seeds], dtype=float)
-            sample_v = self._pchip_sample(seed_u_values, seed_v_values, sample_u)
-
-            curve_points = [
-                ScanPoint(
-                    float(pose.x + cp * uu - sp * vv),
-                    float(pose.y + sp * uu + cp * vv),
-                )
-                for uu, vv in zip(sample_u, sample_v)
-            ]
-
-            curve_confidence = clamp(
-                0.35 * min(1.0, len(row_seeds) / 6.0)
-                + 0.35 * min(1.0, len(u_row) / max(20.0, float(self.p.map_row_seed_min_points) * 3.0))
-                + 0.30 * min(1.0, float(line.confidence)),
-                0.0,
-                1.0,
-            )
-
-            curves.append(
-                MapRowCurve(
-                    valid=True,
-                    row_index=row_index,
-                    row_v=float(line.lateral_v),
-                    row_yaw=float(row_yaw),
-                    confidence=float(curve_confidence),
-                    source="seeded_row_curve",
-                    seeds=row_seeds,
-                    points=curve_points,
-                )
-            )
-
-        return seeds, curves
-
-    def _pchip_sample(self, x: np.ndarray, y: np.ndarray, x_query: np.ndarray) -> np.ndarray:
-        x = np.asarray(x, dtype=float)
-        y = np.asarray(y, dtype=float)
-        x_query = np.asarray(x_query, dtype=float)
-
-        if len(x) == 0:
-            return np.zeros_like(x_query)
-
-        if len(x) == 1:
-            return np.full_like(x_query, float(y[0]))
-
-        if len(x) == 2:
-            return np.interp(x_query, x, y)
-
-        h = np.diff(x)
-        delta = np.diff(y) / np.maximum(h, 1e-9)
-        slopes = np.zeros_like(y)
-
-        def endpoint_slope(h0: float, h1: float, d0: float, d1: float) -> float:
-            slope = ((2.0 * h0 + h1) * d0 - h0 * d1) / max(h0 + h1, 1e-9)
-            if slope * d0 <= 0.0:
-                return 0.0
-            if d0 * d1 < 0.0 and abs(slope) > abs(3.0 * d0):
-                return 3.0 * d0
-            return slope
-
-        slopes[0] = endpoint_slope(float(h[0]), float(h[1]), float(delta[0]), float(delta[1]))
-        slopes[-1] = endpoint_slope(float(h[-1]), float(h[-2]), float(delta[-1]), float(delta[-2]))
-
-        for index in range(1, len(x) - 1):
-            d_prev = float(delta[index - 1])
-            d_next = float(delta[index])
-            if d_prev == 0.0 or d_next == 0.0 or d_prev * d_next < 0.0:
-                slopes[index] = 0.0
-                continue
-
-            h_prev = float(h[index - 1])
-            h_next = float(h[index])
-            w_prev = 2.0 * h_next + h_prev
-            w_next = h_next + 2.0 * h_prev
-            slopes[index] = (w_prev + w_next) / (w_prev / d_prev + w_next / d_next)
-
-        result = np.empty_like(x_query)
-
-        for i, xq in enumerate(x_query):
-            if xq <= x[0]:
-                interval = 0
-            elif xq >= x[-1]:
-                interval = len(x) - 2
-            else:
-                interval = int(np.searchsorted(x, xq) - 1)
-
-            interval = max(0, min(interval, len(x) - 2))
-            h_i = float(x[interval + 1] - x[interval])
-            if h_i <= 1e-9:
-                result[i] = float(y[interval])
-                continue
-
-            t = float((xq - x[interval]) / h_i)
-            t2 = t * t
-            t3 = t2 * t
-            h00 = 2.0 * t3 - 3.0 * t2 + 1.0
-            h10 = t3 - 2.0 * t2 + t
-            h01 = -2.0 * t3 + 3.0 * t2
-            h11 = t3 - t2
-
-            result[i] = (
-                h00 * y[interval]
-                + h10 * h_i * slopes[interval]
-                + h01 * y[interval + 1]
-                + h11 * h_i * slopes[interval + 1]
-            )
-
-        return result
 
     def _occupied_points_local(
         self,
@@ -1723,12 +1521,7 @@ class LocalPlanner:
         return LocalPath(odom_points, True, frame_id, "TURN_GEOMETRIC_UTURN")
 
 
-    def plan_turn_path_to_map_lane(
-        self,
-        start: Pose2D,
-        target_lane: MapLane,
-        row_yaw: Optional[float] = None,
-    ) -> LocalPath:
+    def plan_turn_path_to_map_lane(self, start: Pose2D, target_lane: MapLane) -> LocalPath:
         if not target_lane.valid:
             return LocalPath([], False, self.p.map_frame, "invalid target map lane")
 
@@ -1736,6 +1529,12 @@ class LocalPlanner:
 
         if abs(row_shift) < 0.10:
             return LocalPath([], False, self.p.map_frame, "target map lane too close to current lane")
+
+        direction = 1.0 if row_shift > 0.0 else -1.0
+        radius = max(abs(row_shift) / 2.0, self.p.min_turn_radius)
+
+        if radius <= 0.05:
+            return LocalPath([], False, self.p.map_frame, "invalid map lane turn radius")
 
         local: List[PathPoint] = []
 
@@ -1745,28 +1544,21 @@ class LocalPlanner:
 
         x_offset = self.p.exit_distance
 
-        curve_length = max(
-            float(self.p.turn_forward_distance),
-            abs(row_shift) * 1.6,
-            2.5 * float(self.p.min_turn_radius),
-            0.60,
-        )
-        curve_length = min(curve_length, 4.0)
-        curve_start_x = x_offset
-        curve_end_x = x_offset - curve_length
+        for phi in np.linspace(-math.pi / 2.0, math.pi / 2.0, 90):
+            x = x_offset + radius * math.cos(phi)
+            y = direction * (radius + radius * math.sin(phi))
 
-        for step in np.linspace(0.0, 1.0, 56):
-            s = step * step * (3.0 - 2.0 * step)
-            x = curve_start_x + (curve_end_x - curve_start_x) * s
-            y = row_shift * s
-            yaw = math.pi * s
+            dx_dphi = -radius * math.sin(phi)
+            dy_dphi = direction * radius * math.cos(phi)
+            yaw = math.atan2(dy_dphi, dx_dphi)
+
             local.append(PathPoint(float(x), float(y), float(yaw), self.p.turn_speed))
 
         end_y = row_shift
 
         if self.p.enter_distance > 0.01:
             for s in np.linspace(0.0, self.p.enter_distance, 20):
-                x = curve_end_x - float(s)
+                x = x_offset - float(s)
                 y = end_y
                 yaw = math.pi
                 local.append(PathPoint(float(x), float(y), float(yaw), self.p.enter_speed))
@@ -1775,20 +1567,13 @@ class LocalPlanner:
         c = math.cos(start.yaw)
         s = math.sin(start.yaw)
 
-        if row_yaw is None:
-            row_yaw = start.yaw
-
         for p in local:
             mx = start.x + c * p.x - s * p.y
             my = start.y + s * p.x + c * p.y
             myaw = wrap_to_pi(start.yaw + p.yaw)
             map_points.append(PathPoint(float(mx), float(my), float(myaw), float(p.v)))
 
-        reason = "TURN_SPLINE_LANE_UTURN"
-        if row_yaw is not None:
-            reason += f"_rowyaw_{row_yaw:.2f}"
-
-        return LocalPath(map_points, True, self.p.map_frame, reason)
+        return LocalPath(map_points, True, self.p.map_frame, "TURN_SLAM_LANE_UTURN")
 
 
     def plan_constant_curve_base_link(
@@ -2237,40 +2022,6 @@ class MissionManager:
         self.acquire_start_time = None
 
         self.started = False
-
-    def _refresh_map_row_analysis(
-        self,
-        latest_map: Optional[OccupancyGrid],
-        pose_map: Optional[Pose2D],
-        map_detector: Optional[MapRowDetector],
-        select_target: bool = False,
-    ) -> Optional[MapLane]:
-        if not self.p.map_row_detection_enabled or latest_map is None or map_detector is None or pose_map is None:
-            return None
-
-        self.map_lanes, self.map_row_bands, self.last_map_row_reason = map_detector.detect_lanes(
-            latest_map,
-            pose_map,
-        )
-
-        target_lane: Optional[MapLane] = None
-        if select_target:
-            target_lane = map_detector.select_target_lane(
-                self.map_lanes,
-                self.map_row_bands,
-                self.p.row_shift_direction,
-                self.p.row_shift_count,
-            )
-
-        self.last_target_lane_reason = map_detector.last_target_reason
-        self.expected_target_offset = map_detector.last_expected_target_offset
-        self.detected_target_offset = map_detector.last_detected_target_offset
-        self.target_offset_error = map_detector.last_target_offset_error
-        self.reference_row_v = map_detector.last_reference_row_v
-        self.target_row_v = map_detector.last_target_row_v
-        self.candidate_rows_text = map_detector.last_candidate_rows_text
-
-        return target_lane
 
     def start(self) -> None:
         self.pattern_steps = self.load_pattern()
@@ -2839,7 +2590,23 @@ class MissionManager:
             # Plausibilisierung. Das Manoever faehrt nicht beliebig zu einer absoluten
             # Map-Lane, sondern nur den pattern-relativen Sollversatz.
             if self.p.map_row_detection_enabled and latest_map is not None and map_detector is not None:
-                self._refresh_map_row_analysis(latest_map, pose_map, map_detector)
+                self.map_lanes, self.map_row_bands, self.last_map_row_reason = map_detector.detect_lanes(
+                    latest_map,
+                    pose_map,
+                )
+                _ = map_detector.select_target_lane(
+                    self.map_lanes,
+                    self.map_row_bands,
+                    self.p.row_shift_direction,
+                    self.p.row_shift_count,
+                )
+                self.last_target_lane_reason = map_detector.last_target_reason
+                self.expected_target_offset = map_detector.last_expected_target_offset
+                self.detected_target_offset = map_detector.last_detected_target_offset
+                self.target_offset_error = map_detector.last_target_offset_error
+                self.reference_row_v = map_detector.last_reference_row_v
+                self.target_row_v = map_detector.last_target_row_v
+                self.candidate_rows_text = map_detector.last_candidate_rows_text
                 self._capture_headland_reference_row_yaw(map_detector)
                 self._update_headland_measured_shift(pose_map)
                 remaining = self._headland_pre_entry_shift_target() - abs(self.headland_measured_shift)
@@ -2965,13 +2732,28 @@ class MissionManager:
                     if map_detector is None:
                         return LocalPath([], False, self.p.map_frame, "PLAN_TURN blocked: no MapRowDetector")
 
-                    self.target_map_lane = self._refresh_map_row_analysis(latest_map, pose_map, map_detector, select_target=True)
+                    self.map_lanes, self.map_row_bands, self.last_map_row_reason = map_detector.detect_lanes(
+                        latest_map,
+                        pose_map,
+                    )
+                    self.target_map_lane = map_detector.select_target_lane(
+                        self.map_lanes,
+                        self.map_row_bands,
+                        self.p.row_shift_direction,
+                        self.p.row_shift_count,
+                    )
+                    self.last_target_lane_reason = map_detector.last_target_reason
+                    self.expected_target_offset = map_detector.last_expected_target_offset
+                    self.detected_target_offset = map_detector.last_detected_target_offset
+                    self.target_offset_error = map_detector.last_target_offset_error
+                    self.reference_row_v = map_detector.last_reference_row_v
+                    self.target_row_v = map_detector.last_target_row_v
+                    self.candidate_rows_text = map_detector.last_candidate_rows_text
 
                     if self.target_map_lane is not None:
                         self.active_turn_path = planner.plan_turn_path_to_map_lane(
                             pose_map,
                             self.target_map_lane,
-                            self.headland_reference_row_yaw_map,
                         )
 
                         if not self.active_turn_path.valid or len(self.active_turn_path.points) == 0:
@@ -3081,7 +2863,23 @@ class MissionManager:
                     self.turn_replan_frame_counter = 0
                     self.turn_replan_attempts += 1
 
-                    replanning_target_lane = self._refresh_map_row_analysis(latest_map, pose_map, map_detector, select_target=True)
+                    self.map_lanes, self.map_row_bands, self.last_map_row_reason = map_detector.detect_lanes(
+                        latest_map,
+                        pose_map,
+                    )
+                    replanning_target_lane = map_detector.select_target_lane(
+                        self.map_lanes,
+                        self.map_row_bands,
+                        self.p.row_shift_direction,
+                        self.p.row_shift_count,
+                    )
+                    self.last_target_lane_reason = map_detector.last_target_reason
+                    self.expected_target_offset = map_detector.last_expected_target_offset
+                    self.detected_target_offset = map_detector.last_detected_target_offset
+                    self.target_offset_error = map_detector.last_target_offset_error
+                    self.reference_row_v = map_detector.last_reference_row_v
+                    self.target_row_v = map_detector.last_target_row_v
+                    self.candidate_rows_text = map_detector.last_candidate_rows_text
 
                     if (
                         replanning_target_lane is not None
@@ -3090,7 +2888,6 @@ class MissionManager:
                         replanned_path = planner.plan_turn_path_to_map_lane(
                             pose_map,
                             replanning_target_lane,
-                            self.headland_reference_row_yaw_map,
                         )
 
                         if replanned_path.valid and len(replanned_path.points) > 0:
@@ -3274,6 +3071,9 @@ class MissionManager:
 
         return LocalPath([], False, "base_link", "unknown state")
 
+############################################################
+# Main Node
+############################################################
 
 class MaizeNavigator(Node):
     def __init__(self):
@@ -3474,9 +3274,6 @@ class MaizeNavigator(Node):
         p.map_row_max_abs_line_slope = float(declare("map_row_max_abs_line_slope", p.map_row_max_abs_line_slope))
         p.map_row_max_lines = int(declare("map_row_max_lines", p.map_row_max_lines))
         p.map_row_line_merge_distance = float(declare("map_row_line_merge_distance", p.map_row_line_merge_distance))
-        p.map_row_seed_bin_size = float(declare("map_row_seed_bin_size", p.map_row_seed_bin_size))
-        p.map_row_seed_min_points = int(declare("map_row_seed_min_points", p.map_row_seed_min_points))
-        p.map_row_curve_sample_count = int(declare("map_row_curve_sample_count", p.map_row_curve_sample_count))
         p.map_lane_accept_tolerance = float(declare("map_lane_accept_tolerance", p.map_lane_accept_tolerance))
 
         p.turn_replan_enabled = bool(declare("turn_replan_enabled", p.turn_replan_enabled))
@@ -3704,11 +3501,6 @@ class MaizeNavigator(Node):
                     f"map_bands={len(self.mission.map_row_bands)}, "
                     f"map_reason={self.mission.last_map_row_reason}"
                 )
-            reasons.append(
-                f"map_row_seeds={len(self.map_row_detector.last_row_seeds)}, "
-                f"map_row_curves={len(self.map_row_detector.last_row_curves)}, "
-                f"map_row_lines={len(self.map_row_detector.last_row_lines)}"
-            )
 
         if state == MissionState.EXECUTE_TURN:
             if self.mission.active_turn_uses_map_lane:
@@ -3757,9 +3549,6 @@ class MaizeNavigator(Node):
             f" | final_cmd=({safe_cmd.linear.x:.3f}, {safe_cmd.angular.z:.3f})"
             f" | safety_enabled={self.p.enable_safety}"
             f" | map_rows_enabled={self.p.map_row_detection_enabled}"
-            f" | map_row_seeds={len(self.map_row_detector.last_row_seeds)}"
-            f" | map_row_curves={len(self.map_row_detector.last_row_curves)}"
-            f" | map_row_lines={len(self.map_row_detector.last_row_lines)}"
             f" | map_lanes={len(self.mission.map_lanes)}"
             f" | map_bands={len(self.mission.map_row_bands)}"
             f" | target_map_lane={target_lane_text}"
@@ -3829,7 +3618,7 @@ class MaizeNavigator(Node):
         self.end_pub.publish(end_msg)
 
         self.publish_path(path)
-        self.publish_markers(det, row, self.map_row_detector.last_row_seeds, self.map_row_detector.last_row_curves)
+        self.publish_markers(det, row)
 
     def publish_path(self, path: LocalPath) -> None:
         msg = Path()
@@ -3854,13 +3643,7 @@ class MaizeNavigator(Node):
 
         self.path_pub.publish(msg)
 
-    def publish_markers(
-        self,
-        det: RowDetection,
-        row: RowModel,
-        map_seeds: Optional[List[MapRowSeed]] = None,
-        map_curves: Optional[List[MapRowCurve]] = None,
-    ) -> None:
+    def publish_markers(self, det: RowDetection, row: RowModel) -> None:
         markers = MarkerArray()
 
         def line_marker(
@@ -3902,54 +3685,6 @@ class MaizeNavigator(Node):
         markers.markers.append(
             line_marker(3, row.center_a, row.center_b, (1.0, 0.5, 0.0), row.valid)
         )
-
-        if map_seeds:
-            seed_marker = Marker()
-            seed_marker.header.stamp = self.get_clock().now().to_msg()
-            seed_marker.header.frame_id = self.p.map_frame
-            seed_marker.ns = "map_row_seeds"
-            seed_marker.id = 20
-            seed_marker.type = Marker.POINTS
-            seed_marker.action = Marker.ADD
-            seed_marker.scale.x = 0.06
-            seed_marker.scale.y = 0.06
-            seed_marker.color.r = 0.2
-            seed_marker.color.g = 0.8
-            seed_marker.color.b = 1.0
-            seed_marker.color.a = 1.0
-
-            for seed in map_seeds:
-                pt = Point()
-                pt.x = float(seed.x)
-                pt.y = float(seed.y)
-                pt.z = 0.05
-                seed_marker.points.append(pt)
-
-            markers.markers.append(seed_marker)
-
-        if map_curves:
-            for index, curve in enumerate(map_curves):
-                marker = Marker()
-                marker.header.stamp = self.get_clock().now().to_msg()
-                marker.header.frame_id = self.p.map_frame
-                marker.ns = "map_row_curves"
-                marker.id = 30 + index
-                marker.type = Marker.LINE_STRIP
-                marker.action = Marker.ADD if curve.valid and len(curve.points) > 1 else Marker.DELETE
-                marker.scale.x = 0.04
-                marker.color.r = 1.0
-                marker.color.g = 0.2
-                marker.color.b = 0.9
-                marker.color.a = 1.0
-
-                for pt_src in curve.points:
-                    pt = Point()
-                    pt.x = float(pt_src.x)
-                    pt.y = float(pt_src.y)
-                    pt.z = 0.05
-                    marker.points.append(pt)
-
-                markers.markers.append(marker)
 
         self.marker_pub.publish(markers)
 
