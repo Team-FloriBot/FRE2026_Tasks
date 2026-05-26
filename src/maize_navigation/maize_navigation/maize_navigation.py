@@ -19,6 +19,7 @@ from nav_msgs.msg import OccupancyGrid, Path
 from sensor_msgs.msg import LaserScan
 from std_msgs.msg import Float32, String
 from std_srvs.srv import Trigger
+from fre2026_task_interfaces.srv import SetNavigationPattern, GetNavigationStatus
 from visualization_msgs.msg import Marker, MarkerArray
 
 import tf2_ros
@@ -201,6 +202,19 @@ def parse_pattern(pattern: str) -> List[PatternStep]:
     return steps
 
 
+def normalize_pattern(pattern: str) -> Tuple[str, List[PatternStep]]:
+    steps = parse_pattern(pattern)
+
+    if not steps:
+        raise ValueError("Pattern darf nicht leer sein.")
+
+    normalized = " ".join(
+        f"{step.row_shift_count}{step.row_shift_direction}"
+        for step in steps
+    )
+    return normalized, steps
+
+
 class MissionState(Enum):
     IDLE = 0
     FOLLOW_ROW = 1
@@ -288,9 +302,10 @@ class NavigatorParams:
     turn_forward_distance: float = 2.20
     min_turn_radius: float = 0.38
     enter_distance: float = 0.90
-    pattern: str = "1L 2R 2L 3R"
-    row_shift_count: int = 1
-    row_shift_direction: str = "L"
+    # Laufzeitwerte des aktuell auszufuehrenden Pattern-Schritts.
+    # Sie werden ausschliesslich durch ein per Service geladenes Pattern gesetzt.
+    row_shift_count: int = 0
+    row_shift_direction: str = ""
     turn_180: bool = True
 
     # Robuster Gassenwechsel im Vorgewende.
@@ -2012,6 +2027,7 @@ class MissionManager:
         self.reference_row_v: float = 0.0
         self.target_row_v: float = 0.0
         self.candidate_rows_text: str = ""
+        self.loaded_pattern: str = ""
         self.pattern_steps: List[PatternStep] = []
         self.pattern_index = 0
         self.pattern_completed = False
@@ -2023,8 +2039,50 @@ class MissionManager:
 
         self.started = False
 
+    def has_loaded_pattern(self) -> bool:
+        return bool(self.pattern_steps)
+
+    def set_pattern(self, pattern: str) -> str:
+        if self.state != MissionState.IDLE:
+            raise ValueError(
+                "Pattern kann momentan nur im Zustand IDLE gesetzt werden."
+            )
+
+        normalized, steps = normalize_pattern(pattern)
+        self.loaded_pattern = normalized
+        self.pattern_steps = steps
+        self.pattern_index = 0
+        self.pattern_completed = False
+        self.apply_current_pattern_step()
+        self.node.get_logger().info(
+            f"Navigation pattern loaded via service: {self.loaded_pattern}"
+        )
+        return self.loaded_pattern
+
+    def clear_pattern(self) -> None:
+        self.loaded_pattern = ""
+        self.pattern_steps = []
+        self.pattern_index = 0
+        self.pattern_completed = False
+        self.p.row_shift_count = 0
+        self.p.row_shift_direction = ""
+
+    def active_pattern_step_text(self) -> str:
+        if not self.pattern_steps or self.pattern_index >= len(self.pattern_steps):
+            return ""
+
+        step = self.pattern_steps[self.pattern_index]
+        return f"{step.row_shift_count}{step.row_shift_direction}"
+
     def start(self) -> None:
-        self.pattern_steps = self.load_pattern()
+        if self.state != MissionState.IDLE:
+            raise ValueError("Navigation kann nur aus dem Zustand IDLE gestartet werden.")
+
+        if not self.has_loaded_pattern():
+            raise ValueError(
+                "Kein Pattern geladen. Vor dem Start muss ein Pattern per Service uebertragen werden."
+            )
+
         self.pattern_index = 0
         self.pattern_completed = False
         self.apply_current_pattern_step()
@@ -2059,22 +2117,8 @@ class MissionManager:
         self.reference_row_v = 0.0
         self.target_row_v = 0.0
         self.candidate_rows_text = ""
-        self.pattern_completed = False
+        self.clear_pattern()
         self.transition(MissionState.IDLE, "stop requested")
-
-    def load_pattern(self) -> List[PatternStep]:
-        try:
-            steps = parse_pattern(self.p.pattern)
-        except ValueError as exc:
-            self.node.get_logger().error(str(exc))
-            steps = [PatternStep(self.p.row_shift_count, self.p.row_shift_direction.upper())]
-
-        if len(steps) == 0:
-            steps = [PatternStep(self.p.row_shift_count, self.p.row_shift_direction.upper())]
-
-        text = " ".join(f"{step.row_shift_count}{step.row_shift_direction}" for step in steps)
-        self.node.get_logger().info(f"Loaded row pattern: {text}")
-        return steps
 
     def apply_current_pattern_step(self) -> None:
         if not self.pattern_steps:
@@ -3123,6 +3167,16 @@ class MaizeNavigator(Node):
         self.last_diag_text = ""
         self.last_diag_log_time = self.get_clock().now()
 
+        self.set_pattern_srv = self.create_service(
+            SetNavigationPattern,
+            "/set_navigation_pattern",
+            self.set_navigation_pattern_cb,
+        )
+        self.get_status_srv = self.create_service(
+            GetNavigationStatus,
+            "/get_navigation_status",
+            self.get_navigation_status_cb,
+        )
         self.start_srv = self.create_service(Trigger, "/start_navigation", self.start_cb)
         self.stop_srv = self.create_service(Trigger, "/stop_navigation", self.stop_cb)
 
@@ -3209,9 +3263,6 @@ class MaizeNavigator(Node):
         p.turn_forward_distance = float(declare("turn_forward_distance", p.turn_forward_distance))
         p.min_turn_radius = float(declare("min_turn_radius", p.min_turn_radius))
         p.enter_distance = float(declare("enter_distance", p.enter_distance))
-        p.pattern = str(declare("pattern", p.pattern))
-        p.row_shift_count = int(declare("row_shift_count", p.row_shift_count))
-        p.row_shift_direction = str(declare("row_shift_direction", p.row_shift_direction))
         p.turn_180 = bool(declare("turn_180", p.turn_180))
 
         p.headland_maneuver_enabled = bool(declare("headland_maneuver_enabled", p.headland_maneuver_enabled))
@@ -3294,17 +3345,74 @@ class MaizeNavigator(Node):
     def map_callback(self, msg: OccupancyGrid) -> None:
         self.latest_map = msg
 
-    def start_cb(self, request, response):
-        self.mission.start()
+    def fill_navigation_status(self, response):
+        pattern_loaded = self.mission.has_loaded_pattern()
+        can_set_pattern = self.mission.state == MissionState.IDLE
+        can_start = self.mission.state == MissionState.IDLE and pattern_loaded
+        can_abort = self.mission.state not in (MissionState.IDLE, MissionState.FINISHED)
+
+        response.mission_state = self.mission.state.name
+        response.pattern_loaded = pattern_loaded
+        response.active_pattern = self.mission.loaded_pattern
+        response.active_step_index = self.mission.pattern_index + 1 if pattern_loaded else 0
+        response.total_steps = len(self.mission.pattern_steps)
+        response.active_step = self.mission.active_pattern_step_text()
+        response.can_set_pattern = can_set_pattern
+        response.can_start = can_start
+        response.can_pause = False
+        response.can_resume = False
+        response.can_abort = can_abort
+        return response
+
+    def set_navigation_pattern_cb(self, request, response):
+        try:
+            response.accepted_pattern = self.mission.set_pattern(request.pattern)
+            response.success = True
+            response.message = "Pattern erfolgreich geladen."
+        except ValueError as exc:
+            response.success = False
+            response.message = str(exc)
+            response.accepted_pattern = self.mission.loaded_pattern
+
+        response.mission_state = self.mission.state.name
+        response.can_start = (
+            self.mission.state == MissionState.IDLE
+            and self.mission.has_loaded_pattern()
+        )
+        response.can_resume = False
+        return response
+
+    def get_navigation_status_cb(self, request, response):
         response.success = True
-        response.message = "navigation started"
+        if self.mission.state == MissionState.IDLE:
+            response.message = (
+                "Bereit. Pattern geladen."
+                if self.mission.has_loaded_pattern()
+                else "Bereit. Kein Pattern geladen."
+            )
+        elif self.mission.state == MissionState.FINISHED:
+            response.message = "Mission beendet."
+        else:
+            response.message = "Mission aktiv."
+        return self.fill_navigation_status(response)
+
+    def start_cb(self, request, response):
+        try:
+            self.mission.start()
+            response.success = True
+            response.message = (
+                f"Navigation gestartet mit Pattern: {self.mission.loaded_pattern}"
+            )
+        except ValueError as exc:
+            response.success = False
+            response.message = str(exc)
         return response
 
     def stop_cb(self, request, response):
         self.mission.stop()
         self.publish_stop()
         response.success = True
-        response.message = "navigation stopped"
+        response.message = "Navigation abgebrochen. Geladenes Pattern wurde verworfen."
         return response
 
     def control_loop(self) -> None:
