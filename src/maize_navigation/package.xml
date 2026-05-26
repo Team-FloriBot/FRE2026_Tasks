@@ -4,7 +4,7 @@
   <version>0.0.1</version>
   <description>Single-node maize row navigation prototype with row acquisition.</description>
 
-  <maintainer email="todo@example.com">FRE2026 Team</maintainer>
+  <maintainer email="tzimmerman@stud.hs-heilbronn.de">FRE2026 Team</maintainer>
   <license>MIT</license>
 
   <buildtool_depend>ament_python</buildtool_depend>
@@ -19,6 +19,7 @@
   <depend>tf2_ros</depend>
   <depend>tf_transformations</depend>
   <depend>python3-numpy</depend>
+  <depend>fre2026_task_interfaces</depend>
 
   <exec_depend>ros-jazzy-tf-transformations</exec_depend>
 
