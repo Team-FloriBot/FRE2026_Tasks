@@ -1066,12 +1066,34 @@ class MapRowDetector:
             entrance_x = 0.5 * (p_r[0] + p_l[0])
             entrance_y = 0.5 * (p_r[1] + p_l[1])
 
-            # Use average row_yaw as entrance yaw (map-frame)
-            entrance_yaw = 0.5 * (float(right_curve.row_yaw) + float(left_curve.row_yaw))
+            # Compute entrance yaw from vector between the two spline starts.
+            # The row direction is approximately perpendicular to that vector.
+            dx = p_l[0] - p_r[0]
+            dy = p_l[1] - p_r[1]
+            perp = math.atan2(dy, dx) + math.pi / 2.0
+
+            # Choose yaw that is consistent with latched map row yaw if available
+            entrance_yaw = wrap_to_pi(perp)
+            if self.last_row_yaw_map is not None:
+                cand = wrap_to_pi(perp)
+                cand_alt = wrap_to_pi(perp + math.pi)
+                ref = float(self.last_row_yaw_map)
+                if abs(wrap_to_pi(cand - ref)) <= abs(wrap_to_pi(cand_alt - ref)):
+                    entrance_yaw = cand
+                else:
+                    entrance_yaw = cand_alt
 
             center_v = 0.5 * (float(right_curve.row_v) + float(left_curve.row_v))
             width = float(left_curve.row_v) - float(right_curve.row_v)
             confidence = clamp(0.5 * float(right_curve.confidence) + 0.5 * float(left_curve.confidence), 0.0, 1.0)
+
+            # Update diagnostic candidate rows text for consumers (MissionManager)
+            try:
+                rows_text = ",".join(f"{float(c.row_v):.3f}" for c in valid_curves[:12])
+                cur_lane_text = f"cur_idx={current_idx}, target_idx={target_idx}, lanes={len(lane_centers)}"
+                self.last_candidate_rows_text = f"{rows_text};{cur_lane_text}"
+            except Exception:
+                self.last_candidate_rows_text = ""
 
             return MapLane(
                 valid=True,
