@@ -3098,10 +3098,14 @@ class MissionManager:
                 self.node.get_logger().warn(
                     f"ENTRY_CURVE overshoot guard: measured_shift={self.headland_measured_shift:.3f}, "
                     f"required_shift={self.headland_required_shift:.3f}, "
-                    f"tolerance={overshoot_tolerance:.3f}. Switching to ACQUIRE_ROW."
+                    f"tolerance={overshoot_tolerance:.3f}. Staying in map-guided follow mode."
                 )
-                self.transition(MissionState.ACQUIRE_ROW, "entry curve overshoot guard")
-                return planner.plan_acquire_row(row)
+                self.transition(MissionState.FOLLOW_ROW, "entry curve overshoot guard")
+                return planner.plan_headland_shift_map_heading(
+                    pose_map,
+                    pose_map.yaw,
+                    reason="FOLLOW_ROW_MAP",
+                )
 
             self.entry_shift_ok = self._entry_shift_window_ok()
             self.entry_reference_side_ok = self._entry_reference_side_detected(row)
@@ -3136,14 +3140,22 @@ class MissionManager:
             if map_target_yaw is not None:
                 yaw_error_to_map_row = abs(wrap_to_pi(float(map_target_yaw) - pose_map.yaw))
                 if yaw_error_to_map_row <= max(0.0, float(self.p.entry_yaw_accept_tolerance)):
-                    self.transition(MissionState.ACQUIRE_ROW, "entry curve aligned to map row yaw; target lane not geometrically centered yet")
-                    return planner.plan_acquire_row(row)
+                    self.transition(MissionState.FOLLOW_ROW, "entry curve aligned to map row yaw")
+                    return planner.plan_headland_shift_map_heading(
+                        pose_map,
+                        float(map_target_yaw),
+                        reason="FOLLOW_ROW_MAP",
+                    )
 
             yaw_progress = self.headland_direction * wrap_to_pi(pose_map.yaw - float(self.entry_curve_start_yaw))
             target_entry_yaw = self._effective_entry_curve_yaw_change()
             if yaw_progress >= target_entry_yaw:
-                self.transition(MissionState.ACQUIRE_ROW, "entry curve completed; target lane not geometrically centered yet")
-                return planner.plan_acquire_row(row)
+                self.transition(MissionState.FOLLOW_ROW, "entry curve completed")
+                return planner.plan_headland_shift_map_heading(
+                    pose_map,
+                    float(map_target_yaw) if map_target_yaw is not None else pose_map.yaw,
+                    reason="FOLLOW_ROW_MAP",
+                )
 
             return planner.plan_constant_curve_base_link(
                 self.headland_direction,
