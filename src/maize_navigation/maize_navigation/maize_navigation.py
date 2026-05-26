@@ -3349,6 +3349,15 @@ class MissionManager:
             if active_pose is not None and controller.path_goal_reached(self.active_turn_path, active_pose):
                 self.active_turn_path = None
                 self.active_turn_uses_map_lane = False
+                if self.p.map_row_detection_enabled:
+                    if self.advance_pattern():
+                        self.transition(MissionState.FOLLOW_ROW, "map-guided turn path reached")
+                        return planner.plan_follow_row(row)
+
+                    self.pattern_completed = True
+                    self.transition(MissionState.FOLLOW_ROW, "final map-guided turn path reached")
+                    return planner.plan_follow_row(row)
+
                 self.transition(MissionState.ACQUIRE_ROW, "turn path reached")
                 return planner.plan_acquire_row(row)
 
