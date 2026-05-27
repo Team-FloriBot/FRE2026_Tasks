@@ -42,11 +42,11 @@ class Pose2D:
 # --- Data Structures for Splines ---
 
 class PlantSpline:
-    def __init__(self, points: np.ndarray, heading_yaw: float = 0.0, s: float = 0.2):
+    def __init__(self, points: np.ndarray, heading_yaw: float = 0.0, s: float = 2.0):
         """
         points: (N, 2) array of (x, y) coordinates in map frame
         heading_yaw: Approximate current heading yaw of the robot to align spline direction
-        s: smoothing factor for UnivariateSpline
+        s: high smoothing factor for UnivariateSpline to prevent overfitting and loops
         """
         self.valid = False
         self.t_min = 0.0
@@ -79,8 +79,9 @@ class PlantSpline:
         if len(unique_t) < 4:
             return
             
-        self.x_spline = UnivariateSpline(unique_t, self.points[unique_idx, 0], s=s)
-        self.y_spline = UnivariateSpline(unique_t, self.points[unique_idx, 1], s=s)
+        # Use low-degree spline (k=2) with high smoothing (s) to get a super smooth curve
+        self.x_spline = UnivariateSpline(unique_t, self.points[unique_idx, 0], k=2, s=s)
+        self.y_spline = UnivariateSpline(unique_t, self.points[unique_idx, 1], k=2, s=s)
         self.valid = True
         self.t_min = unique_t[0]
         self.t_max = unique_t[-1]
@@ -159,10 +160,6 @@ class MaizeNavigator(Node):
         
         self.latest_map: Optional[OccupancyGrid] = None
         self.robot_pose: Optional[Pose2D] = None
-        
-        # We store the compiled historical points of each active row
-        self.left_row_points: Optional[np.ndarray] = None
-        self.right_row_points: Optional[np.ndarray] = None
         
         self.left_row_spline: Optional[PlantSpline] = None
         self.right_row_spline: Optional[PlantSpline] = None
@@ -286,11 +283,11 @@ class MaizeNavigator(Node):
             
         best_left, best_right = min(left_peaks), max(right_peaks)
         
-        self.left_row_points = points[np.abs(local_y - best_left) < 0.25]
-        self.right_row_points = points[np.abs(local_y - best_right) < 0.25]
+        left_pts = points[np.abs(local_y - best_left) < 0.25]
+        right_pts = points[np.abs(local_y - best_right) < 0.25]
         
-        self.left_row_spline = PlantSpline(self.left_row_points, heading_yaw=self.robot_pose.yaw)
-        self.right_row_spline = PlantSpline(self.right_row_points, heading_yaw=self.robot_pose.yaw)
+        self.left_row_spline = PlantSpline(left_pts, heading_yaw=self.robot_pose.yaw)
+        self.right_row_spline = PlantSpline(right_pts, heading_yaw=self.robot_pose.yaw)
         
         if self.left_row_spline.valid and self.right_row_spline.valid:
             self.row_entry_pose = self.robot_pose
@@ -298,41 +295,42 @@ class MaizeNavigator(Node):
             self.get_logger().info(f"Rows found. Width: {best_left - best_right:.2f}m. Following...")
 
     def handle_follow_row(self):
-        # 1. Project robot onto current splines
+        # 1. Update Splines purely based on current live-view map points (no historical accumulation to prevent drift)
+        points = self.get_map_points_in_roi(self.robot_pose, self.p.hist_roi_size * 1.5)
+        if len(points) >= 10:
+            c, s = math.cos(-self.robot_pose.yaw), math.sin(-self.robot_pose.yaw)
+            dx, dy = points[:, 0] - self.robot_pose.x, points[:, 1] - self.robot_pose.y
+            local_y = s * dx + c * dy
+            
+            p_robot = np.array([self.robot_pose.x, self.robot_pose.y])
+            t_l_curr = self.left_row_spline.project(p_robot)
+            t_r_curr = self.right_row_spline.project(p_robot)
+            
+            curr_l_world = np.array(self.left_row_spline.evaluate(t_l_curr))
+            curr_r_world = np.array(self.right_row_spline.evaluate(t_r_curr))
+            
+            curr_l_local_y = s * (curr_l_world[0] - self.robot_pose.x) + c * (curr_l_world[1] - self.robot_pose.y)
+            curr_r_local_y = s * (curr_r_world[0] - self.robot_pose.x) + c * (curr_r_world[1] - self.robot_pose.y)
+            
+            # Filter live map points belonging to left/right rows
+            new_left_pts = points[np.abs(local_y - curr_l_local_y) < 0.25]
+            new_right_pts = points[np.abs(local_y - curr_r_local_y) < 0.25]
+            
+            if len(new_left_pts) >= 4:
+                temp_spline = PlantSpline(new_left_pts, heading_yaw=self.robot_pose.yaw)
+                if temp_spline.valid:
+                    self.left_row_spline = temp_spline
+            if len(new_right_pts) >= 4:
+                temp_spline = PlantSpline(new_right_pts, heading_yaw=self.robot_pose.yaw)
+                if temp_spline.valid:
+                    self.right_row_spline = temp_spline
+
+        # 2. Project robot onto splines
         p_robot = np.array([self.robot_pose.x, self.robot_pose.y])
         t_l = self.left_row_spline.project(p_robot)
         t_r = self.right_row_spline.project(p_robot)
 
-        # 2. Lookahead search along spline end-tangents to find new points
-        # For Left Spline:
-        end_val_l = np.array(self.left_row_spline.evaluate(self.left_row_spline.t_max))
-        dir_l = self.left_row_spline.get_direction(self.left_row_spline.t_max)
-        new_pts_l = self.find_points_along_tangent(end_val_l, dir_l, max_dist=2.5, width=0.4)
-        
-        if len(new_pts_l) > 0:
-            # Append unique points
-            self.left_row_points = self.accumulate_unique_points(self.left_row_points, new_pts_l)
-            # Refit Left Spline
-            temp_spline = PlantSpline(self.left_row_points, heading_yaw=self.robot_pose.yaw)
-            if temp_spline.valid:
-                self.left_row_spline = temp_spline
-
-        # For Right Spline:
-        end_val_r = np.array(self.right_row_spline.evaluate(self.right_row_spline.t_max))
-        dir_r = self.right_row_spline.get_direction(self.right_row_spline.t_max)
-        new_pts_r = self.find_points_along_tangent(end_val_r, dir_r, max_dist=2.5, width=0.4)
-        
-        if len(new_pts_r) > 0:
-            self.right_row_points = self.accumulate_unique_points(self.right_row_points, new_pts_r)
-            temp_spline = PlantSpline(self.right_row_points, heading_yaw=self.robot_pose.yaw)
-            if temp_spline.valid:
-                self.right_row_spline = temp_spline
-
-        # 3. Project robot on updated splines
-        t_l = self.left_row_spline.project(p_robot)
-        t_r = self.right_row_spline.project(p_robot)
-
-        # 4. Robust End of row detection using the forward lookahead window from our tangent search
+        # 3. Robust End of row detection using live lookahead
         points_ahead = self.get_map_points_in_front(self.robot_pose, distance=2.5, width=1.0)
         dist_in_row = math.hypot(self.robot_pose.x - self.row_entry_pose.x, self.robot_pose.y - self.row_entry_pose.y)
         
@@ -345,7 +343,7 @@ class MaizeNavigator(Node):
             self.state = MissionState.EXIT_ROW
             return
 
-        # 5. Pure Pursuit on mid-spline (using local cross track correction relative to current splines)
+        # 4. Pure Pursuit on mid-spline
         t_lookahead = (t_l + t_r) / 2.0 + self.p.lookahead_dist
         t_l_eval = max(self.left_row_spline.t_min, min(t_lookahead, self.left_row_spline.t_max))
         t_r_eval = max(self.right_row_spline.t_min, min(t_lookahead, self.right_row_spline.t_max))
@@ -354,55 +352,20 @@ class MaizeNavigator(Node):
         p_r = np.array(self.right_row_spline.evaluate(t_r_eval))
         p_target = (p_l + p_r) / 2.0
         
-        # Additional safety check: Calculate lateral offset in local robot frame at robot's current projection
-        # This keeps the robot centered even if odometry/SLAM slips a bit!
+        # Local lateral error correction
         curr_p_l = np.array(self.left_row_spline.evaluate(t_l))
         curr_p_r = np.array(self.right_row_spline.evaluate(t_r))
         curr_mid = (curr_p_l + curr_p_r) / 2.0
         
-        # Local offset to the current row center
         c, s = math.cos(-self.robot_pose.yaw), math.sin(-self.robot_pose.yaw)
         local_dy = s * (curr_mid[0] - self.robot_pose.x) + c * (curr_mid[1] - self.robot_pose.y)
         
-        # Adjust target locally by injecting a correction based on current local offset
         if abs(local_dy) > 0.05:
-            # Shift the lookahead target slightly laterally to pull us back to the center of the local splines
             target_yaw = self.robot_pose.yaw + math.pi / 2.0
             p_target[0] += math.cos(target_yaw) * local_dy * 0.5
             p_target[1] += math.sin(target_yaw) * local_dy * 0.5
         
         self.drive_to_point(p_target)
-
-    def find_points_along_tangent(self, start_pos: np.ndarray, yaw: float, max_dist: float, width: float) -> np.ndarray:
-        """Looks for plant points ahead of the spline's end point in the direction of its tangent."""
-        # Query map cells in a generous bounding area
-        points = self.get_map_points_in_roi(Pose2D(start_pos[0], start_pos[1], yaw), max_dist * 2)
-        if len(points) == 0:
-            return points
-            
-        c, s = math.cos(-yaw), math.sin(-yaw)
-        dx = points[:, 0] - start_pos[0]
-        dy = points[:, 1] - start_pos[1]
-        
-        # Transform points to lookahead window local frame (x_local: along tangent, y_local: lateral deviation)
-        lx = c * dx - s * dy
-        ly = s * dx + c * dy
-        
-        # Filter points inside lookahead search window
-        mask = (lx > 0.05) & (lx < max_dist) & (np.abs(ly) < width / 2.0)
-        return points[mask]
-
-    def accumulate_unique_points(self, current_pts: np.ndarray, new_pts: np.ndarray) -> np.ndarray:
-        """Filters new points to only append those that aren't already represented in current_pts."""
-        # Simple spatial proximity filter: keep points that are at least 0.05m away from any existing point
-        kept = []
-        for pt in new_pts:
-            dists = np.linalg.norm(current_pts - pt, axis=1)
-            if np.min(dists) > 0.05:
-                kept.append(pt)
-        if len(kept) > 0:
-            return np.vstack((current_pts, np.array(kept)))
-        return current_pts
 
     def get_map_points_in_front(self, pose: Pose2D, distance: float, width: float) -> np.ndarray:
         points = self.get_map_points_in_roi(pose, distance * 2)
@@ -526,4 +489,8 @@ def main(args=None):
 
 if __name__ == "__main__":
     main()
+
+</final_file_content>
+
+IMPORTANT: For any future changes to this file, use the final_file_content shown above as your reference. This content reflects the current state of the file, including any auto-formatting (e.g., if you used single quotes but the formatter converted them to double quotes). Always base your SEARCH/REPLACE operations on this final version to ensure accuracy.
 
