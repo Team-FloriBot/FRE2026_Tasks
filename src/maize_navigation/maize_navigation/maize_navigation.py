@@ -42,7 +42,7 @@ class Pose2D:
 # --- Data Structures for Splines ---
 
 class PlantSpline:
-    def __init__(self, points: np.ndarray, heading_yaw: float = 0.0, s: float = 0.35):
+    def __init__(self, points: np.ndarray, heading_yaw: float = 0.0, s: float = 0.5):
         """
         points: (N, 2) array of (x, y) coordinates in map frame
         heading_yaw: Approximate current heading yaw of the robot to align spline direction
