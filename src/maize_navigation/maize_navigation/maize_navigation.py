@@ -345,7 +345,7 @@ class MaizeNavigator(Node):
             self.state = MissionState.EXIT_ROW
             return
 
-        # 5. Pure Pursuit on mid-spline
+        # 5. Pure Pursuit on mid-spline (using local cross track correction relative to current splines)
         t_lookahead = (t_l + t_r) / 2.0 + self.p.lookahead_dist
         t_l_eval = max(self.left_row_spline.t_min, min(t_lookahead, self.left_row_spline.t_max))
         t_r_eval = max(self.right_row_spline.t_min, min(t_lookahead, self.right_row_spline.t_max))
@@ -353,6 +353,23 @@ class MaizeNavigator(Node):
         p_l = np.array(self.left_row_spline.evaluate(t_l_eval))
         p_r = np.array(self.right_row_spline.evaluate(t_r_eval))
         p_target = (p_l + p_r) / 2.0
+        
+        # Additional safety check: Calculate lateral offset in local robot frame at robot's current projection
+        # This keeps the robot centered even if odometry/SLAM slips a bit!
+        curr_p_l = np.array(self.left_row_spline.evaluate(t_l))
+        curr_p_r = np.array(self.right_row_spline.evaluate(t_r))
+        curr_mid = (curr_p_l + curr_p_r) / 2.0
+        
+        # Local offset to the current row center
+        c, s = math.cos(-self.robot_pose.yaw), math.sin(-self.robot_pose.yaw)
+        local_dy = s * (curr_mid[0] - self.robot_pose.x) + c * (curr_mid[1] - self.robot_pose.y)
+        
+        # Adjust target locally by injecting a correction based on current local offset
+        if abs(local_dy) > 0.05:
+            # Shift the lookahead target slightly laterally to pull us back to the center of the local splines
+            target_yaw = self.robot_pose.yaw + math.pi / 2.0
+            p_target[0] += math.cos(target_yaw) * local_dy * 0.5
+            p_target[1] += math.sin(target_yaw) * local_dy * 0.5
         
         self.drive_to_point(p_target)
 
