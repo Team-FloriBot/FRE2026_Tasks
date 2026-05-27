@@ -42,7 +42,7 @@ class Pose2D:
 # --- Data Structures for Splines ---
 
 class PlantSpline:
-    def __init__(self, points: np.ndarray, heading_yaw: float = 0.0, s: float = 0.15):
+    def __init__(self, points: np.ndarray, heading_yaw: float = 0.0, s: float = 0.35):
         """
         points: (N, 2) array of (x, y) coordinates in map frame
         heading_yaw: Approximate current heading yaw of the robot to align spline direction
@@ -81,8 +81,8 @@ class PlantSpline:
             
         # k=2 (quadratic spline) is perfect to capture inflection points of S-curves!
         # s=0.15 allows tight tracking of local curve variations
-        self.x_spline = UnivariateSpline(unique_t, self.points[unique_idx, 0], k=2, s=s)
-        self.y_spline = UnivariateSpline(unique_t, self.points[unique_idx, 1], k=2, s=s)
+        self.x_spline = UnivariateSpline(unique_t, self.points[unique_idx, 0], k=3, s=s)
+        self.y_spline = UnivariateSpline(unique_t, self.points[unique_idx, 1], k=3, s=s)
         self.valid = True
         self.t_min = unique_t[0]
         self.t_max = unique_t[-1]
