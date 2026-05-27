@@ -159,6 +159,7 @@ class MaizeNavigator(Node):
         self.exit_start_pose: Optional[Pose2D] = None
         self.turn_start_pose: Optional[Pose2D] = None
         self.target_row_y_offset: float = 0.0
+        self.row_entry_pose: Optional[Pose2D] = None
         
         self.tf_buffer = tf2_ros.Buffer()
         self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
@@ -277,6 +278,7 @@ class MaizeNavigator(Node):
         self.right_row_spline = PlantSpline(points[np.abs(local_y - best_right) < 0.2])
         
         if self.left_row_spline.valid and self.right_row_spline.valid:
+            self.row_entry_pose = self.robot_pose
             self.state = MissionState.FOLLOW_ROW
             self.get_logger().info(f"Rows found. Width: {best_left - best_right:.2f}m. Following...")
 
@@ -314,14 +316,20 @@ class MaizeNavigator(Node):
         
         # 3. Robust End of row detection
         # Check if there are points ahead in the map
-        points_ahead = self.get_map_points_in_front(self.robot_pose, distance=2.0, width=1.0)
+        points_ahead = self.get_map_points_in_front(self.robot_pose, distance=2.5, width=1.0)
         
-        # We only exit if we are near spline end AND no more points are seen ahead in the map
+        # Distance traveled in current row
+        dist_in_row = math.hypot(self.robot_pose.x - self.row_entry_pose.x, self.robot_pose.y - self.row_entry_pose.y)
+        
+        # We only exit if:
+        # 1. We have traveled at least 2 meters in the row (prevent premature exit at start)
+        # 2. We are near spline end
+        # 3. No more points are seen ahead in the map
         near_spline_end = (t_l > self.left_row_spline.t_max - 0.3) or (t_r > self.right_row_spline.t_max - 0.3)
         no_points_ahead = len(points_ahead) < 3
         
-        if near_spline_end and no_points_ahead:
-            self.get_logger().info(f"Row end confirmed. Points ahead: {len(points_ahead)}")
+        if dist_in_row > 2.0 and near_spline_end and no_points_ahead:
+            self.get_logger().info(f"Row end confirmed. Dist: {dist_in_row:.2f}m, Points ahead: {len(points_ahead)}")
             self.exit_start_pose = self.robot_pose
             self.state = MissionState.EXIT_ROW
             return
@@ -411,6 +419,7 @@ class MaizeNavigator(Node):
         if yaw_diff >= math.pi / 2.0 - 0.1:
             self.get_logger().info("Entered new row. Re-initializing...")
             self.current_pattern_idx = (self.current_pattern_idx + 1) % len(self.pattern_steps)
+            self.row_entry_pose = self.robot_pose # Reset entry pose for the new row
             self.state = MissionState.INITIALIZING
             return
 
