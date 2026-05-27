@@ -70,6 +70,10 @@ class PlantSpline:
         self.t = projections[sort_idx]
         # Remove duplicate t values for spline fitting
         unique_t, unique_idx = np.unique(self.t, return_index=True)
+        if len(unique_t) < 4:
+            self.valid = False
+            return
+            
         self.x_spline = UnivariateSpline(unique_t, self.points[unique_idx, 0], s=s)
         self.y_spline = UnivariateSpline(unique_t, self.points[unique_idx, 1], s=s)
         self.valid = True
@@ -290,8 +294,7 @@ class MaizeNavigator(Node):
             dx, dy = points[:, 0] - self.robot_pose.x, points[:, 1] - self.robot_pose.y
             local_y = s * dx + c * dy
             
-            # Use current splines to filter points for update (to stay on the same rows)
-            # Find the local_y of the splines at robot position
+            # Use current splines to filter points for update
             p_robot = np.array([self.robot_pose.x, self.robot_pose.y])
             t_l_curr = self.left_row_spline.project(p_robot)
             t_r_curr = self.right_row_spline.project(p_robot)
@@ -299,7 +302,6 @@ class MaizeNavigator(Node):
             curr_l_world = np.array(self.left_row_spline.evaluate(t_l_curr))
             curr_r_world = np.array(self.right_row_spline.evaluate(t_r_curr))
             
-            # Transform spline world positions to local robot frame to get expected local_y
             curr_l_local_y = s * (curr_l_world[0] - self.robot_pose.x) + c * (curr_l_world[1] - self.robot_pose.y)
             curr_r_local_y = s * (curr_r_world[0] - self.robot_pose.x) + c * (curr_r_world[1] - self.robot_pose.y)
             
@@ -315,16 +317,9 @@ class MaizeNavigator(Node):
         t_r = self.right_row_spline.project(p_robot)
         
         # 3. Robust End of row detection
-        # Check if there are points ahead in the map
         points_ahead = self.get_map_points_in_front(self.robot_pose, distance=2.5, width=1.0)
-        
-        # Distance traveled in current row
         dist_in_row = math.hypot(self.robot_pose.x - self.row_entry_pose.x, self.robot_pose.y - self.row_entry_pose.y)
         
-        # We only exit if:
-        # 1. We have traveled at least 2 meters in the row (prevent premature exit at start)
-        # 2. We are near spline end
-        # 3. No more points are seen ahead in the map
         near_spline_end = (t_l > self.left_row_spline.t_max - 0.3) or (t_r > self.right_row_spline.t_max - 0.3)
         no_points_ahead = len(points_ahead) < 3
         
@@ -336,9 +331,8 @@ class MaizeNavigator(Node):
 
         # 4. Pure Pursuit on mid-spline
         t_lookahead = (t_l + t_r) / 2.0 + self.p.lookahead_dist
-        # Clip t_lookahead to stay within spline bounds for evaluation
-        t_l_eval = min(t_lookahead, self.left_row_spline.t_max)
-        t_r_eval = min(t_lookahead, self.right_row_spline.t_max)
+        t_l_eval = max(self.left_row_spline.t_min, min(t_lookahead, self.left_row_spline.t_max))
+        t_r_eval = max(self.right_row_spline.t_min, min(t_lookahead, self.right_row_spline.t_max))
         
         p_l = np.array(self.left_row_spline.evaluate(t_l_eval))
         p_r = np.array(self.right_row_spline.evaluate(t_r_eval))
@@ -347,66 +341,47 @@ class MaizeNavigator(Node):
         self.drive_to_point(p_target)
 
     def get_map_points_in_front(self, pose: Pose2D, distance: float, width: float) -> np.ndarray:
-        """Helper to check for plants ahead of the robot in the map"""
         points = self.get_map_points_in_roi(pose, distance * 2)
         if len(points) == 0: return points
-        
         c, s = math.cos(-pose.yaw), math.sin(-pose.yaw)
         dx, dy = points[:, 0] - pose.x, points[:, 1] - pose.y
-        local_x = c * dx - s * dy
-        local_y = s * dx + c * dy
-        
-        # Points in front (x > 0.3) and within the lane width
+        local_x, local_y = c * dx - s * dy, s * dx + c * dy
         mask = (local_x > 0.3) & (local_x < distance) & (np.abs(local_y) < width/2.0)
         return points[mask]
 
     def handle_exit_row(self):
-        # Drive straight for exit_distance
         dist = math.hypot(self.robot_pose.x - self.exit_start_pose.x, self.robot_pose.y - self.exit_start_pose.y)
         if dist >= self.p.exit_distance:
             self.get_logger().info("Exit complete. Turning...")
             self.turn_start_pose = self.robot_pose
             self.state = MissionState.TURN_OUT
             return
-        
         cmd = Twist()
         cmd.linear.x = self.p.follow_speed
         self.cmd_pub.publish(cmd)
 
     def handle_turn_out(self):
-        # 90 degree turn
         num, side = self.pattern_steps[self.current_pattern_idx]
         dir = 1.0 if side == "L" else -1.0
-        
         yaw_diff = abs(wrap_to_pi(self.robot_pose.yaw - self.turn_start_pose.yaw))
         if yaw_diff >= math.pi / 2.0 - 0.1:
             self.get_logger().info("Turn out complete. Shifting...")
-            # Calculate shift distance based on pattern
-            # 1L means we go to the next lane. Current lane is between row 0 and 1.
-            # Next lane is between row 1 and 2. 
-            # Center of 1L is 0.75m away from current center.
             self.target_row_y_offset = num * self.p.expected_row_width
-            self.turn_start_pose = self.robot_pose # reuse for shift start
+            self.turn_start_pose = self.robot_pose
             self.state = MissionState.SHIFT
             return
-            
         cmd = Twist()
         cmd.linear.x = self.p.turn_speed
         cmd.angular.z = dir * (self.p.turn_speed / self.p.min_turn_radius)
         self.cmd_pub.publish(cmd)
 
     def handle_shift(self):
-        # Drive parallel to headland
         dist = math.hypot(self.robot_pose.x - self.turn_start_pose.x, self.robot_pose.y - self.turn_start_pose.y)
-        # We need to shift by target_row_y_offset minus the radius we used for turning and will use for turning in
-        # Approx: shift_dist = target_row_y_offset - 2*radius?
-        # Actually simplified: let's just use the offset
         if dist >= abs(self.target_row_y_offset) - 2 * self.p.min_turn_radius:
             self.get_logger().info("Shift complete. Turning in...")
             self.turn_start_pose = self.robot_pose
             self.state = MissionState.TURN_IN
             return
-            
         cmd = Twist()
         cmd.linear.x = self.p.follow_speed
         self.cmd_pub.publish(cmd)
@@ -414,15 +389,13 @@ class MaizeNavigator(Node):
     def handle_turn_in(self):
         num, side = self.pattern_steps[self.current_pattern_idx]
         dir = 1.0 if side == "L" else -1.0
-        
         yaw_diff = abs(wrap_to_pi(self.robot_pose.yaw - self.turn_start_pose.yaw))
         if yaw_diff >= math.pi / 2.0 - 0.1:
             self.get_logger().info("Entered new row. Re-initializing...")
             self.current_pattern_idx = (self.current_pattern_idx + 1) % len(self.pattern_steps)
-            self.row_entry_pose = self.robot_pose # Reset entry pose for the new row
+            self.row_entry_pose = self.robot_pose
             self.state = MissionState.INITIALIZING
             return
-
         cmd = Twist()
         cmd.linear.x = self.p.turn_speed
         cmd.angular.z = dir * (self.p.turn_speed / self.p.min_turn_radius)
@@ -432,9 +405,10 @@ class MaizeNavigator(Node):
         dx, dy = target[0] - self.robot_pose.x, target[1] - self.robot_pose.y
         angle_to_target = math.atan2(dy, dx)
         yaw_err = wrap_to_pi(angle_to_target - self.robot_pose.yaw)
-        
+        yaw_err = np.clip(yaw_err, -0.6, 0.6)
         cmd = Twist()
-        cmd.linear.x = self.p.follow_speed
+        speed_factor = np.clip(1.0 - abs(yaw_err)/0.8, 0.2, 1.0)
+        cmd.linear.x = self.p.follow_speed * speed_factor
         cmd.angular.z = self.p.yaw_kp * yaw_err
         self.cmd_pub.publish(cmd)
 
@@ -442,16 +416,12 @@ class MaizeNavigator(Node):
         if self.latest_map is None: return np.array([])
         info = self.latest_map.info
         grid = np.array(self.latest_map.data).reshape((info.height, info.width))
-        
-        # Grid indices
         ix = int((pose.x - info.origin.position.x) / info.resolution)
         iy = int((pose.y - info.origin.position.y) / info.resolution)
         r = int(size / (2 * info.resolution))
-        
         y_slice = slice(max(0, iy-r), min(info.height, iy+r))
         x_slice = slice(max(0, ix-r), min(info.width, ix+r))
         roi = grid[y_slice, x_slice]
-        
         occ_y, occ_x = np.where(roi > self.p.occ_threshold)
         world_x = (occ_x + x_slice.start) * info.resolution + info.origin.position.x
         world_y = (occ_y + y_slice.start) * info.resolution + info.origin.position.y
