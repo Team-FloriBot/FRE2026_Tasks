@@ -281,25 +281,76 @@ class MaizeNavigator(Node):
             self.get_logger().info(f"Rows found. Width: {best_left - best_right:.2f}m. Following...")
 
     def handle_follow_row(self):
-        # 1. Project robot onto both splines
+        # 1. Continuous Spline Update from Map
+        points = self.get_map_points_in_roi(self.robot_pose, self.p.hist_roi_size * 1.5)
+        if len(points) >= 10:
+            c, s = math.cos(-self.robot_pose.yaw), math.sin(-self.robot_pose.yaw)
+            dx, dy = points[:, 0] - self.robot_pose.x, points[:, 1] - self.robot_pose.y
+            local_y = s * dx + c * dy
+            
+            # Use current splines to filter points for update (to stay on the same rows)
+            # Find the local_y of the splines at robot position
+            p_robot = np.array([self.robot_pose.x, self.robot_pose.y])
+            t_l_curr = self.left_row_spline.project(p_robot)
+            t_r_curr = self.right_row_spline.project(p_robot)
+            
+            curr_l_world = np.array(self.left_row_spline.evaluate(t_l_curr))
+            curr_r_world = np.array(self.right_row_spline.evaluate(t_r_curr))
+            
+            # Transform spline world positions to local robot frame to get expected local_y
+            curr_l_local_y = s * (curr_l_world[0] - self.robot_pose.x) + c * (curr_l_world[1] - self.robot_pose.y)
+            curr_r_local_y = s * (curr_r_world[0] - self.robot_pose.x) + c * (curr_r_world[1] - self.robot_pose.y)
+            
+            new_left_pts = points[np.abs(local_y - curr_l_local_y) < 0.25]
+            new_right_pts = points[np.abs(local_y - curr_r_local_y) < 0.25]
+            
+            if len(new_left_pts) >= 4: self.left_row_spline = PlantSpline(new_left_pts)
+            if len(new_right_pts) >= 4: self.right_row_spline = PlantSpline(new_right_pts)
+
+        # 2. Project robot onto updated splines
         p_robot = np.array([self.robot_pose.x, self.robot_pose.y])
         t_l = self.left_row_spline.project(p_robot)
         t_r = self.right_row_spline.project(p_robot)
         
-        # 2. End of row detection (shorter spline)
-        if t_l > self.left_row_spline.t_max - 0.2 or t_r > self.right_row_spline.t_max - 0.2:
-            self.get_logger().info("End of row detected.")
+        # 3. Robust End of row detection
+        # Check if there are points ahead in the map
+        points_ahead = self.get_map_points_in_front(self.robot_pose, distance=2.0, width=1.0)
+        
+        # We only exit if we are near spline end AND no more points are seen ahead in the map
+        near_spline_end = (t_l > self.left_row_spline.t_max - 0.3) or (t_r > self.right_row_spline.t_max - 0.3)
+        no_points_ahead = len(points_ahead) < 3
+        
+        if near_spline_end and no_points_ahead:
+            self.get_logger().info(f"Row end confirmed. Points ahead: {len(points_ahead)}")
             self.exit_start_pose = self.robot_pose
             self.state = MissionState.EXIT_ROW
             return
 
-        # 3. Pure Pursuit on mid-spline
+        # 4. Pure Pursuit on mid-spline
         t_lookahead = (t_l + t_r) / 2.0 + self.p.lookahead_dist
-        p_l = np.array(self.left_row_spline.evaluate(t_lookahead))
-        p_r = np.array(self.right_row_spline.evaluate(t_lookahead))
+        # Clip t_lookahead to stay within spline bounds for evaluation
+        t_l_eval = min(t_lookahead, self.left_row_spline.t_max)
+        t_r_eval = min(t_lookahead, self.right_row_spline.t_max)
+        
+        p_l = np.array(self.left_row_spline.evaluate(t_l_eval))
+        p_r = np.array(self.right_row_spline.evaluate(t_r_eval))
         p_target = (p_l + p_r) / 2.0
         
         self.drive_to_point(p_target)
+
+    def get_map_points_in_front(self, pose: Pose2D, distance: float, width: float) -> np.ndarray:
+        """Helper to check for plants ahead of the robot in the map"""
+        points = self.get_map_points_in_roi(pose, distance * 2)
+        if len(points) == 0: return points
+        
+        c, s = math.cos(-pose.yaw), math.sin(-pose.yaw)
+        dx, dy = points[:, 0] - pose.x, points[:, 1] - pose.y
+        local_x = c * dx - s * dy
+        local_y = s * dx + c * dy
+        
+        # Points in front (x > 0.3) and within the lane width
+        mask = (local_x > 0.3) & (local_x < distance) & (np.abs(local_y) < width/2.0)
+        return points[mask]
 
     def handle_exit_row(self):
         # Drive straight for exit_distance
