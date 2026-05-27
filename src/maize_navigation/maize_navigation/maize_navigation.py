@@ -42,9 +42,10 @@ class Pose2D:
 # --- Data Structures for Splines ---
 
 class PlantSpline:
-    def __init__(self, points: np.ndarray, s: float = 0.1):
+    def __init__(self, points: np.ndarray, heading_yaw: float = 0.0, s: float = 0.15):
         """
         points: (N, 2) array of (x, y) coordinates in map frame
+        heading_yaw: Approximate current heading yaw of the robot to align spline direction
         s: smoothing factor for UnivariateSpline
         """
         self.valid = False
@@ -61,8 +62,9 @@ class PlantSpline:
         eigenvalues, eigenvectors = np.linalg.eig(cov)
         self.main_dir = eigenvectors[:, np.argmax(eigenvalues)]
         
-        # Ensure direction is consistent (e.g., positive x-ish)
-        if self.main_dir[0] < 0:
+        # Align spline direction with the approximate robot heading
+        heading_vec = np.array([math.cos(heading_yaw), math.sin(heading_yaw)])
+        if np.dot(self.main_dir, heading_vec) < 0:
             self.main_dir = -self.main_dir
             
         # Project points onto main direction to sort them
@@ -139,7 +141,7 @@ class NavigatorParams:
     
     # Control
     pos_kp: float = 2.0
-    yaw_kp: float = 1.5
+    yaw_kp: float = 1.2
     
     # Pattern
     pattern: str = "1L 2R"
@@ -280,8 +282,8 @@ class MaizeNavigator(Node):
             
         best_left, best_right = min(left_peaks), max(right_peaks)
         
-        self.left_row_spline = PlantSpline(points[np.abs(local_y - best_left) < 0.2])
-        self.right_row_spline = PlantSpline(points[np.abs(local_y - best_right) < 0.2])
+        self.left_row_spline = PlantSpline(points[np.abs(local_y - best_left) < 0.25], heading_yaw=self.robot_pose.yaw)
+        self.right_row_spline = PlantSpline(points[np.abs(local_y - best_right) < 0.25], heading_yaw=self.robot_pose.yaw)
         
         if self.left_row_spline.valid and self.right_row_spline.valid:
             self.row_entry_pose = self.robot_pose
@@ -311,11 +313,11 @@ class MaizeNavigator(Node):
             new_right_pts = points[np.abs(local_y - curr_r_local_y) < 0.25]
             
             if len(new_left_pts) >= 4:
-                temp_spline = PlantSpline(new_left_pts)
+                temp_spline = PlantSpline(new_left_pts, heading_yaw=self.robot_pose.yaw)
                 if temp_spline.valid:
                     self.left_row_spline = temp_spline
             if len(new_right_pts) >= 4:
-                temp_spline = PlantSpline(new_right_pts)
+                temp_spline = PlantSpline(new_right_pts, heading_yaw=self.robot_pose.yaw)
                 if temp_spline.valid:
                     self.right_row_spline = temp_spline
 
@@ -413,11 +415,20 @@ class MaizeNavigator(Node):
         dx, dy = target[0] - self.robot_pose.x, target[1] - self.robot_pose.y
         angle_to_target = math.atan2(dy, dx)
         yaw_err = wrap_to_pi(angle_to_target - self.robot_pose.yaw)
-        yaw_err = np.clip(yaw_err, -0.6, 0.6)
+        
+        # Clip yaw error to prevent abrupt turns into the plant rows
+        yaw_err = np.clip(yaw_err, -0.4, 0.4)
+        
         cmd = Twist()
-        speed_factor = np.clip(1.0 - abs(yaw_err)/0.8, 0.2, 1.0)
+        # Scale down speed in case of large corrections
+        speed_factor = np.clip(1.0 - abs(yaw_err)/0.6, 0.3, 1.0)
         cmd.linear.x = self.p.follow_speed * speed_factor
         cmd.angular.z = self.p.yaw_kp * yaw_err
+        
+        self.get_logger().info(
+            f"Fahrbefehl: v={cmd.linear.x:.2f}, w={cmd.angular.z:.2f} (yaw_err={yaw_err:.2f}, dist={math.hypot(dx, dy):.2f})",
+            throttle_duration_sec=0.5
+        )
         self.cmd_pub.publish(cmd)
 
     def get_map_points_in_roi(self, pose: Pose2D, size: float) -> np.ndarray:
