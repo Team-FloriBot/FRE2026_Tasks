@@ -19,6 +19,7 @@
   <depend>tf2_ros</depend>
   <depend>tf_transformations</depend>
   <depend>python3-numpy</depend>
+  <depend>python3-scipy</depend>
 
   <exec_depend>ros-jazzy-tf-transformations</exec_depend>
 
