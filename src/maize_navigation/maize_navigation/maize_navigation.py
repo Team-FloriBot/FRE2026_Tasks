@@ -79,10 +79,10 @@ class PlantSpline:
         if len(unique_t) < 4:
             return
             
-        # k=3 (cubic spline) is perfect to capture inflection points of S-curves!
+        # k=2 (quadratic spline) is perfect to capture inflection points of S-curves!
         # s=0.15 allows tight tracking of local curve variations
-        self.x_spline = UnivariateSpline(unique_t, self.points[unique_idx, 0], k=3, s=s)
-        self.y_spline = UnivariateSpline(unique_t, self.points[unique_idx, 1], k=3, s=s)
+        self.x_spline = UnivariateSpline(unique_t, self.points[unique_idx, 0], k=2, s=s)
+        self.y_spline = UnivariateSpline(unique_t, self.points[unique_idx, 1], k=2, s=s)
         self.valid = True
         self.t_min = unique_t[0]
         self.t_max = unique_t[-1]
