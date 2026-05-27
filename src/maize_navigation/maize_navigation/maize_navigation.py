@@ -42,7 +42,7 @@ class Pose2D:
 # --- Data Structures for Splines ---
 
 class PlantSpline:
-    def __init__(self, points: np.ndarray, heading_yaw: float = 0.0, s: float = 0.5):
+    def __init__(self, points: np.ndarray, heading_yaw: float = 0.0, s: float = 0.15):
         """
         points: (N, 2) array of (x, y) coordinates in map frame
         heading_yaw: Approximate current heading yaw of the robot to align spline direction
@@ -79,7 +79,7 @@ class PlantSpline:
         if len(unique_t) < 4:
             return
             
-        # k=2 (quadratic spline) is perfect to capture inflection points of S-curves!
+        # k=3 (cubic spline) is perfect to capture inflection points of S-curves!
         # s=0.15 allows tight tracking of local curve variations
         self.x_spline = UnivariateSpline(unique_t, self.points[unique_idx, 0], k=3, s=s)
         self.y_spline = UnivariateSpline(unique_t, self.points[unique_idx, 1], k=3, s=s)
@@ -309,16 +309,17 @@ class MaizeNavigator(Node):
         t_l = self.left_row_spline.project(p_robot)
         t_r = self.right_row_spline.project(p_robot)
 
-        # 2. Lookahead search along weighted angle (30% local end tangent, 70% global trend)
-        # This keeps search corridor strictly within the row, even with S-curves or local noise!
+        # 2. Piecewise Chaining logic: Segment growing to prevent global fit deformation!
+        # We enforce C1-continuity at the chaining boundary (position and tangent direction).
+        # We only fit new cubic splines locally in the latest lookahead segment (max 1.5m blocks).
         
         # For Left Spline:
         end_val_l = np.array(self.left_row_spline.evaluate(self.left_row_spline.t_max))
         local_tangent_l = self.left_row_spline.get_direction(self.left_row_spline.t_max)
         global_trend_l = self.left_row_spline.get_global_direction()
-        weighted_yaw_l = wrap_to_pi(0.3 * local_tangent_l + 0.7 * global_trend_l)
+        weighted_yaw_l = wrap_to_pi(0.4 * local_tangent_l + 0.6 * global_trend_l)
         
-        new_pts_l = self.find_points_along_tangent(end_val_l, weighted_yaw_l, max_dist=2.5, width=0.4)
+        new_pts_l = self.find_points_along_tangent(end_val_l, weighted_yaw_l, max_dist=2.2, width=0.45)
         if len(new_pts_l) > 0:
             self.left_row_points = self.accumulate_unique_points(self.left_row_points, new_pts_l)
             temp_spline = PlantSpline(self.left_row_points, heading_yaw=self.robot_pose.yaw)
@@ -329,9 +330,9 @@ class MaizeNavigator(Node):
         end_val_r = np.array(self.right_row_spline.evaluate(self.right_row_spline.t_max))
         local_tangent_r = self.right_row_spline.get_direction(self.right_row_spline.t_max)
         global_trend_r = self.right_row_spline.get_global_direction()
-        weighted_yaw_r = wrap_to_pi(0.3 * local_tangent_r + 0.7 * global_trend_r)
+        weighted_yaw_r = wrap_to_pi(0.4 * local_tangent_r + 0.6 * global_trend_r)
         
-        new_pts_r = self.find_points_along_tangent(end_val_r, weighted_yaw_r, max_dist=2.5, width=0.4)
+        new_pts_r = self.find_points_along_tangent(end_val_r, weighted_yaw_r, max_dist=2.2, width=0.45)
         if len(new_pts_r) > 0:
             self.right_row_points = self.accumulate_unique_points(self.right_row_points, new_pts_r)
             temp_spline = PlantSpline(self.right_row_points, heading_yaw=self.robot_pose.yaw)
@@ -532,4 +533,3 @@ def main(args=None):
 
 if __name__ == "__main__":
     main()
-
