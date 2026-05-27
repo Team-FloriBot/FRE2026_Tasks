@@ -47,8 +47,11 @@ class PlantSpline:
         points: (N, 2) array of (x, y) coordinates in map frame
         s: smoothing factor for UnivariateSpline
         """
+        self.valid = False
+        self.t_min = 0.0
+        self.t_max = 0.0
+        
         if len(points) < 4:
-            self.valid = False
             return
             
         # PCA to find main direction
@@ -71,7 +74,6 @@ class PlantSpline:
         # Remove duplicate t values for spline fitting
         unique_t, unique_idx = np.unique(self.t, return_index=True)
         if len(unique_t) < 4:
-            self.valid = False
             return
             
         self.x_spline = UnivariateSpline(unique_t, self.points[unique_idx, 0], s=s)
@@ -308,8 +310,14 @@ class MaizeNavigator(Node):
             new_left_pts = points[np.abs(local_y - curr_l_local_y) < 0.25]
             new_right_pts = points[np.abs(local_y - curr_r_local_y) < 0.25]
             
-            if len(new_left_pts) >= 4: self.left_row_spline = PlantSpline(new_left_pts)
-            if len(new_right_pts) >= 4: self.right_row_spline = PlantSpline(new_right_pts)
+            if len(new_left_pts) >= 4:
+                temp_spline = PlantSpline(new_left_pts)
+                if temp_spline.valid:
+                    self.left_row_spline = temp_spline
+            if len(new_right_pts) >= 4:
+                temp_spline = PlantSpline(new_right_pts)
+                if temp_spline.valid:
+                    self.right_row_spline = temp_spline
 
         # 2. Project robot onto updated splines
         p_robot = np.array([self.robot_pose.x, self.robot_pose.y])
