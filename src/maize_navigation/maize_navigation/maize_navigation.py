@@ -243,9 +243,11 @@ class MaizeNavigator(Node):
         self.publish_visuals()
 
     def handle_initializing(self):
-        self.get_logger().info("Detecting rows...")
+        self.get_logger().info("Detecting rows...", throttle_duration_sec=2.0)
         points = self.get_map_points_in_roi(self.robot_pose, self.p.hist_roi_size)
-        if len(points) < 10: return
+        if len(points) < 5: 
+            self.get_logger().info(f"Not enough points in ROI: {len(points)}", throttle_duration_sec=2.0)
+            return
 
         # Histogram logic
         c, s = math.cos(-self.robot_pose.yaw), math.sin(-self.robot_pose.yaw)
@@ -257,13 +259,17 @@ class MaizeNavigator(Node):
         
         peaks = []
         for i in range(1, len(hist)-1):
-            if hist[i] > 3 and hist[i] > hist[i-1] and hist[i] > hist[i+1]:
+            if hist[i] > 2 and hist[i] >= hist[i-1] and hist[i] >= hist[i+1]:
                 peaks.append((bin_edges[i] + bin_edges[i+1])/2)
         
-        left_peaks = [p for p in peaks if p > 0.1]
-        right_peaks = [p for p in peaks if p < -0.1]
+        self.get_logger().info(f"Found {len(points)} points, peaks at: {peaks}", throttle_duration_sec=2.0)
         
-        if not left_peaks or not right_peaks: return
+        left_peaks = [p for p in peaks if p > 0.15]
+        right_peaks = [p for p in peaks if p < -0.15]
+        
+        if not left_peaks or not right_peaks: 
+            self.get_logger().info(f"Missing side rows. Left peaks: {left_peaks}, Right peaks: {right_peaks}", throttle_duration_sec=2.0)
+            return
             
         best_left, best_right = min(left_peaks), max(right_peaks)
         
