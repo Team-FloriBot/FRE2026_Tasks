@@ -42,11 +42,11 @@ class Pose2D:
 # --- Data Structures for Splines ---
 
 class PlantSpline:
-    def __init__(self, points: np.ndarray, heading_yaw: float = 0.0, s: float = 2.0):
+    def __init__(self, points: np.ndarray, heading_yaw: float = 0.0, s: float = 0.6):
         """
         points: (N, 2) array of (x, y) coordinates in map frame
         heading_yaw: Approximate current heading yaw of the robot to align spline direction
-        s: high smoothing factor for UnivariateSpline to prevent overfitting and loops
+        s: Balanced smoothing factor to allow tracking real curves while filtering high-frequency noise
         """
         self.valid = False
         self.t_min = 0.0
@@ -79,7 +79,7 @@ class PlantSpline:
         if len(unique_t) < 4:
             return
             
-        # Use low-degree spline (k=2) with high smoothing (s) to get a super smooth curve
+        # k=2 (quadratic spline) is perfect: it matches gentle curves beautifully and cannot loop/oscillate.
         self.x_spline = UnivariateSpline(unique_t, self.points[unique_idx, 0], k=2, s=s)
         self.y_spline = UnivariateSpline(unique_t, self.points[unique_idx, 1], k=2, s=s)
         self.valid = True
@@ -93,6 +93,10 @@ class PlantSpline:
         dx = self.x_spline.derivative()(t)
         dy = self.y_spline.derivative()(t)
         return math.atan2(dy, dx)
+
+    def get_global_direction(self) -> float:
+        """Global row trend from PCA main_dir"""
+        return float(math.atan2(self.main_dir[1], self.main_dir[0]))
 
     def get_points(self, num: int = 50) -> np.ndarray:
         t_vals = np.linspace(self.t_min, self.t_max, num)
@@ -160,6 +164,10 @@ class MaizeNavigator(Node):
         
         self.latest_map: Optional[OccupancyGrid] = None
         self.robot_pose: Optional[Pose2D] = None
+        
+        # We store and dynamically extend the compiled historical points of each active row
+        self.left_row_points: Optional[np.ndarray] = None
+        self.right_row_points: Optional[np.ndarray] = None
         
         self.left_row_spline: Optional[PlantSpline] = None
         self.right_row_spline: Optional[PlantSpline] = None
@@ -283,11 +291,11 @@ class MaizeNavigator(Node):
             
         best_left, best_right = min(left_peaks), max(right_peaks)
         
-        left_pts = points[np.abs(local_y - best_left) < 0.25]
-        right_pts = points[np.abs(local_y - best_right) < 0.25]
+        self.left_row_points = points[np.abs(local_y - best_left) < 0.25]
+        self.right_row_points = points[np.abs(local_y - best_right) < 0.25]
         
-        self.left_row_spline = PlantSpline(left_pts, heading_yaw=self.robot_pose.yaw)
-        self.right_row_spline = PlantSpline(right_pts, heading_yaw=self.robot_pose.yaw)
+        self.left_row_spline = PlantSpline(self.left_row_points, heading_yaw=self.robot_pose.yaw)
+        self.right_row_spline = PlantSpline(self.right_row_points, heading_yaw=self.robot_pose.yaw)
         
         if self.left_row_spline.valid and self.right_row_spline.valid:
             self.row_entry_pose = self.robot_pose
@@ -295,42 +303,45 @@ class MaizeNavigator(Node):
             self.get_logger().info(f"Rows found. Width: {best_left - best_right:.2f}m. Following...")
 
     def handle_follow_row(self):
-        # 1. Update Splines purely based on current live-view map points (no historical accumulation to prevent drift)
-        points = self.get_map_points_in_roi(self.robot_pose, self.p.hist_roi_size * 1.5)
-        if len(points) >= 10:
-            c, s = math.cos(-self.robot_pose.yaw), math.sin(-self.robot_pose.yaw)
-            dx, dy = points[:, 0] - self.robot_pose.x, points[:, 1] - self.robot_pose.y
-            local_y = s * dx + c * dy
-            
-            p_robot = np.array([self.robot_pose.x, self.robot_pose.y])
-            t_l_curr = self.left_row_spline.project(p_robot)
-            t_r_curr = self.right_row_spline.project(p_robot)
-            
-            curr_l_world = np.array(self.left_row_spline.evaluate(t_l_curr))
-            curr_r_world = np.array(self.right_row_spline.evaluate(t_r_curr))
-            
-            curr_l_local_y = s * (curr_l_world[0] - self.robot_pose.x) + c * (curr_l_world[1] - self.robot_pose.y)
-            curr_r_local_y = s * (curr_r_world[0] - self.robot_pose.x) + c * (curr_r_world[1] - self.robot_pose.y)
-            
-            # Filter live map points belonging to left/right rows
-            new_left_pts = points[np.abs(local_y - curr_l_local_y) < 0.25]
-            new_right_pts = points[np.abs(local_y - curr_r_local_y) < 0.25]
-            
-            if len(new_left_pts) >= 4:
-                temp_spline = PlantSpline(new_left_pts, heading_yaw=self.robot_pose.yaw)
-                if temp_spline.valid:
-                    self.left_row_spline = temp_spline
-            if len(new_right_pts) >= 4:
-                temp_spline = PlantSpline(new_right_pts, heading_yaw=self.robot_pose.yaw)
-                if temp_spline.valid:
-                    self.right_row_spline = temp_spline
-
-        # 2. Project robot onto splines
+        # 1. Project robot onto current splines
         p_robot = np.array([self.robot_pose.x, self.robot_pose.y])
         t_l = self.left_row_spline.project(p_robot)
         t_r = self.right_row_spline.project(p_robot)
 
-        # 3. Robust End of row detection using live lookahead
+        # 2. Lookahead search along weighted angle (30% local end tangent, 70% global trend)
+        # This keeps search corridor strictly within the row, even with S-curves or local noise!
+        
+        # For Left Spline:
+        end_val_l = np.array(self.left_row_spline.evaluate(self.left_row_spline.t_max))
+        local_tangent_l = self.left_row_spline.get_direction(self.left_row_spline.t_max)
+        global_trend_l = self.left_row_spline.get_global_direction()
+        weighted_yaw_l = wrap_to_pi(0.3 * local_tangent_l + 0.7 * global_trend_l)
+        
+        new_pts_l = self.find_points_along_tangent(end_val_l, weighted_yaw_l, max_dist=2.5, width=0.4)
+        if len(new_pts_l) > 0:
+            self.left_row_points = self.accumulate_unique_points(self.left_row_points, new_pts_l)
+            temp_spline = PlantSpline(self.left_row_points, heading_yaw=self.robot_pose.yaw)
+            if temp_spline.valid:
+                self.left_row_spline = temp_spline
+
+        # For Right Spline:
+        end_val_r = np.array(self.right_row_spline.evaluate(self.right_row_spline.t_max))
+        local_tangent_r = self.right_row_spline.get_direction(self.right_row_spline.t_max)
+        global_trend_r = self.right_row_spline.get_global_direction()
+        weighted_yaw_r = wrap_to_pi(0.3 * local_tangent_r + 0.7 * global_trend_r)
+        
+        new_pts_r = self.find_points_along_tangent(end_val_r, weighted_yaw_r, max_dist=2.5, width=0.4)
+        if len(new_pts_r) > 0:
+            self.right_row_points = self.accumulate_unique_points(self.right_row_points, new_pts_r)
+            temp_spline = PlantSpline(self.right_row_points, heading_yaw=self.robot_pose.yaw)
+            if temp_spline.valid:
+                self.right_row_spline = temp_spline
+
+        # 3. Project robot on updated, highly robust splines
+        t_l = self.left_row_spline.project(p_robot)
+        t_r = self.right_row_spline.project(p_robot)
+
+        # 4. Robust End of row detection using the forward lookahead window
         points_ahead = self.get_map_points_in_front(self.robot_pose, distance=2.5, width=1.0)
         dist_in_row = math.hypot(self.robot_pose.x - self.row_entry_pose.x, self.robot_pose.y - self.row_entry_pose.y)
         
@@ -343,7 +354,7 @@ class MaizeNavigator(Node):
             self.state = MissionState.EXIT_ROW
             return
 
-        # 4. Pure Pursuit on mid-spline
+        # 5. Pure Pursuit on mid-spline with local cross-track correction
         t_lookahead = (t_l + t_r) / 2.0 + self.p.lookahead_dist
         t_l_eval = max(self.left_row_spline.t_min, min(t_lookahead, self.left_row_spline.t_max))
         t_r_eval = max(self.right_row_spline.t_min, min(t_lookahead, self.right_row_spline.t_max))
@@ -366,6 +377,37 @@ class MaizeNavigator(Node):
             p_target[1] += math.sin(target_yaw) * local_dy * 0.5
         
         self.drive_to_point(p_target)
+
+    def find_points_along_tangent(self, start_pos: np.ndarray, yaw: float, max_dist: float, width: float) -> np.ndarray:
+        """Looks for plant points ahead of the spline's end point in the direction of its tangent."""
+        # Query map cells in a generous bounding area
+        points = self.get_map_points_in_roi(Pose2D(start_pos[0], start_pos[1], yaw), max_dist * 2)
+        if len(points) == 0:
+            return points
+            
+        c, s = math.cos(-yaw), math.sin(-yaw)
+        dx = points[:, 0] - start_pos[0]
+        dy = points[:, 1] - start_pos[1]
+        
+        # Transform points to lookahead window local frame (x_local: along tangent, y_local: lateral deviation)
+        lx = c * dx - s * dy
+        ly = s * dx + c * dy
+        
+        # Filter points inside lookahead search window
+        mask = (lx > 0.05) & (lx < max_dist) & (np.abs(ly) < width / 2.0)
+        return points[mask]
+
+    def accumulate_unique_points(self, current_pts: np.ndarray, new_pts: np.ndarray) -> np.ndarray:
+        """Filters new points to only append those that aren't already represented in current_pts."""
+        # Simple spatial proximity filter: keep points that are at least 0.08m away from any existing point
+        kept = []
+        for pt in new_pts:
+            dists = np.linalg.norm(current_pts - pt, axis=1)
+            if np.min(dists) > 0.08:
+                kept.append(pt)
+        if len(kept) > 0:
+            return np.vstack((current_pts, np.array(kept)))
+        return current_pts
 
     def get_map_points_in_front(self, pose: Pose2D, distance: float, width: float) -> np.ndarray:
         points = self.get_map_points_in_roi(pose, distance * 2)
@@ -489,3 +531,8 @@ def main(args=None):
 
 if __name__ == "__main__":
     main()
+
+</final_file_content>
+
+IMPORTANT: For any future changes to this file, use the final_file_content shown above as your reference. This content reflects the current state of the file, including any auto-formatting (e.g., if you used single quotes but the formatter converted them to double quotes). Always base your SEARCH/REPLACE operations on this final version to ensure accuracy.
+
