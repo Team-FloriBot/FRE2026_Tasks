@@ -54,6 +54,10 @@ class PlantSpline:
         self.t_max = 0.0
         self.linear_mode = False
         self.points = points
+        self.main_dir = None
+        self.perp_dir = None
+        self.mean = None
+        self.lateral_spline = None
         
         if len(points) < 4:
             return
@@ -64,6 +68,7 @@ class PlantSpline:
         cov = np.cov(centered.T)
         eigenvalues, eigenvectors = np.linalg.eig(cov)
         self.main_dir = eigenvectors[:, np.argmax(eigenvalues)]
+        self.perp_dir = np.array([-self.main_dir[1], self.main_dir[0]])
         
         # Align spline direction with the approximate robot heading
         heading_vec = np.array([math.cos(heading_yaw), math.sin(heading_yaw)])
@@ -72,10 +77,12 @@ class PlantSpline:
             
         # Project points onto main direction to sort them
         projections = centered @ self.main_dir
+        lateral = centered @ self.perp_dir
         sort_idx = np.argsort(projections)
         self.points = points[sort_idx]
         
         self.t = projections[sort_idx]
+        self.lateral = lateral[sort_idx]
         # Remove duplicate t values for spline fitting
         unique_t, unique_idx = np.unique(self.t, return_index=True)
         if len(unique_t) < 4:
@@ -109,22 +116,20 @@ class PlantSpline:
             return
 
         
-        fit_points = self.points[unique_idx]
         fit_t = unique_t
+        fit_lateral = self.lateral[unique_idx]
         if len(fit_t) > 120:
             sample_idx = np.linspace(0, len(fit_t) - 1, 120).astype(int)
             fit_t = fit_t[sample_idx]
-            fit_points = fit_points[sample_idx]
+            fit_lateral = fit_lateral[sample_idx]
 
-        # Adaptiver Splinegrad wie in der Referenz: bei wenigen Punkten keinen zu hohen Grad erzwingen.
-        # Außerdem adaptives Glätten: s wird skaliert mit Anzahl der Punkte und räumlicher Streuung,
-        # damit Splines bei dichterem / lauterem Rauschen stärker geglättet werden.
+        # 1D-Fit: nur die laterale Abweichung über der Hauptachse wird modelliert.
+        # Das entspricht dem stabilen Referenzansatz viel näher als ein freier 2D-Parametrisierungsspline.
         try:
             k = min(max_k, len(fit_t) - 1)
-            spread = float(np.mean(np.std(fit_points, axis=0)))
-            s_used = float(s) * (1.0 + 0.4 * spread)
-            self.x_spline = UnivariateSpline(fit_t, fit_points[:, 0], k=k, s=s_used)
-            self.y_spline = UnivariateSpline(fit_t, fit_points[:, 1], k=k, s=s_used)
+            lateral_spread = float(np.std(fit_lateral))
+            s_used = float(s) * max(0.35, 1.0 + 0.20 * lateral_spread)
+            self.lateral_spline = UnivariateSpline(fit_t, fit_lateral, k=k, s=s_used)
             self.valid = True
         except Exception:
             self.valid = False
@@ -139,14 +144,17 @@ class PlantSpline:
                 alpha = float(np.clip(alpha, 0.0, 1.0))
                 p = self.line_start + alpha * (self.line_end - self.line_start)
             return float(p[0]), float(p[1])
-        return float(self.x_spline(t)), float(self.y_spline(t))
+        lateral = float(self.lateral_spline(t))
+        p = self.mean + t * self.main_dir + lateral * self.perp_dir
+        return float(p[0]), float(p[1])
 
     def get_direction(self, t: float) -> float:
         if self.linear_mode:
             direction = self.line_end - self.line_start
             return math.atan2(direction[1], direction[0])
-        dx = self.x_spline.derivative()(t)
-        dy = self.y_spline.derivative()(t)
+        lateral_d = float(self.lateral_spline.derivative()(t))
+        direction = self.main_dir + lateral_d * self.perp_dir
+        dx, dy = float(direction[0]), float(direction[1])
         return math.atan2(dy, dx)
 
     def get_global_direction(self) -> float:
@@ -158,7 +166,9 @@ class PlantSpline:
         if self.linear_mode:
             pts = [self.evaluate(t) for t in t_vals]
             return np.array(pts)
-        return np.column_stack((self.x_spline(t_vals), self.y_spline(t_vals)))
+        lateral_vals = self.lateral_spline(t_vals)
+        return np.column_stack((self.mean[0] + t_vals * self.main_dir[0] + lateral_vals * self.perp_dir[0],
+                                self.mean[1] + t_vals * self.main_dir[1] + lateral_vals * self.perp_dir[1]))
     
     def project(self, point: np.ndarray) -> float:
         """Project world point onto spline parameter t"""
