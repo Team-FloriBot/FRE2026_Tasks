@@ -80,12 +80,20 @@ class PlantSpline:
             return
             
         # Adaptiver Splinegrad wie in der Referenz: bei wenigen Punkten keinen zu hohen Grad erzwingen.
-        k = min(3, len(unique_t) - 1)
-        self.x_spline = UnivariateSpline(unique_t, self.points[unique_idx, 0], k=k, s=s)
-        self.y_spline = UnivariateSpline(unique_t, self.points[unique_idx, 1], k=k, s=s)
-        self.valid = True
-        self.t_min = unique_t[0]
-        self.t_max = unique_t[-1]
+        # Außerdem adaptives Glätten: s wird skaliert mit Anzahl der Punkte und räumlicher Streuung,
+        # damit Splines bei dichterem / lauterem Rauschen stärker geglättet werden.
+        try:
+            k = min(3, len(unique_t) - 1)
+            spread = float(np.mean(np.std(self.points[unique_idx], axis=0)))
+            s_used = float(s) * max(1.0, len(unique_t) / 8.0) * (1.0 + spread)
+            self.x_spline = UnivariateSpline(unique_t, self.points[unique_idx, 0], k=k, s=s_used)
+            self.y_spline = UnivariateSpline(unique_t, self.points[unique_idx, 1], k=k, s=s_used)
+            self.valid = True
+            self.t_min = unique_t[0]
+            self.t_max = unique_t[-1]
+        except Exception:
+            self.valid = False
+            return
 
     def evaluate(self, t: float) -> Tuple[float, float]:
         return float(self.x_spline(t)), float(self.y_spline(t))
