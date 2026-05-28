@@ -109,16 +109,22 @@ class PlantSpline:
             return
 
         
-            
+        fit_points = self.points[unique_idx]
+        fit_t = unique_t
+        if len(fit_t) > 120:
+            sample_idx = np.linspace(0, len(fit_t) - 1, 120).astype(int)
+            fit_t = fit_t[sample_idx]
+            fit_points = fit_points[sample_idx]
+
         # Adaptiver Splinegrad wie in der Referenz: bei wenigen Punkten keinen zu hohen Grad erzwingen.
         # Außerdem adaptives Glätten: s wird skaliert mit Anzahl der Punkte und räumlicher Streuung,
         # damit Splines bei dichterem / lauterem Rauschen stärker geglättet werden.
         try:
-            k = min(3, len(unique_t) - 1)
-            spread = float(np.mean(np.std(self.points[unique_idx], axis=0)))
-            s_used = float(s) * max(1.0, len(unique_t) / 8.0) * (1.0 + spread)
-            self.x_spline = UnivariateSpline(unique_t, self.points[unique_idx, 0], k=k, s=s_used)
-            self.y_spline = UnivariateSpline(unique_t, self.points[unique_idx, 1], k=k, s=s_used)
+            k = min(3, len(fit_t) - 1)
+            spread = float(np.mean(np.std(fit_points, axis=0)))
+            s_used = float(s) * (1.0 + 0.4 * spread)
+            self.x_spline = UnivariateSpline(fit_t, fit_points[:, 0], k=k, s=s_used)
+            self.y_spline = UnivariateSpline(fit_t, fit_points[:, 1], k=k, s=s_used)
             self.valid = True
         except Exception:
             self.valid = False
@@ -223,6 +229,11 @@ class MaizeNavigator(Node):
         
         self.left_row_spline: Optional[PlantSpline] = None
         self.right_row_spline: Optional[PlantSpline] = None
+        self.current_left_row_id: Optional[int] = None
+        self.current_right_row_id: Optional[int] = None
+        self.next_row_id: int = 1
+        self.known_rows: dict[int, PlantSpline] = {}
+        self.row_exclusion_distance: float = 0.22
         
         # State specific variables
         self.exit_start_pose: Optional[Pose2D] = None
@@ -319,6 +330,11 @@ class MaizeNavigator(Node):
             self.get_logger().info(f"Not enough points in ROI: {len(points)}", throttle_duration_sec=2.0)
             return
 
+        points = self.filter_points_near_known_rows(points)
+        if len(points) < 5:
+            self.get_logger().info("All ROI points belong to already known rows.", throttle_duration_sec=2.0)
+            return
+
         # Histogram logic
         c, s = math.cos(-self.robot_pose.yaw), math.sin(-self.robot_pose.yaw)
         dx, dy = points[:, 0] - self.robot_pose.x, points[:, 1] - self.robot_pose.y
@@ -350,9 +366,17 @@ class MaizeNavigator(Node):
         self.right_row_spline = PlantSpline(self.right_row_points, heading_yaw=self.robot_pose.yaw, logger=self.get_logger())
         
         if self.left_row_spline.valid and self.right_row_spline.valid:
+            self.current_left_row_id = self.next_row_id
+            self.next_row_id += 1
+            self.current_right_row_id = self.next_row_id
+            self.next_row_id += 1
+            self.known_rows[self.current_left_row_id] = self.left_row_spline
+            self.known_rows[self.current_right_row_id] = self.right_row_spline
             self.row_entry_pose = self.robot_pose
             self.state = MissionState.FOLLOW_ROW
-            self.get_logger().info(f"Rows found. Width: {best_left - best_right:.2f}m. Following...")
+            self.get_logger().info(
+                f"Rows found. IDs: L={self.current_left_row_id}, R={self.current_right_row_id}. Width: {best_left - best_right:.2f}m. Following..."
+            )
 
     def handle_follow_row(self):
         # 1. Project robot onto current splines
@@ -370,12 +394,20 @@ class MaizeNavigator(Node):
         global_trend_l = self.left_row_spline.get_global_direction()
         weighted_yaw_l = wrap_to_pi(0.4 * local_tangent_l + 0.6 * global_trend_l)
         
-        new_pts_l = self.find_points_along_tangent(end_val_l, weighted_yaw_l, max_dist=2.2, width=0.45)
+        new_pts_l = self.find_points_along_tangent(
+            end_val_l,
+            weighted_yaw_l,
+            max_dist=2.2,
+            width=0.45,
+            exclude_row_ids={self.current_right_row_id} if self.current_right_row_id is not None else None,
+        )
         if len(new_pts_l) > 0:
             self.left_row_points = self.accumulate_unique_points(self.left_row_points, new_pts_l)
             temp_spline = PlantSpline(self.left_row_points, heading_yaw=self.robot_pose.yaw, logger=self.get_logger())
             if temp_spline.valid:
                 self.left_row_spline = temp_spline
+                if self.current_left_row_id is not None:
+                    self.known_rows[self.current_left_row_id] = self.left_row_spline
 
         # For Right Spline:
         end_val_r = np.array(self.right_row_spline.evaluate(self.right_row_spline.t_max))
@@ -383,12 +415,20 @@ class MaizeNavigator(Node):
         global_trend_r = self.right_row_spline.get_global_direction()
         weighted_yaw_r = wrap_to_pi(0.4 * local_tangent_r + 0.6 * global_trend_r)
         
-        new_pts_r = self.find_points_along_tangent(end_val_r, weighted_yaw_r, max_dist=2.2, width=0.45)
+        new_pts_r = self.find_points_along_tangent(
+            end_val_r,
+            weighted_yaw_r,
+            max_dist=2.2,
+            width=0.45,
+            exclude_row_ids={self.current_left_row_id} if self.current_left_row_id is not None else None,
+        )
         if len(new_pts_r) > 0:
             self.right_row_points = self.accumulate_unique_points(self.right_row_points, new_pts_r)
             temp_spline = PlantSpline(self.right_row_points, heading_yaw=self.robot_pose.yaw, logger=self.get_logger())
             if temp_spline.valid:
                 self.right_row_spline = temp_spline
+                if self.current_right_row_id is not None:
+                    self.known_rows[self.current_right_row_id] = self.right_row_spline
 
         # 3. Project robot on updated, highly robust splines
         t_l = self.left_row_spline.project(p_robot)
@@ -431,7 +471,14 @@ class MaizeNavigator(Node):
         
         self.drive_to_point(p_target)
 
-    def find_points_along_tangent(self, start_pos: np.ndarray, yaw: float, max_dist: float, width: float) -> np.ndarray:
+    def find_points_along_tangent(
+        self,
+        start_pos: np.ndarray,
+        yaw: float,
+        max_dist: float,
+        width: float,
+        exclude_row_ids: Optional[set[int]] = None,
+    ) -> np.ndarray:
         """Looks for plant points ahead of the spline's end point in the direction of its tangent."""
         # Query map cells in a generous bounding area
         points = self.get_map_points_in_roi(Pose2D(start_pos[0], start_pos[1], yaw), max_dist * 2)
@@ -448,7 +495,7 @@ class MaizeNavigator(Node):
         
         # Filter points inside lookahead search window
         mask = (lx > 0.05) & (lx < max_dist) & (np.abs(ly) < width / 2.0)
-        return points[mask]
+        return self.filter_points_near_known_rows(points[mask], exclude_row_ids=exclude_row_ids)
 
     def accumulate_unique_points(self, current_pts: np.ndarray, new_pts: np.ndarray) -> np.ndarray:
         """Filters new points to only append those that aren't already represented in current_pts."""
@@ -461,6 +508,26 @@ class MaizeNavigator(Node):
         if len(kept) > 0:
             return np.vstack((current_pts, np.array(kept)))
         return current_pts
+
+    def spline_point_distances(self, points: np.ndarray, spline: PlantSpline) -> np.ndarray:
+        if len(points) == 0 or spline is None or not spline.valid:
+            return np.array([])
+        spline_points = spline.get_points(num=60)
+        deltas = points[:, None, :] - spline_points[None, :, :]
+        return np.min(np.linalg.norm(deltas, axis=2), axis=1)
+
+    def filter_points_near_known_rows(self, points: np.ndarray, exclude_row_ids: Optional[set[int]] = None, min_dist: Optional[float] = None) -> np.ndarray:
+        if len(points) == 0 or not self.known_rows:
+            return points
+        threshold = self.row_exclusion_distance if min_dist is None else min_dist
+        mask = np.ones(len(points), dtype=bool)
+        for row_id, spline in self.known_rows.items():
+            if exclude_row_ids and row_id in exclude_row_ids:
+                continue
+            distances = self.spline_point_distances(points, spline)
+            if len(distances) > 0:
+                mask &= distances > threshold
+        return points[mask]
 
     def get_map_points_in_front(self, pose: Pose2D, distance: float, width: float) -> np.ndarray:
         points = self.get_map_points_in_roi(pose, distance * 2)
