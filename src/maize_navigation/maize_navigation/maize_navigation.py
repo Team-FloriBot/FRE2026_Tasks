@@ -51,6 +51,7 @@ class PlantSpline:
         self.valid = False
         self.t_min = 0.0
         self.t_max = 0.0
+        self.linear_mode = False
         self.points = points
         
         if len(points) < 4:
@@ -78,6 +79,18 @@ class PlantSpline:
         unique_t, unique_idx = np.unique(self.t, return_index=True)
         if len(unique_t) < 4:
             return
+
+        self.t_min = unique_t[0]
+        self.t_max = unique_t[-1]
+
+        # Bei wenigen Punkten lieber eine gerade Linie nehmen, statt eine schwingende Kurve zu erzwingen.
+        # Das entspricht dem Verhalten aus der Referenz, wenn die Reihe noch nicht gut genug sichtbar ist.
+        if len(unique_t) < 6:
+            self.linear_mode = True
+            self.line_start = self.mean + self.t_min * self.main_dir
+            self.line_end = self.mean + self.t_max * self.main_dir
+            self.valid = True
+            return
             
         # Adaptiver Splinegrad wie in der Referenz: bei wenigen Punkten keinen zu hohen Grad erzwingen.
         # Außerdem adaptives Glätten: s wird skaliert mit Anzahl der Punkte und räumlicher Streuung,
@@ -89,16 +102,25 @@ class PlantSpline:
             self.x_spline = UnivariateSpline(unique_t, self.points[unique_idx, 0], k=k, s=s_used)
             self.y_spline = UnivariateSpline(unique_t, self.points[unique_idx, 1], k=k, s=s_used)
             self.valid = True
-            self.t_min = unique_t[0]
-            self.t_max = unique_t[-1]
         except Exception:
             self.valid = False
             return
 
     def evaluate(self, t: float) -> Tuple[float, float]:
+        if self.linear_mode:
+            if self.t_max <= self.t_min:
+                p = self.line_start
+            else:
+                alpha = (t - self.t_min) / (self.t_max - self.t_min)
+                alpha = float(np.clip(alpha, 0.0, 1.0))
+                p = self.line_start + alpha * (self.line_end - self.line_start)
+            return float(p[0]), float(p[1])
         return float(self.x_spline(t)), float(self.y_spline(t))
 
     def get_direction(self, t: float) -> float:
+        if self.linear_mode:
+            direction = self.line_end - self.line_start
+            return math.atan2(direction[1], direction[0])
         dx = self.x_spline.derivative()(t)
         dy = self.y_spline.derivative()(t)
         return math.atan2(dy, dx)
@@ -109,6 +131,9 @@ class PlantSpline:
 
     def get_points(self, num: int = 50) -> np.ndarray:
         t_vals = np.linspace(self.t_min, self.t_max, num)
+        if self.linear_mode:
+            pts = [self.evaluate(t) for t in t_vals]
+            return np.array(pts)
         return np.column_stack((self.x_spline(t_vals), self.y_spline(t_vals)))
     
     def project(self, point: np.ndarray) -> float:
@@ -489,8 +514,6 @@ class MaizeNavigator(Node):
         speed_factor = np.clip(1.0 - abs(yaw_err)/0.6, 0.3, 1.0)
         cmd.linear.x = self.p.follow_speed * speed_factor
         cmd.angular.z = self.p.yaw_kp * yaw_err
-
-        self.get_logger().info("Hallooooooooooooooooooooo")
         
         self.get_logger().info(
             f"Fahrbefehl: v={cmd.linear.x:.2f}, w={cmd.angular.z:.2f} (yaw_err={yaw_err:.2f}, dist={math.hypot(dx, dy):.2f})",
