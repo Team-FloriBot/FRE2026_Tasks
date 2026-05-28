@@ -409,13 +409,20 @@ class MaizeNavigator(Node):
             )
             temp_spline = PlantSpline(self.left_row_points, heading_yaw=self.robot_pose.yaw, logger=self.get_logger())
             if temp_spline.valid:
-                # validation: ensure temp_spline not too close to opposite spline
+                # validation: continuity + avoid drifting into opposite row
                 ok = True
+                if self.left_row_spline and self.left_row_spline.valid:
+                    if not self.is_candidate_continuous(self.left_row_spline, temp_spline):
+                        ok = False
                 if self.right_row_spline and self.right_row_spline.valid:
                     dists = self.spline_point_distances(temp_spline.get_points(num=60), self.right_row_spline)
-                    if len(dists) > 0 and np.min(dists) < max(self.row_exclusion_distance, self.p.expected_row_width * 0.4):
+                    if len(dists) > 0 and np.min(dists) < max(self.row_exclusion_distance, self.p.expected_row_width * 0.45):
                         ok = False
                         self.get_logger().info(f"Rejecting left temp_spline: too close to right row (min_dist={np.min(dists):.3f})")
+                if ok and self.right_row_spline and self.right_row_spline.valid:
+                    if not self.validate_row_pair_geometry(temp_spline, self.right_row_spline):
+                        ok = False
+                        self.get_logger().info("Rejecting left temp_spline: invalid left/right row geometry")
                 if ok:
                     self.left_row_spline = temp_spline
                     if self.current_left_row_id is not None:
@@ -443,11 +450,18 @@ class MaizeNavigator(Node):
             temp_spline = PlantSpline(self.right_row_points, heading_yaw=self.robot_pose.yaw, logger=self.get_logger())
             if temp_spline.valid:
                 ok = True
+                if self.right_row_spline and self.right_row_spline.valid:
+                    if not self.is_candidate_continuous(self.right_row_spline, temp_spline):
+                        ok = False
                 if self.left_row_spline and self.left_row_spline.valid:
                     dists = self.spline_point_distances(temp_spline.get_points(num=60), self.left_row_spline)
-                    if len(dists) > 0 and np.min(dists) < max(self.row_exclusion_distance, self.p.expected_row_width * 0.4):
+                    if len(dists) > 0 and np.min(dists) < max(self.row_exclusion_distance, self.p.expected_row_width * 0.45):
                         ok = False
                         self.get_logger().info(f"Rejecting right temp_spline: too close to left row (min_dist={np.min(dists):.3f})")
+                if ok and self.left_row_spline and self.left_row_spline.valid:
+                    if not self.validate_row_pair_geometry(self.left_row_spline, temp_spline):
+                        ok = False
+                        self.get_logger().info("Rejecting right temp_spline: invalid left/right row geometry")
                 if ok:
                     self.right_row_spline = temp_spline
                     if self.current_right_row_id is not None:
@@ -562,6 +576,47 @@ class MaizeNavigator(Node):
                 return np.array(kept)
             return np.vstack((current_pts, np.array(kept)))
         return current_pts
+
+    def is_candidate_continuous(self, current_spline: PlantSpline, candidate_spline: PlantSpline, max_delta: float = 0.7) -> bool:
+        if current_spline is None or candidate_spline is None:
+            return False
+        if not current_spline.valid or not candidate_spline.valid:
+            return False
+
+        t_ref = min(current_spline.t_max, candidate_spline.t_max)
+        t_ref = max(candidate_spline.t_min, min(t_ref, candidate_spline.t_max))
+        t_cur = max(current_spline.t_min, min(t_ref, current_spline.t_max))
+
+        yaw_old = current_spline.get_direction(t_cur)
+        yaw_new = candidate_spline.get_direction(t_ref)
+        delta = abs(wrap_to_pi(yaw_new - yaw_old))
+        return delta <= max_delta
+
+    def validate_row_pair_geometry(self, left_spline: PlantSpline, right_spline: PlantSpline) -> bool:
+        if self.robot_pose is None:
+            return True
+        if left_spline is None or right_spline is None:
+            return False
+        if not left_spline.valid or not right_spline.valid:
+            return False
+
+        p_robot = np.array([self.robot_pose.x, self.robot_pose.y])
+        t_l = left_spline.project(p_robot)
+        t_r = right_spline.project(p_robot)
+        t_l = max(left_spline.t_min, min(t_l, left_spline.t_max))
+        t_r = max(right_spline.t_min, min(t_r, right_spline.t_max))
+
+        p_l = np.array(left_spline.evaluate(t_l))
+        p_r = np.array(right_spline.evaluate(t_r))
+
+        c, s = math.cos(-self.robot_pose.yaw), math.sin(-self.robot_pose.yaw)
+        dy_l = s * (p_l[0] - self.robot_pose.x) + c * (p_l[1] - self.robot_pose.y)
+        dy_r = s * (p_r[0] - self.robot_pose.x) + c * (p_r[1] - self.robot_pose.y)
+        sep = dy_l - dy_r
+
+        min_sep = max(0.25, 0.45 * self.p.expected_row_width)
+        max_sep = 2.2 * self.p.expected_row_width
+        return sep > min_sep and sep < max_sep
 
     def spline_point_distances(self, points: np.ndarray, spline: PlantSpline) -> np.ndarray:
         if len(points) == 0 or spline is None or not spline.valid:
