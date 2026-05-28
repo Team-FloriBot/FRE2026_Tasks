@@ -400,14 +400,26 @@ class MaizeNavigator(Node):
             max_dist=2.2,
             width=0.45,
             exclude_row_ids={self.current_right_row_id} if self.current_right_row_id is not None else None,
+            current_spline=self.left_row_spline,
+            min_t=self.left_row_spline.t_max if self.left_row_spline is not None else None,
         )
         if len(new_pts_l) > 0:
-            self.left_row_points = self.accumulate_unique_points(self.left_row_points, new_pts_l)
+            self.left_row_points = self.accumulate_unique_points(
+                self.left_row_points, new_pts_l, exclude_row_id=self.current_left_row_id
+            )
             temp_spline = PlantSpline(self.left_row_points, heading_yaw=self.robot_pose.yaw, logger=self.get_logger())
             if temp_spline.valid:
-                self.left_row_spline = temp_spline
-                if self.current_left_row_id is not None:
-                    self.known_rows[self.current_left_row_id] = self.left_row_spline
+                # validation: ensure temp_spline not too close to opposite spline
+                ok = True
+                if self.right_row_spline and self.right_row_spline.valid:
+                    dists = self.spline_point_distances(temp_spline.get_points(num=60), self.right_row_spline)
+                    if len(dists) > 0 and np.min(dists) < max(self.row_exclusion_distance, self.p.expected_row_width * 0.4):
+                        ok = False
+                        self.get_logger().info(f"Rejecting left temp_spline: too close to right row (min_dist={np.min(dists):.3f})")
+                if ok:
+                    self.left_row_spline = temp_spline
+                    if self.current_left_row_id is not None:
+                        self.known_rows[self.current_left_row_id] = self.left_row_spline
 
         # For Right Spline:
         end_val_r = np.array(self.right_row_spline.evaluate(self.right_row_spline.t_max))
@@ -421,14 +433,25 @@ class MaizeNavigator(Node):
             max_dist=2.2,
             width=0.45,
             exclude_row_ids={self.current_left_row_id} if self.current_left_row_id is not None else None,
+            current_spline=self.right_row_spline,
+            min_t=self.right_row_spline.t_max if self.right_row_spline is not None else None,
         )
         if len(new_pts_r) > 0:
-            self.right_row_points = self.accumulate_unique_points(self.right_row_points, new_pts_r)
+            self.right_row_points = self.accumulate_unique_points(
+                self.right_row_points, new_pts_r, exclude_row_id=self.current_right_row_id
+            )
             temp_spline = PlantSpline(self.right_row_points, heading_yaw=self.robot_pose.yaw, logger=self.get_logger())
             if temp_spline.valid:
-                self.right_row_spline = temp_spline
-                if self.current_right_row_id is not None:
-                    self.known_rows[self.current_right_row_id] = self.right_row_spline
+                ok = True
+                if self.left_row_spline and self.left_row_spline.valid:
+                    dists = self.spline_point_distances(temp_spline.get_points(num=60), self.left_row_spline)
+                    if len(dists) > 0 and np.min(dists) < max(self.row_exclusion_distance, self.p.expected_row_width * 0.4):
+                        ok = False
+                        self.get_logger().info(f"Rejecting right temp_spline: too close to left row (min_dist={np.min(dists):.3f})")
+                if ok:
+                    self.right_row_spline = temp_spline
+                    if self.current_right_row_id is not None:
+                        self.known_rows[self.current_right_row_id] = self.right_row_spline
 
         # 3. Project robot on updated, highly robust splines
         t_l = self.left_row_spline.project(p_robot)
@@ -478,6 +501,8 @@ class MaizeNavigator(Node):
         max_dist: float,
         width: float,
         exclude_row_ids: Optional[set[int]] = None,
+        current_spline=None,
+        min_t: Optional[float] = None,
     ) -> np.ndarray:
         """Looks for plant points ahead of the spline's end point in the direction of its tangent."""
         # Query map cells in a generous bounding area
@@ -495,17 +520,46 @@ class MaizeNavigator(Node):
         
         # Filter points inside lookahead search window
         mask = (lx > 0.05) & (lx < max_dist) & (np.abs(ly) < width / 2.0)
-        return self.filter_points_near_known_rows(points[mask], exclude_row_ids=exclude_row_ids)
+        cand = points[mask]
 
-    def accumulate_unique_points(self, current_pts: np.ndarray, new_pts: np.ndarray) -> np.ndarray:
-        """Filters new points to only append those that aren't already represented in current_pts."""
-        # Simple spatial proximity filter: keep points that are at least 0.08m away from any existing point
+        # If current_spline provided, require points to project beyond current t_max (avoid backward points)
+        if current_spline is not None and min_t is not None and len(cand) > 0:
+            proj_t = np.array([current_spline.project(p) for p in cand])
+            eps = 0.05
+            cand = cand[proj_t > (min_t - eps)]
+
+        return self.filter_points_near_known_rows(cand, exclude_row_ids=exclude_row_ids)
+
+    def accumulate_unique_points(self, current_pts: np.ndarray, new_pts: np.ndarray, exclude_row_id: Optional[int] = None) -> np.ndarray:
+        """Filters new points to only append those that aren't already represented in current_pts.
+
+        Also rejects points that are closer to any known row spline (excluding exclude_row_id) than
+        `self.row_exclusion_distance` to avoid stealing points from other rows.
+        """
         kept = []
         for pt in new_pts:
-            dists = np.linalg.norm(current_pts - pt, axis=1)
-            if np.min(dists) > 0.08:
+            # distance to existing current points
+            if current_pts is None or len(current_pts) == 0:
+                min_cur = float('inf')
+            else:
+                dists = np.linalg.norm(current_pts - pt, axis=1)
+                min_cur = float(np.min(dists))
+
+            # distance to known rows (exclude the current row id)
+            min_known = float('inf')
+            for row_id, spline in self.known_rows.items():
+                if exclude_row_id is not None and row_id == exclude_row_id:
+                    continue
+                d = self.spline_point_distances(np.array([pt]), spline)
+                if len(d) > 0:
+                    min_known = min(min_known, float(d[0]))
+
+            if min_cur > 0.08 and min_known > self.row_exclusion_distance:
                 kept.append(pt)
+
         if len(kept) > 0:
+            if current_pts is None or len(current_pts) == 0:
+                return np.array(kept)
             return np.vstack((current_pts, np.array(kept)))
         return current_pts
 
