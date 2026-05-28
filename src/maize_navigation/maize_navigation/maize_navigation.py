@@ -87,13 +87,25 @@ class PlantSpline:
         if logger:
             logger.info(f"Fitting spline with {len(unique_t)} unique points, t range: [{self.t_min:.2f}, {self.t_max:.2f}]")
 
-        # Bei wenigen Punkten lieber eine gerade Linie nehmen, statt eine schwingende Kurve zu erzwingen.
-        # Das entspricht dem Verhalten aus der Referenz, wenn die Reihe noch nicht gut genug sichtbar ist.
-        if len(unique_t) < 6:
+        # Zähle räumliche Cluster: wenn Punkte in Gruppen angehäuft sind (z.B. 2-3 Anhäufungen),
+        # ist die Reihe wahrscheinlich gerade. Viele verstreute Cluster deuten auf Krümmung hin.
+        sorted_pts = self.points[unique_idx]
+        num_clusters = 1
+        cluster_gap_threshold = 0.25  # Meter: ab dieser Lücke ein neuer Cluster
+        
+        for i in range(len(sorted_pts) - 1):
+            dist = np.linalg.norm(sorted_pts[i+1] - sorted_pts[i])
+            if dist > cluster_gap_threshold:
+                num_clusters += 1
+        
+        # Bei wenigen Punkten ODER nur wenigen räumlichen Clustern (2-3) → linear_mode
+        if len(unique_t) < 6 or num_clusters <= 3:
             self.linear_mode = True
             self.line_start = self.mean + self.t_min * self.main_dir
             self.line_end = self.mean + self.t_max * self.main_dir
             self.valid = True
+            if logger:
+                logger.info(f"Using linear mode (n={len(unique_t)}, clusters={num_clusters})")
             return
 
         
