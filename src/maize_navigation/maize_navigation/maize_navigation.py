@@ -83,6 +83,8 @@ class PlantSpline:
         self.t_min = unique_t[0]
         self.t_max = unique_t[-1]
 
+        logger.info(f"Fitting spline with {len(unique_t)} unique points, t range: [{self.t_min:.2f}, {self.t_max:.2f}]")
+
         # Bei wenigen Punkten lieber eine gerade Linie nehmen, statt eine schwingende Kurve zu erzwingen.
         # Das entspricht dem Verhalten aus der Referenz, wenn die Reihe noch nicht gut genug sichtbar ist.
         if len(unique_t) < 6:
@@ -91,6 +93,8 @@ class PlantSpline:
             self.line_end = self.mean + self.t_max * self.main_dir
             self.valid = True
             return
+
+        
             
         # Adaptiver Splinegrad wie in der Referenz: bei wenigen Punkten keinen zu hohen Grad erzwingen.
         # Außerdem adaptives Glätten: s wird skaliert mit Anzahl der Punkte und räumlicher Streuung,
