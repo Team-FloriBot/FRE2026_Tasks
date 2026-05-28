@@ -42,7 +42,7 @@ class Pose2D:
 # --- Data Structures for Splines ---
 
 class PlantSpline:
-    def __init__(self, points: np.ndarray, heading_yaw: float = 0.0, s: float = 0.15, logger: Optional[Node] = None):
+    def __init__(self, points: np.ndarray, heading_yaw: float = 0.0, s: float = 0.15, max_k: int = 2, logger: Optional[Node] = None):
         """
         points: (N, 2) array of (x, y) coordinates in map frame
         heading_yaw: Approximate current heading yaw of the robot to align spline direction
@@ -120,7 +120,7 @@ class PlantSpline:
         # Außerdem adaptives Glätten: s wird skaliert mit Anzahl der Punkte und räumlicher Streuung,
         # damit Splines bei dichterem / lauterem Rauschen stärker geglättet werden.
         try:
-            k = min(3, len(fit_t) - 1)
+            k = min(max_k, len(fit_t) - 1)
             spread = float(np.mean(np.std(fit_points, axis=0)))
             s_used = float(s) * (1.0 + 0.4 * spread)
             self.x_spline = UnivariateSpline(fit_t, fit_points[:, 0], k=k, s=s_used)
@@ -202,6 +202,9 @@ class NavigatorParams:
     exit_distance: float = 0.5
     min_turn_radius: float = 0.5
     lookahead_dist: float = 0.6
+    row_search_max_dist: float = 1.8
+    row_search_width: float = 0.32
+    max_spline_k: int = 2
     
     # Control
     pos_kp: float = 2.0
@@ -266,6 +269,9 @@ class MaizeNavigator(Node):
         p.follow_speed = get_param("follow_speed", p.follow_speed)
         p.min_turn_radius = get_param("min_turn_radius", p.min_turn_radius)
         p.exit_distance = get_param("exit_distance", p.exit_distance)
+        p.row_search_max_dist = get_param("row_search_max_dist", p.row_search_max_dist)
+        p.row_search_width = get_param("row_search_width", p.row_search_width)
+        p.max_spline_k = get_param("max_spline_k", p.max_spline_k)
         return p
 
     def parse_pattern(self, pattern_str: str) -> List[Tuple[int, str]]:
@@ -362,8 +368,8 @@ class MaizeNavigator(Node):
         self.left_row_points = points[np.abs(local_y - best_left) < 0.25]
         self.right_row_points = points[np.abs(local_y - best_right) < 0.25]
         
-        self.left_row_spline = PlantSpline(self.left_row_points, heading_yaw=self.robot_pose.yaw, logger=self.get_logger())
-        self.right_row_spline = PlantSpline(self.right_row_points, heading_yaw=self.robot_pose.yaw, logger=self.get_logger())
+        self.left_row_spline = PlantSpline(self.left_row_points, heading_yaw=self.robot_pose.yaw, max_k=self.p.max_spline_k, logger=self.get_logger())
+        self.right_row_spline = PlantSpline(self.right_row_points, heading_yaw=self.robot_pose.yaw, max_k=self.p.max_spline_k, logger=self.get_logger())
         
         if self.left_row_spline.valid and self.right_row_spline.valid:
             self.current_left_row_id = self.next_row_id
@@ -397,8 +403,8 @@ class MaizeNavigator(Node):
         new_pts_l = self.find_points_along_tangent(
             end_val_l,
             weighted_yaw_l,
-            max_dist=2.2,
-            width=0.45,
+            max_dist=self.p.row_search_max_dist,
+            width=self.p.row_search_width,
             exclude_row_ids={self.current_right_row_id} if self.current_right_row_id is not None else None,
             current_spline=self.left_row_spline,
             min_t=self.left_row_spline.t_max if self.left_row_spline is not None else None,
@@ -407,7 +413,7 @@ class MaizeNavigator(Node):
             self.left_row_points = self.accumulate_unique_points(
                 self.left_row_points, new_pts_l, exclude_row_id=self.current_left_row_id
             )
-            temp_spline = PlantSpline(self.left_row_points, heading_yaw=self.robot_pose.yaw, logger=self.get_logger())
+            temp_spline = PlantSpline(self.left_row_points, heading_yaw=self.robot_pose.yaw, max_k=self.p.max_spline_k, logger=self.get_logger())
             if temp_spline.valid:
                 # validation: continuity + avoid drifting into opposite row
                 ok = True
@@ -437,8 +443,8 @@ class MaizeNavigator(Node):
         new_pts_r = self.find_points_along_tangent(
             end_val_r,
             weighted_yaw_r,
-            max_dist=2.2,
-            width=0.45,
+            max_dist=self.p.row_search_max_dist,
+            width=self.p.row_search_width,
             exclude_row_ids={self.current_left_row_id} if self.current_left_row_id is not None else None,
             current_spline=self.right_row_spline,
             min_t=self.right_row_spline.t_max if self.right_row_spline is not None else None,
@@ -447,7 +453,7 @@ class MaizeNavigator(Node):
             self.right_row_points = self.accumulate_unique_points(
                 self.right_row_points, new_pts_r, exclude_row_id=self.current_right_row_id
             )
-            temp_spline = PlantSpline(self.right_row_points, heading_yaw=self.robot_pose.yaw, logger=self.get_logger())
+            temp_spline = PlantSpline(self.right_row_points, heading_yaw=self.robot_pose.yaw, max_k=self.p.max_spline_k, logger=self.get_logger())
             if temp_spline.valid:
                 ok = True
                 if self.right_row_spline and self.right_row_spline.valid:
@@ -732,17 +738,21 @@ class MaizeNavigator(Node):
 
     def publish_visuals(self):
         markers = MarkerArray()
-        if self.left_row_spline and self.left_row_spline.valid:
-            markers.markers.append(self.create_spline_marker(self.left_row_spline, 0, [0.0, 1.0, 0.0]))
-        if self.right_row_spline and self.right_row_spline.valid:
-            markers.markers.append(self.create_spline_marker(self.right_row_spline, 1, [0.0, 1.0, 0.0]))
+        for row_id in sorted(self.known_rows.keys()):
+            spline = self.known_rows[row_id]
+            if spline is None or not spline.valid:
+                continue
+            is_current = row_id in {self.current_left_row_id, self.current_right_row_id}
+            color = [0.0, 1.0, 0.0] if is_current else [0.65, 0.65, 0.65]
+            alpha = 1.0 if is_current else 0.55
+            markers.markers.append(self.create_spline_marker(spline, row_id, color, alpha=alpha))
         self.marker_pub.publish(markers)
 
-    def create_spline_marker(self, spline: PlantSpline, id: int, color: list) -> Marker:
+    def create_spline_marker(self, spline: PlantSpline, id: int, color: list, alpha: float = 1.0) -> Marker:
         m = Marker(header=Header(frame_id=self.p.map_frame, stamp=self.get_clock().now().to_msg()))
         m.ns, m.id, m.type, m.action = "splines", id, Marker.LINE_STRIP, Marker.ADD
-        m.scale.x = 0.05
-        m.color.r, m.color.g, m.color.b, m.color.a = color[0], color[1], color[2], 1.0
+        m.scale.x = 0.04
+        m.color.r, m.color.g, m.color.b, m.color.a = color[0], color[1], color[2], alpha
         for p in spline.get_points():
             m.points.append(Point(x=float(p[0]), y=float(p[1]), z=0.0))
         return m
