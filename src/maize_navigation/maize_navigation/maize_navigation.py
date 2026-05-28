@@ -489,6 +489,8 @@ class MaizeNavigator(Node):
         speed_factor = np.clip(1.0 - abs(yaw_err)/0.6, 0.3, 1.0)
         cmd.linear.x = self.p.follow_speed * speed_factor
         cmd.angular.z = self.p.yaw_kp * yaw_err
+
+        self.get_logger().info("Hallooooooooooooooooooooo")
         
         self.get_logger().info(
             f"Fahrbefehl: v={cmd.linear.x:.2f}, w={cmd.angular.z:.2f} (yaw_err={yaw_err:.2f}, dist={math.hypot(dx, dy):.2f})",
