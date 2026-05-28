@@ -42,11 +42,12 @@ class Pose2D:
 # --- Data Structures for Splines ---
 
 class PlantSpline:
-    def __init__(self, points: np.ndarray, heading_yaw: float = 0.0, s: float = 0.15):
+    def __init__(self, points: np.ndarray, heading_yaw: float = 0.0, s: float = 0.15, logger: Optional[Node] = None):
         """
         points: (N, 2) array of (x, y) coordinates in map frame
         heading_yaw: Approximate current heading yaw of the robot to align spline direction
         s: Balanced smoothing factor to allow tracking real curves while filtering high-frequency noise
+        logger: Optional logger for debugging messages
         """
         self.valid = False
         self.t_min = 0.0
@@ -78,12 +79,13 @@ class PlantSpline:
         # Remove duplicate t values for spline fitting
         unique_t, unique_idx = np.unique(self.t, return_index=True)
         if len(unique_t) < 4:
-            return
+            return 
 
         self.t_min = unique_t[0]
         self.t_max = unique_t[-1]
 
-        print(f"Fitting spline with {len(unique_t)} unique points, t range: [{self.t_min:.2f}, {self.t_max:.2f}]")
+        if logger:
+            logger.get_logger().info(f"Fitting spline with {len(unique_t)} unique points, t range: [{self.t_min:.2f}, {self.t_max:.2f}]")
 
         # Bei wenigen Punkten lieber eine gerade Linie nehmen, statt eine schwingende Kurve zu erzwingen.
         # Das entspricht dem Verhalten aus der Referenz, wenn die Reihe noch nicht gut genug sichtbar ist.
@@ -332,8 +334,8 @@ class MaizeNavigator(Node):
         self.left_row_points = points[np.abs(local_y - best_left) < 0.25]
         self.right_row_points = points[np.abs(local_y - best_right) < 0.25]
         
-        self.left_row_spline = PlantSpline(self.left_row_points, heading_yaw=self.robot_pose.yaw)
-        self.right_row_spline = PlantSpline(self.right_row_points, heading_yaw=self.robot_pose.yaw)
+        self.left_row_spline = PlantSpline(self.left_row_points, heading_yaw=self.robot_pose.yaw, logger=self.get_logger())
+        self.right_row_spline = PlantSpline(self.right_row_points, heading_yaw=self.robot_pose.yaw, logger=self.get_logger())
         
         if self.left_row_spline.valid and self.right_row_spline.valid:
             self.row_entry_pose = self.robot_pose
@@ -359,7 +361,7 @@ class MaizeNavigator(Node):
         new_pts_l = self.find_points_along_tangent(end_val_l, weighted_yaw_l, max_dist=2.2, width=0.45)
         if len(new_pts_l) > 0:
             self.left_row_points = self.accumulate_unique_points(self.left_row_points, new_pts_l)
-            temp_spline = PlantSpline(self.left_row_points, heading_yaw=self.robot_pose.yaw)
+            temp_spline = PlantSpline(self.left_row_points, heading_yaw=self.robot_pose.yaw, logger=self.get_logger())
             if temp_spline.valid:
                 self.left_row_spline = temp_spline
 
@@ -372,7 +374,7 @@ class MaizeNavigator(Node):
         new_pts_r = self.find_points_along_tangent(end_val_r, weighted_yaw_r, max_dist=2.2, width=0.45)
         if len(new_pts_r) > 0:
             self.right_row_points = self.accumulate_unique_points(self.right_row_points, new_pts_r)
-            temp_spline = PlantSpline(self.right_row_points, heading_yaw=self.robot_pose.yaw)
+            temp_spline = PlantSpline(self.right_row_points, heading_yaw=self.robot_pose.yaw, logger=self.get_logger())
             if temp_spline.valid:
                 self.right_row_spline = temp_spline
 
