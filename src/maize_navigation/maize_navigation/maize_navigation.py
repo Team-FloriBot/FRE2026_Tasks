@@ -1342,7 +1342,14 @@ class MaizeNavigator(Node):
             if len(right_pts) > 0:
                 added_right_points.append(right_pts)
 
-            shared_dir = np.array(heading_vec, copy=True)
+            # Keep robot heading for the very first march iteration to avoid 90deg flips;
+            # allow cluster-based refinement afterwards.
+            if step_idx == 0:
+                shared_dir = np.array(heading_vec, copy=True)
+            else:
+                left_dir = self._direction_from_points(left_pts, heading_vec) if len(left_pts) > 0 else heading_vec
+                right_dir = self._direction_from_points(right_pts, heading_vec) if len(right_pts) > 0 else heading_vec
+                shared_dir = self._normalize_vector(left_dir + right_dir)
 
             new_left_start = left_start + step_distance * shared_dir
             new_right_start = right_start + step_distance * shared_dir
