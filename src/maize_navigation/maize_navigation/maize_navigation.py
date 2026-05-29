@@ -214,7 +214,7 @@ class NavigatorParams:
     lookahead_dist: float = 0.6
     row_search_max_dist: float = 1.8
     row_search_width: float = 0.32
-    max_spline_k: int = 2
+    max_spline_k: int = 10
     
     # Control
     pos_kp: float = 2.0
