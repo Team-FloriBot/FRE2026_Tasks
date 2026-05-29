@@ -1,18 +1,17 @@
 coverage_planner:
   ros__parameters:
-    # 2D Koordinaten des Feldes als flache Liste [x1, y1, x2, y2, x3, y3, ...]
-    # Beispielhaft ein 10x10 Meter Feld
-    polygon_coords: [0.0, 0.0, 10.0, 0.0, 10.0, 10.0, 0.0, 10.0]
+    # Feld startet beim Roboter (0,0) und geht 10 Meter nach vorne (X) 
+    # und spannt sich 5 Meter nach links und rechts auf (Y)
+    polygon_coords: [0.0, -5.0, 10.0, -5.0, 10.0, 5.0, 0.0, 5.0]
     
-    # Roboter Parameter
-    operating_width: 0.5  # Die effektive Arbeitsbreite in Metern
-    robot_width: 0.6      # Die physische Breite des Roboters in Metern
-    turn_radius: 1.0      # Minimaler Wenderadius für Dubins-Kurven (für Kinematik entscheidend)
+    # Frames für die Transformation
+    input_frame: "base_link"
+    target_frame: "map"
     
-    # Feld Parameter
-    headland_width: 1.5   # Breite des Vorgewendes zum Wenden in Metern
-    swath_angle_deg: 0.0  # Winkel der Fahrgassen in Grad (0 = parallel zur X-Achse)
-    
-    # Routing
-    routing_pattern: "boustrophedon"  # Unterstützt: "boustrophedon", "snake"
-    frame_id: "map"                   # TF Frame, in dem das Polygon definiert ist
+    # Roboter & Feldkonfiguration
+    operating_width: 3.0
+    robot_width: 0.42
+    turn_radius: 1.0
+    headland_width: 1.5
+    swath_angle_deg: 0.0
+    routing_pattern: "boustrophedon"

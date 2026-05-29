@@ -4,11 +4,14 @@ import rclpy
 from rclpy.node import Node
 import math
 
-# ROS 2 Messages
-from geometry_msgs.msg import PoseStamped
+# ROS 2 Services & Messages
+from std_srvs.srv import Trigger
+from geometry_msgs.msg import PoseStamped, PointStamped
 from nav_msgs.msg import Path
 
-# TF Transformations (wurde in deinem Dockerfile bereits installiert)
+# TF2 für die Transformationen
+import tf2_ros
+from tf2_geometry_msgs import do_transform_point
 from tf_transformations import quaternion_from_euler
 
 # Fields2Cover
@@ -19,22 +22,57 @@ class CoveragePlanner(Node):
         super().__init__('coverage_planner')
 
         # 1. Parameter deklarieren
-        self.declare_parameter('polygon_coords', [0.0, 0.0, 10.0, 0.0, 10.0, 10.0, 0.0, 10.0])
+        self.declare_parameter('polygon_coords', [0.0, -5.0, 10.0, -5.0, 10.0, 5.0, 0.0, 5.0])
         self.declare_parameter('operating_width', 0.5)
         self.declare_parameter('robot_width', 0.6)
         self.declare_parameter('headland_width', 1.5)
         self.declare_parameter('turn_radius', 1.0)
         self.declare_parameter('swath_angle_deg', 0.0)
         self.declare_parameter('routing_pattern', 'boustrophedon')
-        self.declare_parameter('frame_id', 'map')
+        
+        # input_frame: Wo eure Koordinaten herkommen (Roboter)
+        # target_frame: Das weltfeste System (Odom oder Map)
+        self.declare_parameter('input_frame', 'base_link')
+        self.declare_parameter('target_frame', 'odom')
 
-        # 2. Publisher für den finalen Pfad
+        # 2. TF2 Setup initialisieren
+        self.tf_buffer = tf2_ros.Buffer()
+        self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
+
+        # 3. Publisher für den finalen Pfad
         self.path_pub = self.create_publisher(Path, 'plan', 10)
 
-        # 3. Planung direkt beim Start ausführen (kann später auch in einen Service / Action ausgelagert werden)
-        self.generate_coverage_path()
+        # 4. Service erstellen (Wartet passiv auf den Startknopf/Aufruf)
+        self.srv = self.create_service(
+            Trigger, 
+            'trigger_coverage_planning', 
+            self.planning_service_callback
+        )
+        self.get_logger().info("Coverage Planner Service '/trigger_coverage_planning' ist bereit!")
 
-    def generate_coverage_path(self):
+    def planning_service_callback(self, request, response):
+        input_frame = self.get_parameter('input_frame').get_parameter_value().string_value
+        target_frame = self.get_parameter('target_frame').get_parameter_value().string_value
+
+        try:
+            # Aktuellste Transformation zwischen base_link und odom/map holen
+            transform = self.tf_buffer.lookup_transform(
+                target_frame, input_frame, rclpy.time.Time()
+            )
+            
+            self.get_logger().info(f"TF von {input_frame} nach {target_frame} erfolgreich geholt. Starte Pfadplanung...")
+            self.generate_coverage_path(transform)
+            
+            response.success = True
+            response.message = f"Pfadplanung erfolgreich in '{target_frame}' berechnet und publiziert."
+        except Exception as e:
+            response.success = False
+            response.message = f"Fehler bei der Transformation oder Fields2Cover-Planung: {str(e)}"
+            self.get_logger().error(response.message)
+        
+        return response
+
+    def generate_coverage_path(self, transform):
         # Parameter auslesen
         coords = self.get_parameter('polygon_coords').get_parameter_value().double_array_value
         op_width = self.get_parameter('operating_width').get_parameter_value().double_value
@@ -43,40 +81,49 @@ class CoveragePlanner(Node):
         turn_rad = self.get_parameter('turn_radius').get_parameter_value().double_value
         swath_angle = math.radians(self.get_parameter('swath_angle_deg').get_parameter_value().double_value)
         pattern = self.get_parameter('routing_pattern').get_parameter_value().string_value
-
-        self.get_logger().info(f"Starte Path Planning für Task 4 (Pattern: {pattern}, Arbeitsbreite: {op_width}m)")
+        target_frame = self.get_parameter('target_frame').get_parameter_value().string_value
 
         if len(coords) % 2 != 0 or len(coords) < 6:
-            self.get_logger().error("polygon_coords muss eine gerade Anzahl an Elementen (x, y) besitzen und mindestens ein Dreieck bilden!")
+            self.get_logger().error("polygon_coords muss eine gerade Anzahl an Elementen besitzen!")
             return
 
-        # --- Fields2Cover Pipeline ---
+        # --- 1. SCHRITT: Transformation der Koordinaten von base_link nach odom ---
+        transformed_coords = []
+        for i in range(0, len(coords), 2):
+            point_in = PointStamped()
+            point_in.header.frame_id = self.get_parameter('input_frame').get_parameter_value().string_value
+            point_in.point.x = coords[i]
+            point_in.point.y = coords[i+1]
+            point_in.point.z = 0.0
+
+            # Punkt ins globale System transformieren
+            point_out = do_transform_point(point_in, transform)
+            transformed_coords.append((point_out.point.x, point_out.point.y))
+
+        # --- 2. SCHRITT: Fields2Cover Pipeline ---
         try:
-            # A) Feldgrenzen definieren (LinearRing)
             ring = f2c.LinearRing()
-            for i in range(0, len(coords), 2):
-                ring.addPoint(coords[i], coords[i+1])
+            for pt in transformed_coords:
+                ring.addPoint(pt[0], pt[1])
             
-            # WICHTIG: In Fields2Cover muss das Polygon explizit geschlossen werden
-            ring.addPoint(coords[0], coords[1])
+            # Polygon explizit mit dem ersten transformierten Punkt schließen
+            ring.addPoint(transformed_coords[0][0], transformed_coords[0][1])
             
             cell = f2c.Cell(ring)
             cells = f2c.Cells(cell)
 
-            # B) Roboter-Eigenschaften festlegen
             robot = f2c.Robot(rob_width, op_width)
             robot.setMinRadius(turn_rad)
 
-            # C) Vorgewende (Headland) generieren
+            # Vorgewende abgrenzen
             hl_gen = f2c.HG_Const_hl()
             no_hl = hl_gen.generateHeadlands(cells, hl_width)
 
-            # D) Fahrgassen (Swaths) im inneren Feld (ohne Vorgewende) generieren
+            # Gassen generieren (KORREKTUR: .getCell(0) statt .getGeometry(0))
             sg = f2c.SG_BruteForce()
-            # no_hl.getGeometry(0) liefert das nutzbare innere Feld
-            swaths = sg.generateSwaths(swath_angle, op_width, no_hl.getGeometry(0))
+            swaths = sg.generateSwaths(swath_angle, op_width, no_hl.getCell(0))
 
-            # E) Routenplanung (Reihenfolge der Gassen)
+            # Routing Muster bestimmen
             if pattern == 'snake':
                 rp = f2c.RP_Snake()
             else:
@@ -84,26 +131,22 @@ class CoveragePlanner(Node):
             
             route = rp.genRoute(swaths)
 
-            # F) Pfadplanung (Verbindung der Gassen mit realistischen Wendemanövern)
+            # Kinematische Pfadplanung mit Dubins-Kurven
             pp = f2c.PP_PathPlanning()
             dubins = f2c.PT_Dubins()
-            # PlanPath fügt Dubins-Kurven für realistische Roboterklimatiken hinzu
             f2c_path = pp.planPath(robot, route, dubins)
 
-            self.get_logger().info("Fields2Cover Pfad erfolgreich berechnet! Konvertiere zu ROS Path...")
-            self.publish_ros_path(f2c_path)
+            # Pfad publizieren
+            self.publish_ros_path(f2c_path, target_frame)
 
         except Exception as e:
-            self.get_logger().error(f"Fehler bei der Fields2Cover Berechnung: {e}")
+            raise RuntimeError(f"Fields2Cover Kern-Fehler: {e}")
 
-    def publish_ros_path(self, f2c_path):
-        frame_id = self.get_parameter('frame_id').get_parameter_value().string_value
-        
+    def publish_ros_path(self, f2c_path, frame_id):
         ros_path = Path()
         ros_path.header.frame_id = frame_id
         ros_path.header.stamp = self.get_clock().now().to_msg()
 
-        # f2c_path.states enthält alle Wegpunkte (X, Y, Theta)
         for state in f2c_path.states:
             pose = PoseStamped()
             pose.header = ros_path.header
@@ -111,7 +154,7 @@ class CoveragePlanner(Node):
             pose.pose.position.y = state.point.getY()
             pose.pose.position.z = 0.0
             
-            # Yaw (Theta) in Quaternion umwandeln, damit Nav2/ROS damit arbeiten kann
+            # Orientierung (Yaw) berechnen
             q = quaternion_from_euler(0, 0, state.angle)
             pose.pose.orientation.x = q[0]
             pose.pose.orientation.y = q[1]
@@ -121,7 +164,7 @@ class CoveragePlanner(Node):
             ros_path.poses.append(pose)
 
         self.path_pub.publish(ros_path)
-        self.get_logger().info(f"Pfad mit {len(ros_path.poses)} Wegpunkten publiziert auf Topic '/plan'.")
+        self.get_logger().info(f"Pfad mit {len(ros_path.poses)} Wegpunkten erfolgreich auf /plan publiziert!")
 
 def main(args=None):
     rclpy.init(args=args)
