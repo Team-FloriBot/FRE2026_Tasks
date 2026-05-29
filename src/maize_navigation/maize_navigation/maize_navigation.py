@@ -165,9 +165,16 @@ class PlantSpline:
 
                 if len(seg_t) >= 4:
                     requested_k = int(max_k)
-                    k = min(3, max(1, requested_k), len(seg_t) - 1)
+                    line_coeff = np.polyfit(seg_t, seg_lateral, 1)
+                    line_pred = np.polyval(line_coeff, seg_t)
+                    line_res = seg_lateral - line_pred
+                    line_rms = float(np.sqrt(np.mean(line_res ** 2)))
+                    line_max = float(np.max(np.abs(line_res)))
+                    near_linear = line_rms < 0.03 and line_max < 0.08
+
+                    k = 1 if near_linear else min(3, max(1, requested_k), len(seg_t) - 1)
                     lateral_spread = float(np.std(seg_lateral))
-                    s_used = max(0.25, float(s) * 0.02 * max(0.75, 1.0 + 0.15 * lateral_spread))
+                    s_used = 0.0 if near_linear else max(0.25, float(s) * 0.02 * max(0.75, 1.0 + 0.15 * lateral_spread))
                     segment = UnivariateSpline(seg_t, seg_lateral, k=k, s=s_used)
                     self.segment_splines.append(segment)
                     self.segment_bounds.append((float(seg_t[0]), float(seg_t[-1])))
@@ -282,9 +289,16 @@ class PlantSpline:
 
         try:
             requested_k = int(max_k)
-            k = min(3, max(1, requested_k), len(tail_t) - 1)
+            line_coeff = np.polyfit(tail_t, tail_lateral, 1)
+            line_pred = np.polyval(line_coeff, tail_t)
+            line_res = tail_lateral - line_pred
+            line_rms = float(np.sqrt(np.mean(line_res ** 2)))
+            line_max = float(np.max(np.abs(line_res)))
+            near_linear = line_rms < 0.03 and line_max < 0.08
+
+            k = 1 if near_linear else min(3, max(1, requested_k), len(tail_t) - 1)
             lateral_spread = float(np.std(tail_lateral))
-            s_used = max(0.2, float(s) * 0.015 * max(0.75, 1.0 + 0.10 * lateral_spread))
+            s_used = 0.0 if near_linear else max(0.2, float(s) * 0.015 * max(0.75, 1.0 + 0.10 * lateral_spread))
             segment = UnivariateSpline(tail_t, tail_lateral, k=k, s=s_used)
 
             extended.segment_splines = list(self.segment_splines) + [segment]
@@ -430,6 +444,7 @@ class NavigatorParams:
     row_search_max_dist: float = 2.2
     row_search_width: float = 0.50
     row_exclusion_distance: float = 0.30
+    row_extension_max_spline_distance: float = 0.22
     spline_s: float = 30.0
     max_spline_k: int = 5
     min_lane_width: float = 0.5
@@ -502,6 +517,7 @@ class MaizeNavigator(Node):
         p.row_search_max_dist = get_param("row_search_max_dist", p.row_search_max_dist)
         p.row_search_width = get_param("row_search_width", p.row_search_width)
         p.row_exclusion_distance = get_param("row_exclusion_distance", p.row_exclusion_distance)
+        p.row_extension_max_spline_distance = get_param("row_extension_max_spline_distance", p.row_extension_max_spline_distance)
         p.spline_s = get_param("spline_s", p.spline_s)
         p.max_spline_k = get_param("max_spline_k", p.max_spline_k)
         p.lookahead_dist = get_param("lookahead_dist", p.lookahead_dist)
@@ -836,6 +852,14 @@ class MaizeNavigator(Node):
             proj_t = np.array([current_spline.project(p) for p in cand])
             eps = 0.35
             cand = cand[proj_t > (min_t - eps)]
+
+        # Keep tail candidates within a narrow corridor around the current spline.
+        # This prevents appending points from neighboring rows.
+        if current_spline is not None and len(cand) > 0:
+            d_to_spline = self.spline_point_distances(cand, current_spline)
+            if len(d_to_spline) > 0:
+                max_dist = max(0.10, float(self.p.row_extension_max_spline_distance))
+                cand = cand[d_to_spline <= max_dist]
 
         return self.filter_points_near_known_rows(cand, exclude_row_ids=exclude_row_ids)
 
