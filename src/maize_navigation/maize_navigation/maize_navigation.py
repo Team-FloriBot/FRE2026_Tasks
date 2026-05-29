@@ -1146,6 +1146,34 @@ class MaizeNavigator(Node):
                 clusters.append(cluster)
         return clusters
 
+    def _cluster_nearby_points_with_indices(self, points: np.ndarray, cluster_radius: float) -> List[tuple]:
+        """Return clusters together with their member indices into the provided `points` array.
+
+        Each element is a tuple (cluster_points, indices_array).
+        """
+        if len(points) == 0:
+            return []
+        visited = np.zeros(len(points), dtype=bool)
+        clusters: List[tuple] = []
+        for seed_idx in range(len(points)):
+            if visited[seed_idx]:
+                continue
+            stack = [seed_idx]
+            visited[seed_idx] = True
+            member_indices: List[int] = []
+            while stack:
+                idx = stack.pop()
+                member_indices.append(idx)
+                deltas = points - points[idx]
+                neighbors = np.where((np.linalg.norm(deltas, axis=1) <= cluster_radius) & (~visited))[0]
+                for neighbor_idx in neighbors:
+                    visited[neighbor_idx] = True
+                    stack.append(int(neighbor_idx))
+            cluster = points[np.array(member_indices, dtype=int)]
+            if len(cluster) >= 2:
+                clusters.append((cluster, np.array(member_indices, dtype=int)))
+        return clusters
+
     def _direction_from_points(self, points: np.ndarray, fallback_dir: np.ndarray) -> np.ndarray:
         if len(points) < 2:
             return self._normalize_vector(np.asarray(fallback_dir, dtype=float))
@@ -1204,8 +1232,8 @@ class MaizeNavigator(Node):
             if len(candidate_points) == 0:
                 break
 
-            clusters = self._cluster_nearby_points(candidate_points, cluster_radius)
-            if not clusters:
+            clusters_with_idx = self._cluster_nearby_points_with_indices(candidate_points, cluster_radius)
+            if not clusters_with_idx:
                 break
 
             left_ref = float((left_end - pair_center) @ pair_perp)
@@ -1213,7 +1241,17 @@ class MaizeNavigator(Node):
             step_left_clusters: List[np.ndarray] = []
             step_right_clusters: List[np.ndarray] = []
 
-            for cluster in clusters:
+            # Track assigned indices relative to candidate_points to ensure exclusivity
+            assigned_candidate_indices = set()
+            candidate_idx_map = np.where(candidate_mask)[0]
+
+            for cluster, rel_indices in clusters_with_idx:
+                # map cluster-relative indices to indices into remaining_points via candidate_idx_map
+                mapped = [int(candidate_idx_map[i]) for i in rel_indices]
+                # skip if any point already assigned
+                if any(mi in assigned_candidate_indices for mi in mapped):
+                    continue
+
                 centroid = np.mean(cluster, axis=0)
                 centroid_rel = centroid - pair_center
                 centroid_along = float(centroid_rel @ shared_dir)
@@ -1224,8 +1262,10 @@ class MaizeNavigator(Node):
                 d_right = abs(centroid_orth - right_ref)
                 if d_left <= d_right:
                     step_left_clusters.append(cluster)
+                    assigned_candidate_indices.update(mapped)
                 else:
                     step_right_clusters.append(cluster)
+                    assigned_candidate_indices.update(mapped)
 
             if not step_left_clusters and not step_right_clusters:
                 break
@@ -1246,11 +1286,11 @@ class MaizeNavigator(Node):
             shared_dir = self._normalize_vector(left_dir + right_dir)
             shared_heading_yaw = float(math.atan2(shared_dir[1], shared_dir[0]))
 
-            remove_points = np.vstack([pts for pts in (left_step_points, right_step_points) if len(pts) > 0])
-            if len(remove_points) > 0:
+            # Remove consumed points from remaining_points using assigned_candidate_indices
+            if len(assigned_candidate_indices) > 0:
                 keep_mask = np.ones(len(remaining_points), dtype=bool)
-                for ref_point in remove_points:
-                    keep_mask &= np.linalg.norm(remaining_points - ref_point, axis=1) > cluster_radius
+                for idx in sorted(assigned_candidate_indices):
+                    keep_mask[idx] = False
                 remaining_points = remaining_points[keep_mask]
             pair_center = pair_center + shared_dir * step_distance
             left_end = left_end + shared_dir * step_distance
@@ -1297,15 +1337,22 @@ class MaizeNavigator(Node):
         for step_idx in range(24):
             pair_perp = np.array([-shared_dir[1], shared_dir[0]], dtype=float)
             current_forward_max_dist = step_distance if step_idx == 0 else forward_max_dist
-            clusters = self._cluster_nearby_points(remaining_points, cluster_radius)
-            if not clusters:
+            clusters_with_idx = self._cluster_nearby_points_with_indices(remaining_points, cluster_radius)
+            if not clusters_with_idx:
                 break
 
             assigned_left: List[np.ndarray] = []
             assigned_right: List[np.ndarray] = []
-            consumed_points: List[np.ndarray] = []
+            consumed_indices: List[int] = []
 
-            for cluster in clusters:
+            # Track indices into remaining_points already assigned this step
+            assigned_indices_set = set()
+
+            for cluster, rel_indices in clusters_with_idx:
+                # skip if any member was already assigned
+                if any(int(i) in assigned_indices_set for i in rel_indices):
+                    continue
+
                 centroid = np.mean(cluster, axis=0)
 
                 rel_left = centroid - left_start
@@ -1325,11 +1372,15 @@ class MaizeNavigator(Node):
                 else:
                     choose_left = valid_left
 
+                mapped_indices = [int(i) for i in rel_indices]
                 if choose_left:
                     assigned_left.append(cluster)
+                    assigned_indices_set.update(mapped_indices)
+                    consumed_indices.extend(mapped_indices)
                 else:
                     assigned_right.append(cluster)
-                consumed_points.append(cluster)
+                    assigned_indices_set.update(mapped_indices)
+                    consumed_indices.extend(mapped_indices)
 
             if not assigned_left and not assigned_right:
                 break
@@ -1349,7 +1400,19 @@ class MaizeNavigator(Node):
             else:
                 left_dir = self._direction_from_points(left_pts, heading_vec) if len(left_pts) > 0 else heading_vec
                 right_dir = self._direction_from_points(right_pts, heading_vec) if len(right_pts) > 0 else heading_vec
-                shared_dir = self._normalize_vector(left_dir + right_dir)
+                # Robustness: require enough assigned points and limited angular deviation
+                total_assigned = int(len(left_pts) + len(right_pts))
+                min_assigned_points = 6
+                max_angle_rad = math.radians(30.0)
+                candidate = self._normalize_vector(left_dir + right_dir)
+                cand_yaw = float(math.atan2(candidate[1], candidate[0]))
+                heading_yaw = float(math.atan2(heading_vec[1], heading_vec[0]))
+                angle_diff = abs(wrap_to_pi(cand_yaw - heading_yaw))
+                if total_assigned >= min_assigned_points and angle_diff <= max_angle_rad:
+                    shared_dir = candidate
+                else:
+                    # keep previous shared_dir (no large, unsupported rotation)
+                    shared_dir = np.array(shared_dir, copy=True)
 
             new_left_start = left_start + step_distance * shared_dir
             new_right_start = right_start + step_distance * shared_dir
@@ -1358,11 +1421,10 @@ class MaizeNavigator(Node):
             left_start = new_left_start
             right_start = new_right_start
 
-            if consumed_points:
-                remove_points = np.vstack(consumed_points)
+            if len(consumed_indices) > 0:
                 keep_mask = np.ones(len(remaining_points), dtype=bool)
-                for ref_point in remove_points:
-                    keep_mask &= np.linalg.norm(remaining_points - ref_point, axis=1) > cluster_radius
+                for idx in sorted(set(consumed_indices)):
+                    keep_mask[idx] = False
                 remaining_points = remaining_points[keep_mask]
             if len(remaining_points) == 0:
                 break
