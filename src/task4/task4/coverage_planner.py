@@ -129,14 +129,15 @@ class CoveragePlanner(Node):
             else:
                 rp = f2c.RP_Boustrophedon()
             
-            # KORREKTUR: Gibt die Gassen in der richtigen Anfahr-Reihenfolge zurück
             sorted_swaths = rp.genSortedSwaths(swaths)
 
             # Kinematische Pfadplanung mit Dubins-Kurven
             pp = f2c.PP_PathPlanning()
-            dubins = f2c.PT_Dubins()
             
-            # KORREKTUR: planPath frisst den Roboter, die sortierten Swaths und den Kurventyp
+            # KORREKTUR: PP_DubinsCurves statt PT_Dubins
+            dubins = f2c.PP_DubinsCurves()
+            
+            # Pfad generieren
             f2c_path = pp.planPath(robot, sorted_swaths, dubins)
 
             # Pfad publizieren
