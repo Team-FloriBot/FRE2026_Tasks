@@ -121,15 +121,24 @@ class CoveragePlanner(Node):
             sg = f2c.SG_BruteForce()
             swaths = sg.generateSwaths(swath_angle, op_width, no_hl.getCell(0))
 
-            # Routing Muster bestimmen
+            # 1. Spezifischen Planer wählen (erbt von RoutePlannerBase)
             if pattern == 'snake':
                 rp = f2c.RP_Snake()
             else:
                 rp = f2c.RP_Boustrophedon()
             
+            # 2. Deine Idee: Startpunkt direkt im Planer-Objekt verankern
+            try:
+                # Wir übergeben die aktuelle Roboterposition als Startpunkt
+                rp.setStartAndEndPoint(robot_start_point)
+                self.get_logger().info("Startpunkt erfolgreich im RoutePlanner gesetzt!")
+            except AttributeError:
+                self.get_logger().warning("setStartAndEndPoint existiert auf diesem Objekt nicht. Nutze Fallback.")
+
+            # 3. Gassen sortieren (Nutzt jetzt intern den gesetzten Startpunkt, falls supported)
             sorted_swaths = rp.genSortedSwaths(swaths)
 
-            # Pfadplanung (bleibt gleich)
+            # 4. Pfadplanung wie gehabt
             pp = f2c.PP_PathPlanning()
             dubins = f2c.PP_DubinsCurves()
             f2c_path = pp.planPath(robot, sorted_swaths, dubins)
