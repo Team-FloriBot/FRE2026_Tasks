@@ -434,6 +434,7 @@ class MaizeNavigator(Node):
                 if self.left_row_spline and self.left_row_spline.valid:
                     if not self.is_candidate_continuous(self.left_row_spline, temp_spline):
                         ok = False
+                        self.get_logger().info("Rejecting left temp_spline: continuity check failed")
                 if self.right_row_spline and self.right_row_spline.valid:
                     dists = self.spline_point_distances(temp_spline.get_points(num=60), self.right_row_spline)
                     if len(dists) > 0 and np.min(dists) < max(self.row_exclusion_distance, self.p.expected_row_width * 0.45):
@@ -447,6 +448,8 @@ class MaizeNavigator(Node):
                     self.left_row_spline = temp_spline
                     if self.current_left_row_id is not None:
                         self.known_rows[self.current_left_row_id] = self.left_row_spline
+            else:
+                self.get_logger().info("Rejecting left temp_spline: spline fit invalid")
 
         # For Right Spline:
         end_val_r = np.array(self.right_row_spline.evaluate(self.right_row_spline.t_max))
@@ -473,6 +476,7 @@ class MaizeNavigator(Node):
                 if self.right_row_spline and self.right_row_spline.valid:
                     if not self.is_candidate_continuous(self.right_row_spline, temp_spline):
                         ok = False
+                        self.get_logger().info("Rejecting right temp_spline: continuity check failed")
                 if self.left_row_spline and self.left_row_spline.valid:
                     dists = self.spline_point_distances(temp_spline.get_points(num=60), self.left_row_spline)
                     if len(dists) > 0 and np.min(dists) < max(self.row_exclusion_distance, self.p.expected_row_width * 0.45):
@@ -486,6 +490,8 @@ class MaizeNavigator(Node):
                     self.right_row_spline = temp_spline
                     if self.current_right_row_id is not None:
                         self.known_rows[self.current_right_row_id] = self.right_row_spline
+            else:
+                self.get_logger().info("Rejecting right temp_spline: spline fit invalid")
 
         # 3. Project robot on updated, highly robust splines
         t_l = self.left_row_spline.project(p_robot)
