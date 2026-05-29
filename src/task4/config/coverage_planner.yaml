@@ -14,4 +14,3 @@ coverage_planner:
     turn_radius: 1.0
     headland_width: 1.5
     swath_angle_deg: 0.0
-    routing_pattern: "boustrophedon"

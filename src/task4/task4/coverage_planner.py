@@ -28,7 +28,6 @@ class CoveragePlanner(Node):
         self.declare_parameter('headland_width', 1.5)
         self.declare_parameter('turn_radius', 1.0)
         self.declare_parameter('swath_angle_deg', 0.0)
-        self.declare_parameter('routing_pattern', 'boustrophedon')
         
         self.declare_parameter('input_frame', 'base_link')
         self.declare_parameter('target_frame', 'odom')
@@ -77,14 +76,13 @@ class CoveragePlanner(Node):
         hl_width = self.get_parameter('headland_width').get_parameter_value().double_value
         turn_rad = self.get_parameter('turn_radius').get_parameter_value().double_value
         swath_angle = math.radians(self.get_parameter('swath_angle_deg').get_parameter_value().double_value)
-        pattern = self.get_parameter('routing_pattern').get_parameter_value().string_value
         target_frame = self.get_parameter('target_frame').get_parameter_value().string_value
 
         if len(coords) % 2 != 0 or len(coords) < 6:
             self.get_logger().error("polygon_coords muss eine gerade Anzahl an Elementen besitzen!")
             return
 
-        # 1. Transformation nach odom
+        # 1. Transformation nach odom/map
         transformed_coords = []
         for i in range(0, len(coords), 2):
             point_in = PointStamped()
@@ -99,7 +97,7 @@ class CoveragePlanner(Node):
         robot_x = transform.transform.translation.x
         robot_y = transform.transform.translation.y
         
-        # Fields2Cover Point für den Start erstellen
+        # Fields2Cover Point für den echten Start des Graphen erstellen
         robot_start_point = f2c.Point(robot_x, robot_y)
 
         # 2. Fields2Cover Pipeline
@@ -121,27 +119,28 @@ class CoveragePlanner(Node):
             sg = f2c.SG_BruteForce()
             swaths = sg.generateSwaths(swath_angle, op_width, no_hl.getCell(0))
 
-            # 1. Spezifischen Planer wählen (erbt von RoutePlannerBase)
-            if pattern == 'snake':
-                rp = f2c.RP_Snake()
-            else:
-                rp = f2c.RP_Boustrophedon()
+            # --- NEU: Globale Graphen-Routenplanung (TSP) ---
+            route_planner = f2c.RP_RoutePlannerBase()
             
-            # 2. Deine Idee: Startpunkt direkt im Planer-Objekt verankern
+            # Startpunkt nativ im Optimierer verankern
+            route_planner.setStartAndEndPoint(robot_start_point)
+
+            # SWIG-Sicherheit: Swaths in den geforderten Zellen-Container packen
+            swaths_by_cells = f2c.SwathsByCells()
             try:
-                # Wir übergeben die aktuelle Roboterposition als Startpunkt
-                rp.setStartAndEndPoint(robot_start_point)
-                self.get_logger().info("Startpunkt erfolgreich im RoutePlanner gesetzt!")
+                swaths_by_cells.append(swaths)
             except AttributeError:
-                self.get_logger().warning("setStartAndEndPoint existiert auf diesem Objekt nicht. Nutze Fallback.")
+                swaths_by_cells.push_back(swaths)
 
-            # 3. Gassen sortieren (Nutzt jetzt intern den gesetzten Startpunkt, falls supported)
-            sorted_swaths = rp.genSortedSwaths(swaths)
+            # Optimierte Route berechnen (Reihenfolge & Richtungen im Graphen optimiert)
+            route = route_planner.genRoute(no_hl, swaths_by_cells)
 
-            # 4. Pfadplanung wie gehabt
+            # --- Kinematische Pfadplanung ---
             pp = f2c.PP_PathPlanning()
             dubins = f2c.PP_DubinsCurves()
-            f2c_path = pp.planPath(robot, sorted_swaths, dubins)
+            
+            # Wichtig: Überladung von planPath nutzt jetzt das 'route'-Objekt
+            f2c_path = pp.planPath(robot, route, dubins)
 
             self.publish_ros_path(f2c_path, target_frame)
 
@@ -153,7 +152,6 @@ class CoveragePlanner(Node):
         ros_path.header.frame_id = frame_id
         ros_path.header.stamp = self.get_clock().now().to_msg()
 
-        # Dynamische Ermittlung der Zustände (SWIG Vektor vs. Attribut)
         states = []
         if hasattr(f2c_path, 'states'):
             states = f2c_path.states
