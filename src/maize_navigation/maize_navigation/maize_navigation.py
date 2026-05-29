@@ -1282,17 +1282,8 @@ class MaizeNavigator(Node):
 
         left_start = np.array(left_chain[-1], dtype=float)
         right_start = np.array(right_chain[-1], dtype=float)
-        # Prefer the row direction (perpendicular to the across-vector between starts)
-        # but keep its sign aligned with the robot's heading so the lines point forward.
-        across = right_start - left_start
-        if float(np.linalg.norm(across)) < 1e-6:
-            shared_dir = self._normalize_vector(np.array([math.cos(initial_heading_yaw), math.sin(initial_heading_yaw)], dtype=float))
-        else:
-            row_dir = self._normalize_vector(np.array([-across[1], across[0]], dtype=float))
-            heading_vec = np.array([math.cos(initial_heading_yaw), math.sin(initial_heading_yaw)], dtype=float)
-            if np.dot(row_dir, heading_vec) < 0:
-                row_dir = -row_dir
-            shared_dir = row_dir
+        # Start with the robot heading directly; later iterations can refine the direction.
+        shared_dir = self._normalize_vector(np.array([math.cos(initial_heading_yaw), math.sin(initial_heading_yaw)], dtype=float))
 
         pair_center = 0.5 * (left_start + right_start)
         remaining_points = self.get_map_points_in_roi(Pose2D(pair_center[0], pair_center[1], initial_heading_yaw), 6.0)
@@ -1302,8 +1293,9 @@ class MaizeNavigator(Node):
         added_left_points: List[np.ndarray] = []
         added_right_points: List[np.ndarray] = []
 
-        for _ in range(24):
+        for step_idx in range(24):
             pair_perp = np.array([-shared_dir[1], shared_dir[0]], dtype=float)
+            current_forward_max_dist = step_distance if step_idx == 0 else forward_max_dist
             clusters = self._cluster_nearby_points(remaining_points, cluster_radius)
             if not clusters:
                 break
@@ -1322,8 +1314,8 @@ class MaizeNavigator(Node):
                 orth_left = float(abs(rel_left @ pair_perp))
                 orth_right = float(abs(rel_right @ pair_perp))
 
-                valid_left = along_left >= 0.0 and along_left <= forward_max_dist and orth_left <= orthogonal_max_dist
-                valid_right = along_right >= 0.0 and along_right <= forward_max_dist and orth_right <= orthogonal_max_dist
+                valid_left = along_left >= 0.0 and along_left <= current_forward_max_dist and orth_left <= orthogonal_max_dist
+                valid_right = along_right >= 0.0 and along_right <= current_forward_max_dist and orth_right <= orthogonal_max_dist
 
                 if not valid_left and not valid_right:
                     continue
