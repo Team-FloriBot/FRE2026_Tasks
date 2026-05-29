@@ -24,6 +24,7 @@ maize_navigator:
     row_window_prediction_weight: 1.6
     row_window_smoothness_weight: 1.8
     row_window_gap_penalty: 1.4
+    row_end_front_point_ratio: 0.08
     min_lane_width: 0.55
     max_lane_width: 1.20
 

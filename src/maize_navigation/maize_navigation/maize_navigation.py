@@ -80,8 +80,8 @@ class PlantSpline:
         self.segment_splines: List[object] = []
         self.lateral_spline = None
         # Debug: store last window candidates and rejected hypotheses for visualization
-        self._last_rejected: List[Tuple[float, float, float]] = []  # list of (t, lateral, score)
-        self._last_accepted: List[Tuple[float, float, float]] = []
+        self._last_rejected: List[dict] = []
+        self._last_accepted: List[dict] = []
 
         if len(self.points) < 4:
             return
@@ -270,7 +270,7 @@ class PlantSpline:
             score = 2.5 * support - 1.2 * abs(cand - float(np.median(first_values)) if len(first_values) > 0 else 0.0)
             beams.append({"t": [first_center], "l": [cand], "score": float(score)})
             # record as initially accepted candidate for debug
-            self._last_accepted.append((float(first_center), float(cand), float(score)))
+            self._last_accepted.append({"t": [float(first_center)], "l": [float(cand)], "score": float(score)})
 
         for center in centers[1:]:
             center = float(center)
@@ -327,7 +327,7 @@ class PlantSpline:
             for beam in new_beams:
                 if beam not in pruned:
                     try:
-                        self._last_rejected.append((float(beam["t"][-1]), float(beam["l"][-1]), float(beam["score"])))
+                        self._last_rejected.append({"t": list(beam["t"]), "l": list(beam["l"]), "score": float(beam["score"])})
                     except Exception:
                         pass
             beams = pruned if pruned else new_beams[:beam_width]
@@ -367,11 +367,7 @@ class PlantSpline:
         self.lateral_spline = None
         self.valid = True
         # store final accepted endpoints for debug
-        for t_val, l_val in zip(self.anchor_t, self.anchor_lateral):
-            try:
-                self._last_accepted.append((float(t_val), float(l_val), 0.0))
-            except Exception:
-                pass
+        self._last_accepted.append({"t": [float(v) for v in self.anchor_t], "l": [float(v) for v in self.anchor_lateral], "score": float(best["score"])})
         if logger:
             logger.info(f"Built sliding-window row with {len(self.anchor_t)} anchors and {len(self.segment_bounds)} segments")
         return True
@@ -527,6 +523,7 @@ class NavigatorParams:
     row_window_prediction_weight: float = 2.2
     row_window_smoothness_weight: float = 1.1
     row_window_gap_penalty: float = 0.9
+    row_end_front_point_ratio: float = 0.08
     min_lane_width: float = 0.5
     max_lane_width: float = 1.5
     
@@ -569,6 +566,7 @@ class MaizeNavigator(Node):
         self.turn_start_pose: Optional[Pose2D] = None
         self.target_row_y_offset: float = 0.0
         self.row_entry_pose: Optional[Pose2D] = None
+        self.row_end_confirm_frames: int = 0
         
         self.tf_buffer = tf2_ros.Buffer()
         self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
@@ -607,6 +605,7 @@ class MaizeNavigator(Node):
         p.row_window_prediction_weight = get_param("row_window_prediction_weight", p.row_window_prediction_weight)
         p.row_window_smoothness_weight = get_param("row_window_smoothness_weight", p.row_window_smoothness_weight)
         p.row_window_gap_penalty = get_param("row_window_gap_penalty", p.row_window_gap_penalty)
+        p.row_end_front_point_ratio = get_param("row_end_front_point_ratio", p.row_end_front_point_ratio)
         p.publish_debug = get_param("publish_debug", p.publish_debug)
         p.lookahead_dist = get_param("lookahead_dist", p.lookahead_dist)
         p.min_lane_width = get_param("min_lane_width", p.min_lane_width)
@@ -779,6 +778,7 @@ class MaizeNavigator(Node):
             self.remember_row(self.current_left_row_id, self.left_row_spline)
             self.remember_row(self.current_right_row_id, self.right_row_spline)
             self.row_entry_pose = self.robot_pose
+            self.row_end_confirm_frames = 0
             self.state = MissionState.FOLLOW_ROW
             self.get_logger().info(
                 f"Rows found. IDs: L={self.current_left_row_id}, R={self.current_right_row_id}. Assigned to peak order {self.row_ids_in_order}. Width: {best_left - best_right:.2f}m. Following..."
@@ -912,13 +912,23 @@ class MaizeNavigator(Node):
         # 4. Robust End of row detection using the forward lookahead window
         points_ahead = self.get_map_points_in_front(self.robot_pose, distance=2.5, width=1.0)
         dist_in_row = math.hypot(self.robot_pose.x - self.row_entry_pose.x, self.robot_pose.y - self.row_entry_pose.y)
+        min_front_points = self.estimate_front_point_threshold(self.robot_pose)
         
-        near_spline_end = (t_l > self.left_row_spline.t_max - 0.3) or (t_r > self.right_row_spline.t_max - 0.3)
-        no_points_ahead = len(points_ahead) < 3
-        
-        if dist_in_row > 2.0 and near_spline_end and no_points_ahead:
-            self.get_logger().info(f"Row end confirmed. Dist: {dist_in_row:.2f}m, Points ahead: {len(points_ahead)}")
+        near_spline_end = (t_l > self.left_row_spline.t_max - 0.2) and (t_r > self.right_row_spline.t_max - 0.2)
+        no_points_ahead = len(points_ahead) < min_front_points
+
+        end_candidate = dist_in_row > 2.0 and near_spline_end and no_points_ahead
+        if end_candidate:
+            self.row_end_confirm_frames += 1
+        else:
+            self.row_end_confirm_frames = 0
+
+        if self.row_end_confirm_frames >= 4:
+            self.get_logger().info(
+                f"Row end confirmed after debounce. Dist: {dist_in_row:.2f}m, Points ahead: {len(points_ahead)}/{min_front_points}, frames: {self.row_end_confirm_frames}"
+            )
             self.exit_start_pose = self.robot_pose
+            self.row_end_confirm_frames = 0
             self.state = MissionState.EXIT_ROW
             return
 
@@ -1124,6 +1134,19 @@ class MaizeNavigator(Node):
         mask = (local_x > 0.3) & (local_x < distance) & (np.abs(local_y) < width/2.0)
         return points[mask]
 
+    def estimate_front_point_threshold(self, pose: Pose2D) -> int:
+        """Estimate the minimum number of points expected ahead of the robot.
+
+        Dense local crops should demand more missing points before a row end is plausible.
+        Sparse crops keep a small floor so the robot can still finish rows in weak maps.
+        """
+        local_points = self.get_map_points_in_roi(pose, self.p.hist_roi_size)
+        if len(local_points) == 0:
+            return 3
+
+        dynamic_threshold = int(round(len(local_points) * float(self.p.row_end_front_point_ratio)))
+        return int(np.clip(dynamic_threshold, 4, 12))
+
     def handle_exit_row(self):
         dist = math.hypot(self.robot_pose.x - self.exit_start_pose.x, self.robot_pose.y - self.exit_start_pose.y)
         if dist >= self.p.exit_distance:
@@ -1222,29 +1245,29 @@ class MaizeNavigator(Node):
                 markers.markers.append(self.create_segment_boundary_marker(spline, row_id, is_current=is_current))
             # publish debug markers for rejected/considered hypotheses
             if self.p.publish_debug and hasattr(spline, "_last_rejected") and len(spline._last_rejected) > 0:
-                m = Marker(header=Header(frame_id=self.p.map_frame, stamp=self.get_clock().now().to_msg()))
-                m.ns, m.id, m.type, m.action = "spline_rejected", 20000 + row_id, Marker.SPHERE_LIST, Marker.ADD
-                m.scale.x = 0.06
-                m.scale.y = 0.06
-                m.scale.z = 0.06
-                m.color.r, m.color.g, m.color.b, m.color.a = 1.0, 0.15, 0.15, 0.9
-                for t_val, l_val, _score in spline._last_rejected:
-                    x = spline.mean[0] + t_val * spline.main_dir[0] + l_val * spline.perp_dir[0]
-                    y = spline.mean[1] + t_val * spline.main_dir[1] + l_val * spline.perp_dir[1]
-                    m.points.append(Point(x=float(x), y=float(y), z=0.0))
-                markers.markers.append(m)
+                for idx, beam in enumerate(spline._last_rejected[:12]):
+                    m = Marker(header=Header(frame_id=self.p.map_frame, stamp=self.get_clock().now().to_msg()))
+                    m.ns, m.id, m.type, m.action = "spline_rejected", 20000 + row_id * 100 + idx, Marker.LINE_STRIP, Marker.ADD
+                    m.scale.x = 0.03
+                    # more transparent for lower-scoring beams
+                    alpha = 0.18 + 0.55 * float(np.clip((beam.get("score", 0.0) + 5.0) / 10.0, 0.0, 1.0))
+                    m.color.r, m.color.g, m.color.b, m.color.a = 1.0, 0.12, 0.12, alpha
+                    for t_val, l_val in zip(beam.get("t", []), beam.get("l", [])):
+                        x = spline.mean[0] + float(t_val) * spline.main_dir[0] + float(l_val) * spline.perp_dir[0]
+                        y = spline.mean[1] + float(t_val) * spline.main_dir[1] + float(l_val) * spline.perp_dir[1]
+                        m.points.append(Point(x=float(x), y=float(y), z=0.0))
+                    markers.markers.append(m)
             if self.p.publish_debug and hasattr(spline, "_last_accepted") and len(spline._last_accepted) > 0:
-                m2 = Marker(header=Header(frame_id=self.p.map_frame, stamp=self.get_clock().now().to_msg()))
-                m2.ns, m2.id, m2.type, m2.action = "spline_accepted", 30000 + row_id, Marker.SPHERE_LIST, Marker.ADD
-                m2.scale.x = 0.06
-                m2.scale.y = 0.06
-                m2.scale.z = 0.06
-                m2.color.r, m2.color.g, m2.color.b, m2.color.a = 0.15, 1.0, 0.15, 0.9
-                for t_val, l_val, _score in spline._last_accepted:
-                    x = spline.mean[0] + t_val * spline.main_dir[0] + l_val * spline.perp_dir[0]
-                    y = spline.mean[1] + t_val * spline.main_dir[1] + l_val * spline.perp_dir[1]
-                    m2.points.append(Point(x=float(x), y=float(y), z=0.0))
-                markers.markers.append(m2)
+                for idx, beam in enumerate(spline._last_accepted[:3]):
+                    m2 = Marker(header=Header(frame_id=self.p.map_frame, stamp=self.get_clock().now().to_msg()))
+                    m2.ns, m2.id, m2.type, m2.action = "spline_accepted", 30000 + row_id * 100 + idx, Marker.LINE_STRIP, Marker.ADD
+                    m2.scale.x = 0.05
+                    m2.color.r, m2.color.g, m2.color.b, m2.color.a = 0.15, 1.0, 0.15, 0.95
+                    for t_val, l_val in zip(beam.get("t", []), beam.get("l", [])):
+                        x = spline.mean[0] + float(t_val) * spline.main_dir[0] + float(l_val) * spline.perp_dir[0]
+                        y = spline.mean[1] + float(t_val) * spline.main_dir[1] + float(l_val) * spline.perp_dir[1]
+                        m2.points.append(Point(x=float(x), y=float(y), z=0.0))
+                    markers.markers.append(m2)
         self.marker_pub.publish(markers)
 
     def create_spline_marker(self, spline: PlantSpline, id: int, color: list, alpha: float = 1.0) -> Marker:
