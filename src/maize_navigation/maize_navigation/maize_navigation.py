@@ -216,7 +216,7 @@ class NavigatorParams:
     row_search_width: float = 0.50
     row_exclusion_distance: float = 0.30
     spline_s: float = 60.0
-    max_spline_k: int = 3
+    max_spline_k: int = 10
     
     # Control
     pos_kp: float = 2.0
@@ -370,14 +370,37 @@ class MaizeNavigator(Node):
         
         self.get_logger().info(f"Found {len(points)} points, peaks at: {peaks}", throttle_duration_sec=2.0)
         
-        left_peaks = [p for p in peaks if p > 0.15]
-        right_peaks = [p for p in peaks if p < -0.15]
-        
-        if not left_peaks or not right_peaks: 
-            self.get_logger().info(f"Missing side rows. Left peaks: {left_peaks}, Right peaks: {right_peaks}", throttle_duration_sec=2.0)
+        if len(peaks) < 2:
+            self.get_logger().info(f"Not enough peaks for row pair selection: {peaks}", throttle_duration_sec=2.0)
             return
-            
-        best_left, best_right = min(left_peaks), max(right_peaks)
+
+        best_left = None
+        best_right = None
+        best_score = float('inf')
+
+        # Prefer a pair whose separation matches the expected row width.
+        # This works even if both rows currently lie on the same side of the robot.
+        for i in range(len(peaks)):
+            for j in range(i + 1, len(peaks)):
+                p1 = peaks[i]
+                p2 = peaks[j]
+                sep = abs(p2 - p1)
+                score = abs(sep - self.p.expected_row_width)
+                if score < best_score:
+                    best_score = score
+                    best_left = max(p1, p2)
+                    best_right = min(p1, p2)
+
+        if best_left is None or best_right is None:
+            self.get_logger().info(f"Could not select a row pair from peaks: {peaks}", throttle_duration_sec=2.0)
+            return
+
+        if abs(best_left - best_right) < self.p.min_lane_width or abs(best_left - best_right) > self.p.max_lane_width:
+            self.get_logger().info(
+                f"Rejecting row pair by width: sep={abs(best_left - best_right):.2f}, expected={self.p.expected_row_width:.2f}",
+                throttle_duration_sec=2.0,
+            )
+            return
         
         self.left_row_points = points[np.abs(local_y - best_left) < 0.25]
         self.right_row_points = points[np.abs(local_y - best_right) < 0.25]
