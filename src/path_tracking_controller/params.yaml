@@ -1,0 +1,26 @@
+pure_pursuit_node:
+  ros__parameters:
+    # ========== Topic-Namen ==========
+    path_topic: "/path"
+    odom_topic: "/odom"
+    cmd_vel_topic: "/cmd_vel"
+    
+    # ========== Frame-Namen ==========
+    map_frame: "map"
+    odom_frame: "odom"
+    base_link_frame: "base_link"
+    
+    # ========== Pure-Pursuit-Parameter ==========
+    lookahead_min: 0.5         # Minimale Lookahead-Distanz [m]
+    lookahead_gain: 1.0        # Gain für adaptive Lookahead-Berechnung
+    
+    # ========== Geschwindigkeitsbeschränkungen ==========
+    max_speed: 2.0             # Maximale Geschwindigkeit [m/s]
+    min_speed: 0.3             # Minimale Geschwindigkeit [m/s]
+    curvature_speed_gain: 2.0  # Gain für krümmungsabhängige Geschwindigkeitsreduktion
+    
+    # ========== Zielerkennung ==========
+    goal_tolerance: 0.15       # Toleranz für Zielerkennung [m]
+    
+    # ========== Regelung ==========
+    control_rate: 30           # Regelrate [Hz]
