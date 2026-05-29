@@ -552,10 +552,11 @@ class MaizeNavigator(Node):
         mask = (lx > 0.05) & (lx < max_dist) & (np.abs(ly) < width / 2.0)
         cand = points[mask]
 
-        # If current_spline provided, require points to project beyond current t_max (avoid backward points)
+        # If current_spline provided, require points to project beyond current t_max (avoid backward points).
+        # Increase eps to tolerate slow map updates so slightly older points are accepted.
         if current_spline is not None and min_t is not None and len(cand) > 0:
             proj_t = np.array([current_spline.project(p) for p in cand])
-            eps = 0.05
+            eps = 0.2
             cand = cand[proj_t > (min_t - eps)]
 
         return self.filter_points_near_known_rows(cand, exclude_row_ids=exclude_row_ids)
@@ -567,6 +568,25 @@ class MaizeNavigator(Node):
         `self.row_exclusion_distance` to avoid stealing points from other rows.
         """
         kept = []
+
+        # Estimate along-axis of the current points to allow accepting points
+        # that are further along the row even if they are spatially close
+        if current_pts is None or len(current_pts) == 0:
+            along_dir = None
+            max_proj_cur = -float('inf')
+            cur_origin = None
+        else:
+            cur_origin = current_pts[0]
+            vec = current_pts[-1] - current_pts[0]
+            norm = np.linalg.norm(vec)
+            if norm < 1e-6:
+                along_dir = None
+                max_proj_cur = -float('inf')
+            else:
+                along_dir = vec / norm
+                proj_vals = np.dot(current_pts - cur_origin, along_dir)
+                max_proj_cur = float(np.max(proj_vals))
+
         for pt in new_pts:
             # distance to existing current points
             if current_pts is None or len(current_pts) == 0:
@@ -584,7 +604,18 @@ class MaizeNavigator(Node):
                 if len(d) > 0:
                     min_known = min(min_known, float(d[0]))
 
-            if min_cur > 0.08 and min_known > self.row_exclusion_distance:
+            accept = False
+            # standard acceptance when point is sufficiently far from existing points
+            if min_cur > 0.04 and min_known > self.row_exclusion_distance:
+                accept = True
+            else:
+                # If point projects further along the current point chain, accept
+                if along_dir is not None and cur_origin is not None:
+                    proj_pt = float(np.dot(pt - cur_origin, along_dir))
+                    if proj_pt > max_proj_cur + 0.01 and min_known > self.row_exclusion_distance:
+                        accept = True
+
+            if accept:
                 kept.append(pt)
 
         if len(kept) > 0:
