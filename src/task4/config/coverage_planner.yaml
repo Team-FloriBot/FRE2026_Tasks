@@ -9,7 +9,7 @@ coverage_planner:
     target_frame: "map"
     
     # Roboter & Feldkonfiguration
-    operating_width: 0.5
+    operating_width: 1.0
     robot_width: 0.42
     turn_radius: 1.0
     headland_width: 1.5
