@@ -127,14 +127,7 @@ class CoveragePlanner(Node):
             else:
                 rp = f2c.RP_Boustrophedon()
             
-            # KORREKTUR: Startpunkt an den Sortierer übergeben!
-            # Versucht, die Gassen passend zur Roboterposition zu sortieren.
-            try:
-                sorted_swaths = rp.genSortedSwaths(swaths, robot_start_point)
-            except TypeError:
-                # Falls deine Python-Bindings die Überladung mit Point nicht unterstützen:
-                self.get_logger().warning("genSortedSwaths akzeptiert keinen Startpunkt in dieser Version. Nutze Standard-Sortierung.")
-                sorted_swaths = rp.genSortedSwaths(swaths)
+            sorted_swaths = rp.genSortedSwaths(swaths)
 
             # Pfadplanung (bleibt gleich)
             pp = f2c.PP_PathPlanning()
