@@ -122,7 +122,7 @@ class PlantSpline:
             self._build_linear_fallback(logger)
             return
 
-        if not self._build_window_path(unique_t, unique_lateral, logger):
+        if not self._build_window_path(unique_t, unique_lateral, heading_yaw=heading_yaw, logger=logger):
             self._build_linear_fallback(logger)
 
     def _spawn_extension(self) -> "PlantSpline":
@@ -202,7 +202,7 @@ class PlantSpline:
         if logger:
             logger.info(f"Using linear fallback (n={len(self.points)})")
 
-    def _build_window_path(self, fit_t: np.ndarray, fit_lateral: np.ndarray, logger: Optional[Node] = None) -> bool:
+    def _build_window_path(self, fit_t: np.ndarray, fit_lateral: np.ndarray, heading_yaw: float = 0.0, logger: Optional[Node] = None) -> bool:
         forward_max_dist = max(0.5, float(self.window_length))
         step_distance = max(0.25, float(self.window_step))
         orthogonal_max_dist = max(0.20, float(self.support_radius))
@@ -469,10 +469,10 @@ class NavigatorParams:
     exit_distance: float = 0.5
     min_turn_radius: float = 0.5
     lookahead_dist: float = 0.6
-    row_search_max_dist: float = 2.2
+    row_search_max_dist: float = 2.0
     row_search_width: float = 0.50
     row_exclusion_distance: float = 0.30
-    row_extension_max_spline_distance: float = 0.22
+    row_extension_max_spline_distance: float = 0.50
     row_window_length: float = 0.65
     row_window_step: float = 0.28
     row_window_beam_width: int = 4
@@ -752,32 +752,16 @@ class MaizeNavigator(Node):
         t_l = self.left_row_spline.project(p_robot)
         t_r = self.right_row_spline.project(p_robot)
 
-        # 2. Piecewise Chaining logic: Segment growing to prevent global fit deformation!
-        # We enforce C1-continuity at the chaining boundary (position and tangent direction).
-        # We only fit new cubic splines locally in the latest lookahead segment (max 1.5m blocks).
-        
-        # For Left Spline:
-        end_val_l = np.array(self.left_row_spline.evaluate(self.left_row_spline.t_max))
-        local_tangent_l = self.left_row_spline.get_direction(self.left_row_spline.t_max)
-        global_trend_l = self.left_row_spline.get_global_direction()
-        weighted_yaw_l = wrap_to_pi(0.4 * local_tangent_l + 0.6 * global_trend_l)
-        
-        new_pts_l = self.find_points_along_tangent(
-            end_val_l,
-            weighted_yaw_l,
-            max_dist=self.p.row_search_max_dist,
-            width=self.p.row_search_width,
-            exclude_row_ids={self.current_right_row_id} if self.current_right_row_id is not None else None,
-            current_spline=self.left_row_spline,
-            min_t=self.left_row_spline.t_max if self.left_row_spline is not None else None,
-        )
+        # 2. Paired cluster march: a cluster may only belong to one row, and both rows advance together.
+        new_pts_l, new_pts_r, shared_heading_yaw = self._march_row_pair_clusters(self.left_row_spline, self.right_row_spline)
+
         if len(new_pts_l) > 0:
             self.left_row_points = self.accumulate_unique_points(
                 self.left_row_points, new_pts_l, exclude_row_id=self.current_left_row_id
             )
             temp_spline = self.left_row_spline.extend_with_points(
                 new_pts_l,
-                heading_yaw=self.robot_pose.yaw,
+                heading_yaw=shared_heading_yaw,
                 window_length=self.p.row_window_length,
                 window_step=self.p.row_window_step,
                 beam_width=self.p.row_window_beam_width,
@@ -791,12 +775,7 @@ class MaizeNavigator(Node):
                 logger=self.get_logger(),
             )
             if temp_spline.valid:
-                # validation: continuity + avoid drifting into opposite row
                 ok = True
-                if self.left_row_spline and self.left_row_spline.valid:
-                    if not self.is_candidate_continuous(self.left_row_spline, temp_spline):
-                        ok = False
-                        self.get_logger().info("Rejecting left temp_spline: continuity check failed")
                 if self.right_row_spline and self.right_row_spline.valid:
                     dists = self.spline_point_distances(temp_spline.get_points(num=60), self.right_row_spline)
                     if len(dists) > 0 and np.min(dists) < max(self.row_exclusion_distance, self.p.expected_row_width * 0.45):
@@ -810,31 +789,14 @@ class MaizeNavigator(Node):
                     self.left_row_spline = temp_spline
                     if self.current_left_row_id is not None:
                         self.remember_row(self.current_left_row_id, self.left_row_spline)
-            else:
-                self.get_logger().info("Rejecting left temp_spline: spline fit invalid")
 
-        # For Right Spline:
-        end_val_r = np.array(self.right_row_spline.evaluate(self.right_row_spline.t_max))
-        local_tangent_r = self.right_row_spline.get_direction(self.right_row_spline.t_max)
-        global_trend_r = self.right_row_spline.get_global_direction()
-        weighted_yaw_r = wrap_to_pi(0.4 * local_tangent_r + 0.6 * global_trend_r)
-        
-        new_pts_r = self.find_points_along_tangent(
-            end_val_r,
-            weighted_yaw_r,
-            max_dist=self.p.row_search_max_dist,
-            width=self.p.row_search_width,
-            exclude_row_ids={self.current_left_row_id} if self.current_left_row_id is not None else None,
-            current_spline=self.right_row_spline,
-            min_t=self.right_row_spline.t_max if self.right_row_spline is not None else None,
-        )
         if len(new_pts_r) > 0:
             self.right_row_points = self.accumulate_unique_points(
                 self.right_row_points, new_pts_r, exclude_row_id=self.current_right_row_id
             )
             temp_spline = self.right_row_spline.extend_with_points(
                 new_pts_r,
-                heading_yaw=self.robot_pose.yaw,
+                heading_yaw=shared_heading_yaw,
                 window_length=self.p.row_window_length,
                 window_step=self.p.row_window_step,
                 beam_width=self.p.row_window_beam_width,
@@ -849,10 +811,6 @@ class MaizeNavigator(Node):
             )
             if temp_spline.valid:
                 ok = True
-                if self.right_row_spline and self.right_row_spline.valid:
-                    if not self.is_candidate_continuous(self.right_row_spline, temp_spline):
-                        ok = False
-                        self.get_logger().info("Rejecting right temp_spline: continuity check failed")
                 if self.left_row_spline and self.left_row_spline.valid:
                     dists = self.spline_point_distances(temp_spline.get_points(num=60), self.left_row_spline)
                     if len(dists) > 0 and np.min(dists) < max(self.row_exclusion_distance, self.p.expected_row_width * 0.45):
@@ -866,8 +824,6 @@ class MaizeNavigator(Node):
                     self.right_row_spline = temp_spline
                     if self.current_right_row_id is not None:
                         self.remember_row(self.current_right_row_id, self.right_row_spline)
-            else:
-                self.get_logger().info("Rejecting right temp_spline: spline fit invalid")
 
         # 3. Project robot on updated, highly robust splines
         t_l = self.left_row_spline.project(p_robot)
@@ -1110,6 +1066,152 @@ class MaizeNavigator(Node):
 
         dynamic_threshold = int(round(len(local_points) * float(self.p.row_end_front_point_ratio)))
         return int(np.clip(dynamic_threshold, 4, 12))
+
+    def _normalize_vector(self, vec: np.ndarray) -> np.ndarray:
+        norm = float(np.linalg.norm(vec))
+        if norm < 1e-9:
+            return np.array([1.0, 0.0], dtype=float)
+        return vec / norm
+
+    def _cluster_nearby_points(self, points: np.ndarray, cluster_radius: float) -> List[np.ndarray]:
+        if len(points) == 0:
+            return []
+        visited = np.zeros(len(points), dtype=bool)
+        clusters: List[np.ndarray] = []
+        for seed_idx in range(len(points)):
+            if visited[seed_idx]:
+                continue
+            stack = [seed_idx]
+            visited[seed_idx] = True
+            member_indices: List[int] = []
+            while stack:
+                idx = stack.pop()
+                member_indices.append(idx)
+                deltas = points - points[idx]
+                neighbors = np.where((np.linalg.norm(deltas, axis=1) <= cluster_radius) & (~visited))[0]
+                for neighbor_idx in neighbors:
+                    visited[neighbor_idx] = True
+                    stack.append(int(neighbor_idx))
+            cluster = points[np.array(member_indices, dtype=int)]
+            if len(cluster) >= 2:
+                clusters.append(cluster)
+        return clusters
+
+    def _direction_from_points(self, points: np.ndarray, fallback_dir: np.ndarray) -> np.ndarray:
+        if len(points) < 2:
+            return self._normalize_vector(np.asarray(fallback_dir, dtype=float))
+        centered = points - np.mean(points, axis=0)
+        cov = np.cov(centered.T)
+        eigenvalues, eigenvectors = np.linalg.eig(cov)
+        direction = eigenvectors[:, int(np.argmax(eigenvalues))]
+        direction = self._normalize_vector(direction)
+        fallback_dir = self._normalize_vector(np.asarray(fallback_dir, dtype=float))
+        if np.dot(direction, fallback_dir) < 0:
+            direction = -direction
+        return direction
+
+    def _shared_pair_heading(self, left_spline: PlantSpline, right_spline: PlantSpline, fallback_yaw: float) -> float:
+        vectors = []
+        if left_spline is not None and left_spline.valid:
+            vectors.append(np.array([math.cos(left_spline.get_direction(left_spline.t_max)), math.sin(left_spline.get_direction(left_spline.t_max))]))
+        if right_spline is not None and right_spline.valid:
+            vectors.append(np.array([math.cos(right_spline.get_direction(right_spline.t_max)), math.sin(right_spline.get_direction(right_spline.t_max))]))
+        if not vectors:
+            return float(fallback_yaw)
+        shared_vec = self._normalize_vector(np.sum(vectors, axis=0))
+        return float(math.atan2(shared_vec[1], shared_vec[0]))
+
+    def _march_row_pair_clusters(self, left_spline: PlantSpline, right_spline: PlantSpline) -> Tuple[np.ndarray, np.ndarray, float]:
+        if left_spline is None or right_spline is None or not left_spline.valid or not right_spline.valid:
+            return np.empty((0, 2), dtype=float), np.empty((0, 2), dtype=float), float(self.robot_pose.yaw if self.robot_pose else 0.0)
+
+        step_distance = 0.5
+        forward_max_dist = 2.0
+        orthogonal_max_dist = 0.5
+        cluster_radius = max(0.12, float(self.p.row_cluster_radius))
+
+        left_end = np.array(left_spline.evaluate(left_spline.t_max), dtype=float)
+        right_end = np.array(right_spline.evaluate(right_spline.t_max), dtype=float)
+        pair_center = 0.5 * (left_end + right_end)
+        shared_heading_yaw = self._shared_pair_heading(left_spline, right_spline, self.robot_pose.yaw if self.robot_pose else 0.0)
+        shared_dir = self._normalize_vector(np.array([math.cos(shared_heading_yaw), math.sin(shared_heading_yaw)], dtype=float))
+
+        collected_left: List[np.ndarray] = []
+        collected_right: List[np.ndarray] = []
+        remaining_points = self.get_map_points_in_roi(Pose2D(pair_center[0], pair_center[1], shared_heading_yaw), 4.5)
+        if len(remaining_points) == 0:
+            return np.empty((0, 2), dtype=float), np.empty((0, 2), dtype=float), shared_heading_yaw
+
+        left_points_ref = np.array(self.left_row_points, copy=True) if self.left_row_points is not None else np.empty((0, 2), dtype=float)
+        right_points_ref = np.array(self.right_row_points, copy=True) if self.right_row_points is not None else np.empty((0, 2), dtype=float)
+
+        for _ in range(12):
+            pair_perp = np.array([-shared_dir[1], shared_dir[0]], dtype=float)
+            rel = remaining_points - pair_center
+            along = rel @ shared_dir
+            orth = rel @ pair_perp
+            candidate_mask = (along >= 0.0) & (along <= forward_max_dist) & (np.abs(orth) <= orthogonal_max_dist)
+            candidate_points = remaining_points[candidate_mask]
+            if len(candidate_points) == 0:
+                break
+
+            clusters = self._cluster_nearby_points(candidate_points, cluster_radius)
+            if not clusters:
+                break
+
+            left_ref = float((left_end - pair_center) @ pair_perp)
+            right_ref = float((right_end - pair_center) @ pair_perp)
+            step_left_clusters: List[np.ndarray] = []
+            step_right_clusters: List[np.ndarray] = []
+
+            for cluster in clusters:
+                centroid = np.mean(cluster, axis=0)
+                centroid_rel = centroid - pair_center
+                centroid_along = float(centroid_rel @ shared_dir)
+                centroid_orth = float(centroid_rel @ pair_perp)
+                if centroid_along < 0.0 or centroid_along > forward_max_dist or abs(centroid_orth) > orthogonal_max_dist:
+                    continue
+                d_left = abs(centroid_orth - left_ref)
+                d_right = abs(centroid_orth - right_ref)
+                if d_left <= d_right:
+                    step_left_clusters.append(cluster)
+                else:
+                    step_right_clusters.append(cluster)
+
+            if not step_left_clusters and not step_right_clusters:
+                break
+
+            if step_left_clusters:
+                left_step_points = np.vstack(step_left_clusters)
+                collected_left.append(left_step_points)
+            else:
+                left_step_points = np.empty((0, 2), dtype=float)
+            if step_right_clusters:
+                right_step_points = np.vstack(step_right_clusters)
+                collected_right.append(right_step_points)
+            else:
+                right_step_points = np.empty((0, 2), dtype=float)
+
+            left_dir = self._direction_from_points(left_step_points, shared_dir) if len(left_step_points) > 0 else shared_dir
+            right_dir = self._direction_from_points(right_step_points, shared_dir) if len(right_step_points) > 0 else shared_dir
+            shared_dir = self._normalize_vector(left_dir + right_dir)
+            shared_heading_yaw = float(math.atan2(shared_dir[1], shared_dir[0]))
+
+            remove_points = np.vstack([pts for pts in (left_step_points, right_step_points) if len(pts) > 0])
+            if len(remove_points) > 0:
+                keep_mask = np.ones(len(remaining_points), dtype=bool)
+                for ref_point in remove_points:
+                    keep_mask &= np.linalg.norm(remaining_points - ref_point, axis=1) > cluster_radius
+                remaining_points = remaining_points[keep_mask]
+            pair_center = pair_center + shared_dir * step_distance
+            left_end = left_end + shared_dir * step_distance
+            right_end = right_end + shared_dir * step_distance
+            if len(remaining_points) == 0:
+                break
+
+        left_out = np.vstack(collected_left) if collected_left else np.empty((0, 2), dtype=float)
+        right_out = np.vstack(collected_right) if collected_right else np.empty((0, 2), dtype=float)
+        return left_out, right_out, shared_heading_yaw
 
     def handle_exit_row(self):
         dist = math.hypot(self.robot_pose.x - self.exit_start_pose.x, self.robot_pose.y - self.exit_start_pose.y)
