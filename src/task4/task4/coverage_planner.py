@@ -100,7 +100,7 @@ class CoveragePlanner(Node):
             point_out = do_transform_point(point_in, transform)
             transformed_coords.append((point_out.point.x, point_out.point.y))
 
-        # --- 2. SCHRITT: Fields2Cover Pipeline (Flache API-Struktur) ---
+        # --- 2. SCHRITT: Fields2Cover Pipeline (Exakte API-Anpassung) ---
         try:
             ring = f2c.LinearRing()
             for pt in transformed_coords:
@@ -115,25 +115,25 @@ class CoveragePlanner(Node):
             robot = f2c.Robot(rob_width, op_width)
             robot.max_curv = 1.0 / turn_rad
 
-            # Vorgewende abgrenzen (Direkt auf f2c-Ebene)
-            hl_gen = f2c.ConstHl()
+            # Vorgewende abgrenzen (Verwendet eure verifizierte Klasse)
+            hl_gen = f2c.HG_Const_gen()
             no_hl = hl_gen.generateHeadlands(cells, hl_width)
 
             # Gassen generieren
-            sg = f2c.BruteForce()
+            sg = f2c.SG_BruteForce()
             swaths = sg.generateSwaths(swath_angle, op_width, no_hl.getCell(0))
 
             # Routing Muster bestimmen
             if pattern == 'snake':
-                rp = f2c.Snake()
+                rp = f2c.RP_Snake()
             else:
-                rp = f2c.Boustrophedon()
+                rp = f2c.RP_Boustrophedon()
             
             route = rp.genRoute(swaths)
 
             # Kinematische Pfadplanung mit Dubins-Kurven
-            pp = f2c.PathPlanning()
-            dubins = f2c.DubinsCurves()
+            pp = f2c.PP_PathPlanning()
+            dubins = f2c.PT_Dubins()
             f2c_path = pp.planPath(robot, route, dubins)
 
             # Pfad publizieren
