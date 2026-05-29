@@ -129,12 +129,15 @@ class CoveragePlanner(Node):
             else:
                 rp = f2c.RP_Boustrophedon()
             
-            route = rp.genRoute(swaths)
+            # KORREKTUR 1: generateRoute statt genRoute
+            route = rp.generateRoute(swaths)
 
             # Kinematische Pfadplanung mit Dubins-Kurven
             pp = f2c.PP_PathPlanning()
             dubins = f2c.PT_Dubins()
-            f2c_path = pp.planPath(robot, route, dubins)
+            
+            # KORREKTUR 2: generatePath statt planPath
+            f2c_path = pp.generatePath(robot, route, dubins)
 
             # Pfad publizieren
             self.publish_ros_path(f2c_path, target_frame)
