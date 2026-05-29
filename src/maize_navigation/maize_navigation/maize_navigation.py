@@ -57,6 +57,8 @@ class PlantSpline:
         self.main_dir = None
         self.perp_dir = None
         self.mean = None
+        self.segment_splines: List[UnivariateSpline] = []
+        self.segment_bounds: List[Tuple[float, float]] = []
         self.lateral_spline = None
         
         if len(points) < 4:
@@ -105,8 +107,9 @@ class PlantSpline:
             if dist > cluster_gap_threshold:
                 num_clusters += 1
         
-        # Bei wenigen Punkten ODER nur wenigen räumlichen Clustern (2-3) → linear_mode
-        if len(unique_t) < 6 or num_clusters <= 3:
+        # Bei wirklich wenigen Punkten ist ein stabiler Linear-Fallback besser als ein instabiler Spline.
+        # Die Cluster-Heuristik bleibt nur als Hinweis im Log erhalten, sie erzwingt aber keinen Linear-Fallback mehr.
+        if len(unique_t) < 6:
             self.linear_mode = True
             self.line_start = self.mean + self.t_min * self.main_dir
             self.line_end = self.mean + self.t_max * self.main_dir
@@ -118,32 +121,234 @@ class PlantSpline:
         
         fit_t = unique_t
         fit_lateral = self.lateral[unique_idx]
-        if len(fit_t) > 120:
-            sample_idx = np.linspace(0, len(fit_t) - 1, 120).astype(int)
-            fit_t = fit_t[sample_idx]
-            fit_lateral = fit_lateral[sample_idx]
 
-        # 1D-Fit: nur die laterale Abweichung über der Hauptachse wird modelliert.
-        # Das entspricht dem stabilen Referenzansatz viel näher als ein freier 2D-Parametrisierungsspline.
+        # Build robust local control points so individual displaced plants do not drag the row centerline away.
+        # Median values per sliding window keep small bends while suppressing outliers.
+        if len(fit_t) > 8:
+            window_size = max(5, min(12, len(fit_t) // 4))
+            step_size = max(2, window_size // 2)
+            control_t = []
+            control_lateral = []
+            for start in range(0, len(fit_t), step_size):
+                end = min(len(fit_t), start + window_size)
+                if end - start < 4:
+                    continue
+                control_t.append(float(np.median(fit_t[start:end])))
+                control_lateral.append(float(np.median(fit_lateral[start:end])))
+            if len(control_t) >= 4:
+                fit_t = np.asarray(control_t, dtype=float)
+                fit_lateral = np.asarray(control_lateral, dtype=float)
+
+        # Piecewise 1D-Fit: the row is represented by overlapping local splines in the same PCA frame.
+        # This keeps small bends and outliers local instead of pulling the complete row shape around.
         try:
-            # SciPy UnivariateSpline supports only low-order splines (k <= 5).
-            # Clamp both by data size and library limits so invalid k values do not kill the fit.
-            requested_k = int(max_k)
-            k = min(max(1, requested_k), 5, len(fit_t) - 1)
-            if logger:
-                if k != requested_k:
-                    logger.info(f"Fitting spline with k = {k} (requested {requested_k})")
-                else:
-                    logger.info(f"Fitting spline with k = {k}")
-            lateral_spread = float(np.std(fit_lateral))
-            s_used = float(s) * max(0.35, 1.0 + 0.20 * lateral_spread)
-            self.lateral_spline = UnivariateSpline(fit_t, fit_lateral, k=k, s=s_used)
+            self.segment_splines = []
+            self.segment_bounds = []
+
+            if len(fit_t) < 6:
+                self.linear_mode = True
+                self.line_start = self.mean + self.t_min * self.main_dir
+                self.line_end = self.mean + self.t_max * self.main_dir
+                self.valid = True
+                if logger:
+                    logger.info(f"Using linear mode (n={len(fit_t)}, clusters={num_clusters})")
+                return
+
+            segment_size = max(6, min(12, len(fit_t) // 5 if len(fit_t) >= 15 else len(fit_t)))
+            overlap = max(3, int(round(segment_size * 0.6)))
+            start_idx = 0
+
+            while start_idx < len(fit_t) - 3:
+                end_idx = min(len(fit_t), start_idx + segment_size)
+                seg_t = fit_t[start_idx:end_idx]
+                seg_lateral = fit_lateral[start_idx:end_idx]
+
+                if len(seg_t) >= 4:
+                    requested_k = int(max_k)
+                    k = min(3, max(1, requested_k), len(seg_t) - 1)
+                    lateral_spread = float(np.std(seg_lateral))
+                    s_used = max(0.25, float(s) * 0.02 * max(0.75, 1.0 + 0.15 * lateral_spread))
+                    segment = UnivariateSpline(seg_t, seg_lateral, k=k, s=s_used)
+                    self.segment_splines.append(segment)
+                    self.segment_bounds.append((float(seg_t[0]), float(seg_t[-1])))
+
+                if end_idx >= len(fit_t):
+                    break
+                start_idx = max(0, end_idx - overlap)
+
+            if not self.segment_splines:
+                requested_k = int(max_k)
+                k = min(max(1, requested_k), 5, len(fit_t) - 1)
+                lateral_spread = float(np.std(fit_lateral))
+                s_used = max(0.5, float(s) * 0.05 * max(0.75, 1.0 + 0.15 * lateral_spread))
+                self.lateral_spline = UnivariateSpline(fit_t, fit_lateral, k=k, s=s_used)
+                self.segment_splines = [self.lateral_spline]
+                self.segment_bounds = [(float(fit_t[0]), float(fit_t[-1]))]
+
             self.valid = True
+            if logger:
+                logger.info(f"Built {len(self.segment_splines)} spline segment(s)")
         except Exception as exc:
             if logger:
                 logger.info(f"Spline fit failed: {exc}")
             self.valid = False
             return
+
+    def _spawn_extension(self) -> "PlantSpline":
+        clone = object.__new__(PlantSpline)
+        clone.valid = self.valid
+        clone.t_min = self.t_min
+        clone.t_max = self.t_max
+        clone.linear_mode = self.linear_mode
+        clone.points = np.array(self.points, copy=True)
+        clone.main_dir = np.array(self.main_dir, copy=True) if self.main_dir is not None else None
+        clone.perp_dir = np.array(self.perp_dir, copy=True) if self.perp_dir is not None else None
+        clone.mean = np.array(self.mean, copy=True) if self.mean is not None else None
+        clone.segment_splines = list(self.segment_splines)
+        clone.segment_bounds = list(self.segment_bounds)
+        clone.lateral_spline = self.lateral_spline
+        if self.linear_mode:
+            clone.line_start = np.array(self.line_start, copy=True)
+            clone.line_end = np.array(self.line_end, copy=True)
+        if hasattr(self, "t"):
+            clone.t = np.array(self.t, copy=True)
+        if hasattr(self, "lateral"):
+            clone.lateral = np.array(self.lateral, copy=True)
+        return clone
+
+    def extend_with_points(
+        self,
+        new_points: np.ndarray,
+        heading_yaw: float = 0.0,
+        s: float = 60.0,
+        max_k: int = 3,
+        logger: Optional[Node] = None,
+        overlap_ratio: float = 0.55,
+    ) -> "PlantSpline":
+        if new_points is None or len(new_points) == 0:
+            return self
+        if self.linear_mode:
+            combined = np.vstack((self.points, new_points))
+            return PlantSpline(combined, heading_yaw=heading_yaw, s=s, max_k=max_k, logger=logger)
+
+        extended = self._spawn_extension()
+
+        new_points = np.asarray(new_points, dtype=float)
+        new_centered = new_points - self.mean
+        new_t = new_centered @ self.main_dir
+        new_lateral = new_centered @ self.perp_dir
+
+        combined_points = np.vstack((self.points, new_points))
+        combined_centered = combined_points - self.mean
+        combined_t = combined_centered @ self.main_dir
+        combined_lateral = combined_centered @ self.perp_dir
+        sort_idx = np.argsort(combined_t)
+        combined_t = combined_t[sort_idx]
+        combined_lateral = combined_lateral[sort_idx]
+        combined_points = combined_points[sort_idx]
+
+        if len(combined_t) < 6:
+            return self
+
+        # Only fit the tail plus a generous overlap so the earlier part stays untouched.
+        row_span = max(0.0, float(self.t_max - self.t_min))
+        overlap_t = max(0.45, row_span * overlap_ratio)
+        tail_start = float(self.t_max - overlap_t)
+        tail_mask = combined_t >= tail_start
+
+        tail_t = combined_t[tail_mask]
+        tail_lateral = combined_lateral[tail_mask]
+        tail_points = combined_points[tail_mask]
+
+        if len(tail_t) < 6:
+            tail_t = combined_t
+            tail_lateral = combined_lateral
+            tail_points = combined_points
+
+        if len(tail_t) > 8:
+            window_size = max(5, min(10, len(tail_t) // 3))
+            step_size = max(2, window_size // 2)
+            control_t = []
+            control_lateral = []
+            for start in range(0, len(tail_t), step_size):
+                end = min(len(tail_t), start + window_size)
+                if end - start < 4:
+                    continue
+                control_t.append(float(np.median(tail_t[start:end])))
+                control_lateral.append(float(np.median(tail_lateral[start:end])))
+            if len(control_t) >= 4:
+                tail_t = np.asarray(control_t, dtype=float)
+                tail_lateral = np.asarray(control_lateral, dtype=float)
+
+        try:
+            requested_k = int(max_k)
+            k = min(3, max(1, requested_k), len(tail_t) - 1)
+            lateral_spread = float(np.std(tail_lateral))
+            s_used = max(0.2, float(s) * 0.015 * max(0.75, 1.0 + 0.10 * lateral_spread))
+            segment = UnivariateSpline(tail_t, tail_lateral, k=k, s=s_used)
+
+            extended.segment_splines = list(self.segment_splines) + [segment]
+            extended.segment_bounds = list(self.segment_bounds) + [(float(tail_t[0]), float(tail_t[-1]))]
+            extended.points = combined_points
+            extended.t = combined_t
+            extended.lateral = combined_lateral
+            extended.t_min = float(combined_t[0])
+            extended.t_max = float(combined_t[-1])
+            extended.valid = True
+            if logger:
+                logger.info(f"Extended spline tail with {len(tail_t)} control points; segments={len(extended.segment_splines)}")
+            return extended
+        except Exception as exc:
+            if logger:
+                logger.info(f"Spline tail extension failed: {exc}")
+            return self
+
+    def _segment_candidates(self, t: float) -> List[int]:
+        if not self.segment_bounds:
+            return []
+        candidates = [i for i, (t_start, t_end) in enumerate(self.segment_bounds) if t_start <= t <= t_end]
+        if candidates:
+            return candidates
+        centers = [0.5 * (t_start + t_end) for t_start, t_end in self.segment_bounds]
+        return [int(np.argmin([abs(t - c) for c in centers]))]
+
+    def _evaluate_lateral(self, t: float) -> float:
+        if not self.segment_splines:
+            return float(self.lateral_spline(t))
+        candidates = self._segment_candidates(t)
+        if len(candidates) == 1:
+            return float(self.segment_splines[candidates[0]](t))
+
+        scored = sorted(candidates, key=lambda idx: abs(t - 0.5 * (self.segment_bounds[idx][0] + self.segment_bounds[idx][1])))
+        first_idx = scored[0]
+        second_idx = scored[1]
+        first_center = 0.5 * (self.segment_bounds[first_idx][0] + self.segment_bounds[first_idx][1])
+        second_center = 0.5 * (self.segment_bounds[second_idx][0] + self.segment_bounds[second_idx][1])
+        first_weight = 1.0 / (abs(t - first_center) + 1e-3)
+        second_weight = 1.0 / (abs(t - second_center) + 1e-3)
+        return float(
+            (first_weight * self.segment_splines[first_idx](t) + second_weight * self.segment_splines[second_idx](t))
+            / (first_weight + second_weight)
+        )
+
+    def _evaluate_lateral_derivative(self, t: float) -> float:
+        if not self.segment_splines:
+            return float(self.lateral_spline.derivative()(t))
+        candidates = self._segment_candidates(t)
+        if len(candidates) == 1:
+            return float(self.segment_splines[candidates[0]].derivative()(t))
+
+        scored = sorted(candidates, key=lambda idx: abs(t - 0.5 * (self.segment_bounds[idx][0] + self.segment_bounds[idx][1])))
+        first_idx = scored[0]
+        second_idx = scored[1]
+        first_center = 0.5 * (self.segment_bounds[first_idx][0] + self.segment_bounds[first_idx][1])
+        second_center = 0.5 * (self.segment_bounds[second_idx][0] + self.segment_bounds[second_idx][1])
+        first_weight = 1.0 / (abs(t - first_center) + 1e-3)
+        second_weight = 1.0 / (abs(t - second_center) + 1e-3)
+        return float(
+            (first_weight * self.segment_splines[first_idx].derivative()(t) + second_weight * self.segment_splines[second_idx].derivative()(t))
+            / (first_weight + second_weight)
+        )
 
     def evaluate(self, t: float) -> Tuple[float, float]:
         if self.linear_mode:
@@ -154,7 +359,7 @@ class PlantSpline:
                 alpha = float(np.clip(alpha, 0.0, 1.0))
                 p = self.line_start + alpha * (self.line_end - self.line_start)
             return float(p[0]), float(p[1])
-        lateral = float(self.lateral_spline(t))
+        lateral = self._evaluate_lateral(t)
         p = self.mean + t * self.main_dir + lateral * self.perp_dir
         return float(p[0]), float(p[1])
 
@@ -162,7 +367,7 @@ class PlantSpline:
         if self.linear_mode:
             direction = self.line_end - self.line_start
             return math.atan2(direction[1], direction[0])
-        lateral_d = float(self.lateral_spline.derivative()(t))
+        lateral_d = self._evaluate_lateral_derivative(t)
         direction = self.main_dir + lateral_d * self.perp_dir
         dx, dy = float(direction[0]), float(direction[1])
         return math.atan2(dy, dx)
@@ -176,7 +381,7 @@ class PlantSpline:
         if self.linear_mode:
             pts = [self.evaluate(t) for t in t_vals]
             return np.array(pts)
-        lateral_vals = self.lateral_spline(t_vals)
+        lateral_vals = np.array([self._evaluate_lateral(t) for t in t_vals])
         return np.column_stack((self.mean[0] + t_vals * self.main_dir[0] + lateral_vals * self.perp_dir[0],
                                 self.mean[1] + t_vals * self.main_dir[1] + lateral_vals * self.perp_dir[1]))
     
@@ -478,7 +683,13 @@ class MaizeNavigator(Node):
             self.left_row_points = self.accumulate_unique_points(
                 self.left_row_points, new_pts_l, exclude_row_id=self.current_left_row_id
             )
-            temp_spline = PlantSpline(self.left_row_points, heading_yaw=self.robot_pose.yaw, s=self.p.spline_s, max_k=self.p.max_spline_k, logger=self.get_logger())
+            temp_spline = self.left_row_spline.extend_with_points(
+                new_pts_l,
+                heading_yaw=self.robot_pose.yaw,
+                s=self.p.spline_s,
+                max_k=self.p.max_spline_k,
+                logger=self.get_logger(),
+            )
             if temp_spline.valid:
                 # validation: continuity + avoid drifting into opposite row
                 ok = True
@@ -521,7 +732,13 @@ class MaizeNavigator(Node):
             self.right_row_points = self.accumulate_unique_points(
                 self.right_row_points, new_pts_r, exclude_row_id=self.current_right_row_id
             )
-            temp_spline = PlantSpline(self.right_row_points, heading_yaw=self.robot_pose.yaw, s=self.p.spline_s, max_k=self.p.max_spline_k, logger=self.get_logger())
+            temp_spline = self.right_row_spline.extend_with_points(
+                new_pts_r,
+                heading_yaw=self.robot_pose.yaw,
+                s=self.p.spline_s,
+                max_k=self.p.max_spline_k,
+                logger=self.get_logger(),
+            )
             if temp_spline.valid:
                 ok = True
                 if self.right_row_spline and self.right_row_spline.valid:
@@ -849,6 +1066,8 @@ class MaizeNavigator(Node):
             color = [0.0, 1.0, 0.0] if is_current else [0.65, 0.65, 0.65]
             alpha = 1.0 if is_current else 0.55
             markers.markers.append(self.create_spline_marker(spline, row_id, color, alpha=alpha))
+            if spline.segment_bounds and len(spline.segment_bounds) > 1:
+                markers.markers.append(self.create_segment_boundary_marker(spline, row_id, is_current=is_current))
         self.marker_pub.publish(markers)
 
     def create_spline_marker(self, spline: PlantSpline, id: int, color: list, alpha: float = 1.0) -> Marker:
@@ -857,6 +1076,29 @@ class MaizeNavigator(Node):
         m.scale.x = 0.04
         m.color.r, m.color.g, m.color.b, m.color.a = color[0], color[1], color[2], alpha
         for p in spline.get_points():
+            m.points.append(Point(x=float(p[0]), y=float(p[1]), z=0.0))
+        return m
+
+    def create_segment_boundary_marker(self, spline: PlantSpline, id: int, is_current: bool = False) -> Marker:
+        m = Marker(header=Header(frame_id=self.p.map_frame, stamp=self.get_clock().now().to_msg()))
+        m.ns, m.id, m.type, m.action = "spline_segments", 10000 + id, Marker.SPHERE_LIST, Marker.ADD
+        m.scale.x = 0.12 if is_current else 0.08
+        m.scale.y = 0.12 if is_current else 0.08
+        m.scale.z = 0.12 if is_current else 0.08
+        if is_current:
+            m.color.r = 1.0
+            m.color.g = 0.9
+            m.color.b = 0.05
+            m.color.a = 0.98
+        else:
+            m.color.r = 1.0
+            m.color.g = 0.35
+            m.color.b = 0.05
+            m.color.a = 0.72
+
+        for boundary_start, boundary_end in spline.segment_bounds[1:]:
+            t_boundary = 0.5 * (boundary_start + boundary_end)
+            p = spline.evaluate(t_boundary)
             m.points.append(Point(x=float(p[0]), y=float(p[1]), z=0.0))
         return m
 
