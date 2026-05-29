@@ -42,7 +42,7 @@ class Pose2D:
 # --- Data Structures for Splines ---
 
 class PlantSpline:
-    def __init__(self, points: np.ndarray, heading_yaw: float = 0.0, s: float = 0.15, max_k: int = 2, logger: Optional[Node] = None):
+    def __init__(self, points: np.ndarray, heading_yaw: float = 0.0, s: float = 60.0, max_k: int = 3, logger: Optional[Node] = None):
         """
         points: (N, 2) array of (x, y) coordinates in map frame
         heading_yaw: Approximate current heading yaw of the robot to align spline direction
@@ -98,7 +98,7 @@ class PlantSpline:
         # ist die Reihe wahrscheinlich gerade. Viele verstreute Cluster deuten auf Krümmung hin.
         sorted_pts = self.points[unique_idx]
         num_clusters = 1
-        cluster_gap_threshold = 0.25  # Meter: ab dieser Lücke ein neuer Cluster
+        cluster_gap_threshold = 0.60  # Meter: ab dieser Lücke ein neuer Cluster
         
         for i in range(len(sorted_pts) - 1):
             dist = np.linalg.norm(sorted_pts[i+1] - sorted_pts[i])
@@ -212,9 +212,11 @@ class NavigatorParams:
     exit_distance: float = 0.5
     min_turn_radius: float = 0.5
     lookahead_dist: float = 0.6
-    row_search_max_dist: float = 1.8
-    row_search_width: float = 0.32
-    max_spline_k: int = 10
+    row_search_max_dist: float = 2.2
+    row_search_width: float = 0.50
+    row_exclusion_distance: float = 0.30
+    spline_s: float = 60.0
+    max_spline_k: int = 3
     
     # Control
     pos_kp: float = 2.0
@@ -246,7 +248,7 @@ class MaizeNavigator(Node):
         self.current_right_row_id: Optional[int] = None
         self.next_row_id: int = 1
         self.known_rows: dict[int, PlantSpline] = {}
-        self.row_exclusion_distance: float = 0.22
+        self.row_exclusion_distance: float = self.p.row_exclusion_distance
         
         # State specific variables
         self.exit_start_pose: Optional[Pose2D] = None
@@ -281,6 +283,8 @@ class MaizeNavigator(Node):
         p.exit_distance = get_param("exit_distance", p.exit_distance)
         p.row_search_max_dist = get_param("row_search_max_dist", p.row_search_max_dist)
         p.row_search_width = get_param("row_search_width", p.row_search_width)
+        p.row_exclusion_distance = get_param("row_exclusion_distance", p.row_exclusion_distance)
+        p.spline_s = get_param("spline_s", p.spline_s)
         p.max_spline_k = get_param("max_spline_k", p.max_spline_k)
         return p
 
@@ -378,8 +382,8 @@ class MaizeNavigator(Node):
         self.left_row_points = points[np.abs(local_y - best_left) < 0.25]
         self.right_row_points = points[np.abs(local_y - best_right) < 0.25]
         
-        self.left_row_spline = PlantSpline(self.left_row_points, heading_yaw=self.robot_pose.yaw, max_k=self.p.max_spline_k, logger=self.get_logger())
-        self.right_row_spline = PlantSpline(self.right_row_points, heading_yaw=self.robot_pose.yaw, max_k=self.p.max_spline_k, logger=self.get_logger())
+        self.left_row_spline = PlantSpline(self.left_row_points, heading_yaw=self.robot_pose.yaw, s=self.p.spline_s, max_k=self.p.max_spline_k, logger=self.get_logger())
+        self.right_row_spline = PlantSpline(self.right_row_points, heading_yaw=self.robot_pose.yaw, s=self.p.spline_s, max_k=self.p.max_spline_k, logger=self.get_logger())
         
         if self.left_row_spline.valid and self.right_row_spline.valid:
             self.current_left_row_id = self.next_row_id
@@ -423,7 +427,7 @@ class MaizeNavigator(Node):
             self.left_row_points = self.accumulate_unique_points(
                 self.left_row_points, new_pts_l, exclude_row_id=self.current_left_row_id
             )
-            temp_spline = PlantSpline(self.left_row_points, heading_yaw=self.robot_pose.yaw, max_k=self.p.max_spline_k, logger=self.get_logger())
+            temp_spline = PlantSpline(self.left_row_points, heading_yaw=self.robot_pose.yaw, s=self.p.spline_s, max_k=self.p.max_spline_k, logger=self.get_logger())
             if temp_spline.valid:
                 # validation: continuity + avoid drifting into opposite row
                 ok = True
@@ -463,7 +467,7 @@ class MaizeNavigator(Node):
             self.right_row_points = self.accumulate_unique_points(
                 self.right_row_points, new_pts_r, exclude_row_id=self.current_right_row_id
             )
-            temp_spline = PlantSpline(self.right_row_points, heading_yaw=self.robot_pose.yaw, max_k=self.p.max_spline_k, logger=self.get_logger())
+            temp_spline = PlantSpline(self.right_row_points, heading_yaw=self.robot_pose.yaw, s=self.p.spline_s, max_k=self.p.max_spline_k, logger=self.get_logger())
             if temp_spline.valid:
                 ok = True
                 if self.right_row_spline and self.right_row_spline.valid:
@@ -553,10 +557,10 @@ class MaizeNavigator(Node):
         cand = points[mask]
 
         # If current_spline provided, require points to project beyond current t_max (avoid backward points).
-        # Increase eps to tolerate slow map updates so slightly older points are accepted.
+        # Allow a wider overlap so slowly updated maps can still extend the row.
         if current_spline is not None and min_t is not None and len(cand) > 0:
             proj_t = np.array([current_spline.project(p) for p in cand])
-            eps = 0.2
+            eps = 0.35
             cand = cand[proj_t > (min_t - eps)]
 
         return self.filter_points_near_known_rows(cand, exclude_row_ids=exclude_row_ids)
@@ -606,13 +610,13 @@ class MaizeNavigator(Node):
 
             accept = False
             # standard acceptance when point is sufficiently far from existing points
-            if min_cur > 0.04 and min_known > self.row_exclusion_distance:
+            if min_cur > 0.02 and min_known > self.row_exclusion_distance:
                 accept = True
             else:
                 # If point projects further along the current point chain, accept
                 if along_dir is not None and cur_origin is not None:
                     proj_pt = float(np.dot(pt - cur_origin, along_dir))
-                    if proj_pt > max_proj_cur + 0.01 and min_known > self.row_exclusion_distance:
+                    if proj_pt > max_proj_cur and min_known > self.row_exclusion_distance:
                         accept = True
 
             if accept:
