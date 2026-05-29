@@ -286,6 +286,9 @@ class MaizeNavigator(Node):
         p.row_exclusion_distance = get_param("row_exclusion_distance", p.row_exclusion_distance)
         p.spline_s = get_param("spline_s", p.spline_s)
         p.max_spline_k = get_param("max_spline_k", p.max_spline_k)
+        p.lookahead_dist = get_param("lookahead_dist", p.lookahead_dist)
+        p.min_lane_width = get_param("min_lane_width", 0.5)
+        p.max_lane_width = get_param("max_lane_width", 1.5)
         return p
 
     def parse_pattern(self, pattern_str: str) -> List[Tuple[int, str]]:
