@@ -255,7 +255,10 @@ class PlantSpline:
             eigenvalues_local, eigenvectors_local = np.linalg.eig(cov_local)
             return normalize(eigenvectors_local[:, int(np.argmax(eigenvalues_local))])
 
-        start_anchor = np.mean(self.points, axis=0)
+        # Start from the row beginning (minimum projection along the chosen heading direction),
+        # not from the global mean. This keeps the displayed line complete from row start.
+        start_idx = int(np.argmin(self.t))
+        start_anchor = np.array(self.points[start_idx], copy=True)
         current_anchor = np.array(start_anchor, copy=True)
         current_dir = normalize(np.array(self.main_dir, copy=True))
         if np.dot(current_dir, np.array([math.cos(heading_yaw), math.sin(heading_yaw)])) < 0:
@@ -266,7 +269,8 @@ class PlantSpline:
         anchors_l = [float((current_anchor - self.mean) @ self.perp_dir)]
 
         remaining_points = np.array(self.points, copy=True)
-        max_steps = max(1, int(math.ceil(forward_max_dist / step_distance)) + 2)
+        total_span = max(0.0, float(np.max(self.t) - np.min(self.t)))
+        max_steps = max(1, int(math.ceil(total_span / step_distance)) + 4)
 
         for _step_idx in range(max_steps):
             rel = remaining_points - current_anchor
@@ -516,6 +520,8 @@ class MaizeNavigator(Node):
         
         self.left_row_spline: Optional[PlantSpline] = None
         self.right_row_spline: Optional[PlantSpline] = None
+        self.left_start_chain: Optional[np.ndarray] = None
+        self.right_start_chain: Optional[np.ndarray] = None
         self.current_left_row_id: Optional[int] = None
         self.current_right_row_id: Optional[int] = None
         self.next_row_id: int = 1
@@ -736,6 +742,12 @@ class MaizeNavigator(Node):
         )
         
         if self.left_row_spline.valid and self.right_row_spline.valid:
+            left_start = np.mean(self.left_row_points, axis=0) if self.left_row_points is not None and len(self.left_row_points) > 0 else np.array(self.left_row_spline.evaluate(self.left_row_spline.t_min), dtype=float)
+            right_start = np.mean(self.right_row_points, axis=0) if self.right_row_points is not None and len(self.right_row_points) > 0 else np.array(self.right_row_spline.evaluate(self.right_row_spline.t_min), dtype=float)
+            self.left_start_chain = np.array([left_start], dtype=float)
+            self.right_start_chain = np.array([right_start], dtype=float)
+            self.left_row_spline.row_points = np.array(self.left_start_chain, copy=True)
+            self.right_row_spline.row_points = np.array(self.right_start_chain, copy=True)
             self.current_left_row_id = self.next_row_id
             self.next_row_id += 1
             self.current_right_row_id = self.next_row_id
@@ -755,8 +767,20 @@ class MaizeNavigator(Node):
         t_l = self.left_row_spline.project(p_robot)
         t_r = self.right_row_spline.project(p_robot)
 
-        # 2. Paired cluster march: a cluster may only belong to one row, and both rows advance together.
-        new_pts_l, new_pts_r, shared_heading_yaw = self._march_row_pair_clusters(self.left_row_spline, self.right_row_spline)
+        # 2. Paired line march from the two current startpoints.
+        if self.left_start_chain is None or len(self.left_start_chain) == 0:
+            self.left_start_chain = np.array([np.array(self.left_row_spline.evaluate(self.left_row_spline.t_min), dtype=float)], dtype=float)
+        if self.right_start_chain is None or len(self.right_start_chain) == 0:
+            self.right_start_chain = np.array([np.array(self.right_row_spline.evaluate(self.right_row_spline.t_min), dtype=float)], dtype=float)
+
+        new_left_chain, new_right_chain, new_pts_l, new_pts_r, shared_heading_yaw = self._march_pair_startpoints(
+            self.left_start_chain,
+            self.right_start_chain,
+            self.robot_pose.yaw,
+        )
+
+        self.left_start_chain = new_left_chain
+        self.right_start_chain = new_right_chain
 
         if len(new_pts_l) > 0:
             self.left_row_points = self.accumulate_unique_points(
@@ -790,6 +814,7 @@ class MaizeNavigator(Node):
                         self.get_logger().info("Rejecting left temp_spline: invalid left/right row geometry")
                 if ok:
                     self.left_row_spline = temp_spline
+                    self.left_row_spline.row_points = np.array(self.left_start_chain, copy=True)
                     if self.current_left_row_id is not None:
                         self.remember_row(self.current_left_row_id, self.left_row_spline)
 
@@ -825,6 +850,7 @@ class MaizeNavigator(Node):
                         self.get_logger().info("Rejecting right temp_spline: invalid left/right row geometry")
                 if ok:
                     self.right_row_spline = temp_spline
+                    self.right_row_spline.row_points = np.array(self.right_start_chain, copy=True)
                     if self.current_right_row_id is not None:
                         self.remember_row(self.current_right_row_id, self.right_row_spline)
 
@@ -1049,6 +1075,11 @@ class MaizeNavigator(Node):
     def build_midline_polyline(self, left_spline: PlantSpline, right_spline: PlantSpline, num: int = 60) -> np.ndarray:
         if left_spline is None or right_spline is None or not left_spline.valid or not right_spline.valid:
             return np.empty((0, 2), dtype=float)
+        left_row_points = getattr(left_spline, "row_points", None)
+        right_row_points = getattr(right_spline, "row_points", None)
+        if left_row_points is not None and right_row_points is not None and len(left_row_points) >= 2 and len(right_row_points) >= 2:
+            count = min(len(left_row_points), len(right_row_points))
+            return 0.5 * (np.asarray(left_row_points[:count], dtype=float) + np.asarray(right_row_points[:count], dtype=float))
         left_points = left_spline.get_points(num=num)
         right_points = right_spline.get_points(num=num)
         if len(left_points) == 0 or len(right_points) == 0:
@@ -1231,6 +1262,108 @@ class MaizeNavigator(Node):
         right_out = np.vstack(collected_right) if collected_right else np.empty((0, 2), dtype=float)
         return left_out, right_out, shared_heading_yaw
 
+    def _march_pair_startpoints(
+        self,
+        left_chain: np.ndarray,
+        right_chain: np.ndarray,
+        initial_heading_yaw: float,
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, float]:
+        # Exact paired process: from two startpoints build two parallel lines,
+        # assign clusters uniquely, fit new parallel direction, step 0.5m, repeat.
+        step_distance = 0.5
+        forward_max_dist = 2.0
+        orthogonal_max_dist = 0.5
+        cluster_radius = max(0.12, float(self.p.row_cluster_radius))
+
+        left_chain = np.asarray(left_chain, dtype=float)
+        right_chain = np.asarray(right_chain, dtype=float)
+        if len(left_chain) == 0 or len(right_chain) == 0:
+            return left_chain, right_chain, np.empty((0, 2), dtype=float), np.empty((0, 2), dtype=float), float(initial_heading_yaw)
+
+        left_start = np.array(left_chain[-1], dtype=float)
+        right_start = np.array(right_chain[-1], dtype=float)
+        shared_dir = self._normalize_vector(np.array([math.cos(initial_heading_yaw), math.sin(initial_heading_yaw)], dtype=float))
+
+        pair_center = 0.5 * (left_start + right_start)
+        remaining_points = self.get_map_points_in_roi(Pose2D(pair_center[0], pair_center[1], initial_heading_yaw), 6.0)
+        if len(remaining_points) == 0:
+            return left_chain, right_chain, np.empty((0, 2), dtype=float), np.empty((0, 2), dtype=float), float(initial_heading_yaw)
+
+        added_left_points: List[np.ndarray] = []
+        added_right_points: List[np.ndarray] = []
+
+        for _ in range(24):
+            pair_perp = np.array([-shared_dir[1], shared_dir[0]], dtype=float)
+            clusters = self._cluster_nearby_points(remaining_points, cluster_radius)
+            if not clusters:
+                break
+
+            assigned_left: List[np.ndarray] = []
+            assigned_right: List[np.ndarray] = []
+            consumed_points: List[np.ndarray] = []
+
+            for cluster in clusters:
+                centroid = np.mean(cluster, axis=0)
+
+                rel_left = centroid - left_start
+                rel_right = centroid - right_start
+                along_left = float(rel_left @ shared_dir)
+                along_right = float(rel_right @ shared_dir)
+                orth_left = float(abs(rel_left @ pair_perp))
+                orth_right = float(abs(rel_right @ pair_perp))
+
+                valid_left = along_left >= 0.0 and along_left <= forward_max_dist and orth_left <= orthogonal_max_dist
+                valid_right = along_right >= 0.0 and along_right <= forward_max_dist and orth_right <= orthogonal_max_dist
+
+                if not valid_left and not valid_right:
+                    continue
+                if valid_left and valid_right:
+                    choose_left = orth_left <= orth_right
+                else:
+                    choose_left = valid_left
+
+                if choose_left:
+                    assigned_left.append(cluster)
+                else:
+                    assigned_right.append(cluster)
+                consumed_points.append(cluster)
+
+            if not assigned_left and not assigned_right:
+                break
+
+            left_pts = np.vstack(assigned_left) if assigned_left else np.empty((0, 2), dtype=float)
+            right_pts = np.vstack(assigned_right) if assigned_right else np.empty((0, 2), dtype=float)
+
+            if len(left_pts) > 0:
+                added_left_points.append(left_pts)
+            if len(right_pts) > 0:
+                added_right_points.append(right_pts)
+
+            left_dir = self._direction_from_points(left_pts - left_start, shared_dir) if len(left_pts) > 0 else shared_dir
+            right_dir = self._direction_from_points(right_pts - right_start, shared_dir) if len(right_pts) > 0 else shared_dir
+            shared_dir = self._normalize_vector(left_dir + right_dir)
+
+            new_left_start = left_start + step_distance * shared_dir
+            new_right_start = right_start + step_distance * shared_dir
+            left_chain = np.vstack((left_chain, new_left_start))
+            right_chain = np.vstack((right_chain, new_right_start))
+            left_start = new_left_start
+            right_start = new_right_start
+
+            if consumed_points:
+                remove_points = np.vstack(consumed_points)
+                keep_mask = np.ones(len(remaining_points), dtype=bool)
+                for ref_point in remove_points:
+                    keep_mask &= np.linalg.norm(remaining_points - ref_point, axis=1) > cluster_radius
+                remaining_points = remaining_points[keep_mask]
+            if len(remaining_points) == 0:
+                break
+
+        new_pts_l = np.vstack(added_left_points) if added_left_points else np.empty((0, 2), dtype=float)
+        new_pts_r = np.vstack(added_right_points) if added_right_points else np.empty((0, 2), dtype=float)
+        heading_yaw = float(math.atan2(shared_dir[1], shared_dir[0]))
+        return left_chain, right_chain, new_pts_l, new_pts_r, heading_yaw
+
     def handle_exit_row(self):
         dist = math.hypot(self.robot_pose.x - self.exit_start_pose.x, self.robot_pose.y - self.exit_start_pose.y)
         if dist >= self.p.exit_distance:
@@ -1324,7 +1457,9 @@ class MaizeNavigator(Node):
             is_current = row_id in {self.current_left_row_id, self.current_right_row_id}
             color = [0.0, 1.0, 0.0] if is_current else [0.65, 0.65, 0.65]
             alpha = 1.0 if is_current else 0.55
-            markers.markers.append(self.create_spline_marker(spline, row_id, color, alpha=alpha))
+            row_points = self.get_row_points_for_visualization(row_id, spline)
+            markers.markers.append(self.create_spline_marker(spline, row_id, color, alpha=alpha, row_points=row_points))
+            markers.markers.append(self.create_row_points_marker(row_id, color, alpha=alpha, row_points=row_points, is_current=is_current))
             if spline.segment_bounds and len(spline.segment_bounds) > 1:
                 markers.markers.append(self.create_segment_boundary_marker(spline, row_id, is_current=is_current))
             # publish debug markers for rejected/considered hypotheses
@@ -1354,12 +1489,38 @@ class MaizeNavigator(Node):
                     markers.markers.append(m2)
         self.marker_pub.publish(markers)
 
-    def create_spline_marker(self, spline: PlantSpline, id: int, color: list, alpha: float = 1.0) -> Marker:
+    def get_row_points_for_visualization(self, row_id: int, spline: PlantSpline) -> np.ndarray:
+        if row_id == self.current_left_row_id and self.left_start_chain is not None and len(self.left_start_chain) > 0:
+            return np.asarray(self.left_start_chain, dtype=float)
+        if row_id == self.current_right_row_id and self.right_start_chain is not None and len(self.right_start_chain) > 0:
+            return np.asarray(self.right_start_chain, dtype=float)
+        row_points = getattr(spline, "row_points", None)
+        if row_points is not None and len(row_points) > 0:
+            return np.asarray(row_points, dtype=float)
+        if hasattr(spline, "anchor_world") and spline.anchor_world is not None and len(spline.anchor_world) > 0:
+            return np.asarray(spline.anchor_world, dtype=float)
+        sampled = spline.get_points(num=50)
+        return np.asarray(sampled, dtype=float) if len(sampled) > 0 else np.empty((0, 2), dtype=float)
+
+    def create_spline_marker(self, spline: PlantSpline, id: int, color: list, alpha: float = 1.0, row_points: Optional[np.ndarray] = None) -> Marker:
         m = Marker(header=Header(frame_id=self.p.map_frame, stamp=self.get_clock().now().to_msg()))
         m.ns, m.id, m.type, m.action = "splines", id, Marker.LINE_STRIP, Marker.ADD
         m.scale.x = 0.04
         m.color.r, m.color.g, m.color.b, m.color.a = color[0], color[1], color[2], alpha
-        row_points = getattr(spline, "row_points", spline.anchor_world)
+        if row_points is None:
+            row_points = self.get_row_points_for_visualization(id, spline)
+        for p in row_points:
+            m.points.append(Point(x=float(p[0]), y=float(p[1]), z=0.0))
+        return m
+
+    def create_row_points_marker(self, id: int, color: list, alpha: float, row_points: np.ndarray, is_current: bool) -> Marker:
+        m = Marker(header=Header(frame_id=self.p.map_frame, stamp=self.get_clock().now().to_msg()))
+        m.ns, m.id, m.type, m.action = "row_points", 50000 + id, Marker.SPHERE_LIST, Marker.ADD
+        point_scale = 0.10 if is_current else 0.07
+        m.scale.x = point_scale
+        m.scale.y = point_scale
+        m.scale.z = point_scale
+        m.color.r, m.color.g, m.color.b, m.color.a = color[0], color[1], color[2], max(0.45, alpha)
         for p in row_points:
             m.points.append(Point(x=float(p[0]), y=float(p[1]), z=0.0))
         return m
