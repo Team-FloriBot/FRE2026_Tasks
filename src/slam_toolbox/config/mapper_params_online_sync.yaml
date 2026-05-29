@@ -1,7 +1,9 @@
 slam_toolbox:
   ros__parameters:
 
-    # Plugin params
+    # ============================================================
+    # Solver / Optimierung
+    # ============================================================
     solver_plugin: solver_plugins::CeresSolver
     ceres_linear_solver: SPARSE_NORMAL_CHOLESKY
     ceres_preconditioner: SCHUR_JACOBI
@@ -9,71 +11,131 @@ slam_toolbox:
     ceres_dogleg_type: TRADITIONAL_DOGLEG
     ceres_loss_function: None
 
-    # ROS Parameters
+    # ============================================================
+    # ROS Frames und Topics
+    # ============================================================
     odom_frame: odom
     map_frame: map
-    base_frame: base_link # später ändern auf base_footbrint
+
+    # Beibehalten, solange euer TF-Baum tatsächlich base_link verwendet.
+    # Erst auf base_footprint ändern, wenn dieser Frame sauber publiziert wird.
+    base_frame: base_link
+
     scan_topic: /sensors/merged_scan
     use_map_saver: true
-    mode: mapping #localization
+    mode: mapping  # Alternative: localization
 
-    # if you'd like to immediately start continuing a map at a given pose
-    # or at the dock, but they are mutually exclusive, if pose is given
-    # will use pose
-    #map_file_name: test_steve
-    #map_start_pose: [0.0, 0.0, 0.0]
-    #map_start_at_dock: true
+    # ============================================================
+    # Fortsetzen einer bereits gespeicherten Karte
+    # ============================================================
+    # map_file_name: test_steve
+    # map_start_pose: [0.0, 0.0, 0.0]
+    # map_start_at_dock: true
 
+    # ============================================================
+    # Laufzeit- und Map-Publikationsparameter
+    # ============================================================
     debug_logging: false
+
+    # Jeder eingehende Scan wird berücksichtigt.
     throttle_scans: 1
-    transform_publish_period: 0.02 #if 0 never publishes odometry
-    map_update_interval: 5.0
+
+    # TF map -> odom mit 50 Hz publizieren.
+    # Bei 0.0 wird kein Transform publiziert.
+    transform_publish_period: 0.02
+
+    # Geändert: OccupancyGrid wesentlich häufiger aktualisieren.
+    # Vorher: 5.0 s = 0.2 Hz
+    # Neu:   0.25 s = maximal ca. 4 Hz
+    map_update_interval: 0.25
+
+    # Zellauflösung der Occupancy Map.
     resolution: 0.05
+
     restamp_tf: false
-    min_laser_range: 0.0 #for rastering images
-    max_laser_range: 20.0 #for rastering images
-    minimum_time_interval: 0.5
+
+    # Für die Kartenerzeugung verwendeter Laserbereich.
+    # Falls euer LiDAR im Feld nur bis z. B. 8-12 m zuverlässig misst,
+    # kann max_laser_range später entsprechend reduziert werden.
+    min_laser_range: 0.0
+    max_laser_range: 20.0
+
+    # Geändert: Scans zeitlich häufiger für SLAM zulassen.
+    # Vorher: 0.5 s
+    # Neu:   0.10 s = maximal ca. 10 Scan-Updates/s
+    minimum_time_interval: 0.10
+
     transform_timeout: 0.2
-    tf_buffer_duration: 30.
-    stack_size_to_use: 40000000 #// program needs a larger stack size to serialize large maps
+    tf_buffer_duration: 30.0
+
+    # Für die Serialisierung großer Karten erforderlich.
+    stack_size_to_use: 40000000
+
     enable_interactive_mode: true
 
-    # General Parameters
+    # ============================================================
+    # Allgemeine SLAM-Parameter
+    # ============================================================
     use_scan_matching: true
     use_scan_barycenter: true
-    minimum_travel_distance: 0.5
-    minimum_travel_heading: 0.5
+
+    # Geändert: Neue Scans bereits nach kleinerer Translation aufnehmen.
+    # Vorher: 0.5 m
+    # Neu:   0.05 m
+    minimum_travel_distance: 0.05
+
+    # Geändert: Neue Scans bereits nach kleinerer Rotation aufnehmen.
+    # Vorher: 0.5 rad  ~= 28.6°
+    # Neu:   0.05 rad ~= 2.9°
+    minimum_travel_heading: 0.05
+
+    # Zunächst unverändert lassen.
+    # Bei Problemen während langsamer Wendemanöver kann dieser Wert
+    # separat getestet werden.
     check_min_dist_and_heading_precisely: false
+
     scan_buffer_size: 10
     scan_buffer_maximum_scan_distance: 10.0
-    link_match_minimum_response_fine: 0.1  
+
+    link_match_minimum_response_fine: 0.1
     link_scan_maximum_distance: 1.5
+
     loop_search_maximum_distance: 3.0
-    do_loop_closing: true 
-    loop_match_minimum_chain_size: 10           
-    loop_match_maximum_variance_coarse: 3.0  
-    loop_match_minimum_response_coarse: 0.35    
+    do_loop_closing: true
+
+    loop_match_minimum_chain_size: 10
+    loop_match_maximum_variance_coarse: 3.0
+    loop_match_minimum_response_coarse: 0.35
     loop_match_minimum_response_fine: 0.45
 
-    # Correlation Parameters - Correlation Parameters
+    # ============================================================
+    # Korrelationsparameter für lokales Scan Matching
+    # ============================================================
     correlation_search_space_dimension: 0.5
     correlation_search_space_resolution: 0.01
-    correlation_search_space_smear_deviation: 0.1 
+    correlation_search_space_smear_deviation: 0.1
 
-    # Correlation Parameters - Loop Closure Parameters
+    # ============================================================
+    # Korrelationsparameter für Loop Closure
+    # ============================================================
     loop_search_space_dimension: 8.0
     loop_search_space_resolution: 0.05
     loop_search_space_smear_deviation: 0.03
 
-    # Scan Matcher Parameters
-    distance_variance_penalty: 0.5      
-    angle_variance_penalty: 1.0    
+    # ============================================================
+    # Scan-Matcher-Parameter
+    # ============================================================
+    distance_variance_penalty: 0.5
+    angle_variance_penalty: 1.0
 
-    fine_search_angle_offset: 0.00349     
-    coarse_search_angle_offset: 0.349   
-    coarse_angle_resolution: 0.0349        
+    fine_search_angle_offset: 0.00349
+    coarse_search_angle_offset: 0.349
+    coarse_angle_resolution: 0.0349
+
     minimum_angle_penalty: 0.9
     minimum_distance_penalty: 0.5
+
     use_response_expansion: true
+
     min_pass_through: 2
     occupancy_threshold: 0.1
