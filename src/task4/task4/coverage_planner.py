@@ -112,14 +112,15 @@ class CoveragePlanner(Node):
             cell = f2c.Cell(ring)
             cells = f2c.Cells(cell)
 
+            # HIER DIE KORREKTUR: max_curv statt setMinRadius()
             robot = f2c.Robot(rob_width, op_width)
-            robot.setMinRadius(turn_rad)
+            robot.max_curv = 1.0 / turn_rad
 
             # Vorgewende abgrenzen
             hl_gen = f2c.HG_Const_hl()
             no_hl = hl_gen.generateHeadlands(cells, hl_width)
 
-            # Gassen generieren (KORREKTUR: .getCell(0) statt .getGeometry(0))
+            # Gassen generieren
             sg = f2c.SG_BruteForce()
             swaths = sg.generateSwaths(swath_angle, op_width, no_hl.getCell(0))
 
