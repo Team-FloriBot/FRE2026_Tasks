@@ -50,6 +50,7 @@ class PlantSpline:
         beam_width: int = 4,
         candidate_limit: int = 5,
         support_radius: float = 0.16,
+        cluster_radius: float = 0.18,
         support_weight: float = 2.8,
         prediction_weight: float = 2.2,
         smoothness_weight: float = 1.1,
@@ -69,6 +70,7 @@ class PlantSpline:
         self.beam_width = int(beam_width)
         self.candidate_limit = int(candidate_limit)
         self.support_radius = float(support_radius)
+        self.cluster_radius = float(cluster_radius)
         self.support_weight = float(support_weight)
         self.prediction_weight = float(prediction_weight)
         self.smoothness_weight = float(smoothness_weight)
@@ -154,6 +156,7 @@ class PlantSpline:
         beam_width: int = 4,
         candidate_limit: int = 5,
         support_radius: float = 0.16,
+        cluster_radius: float = 0.18,
         support_weight: float = 2.8,
         prediction_weight: float = 2.2,
         smoothness_weight: float = 1.1,
@@ -174,6 +177,7 @@ class PlantSpline:
             beam_width=beam_width,
             candidate_limit=candidate_limit,
             support_radius=support_radius,
+            cluster_radius=cluster_radius,
             support_weight=support_weight,
             prediction_weight=prediction_weight,
             smoothness_weight=smoothness_weight,
@@ -199,177 +203,131 @@ class PlantSpline:
             logger.info(f"Using linear fallback (n={len(self.points)})")
 
     def _build_window_path(self, fit_t: np.ndarray, fit_lateral: np.ndarray, logger: Optional[Node] = None) -> bool:
-        window_length = max(0.40, self.window_length)
-        window_step = max(0.15, self.window_step)
-        beam_width = max(2, self.beam_width)
-        candidate_limit = max(2, self.candidate_limit)
-        half_window = 0.5 * window_length
-        centers = np.arange(fit_t[0], fit_t[-1] + 0.5 * window_step, window_step)
-        if len(centers) < 2:
+        forward_max_dist = max(0.5, float(self.window_length))
+        step_distance = max(0.25, float(self.window_step))
+        orthogonal_max_dist = max(0.20, float(self.support_radius))
+        cluster_radius = max(0.10, float(self.cluster_radius))
+
+        if len(self.points) < 2:
             return False
 
-        # reset debug lists for this construction
         self._last_rejected = []
         self._last_accepted = []
 
-        def window_mask(center: float, scale: float = 1.0) -> np.ndarray:
-            return np.abs(fit_t - center) <= half_window * scale
+        def normalize(vec: np.ndarray) -> np.ndarray:
+            norm = float(np.linalg.norm(vec))
+            if norm < 1e-9:
+                return np.array([1.0, 0.0], dtype=float)
+            return vec / norm
 
-        def support_radius(window_values: np.ndarray) -> float:
-            if len(window_values) == 0:
-                return self.support_radius
-            spread = float(np.std(window_values))
-            return max(self.support_radius, 0.35 * spread + 0.02)
-
-        def candidate_list(window_values: np.ndarray, predicted: Optional[float], limit: int) -> Tuple[List[float], float]:
-            if len(window_values) == 0:
-                return ([float(predicted)] if predicted is not None else []), self.support_radius
-
-            radius = support_radius(window_values)
-            median = float(np.median(window_values))
-            mean = float(np.mean(window_values))
-            candidates = [median, mean]
-
-            if len(window_values) >= 4:
-                bins = max(3, min(7, int(np.sqrt(len(window_values))) + 1))
-                hist, edges = np.histogram(window_values, bins=bins)
-                for i in range(1, len(hist) - 1):
-                    if hist[i] > 0 and hist[i] >= hist[i - 1] and hist[i] >= hist[i + 1]:
-                        candidates.append(0.5 * (edges[i] + edges[i + 1]))
-                for i in np.argsort(hist)[::-1][:2]:
-                    if hist[i] > 0:
-                        candidates.append(0.5 * (edges[i] + edges[i + 1]))
-
-            if predicted is not None:
-                candidates.extend([predicted, predicted + 0.5 * radius, predicted - 0.5 * radius])
-
-            unique = []
-            for cand in candidates:
-                if cand is None or not np.isfinite(cand):
+        def cluster_points(candidate_points: np.ndarray) -> List[np.ndarray]:
+            if len(candidate_points) == 0:
+                return []
+            visited = np.zeros(len(candidate_points), dtype=bool)
+            clusters: List[np.ndarray] = []
+            for seed_idx in range(len(candidate_points)):
+                if visited[seed_idx]:
                     continue
-                if all(abs(float(cand) - other) > 1e-3 for other in unique):
-                    unique.append(float(cand))
+                stack = [seed_idx]
+                visited[seed_idx] = True
+                member_indices = []
+                while stack:
+                    idx = stack.pop()
+                    member_indices.append(idx)
+                    deltas = candidate_points - candidate_points[idx]
+                    neighbor_mask = np.linalg.norm(deltas, axis=1) <= cluster_radius
+                    neighbors = np.where(neighbor_mask & (~visited))[0]
+                    for neighbor_idx in neighbors:
+                        visited[neighbor_idx] = True
+                        stack.append(int(neighbor_idx))
+                cluster = candidate_points[np.array(member_indices, dtype=int)]
+                if len(cluster) >= 2:
+                    clusters.append(cluster)
+            return clusters
 
-            unique.sort(key=lambda cand: abs(cand - median))
-            return unique[:limit], radius
+        def fit_cluster_direction(cluster: np.ndarray) -> np.ndarray:
+            if len(cluster) < 2:
+                return self.main_dir
+            centered = cluster - np.mean(cluster, axis=0)
+            cov_local = np.cov(centered.T)
+            eigenvalues_local, eigenvectors_local = np.linalg.eig(cov_local)
+            return normalize(eigenvectors_local[:, int(np.argmax(eigenvalues_local))])
 
-        def support_score(window_values: np.ndarray, candidate: float, radius: float) -> int:
-            if len(window_values) == 0:
-                return 0
-            return int(np.sum(np.abs(window_values - candidate) <= radius))
+        start_anchor = np.mean(self.points, axis=0)
+        current_anchor = np.array(start_anchor, copy=True)
+        current_dir = normalize(np.array(self.main_dir, copy=True))
+        if np.dot(current_dir, np.array([math.cos(heading_yaw), math.sin(heading_yaw)])) < 0:
+            current_dir = -current_dir
 
-        first_center = float(centers[0])
-        first_values = fit_lateral[window_mask(first_center, scale=1.4)]
-        first_candidates, first_radius = candidate_list(first_values, predicted=None, limit=candidate_limit)
-        if not first_candidates:
-            first_candidates = [float(np.median(fit_lateral))]
+        anchors_world = [current_anchor]
+        anchors_t = [0.0]
+        anchors_l = [float((current_anchor - self.mean) @ self.perp_dir)]
 
-        beams = []
-        for cand in first_candidates:
-            support = support_score(first_values, cand, first_radius)
-            score = 2.5 * support - 1.2 * abs(cand - float(np.median(first_values)) if len(first_values) > 0 else 0.0)
-            beams.append({"t": [first_center], "l": [cand], "score": float(score)})
-            # record as initially accepted candidate for debug
-            self._last_accepted.append({"t": [float(first_center)], "l": [float(cand)], "score": float(score)})
+        remaining_points = np.array(self.points, copy=True)
+        max_steps = max(1, int(math.ceil(forward_max_dist / step_distance)) + 2)
 
-        for center in centers[1:]:
-            center = float(center)
-            broad_values = fit_lateral[window_mask(center, scale=1.4)]
-            base_values = fit_lateral[window_mask(center, scale=1.0)]
-            window_values = broad_values if len(broad_values) > 0 else base_values
-            if len(window_values) == 0:
-                window_values = fit_lateral
-            if len(window_values) == 0:
-                continue
+        for _step_idx in range(max_steps):
+            rel = remaining_points - current_anchor
+            along = rel @ current_dir
+            perp = rel @ np.array([-current_dir[1], current_dir[0]])
+            candidate_mask = (along >= 0.0) & (along <= forward_max_dist) & (np.abs(perp) <= orthogonal_max_dist)
+            candidate_points = remaining_points[candidate_mask]
+            if len(candidate_points) == 0:
+                break
 
-            new_beams = []
-            radius = support_radius(window_values)
-            for beam in beams:
-                prev_t = float(beam["t"][-1])
-                prev_l = float(beam["l"][-1])
-                if len(beam["t"]) >= 2:
-                    prev_dt = max(1e-3, float(beam["t"][-1] - beam["t"][-2]))
-                    prev_slope = float((beam["l"][-1] - beam["l"][-2]) / prev_dt)
-                else:
-                    prev_slope = 0.0
+            clusters = cluster_points(candidate_points)
+            if not clusters:
+                break
 
-                predicted = prev_l + prev_slope * (center - prev_t)
-                candidates_for_window, radius = candidate_list(window_values, predicted=predicted, limit=candidate_limit)
-                combined_candidates = list(candidates_for_window)
-                combined_candidates.append(predicted)
+            best_cluster = None
+            best_score = -float("inf")
+            for cluster in clusters:
+                centroid = np.mean(cluster, axis=0)
+                rel_centroid = centroid - current_anchor
+                along_c = float(rel_centroid @ current_dir)
+                perp_c = float(rel_centroid @ np.array([-current_dir[1], current_dir[0]]))
+                score = float(len(cluster))
+                score -= 1.2 * abs(along_c - step_distance)
+                score -= 0.6 * abs(perp_c)
+                if score > best_score:
+                    best_score = score
+                    best_cluster = cluster
 
-                for cand in combined_candidates:
-                    cand = float(cand)
-                    support = support_score(window_values, cand, radius)
-                    dt = max(1e-3, center - prev_t)
-                    candidate_slope = (cand - prev_l) / dt
-                    continuity_penalty = abs(cand - predicted) / max(radius, 0.05)
-                    slope_penalty = abs(candidate_slope - prev_slope)
-                    gap_penalty = 0.0 if support > 0 else 1.0
-                    score = float(beam["score"]) + self.support_weight * float(support) - self.prediction_weight * continuity_penalty - self.smoothness_weight * slope_penalty - self.gap_penalty * gap_penalty
-                    new_beams.append({"t": beam["t"] + [center], "l": beam["l"] + [cand], "score": score})
+            if best_cluster is None or best_score < 1.0:
+                break
 
-            if not new_beams:
-                new_beams = beams
+            centroid = np.mean(best_cluster, axis=0)
+            step_vec = centroid - current_anchor
+            step_len = float(np.linalg.norm(step_vec))
+            if step_len < 0.12:
+                break
 
-            new_beams.sort(key=lambda item: item["score"], reverse=True)
-            pruned = []
-            seen = set()
-            for beam in new_beams:
-                key = (round(float(beam["l"][-1]) / 0.03), len(beam["t"]))
-                if key in seen:
-                    continue
-                seen.add(key)
-                pruned.append(beam)
-                if len(pruned) >= beam_width:
-                    break
-            # collect rejected candidates for debug visualization
-            for beam in new_beams:
-                if beam not in pruned:
-                    try:
-                        self._last_rejected.append({"t": list(beam["t"]), "l": list(beam["l"]), "score": float(beam["score"])})
-                    except Exception:
-                        pass
-            beams = pruned if pruned else new_beams[:beam_width]
+            current_dir = normalize(0.6 * current_dir + 0.4 * (step_vec / step_len))
+            current_anchor = centroid
+            anchors_world.append(np.array(current_anchor, copy=True))
+            anchors_t.append(anchors_t[-1] + step_len)
+            anchors_l.append(float((current_anchor - self.mean) @ self.perp_dir))
 
-        if not beams:
+            keep_mask = np.ones(len(remaining_points), dtype=bool)
+            for cluster_point in best_cluster:
+                keep_mask &= np.linalg.norm(remaining_points - cluster_point, axis=1) > cluster_radius
+            remaining_points = remaining_points[keep_mask]
+            if len(remaining_points) == 0:
+                break
+
+        if len(anchors_world) < 2:
             return False
 
-        best = max(beams, key=lambda item: item["score"])
-        anchor_t = np.asarray(best["t"], dtype=float)
-        anchor_lateral = np.asarray(best["l"], dtype=float)
-        order = np.argsort(anchor_t)
-        anchor_t = anchor_t[order]
-        anchor_lateral = anchor_lateral[order]
+        self.anchor_world = np.asarray(anchors_world, dtype=float)
+        self.anchor_t = np.asarray(anchors_t, dtype=float)
+        self.anchor_lateral = np.asarray(anchors_l, dtype=float)
 
-        unique_anchor_t = [float(anchor_t[0])]
-        unique_anchor_l = [float(anchor_lateral[0])]
-        for t_val, l_val in zip(anchor_t[1:], anchor_lateral[1:]):
-            if abs(float(t_val) - unique_anchor_t[-1]) < 1e-3:
-                unique_anchor_l[-1] = 0.5 * (unique_anchor_l[-1] + float(l_val))
-            else:
-                unique_anchor_t.append(float(t_val))
-                unique_anchor_l.append(float(l_val))
-
-        anchor_t = np.asarray(unique_anchor_t, dtype=float)
-        anchor_lateral = np.asarray(unique_anchor_l, dtype=float)
-        if len(anchor_t) < 2:
-            return False
-
-        self.anchor_t = anchor_t
-        self.anchor_lateral = anchor_lateral
-        self.anchor_world = np.column_stack((
-            self.mean[0] + self.anchor_t * self.main_dir[0] + self.anchor_lateral * self.perp_dir[0],
-            self.mean[1] + self.anchor_t * self.main_dir[1] + self.anchor_lateral * self.perp_dir[1],
-        ))
         self.segment_bounds = [(float(self.anchor_t[i]), float(self.anchor_t[i + 1])) for i in range(len(self.anchor_t) - 1)]
         self.segment_splines = []
         self.lateral_spline = None
         self.valid = True
-        # store final accepted endpoints for debug
-        self._last_accepted.append({"t": [float(v) for v in self.anchor_t], "l": [float(v) for v in self.anchor_lateral], "score": float(best["score"])})
         if logger:
-            logger.info(f"Built sliding-window row with {len(self.anchor_t)} anchors and {len(self.segment_bounds)} segments")
+            logger.info(f"Built clustered row with {len(self.anchor_t)} anchors and {len(self.segment_bounds)} segments")
         return True
 
     def _interpolate_lateral(self, t: float) -> float:
@@ -523,6 +481,7 @@ class NavigatorParams:
     row_window_prediction_weight: float = 2.2
     row_window_smoothness_weight: float = 1.1
     row_window_gap_penalty: float = 0.9
+    row_cluster_radius: float = 0.18
     row_end_front_point_ratio: float = 0.08
     min_lane_width: float = 0.5
     max_lane_width: float = 1.5
@@ -605,6 +564,7 @@ class MaizeNavigator(Node):
         p.row_window_prediction_weight = get_param("row_window_prediction_weight", p.row_window_prediction_weight)
         p.row_window_smoothness_weight = get_param("row_window_smoothness_weight", p.row_window_smoothness_weight)
         p.row_window_gap_penalty = get_param("row_window_gap_penalty", p.row_window_gap_penalty)
+        p.row_cluster_radius = get_param("row_cluster_radius", p.row_cluster_radius)
         p.row_end_front_point_ratio = get_param("row_end_front_point_ratio", p.row_end_front_point_ratio)
         p.publish_debug = get_param("publish_debug", p.publish_debug)
         p.lookahead_dist = get_param("lookahead_dist", p.lookahead_dist)
@@ -749,6 +709,7 @@ class MaizeNavigator(Node):
             beam_width=self.p.row_window_beam_width,
             candidate_limit=self.p.row_window_candidate_limit,
             support_radius=self.p.row_extension_max_spline_distance,
+            cluster_radius=self.p.row_cluster_radius,
             support_weight=self.p.row_window_support_weight,
             prediction_weight=self.p.row_window_prediction_weight,
             smoothness_weight=self.p.row_window_smoothness_weight,
@@ -763,6 +724,7 @@ class MaizeNavigator(Node):
             beam_width=self.p.row_window_beam_width,
             candidate_limit=self.p.row_window_candidate_limit,
             support_radius=self.p.row_extension_max_spline_distance,
+            cluster_radius=self.p.row_cluster_radius,
             support_weight=self.p.row_window_support_weight,
             prediction_weight=self.p.row_window_prediction_weight,
             smoothness_weight=self.p.row_window_smoothness_weight,
@@ -821,6 +783,7 @@ class MaizeNavigator(Node):
                 beam_width=self.p.row_window_beam_width,
                 candidate_limit=self.p.row_window_candidate_limit,
                 support_radius=self.p.row_extension_max_spline_distance,
+                cluster_radius=self.p.row_cluster_radius,
                 support_weight=self.p.row_window_support_weight,
                 prediction_weight=self.p.row_window_prediction_weight,
                 smoothness_weight=self.p.row_window_smoothness_weight,
@@ -877,6 +840,7 @@ class MaizeNavigator(Node):
                 beam_width=self.p.row_window_beam_width,
                 candidate_limit=self.p.row_window_candidate_limit,
                 support_radius=self.p.row_extension_max_spline_distance,
+                cluster_radius=self.p.row_cluster_radius,
                 support_weight=self.p.row_window_support_weight,
                 prediction_weight=self.p.row_window_prediction_weight,
                 smoothness_weight=self.p.row_window_smoothness_weight,

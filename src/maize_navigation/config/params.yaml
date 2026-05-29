@@ -16,14 +16,15 @@ maize_navigator:
     row_search_width: 0.50
     row_exclusion_distance: 0.30
     row_extension_max_spline_distance: 0.22
-    row_window_length: 0.70
-    row_window_step: 0.25
+    row_window_length: 2.00
+    row_window_step: 0.50
     row_window_beam_width: 6
     row_window_candidate_limit: 6
     row_window_support_weight: 3.2
     row_window_prediction_weight: 1.6
     row_window_smoothness_weight: 1.8
     row_window_gap_penalty: 1.4
+    row_cluster_radius: 0.18
     row_end_front_point_ratio: 0.08
     min_lane_width: 0.55
     max_lane_width: 1.20
