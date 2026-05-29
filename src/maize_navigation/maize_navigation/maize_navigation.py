@@ -198,7 +198,7 @@ class NavigatorParams:
     map_topic: str = "/map"
     map_frame: str = "map"
     
-    control_frequency: float = 20.0
+    control_frequency: float = 30.0
     expected_row_width: float = 0.75
     
     # Histogram params
@@ -207,8 +207,8 @@ class NavigatorParams:
     occ_threshold: int = 50
     
     # Driving params
-    follow_speed: float = 0.35
-    turn_speed: float = 0.25
+    follow_speed: float = 0.25
+    turn_speed: float = 0.20
     exit_distance: float = 0.5
     min_turn_radius: float = 0.5
     lookahead_dist: float = 0.6
