@@ -30,19 +30,17 @@ class CoveragePlanner(Node):
         self.declare_parameter('swath_angle_deg', 0.0)
         self.declare_parameter('routing_pattern', 'boustrophedon')
         
-        # input_frame: Wo eure Koordinaten herkommen (Roboter)
-        # target_frame: Das weltfeste System (Odom oder Map)
         self.declare_parameter('input_frame', 'base_link')
         self.declare_parameter('target_frame', 'odom')
 
-        # 2. TF2 Setup initialisieren
+        # 2. TF2 Setup
         self.tf_buffer = tf2_ros.Buffer()
         self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
 
-        # 3. Publisher für den finalen Pfad
+        # 3. Publisher
         self.path_pub = self.create_publisher(Path, 'plan', 10)
 
-        # 4. Service erstellen (Wartet passiv auf den Startknopf/Aufruf)
+        # 4. Service
         self.srv = self.create_service(
             Trigger, 
             'trigger_coverage_planning', 
@@ -55,12 +53,12 @@ class CoveragePlanner(Node):
         target_frame = self.get_parameter('target_frame').get_parameter_value().string_value
 
         try:
-            # Aktuellste Transformation zwischen base_link und odom/map holen
             transform = self.tf_buffer.lookup_transform(
                 target_frame, input_frame, rclpy.time.Time()
             )
+            self.get_logger().info(f"TF von {input_frame} nach {target_frame} geholt. Starte Pfadplanung...")
             
-            self.get_logger().info(f"TF von {input_frame} nach {target_frame} erfolgreich geholt. Starte Pfadplanung...")
+            # Aufruf der Planungs-Pipeline
             self.generate_coverage_path(transform)
             
             response.success = True
@@ -73,7 +71,6 @@ class CoveragePlanner(Node):
         return response
 
     def generate_coverage_path(self, transform):
-        # Parameter auslesen
         coords = self.get_parameter('polygon_coords').get_parameter_value().double_array_value
         op_width = self.get_parameter('operating_width').get_parameter_value().double_value
         rob_width = self.get_parameter('robot_width').get_parameter_value().double_value
@@ -87,7 +84,7 @@ class CoveragePlanner(Node):
             self.get_logger().error("polygon_coords muss eine gerade Anzahl an Elementen besitzen!")
             return
 
-        # --- 1. SCHRITT: Transformation der Koordinaten von base_link nach odom ---
+        # 1. Transformation nach odom
         transformed_coords = []
         for i in range(0, len(coords), 2):
             point_in = PointStamped()
@@ -96,17 +93,14 @@ class CoveragePlanner(Node):
             point_in.point.y = coords[i+1]
             point_in.point.z = 0.0
 
-            # Punkt ins globale System transformieren
             point_out = do_transform_point(point_in, transform)
             transformed_coords.append((point_out.point.x, point_out.point.y))
 
-        # --- 2. SCHRITT: Fields2Cover Pipeline (Exakte API-Anpassung) ---
+        # 2. Fields2Cover Pipeline
         try:
             ring = f2c.LinearRing()
             for pt in transformed_coords:
                 ring.addPoint(pt[0], pt[1])
-            
-            # Polygon explizit mit dem ersten transformierten Punkt schließen
             ring.addPoint(transformed_coords[0][0], transformed_coords[0][1])
             
             cell = f2c.Cell(ring)
@@ -115,7 +109,7 @@ class CoveragePlanner(Node):
             robot = f2c.Robot(rob_width, op_width)
             robot.max_curv = 1.0 / turn_rad
 
-            # Vorgewende abgrenzen 
+            # Vorgewende
             hl_gen = f2c.HG_Const_gen()
             no_hl = hl_gen.generateHeadlands(cells, hl_width)
 
@@ -123,7 +117,7 @@ class CoveragePlanner(Node):
             sg = f2c.SG_BruteForce()
             swaths = sg.generateSwaths(swath_angle, op_width, no_hl.getCell(0))
 
-            # Routing Muster bestimmen & Gassen sortieren
+            # Routing (Gassen sortieren)
             if pattern == 'snake':
                 rp = f2c.RP_Snake()
             else:
@@ -131,34 +125,29 @@ class CoveragePlanner(Node):
             
             sorted_swaths = rp.genSortedSwaths(swaths)
 
-            # Kinematische Pfadplanung mit Dubins-Kurven
+            # Pfadplanung
             pp = f2c.PP_PathPlanning()
-            
-            # KORREKTUR: PP_DubinsCurves statt PT_Dubins
             dubins = f2c.PP_DubinsCurves()
-            
-            # Pfad generieren
             f2c_path = pp.planPath(robot, sorted_swaths, dubins)
 
-            # Pfad publizieren
+            # Aufruf der korrigierten Publisher-Methode über self
             self.publish_ros_path(f2c_path, target_frame)
 
         except Exception as e:
-            raise RuntimeError(f"Fields2Cover Kern-Fehler: {e}")
+            raise RuntimeError(f"{e}")
 
-def publish_ros_path(self, f2c_path, frame_id):
+    def publish_ros_path(self, f2c_path, frame_id):
         ros_path = Path()
         ros_path.header.frame_id = frame_id
         ros_path.header.stamp = self.get_clock().now().to_msg()
 
-        # --- Ermitteln, wie die Zustände im Pfad gespeichert sind ---
+        # Dynamische Ermittlung der Zustände (SWIG Vektor vs. Attribut)
         states = []
         if hasattr(f2c_path, 'states'):
             states = f2c_path.states
         elif hasattr(f2c_path, 'getStates'):
             states = f2c_path.getStates()
         else:
-            # Falls das Path-Objekt selbst der Vektor/die Liste ist (SWIG-Standard)
             states = f2c_path
 
         try:
@@ -169,7 +158,6 @@ def publish_ros_path(self, f2c_path, frame_id):
                 pose.pose.position.y = state.point.getY()
                 pose.pose.position.z = 0.0
                 
-                # Orientierung (Yaw) berechnen
                 q = quaternion_from_euler(0, 0, state.angle)
                 pose.pose.orientation.x = q[0]
                 pose.pose.orientation.y = q[1]
@@ -179,15 +167,13 @@ def publish_ros_path(self, f2c_path, frame_id):
                 ros_path.poses.append(pose)
         except Exception as e:
             self.get_logger().error(f"Fehler beim Parsen der Pfad-Zustände: {e}")
-            # Falls auch 'state.point' oder 'state.angle' anders heißen, 
-            # loggen wir hier die Attribute des ersten Elements zur Diagnose
             if len(states) > 0:
-                self.get_logger().info(f"Attribute eines PathState-Objekts: {dir(states[0])}")
+                self.get_logger().info(f"Verfügbare Attribute im Zustand: {dir(states[0])}")
             return
 
         self.path_pub.publish(ros_path)
         self.get_logger().info(f"Pfad mit {len(ros_path.poses)} Wegpunkten erfolgreich auf /plan publiziert!")
-        
+
 def main(args=None):
     rclpy.init(args=args)
     node = CoveragePlanner()
