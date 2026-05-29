@@ -112,12 +112,11 @@ class CoveragePlanner(Node):
             cell = f2c.Cell(ring)
             cells = f2c.Cells(cell)
 
-            # HIER DIE KORREKTUR: max_curv statt setMinRadius()
             robot = f2c.Robot(rob_width, op_width)
             robot.max_curv = 1.0 / turn_rad
 
-            # Vorgewende abgrenzen
-            hl_gen = f2c.HG_Const_hl()
+            # Vorgewende abgrenzen (KORREKTUR: HG_ConstHl statt HG_Const_hl)
+            hl_gen = f2c.HG_ConstHl()
             no_hl = hl_gen.generateHeadlands(cells, hl_width)
 
             # Gassen generieren
