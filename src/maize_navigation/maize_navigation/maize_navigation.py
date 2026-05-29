@@ -51,40 +51,49 @@ class PlantSpline:
         candidate_limit: int = 5,
         support_radius: float = 0.16,
         cluster_radius: float = 0.18,
-        support_weight: float = 2.8,
-        prediction_weight: float = 2.2,
+            clusters_with_idx = self._cluster_nearby_points_with_indices(candidate_points, cluster_radius)
+            if not clusters_with_idx:
         smoothness_weight: float = 1.1,
         gap_penalty: float = 0.9,
-        logger: Optional[Node] = None,
-    ):
+            left_ref = float((left_end - pair_center) @ pair_perp)
+            right_ref = float((right_end - pair_center) @ pair_perp)
         self.valid = False
         self.t_min = 0.0
         self.t_max = 0.0
-        self.linear_mode = False
-        self.points = np.asarray(points, dtype=float)
-        self.main_dir = None
+            # Track assigned indices relative to candidate_points to ensure exclusivity
+            assigned_candidate_indices = set()
+            candidate_idx_map = np.where(candidate_mask)[0]
         self.perp_dir = None
-        self.mean = None
-        self.window_length = float(window_length)
-        self.window_step = float(window_step)
-        self.beam_width = int(beam_width)
-        self.candidate_limit = int(candidate_limit)
-        self.support_radius = float(support_radius)
-        self.cluster_radius = float(cluster_radius)
-        self.support_weight = float(support_weight)
-        self.prediction_weight = float(prediction_weight)
-        self.smoothness_weight = float(smoothness_weight)
-        self.gap_penalty = float(gap_penalty)
-        self.anchor_t = np.array([], dtype=float)
-        self.anchor_lateral = np.array([], dtype=float)
-        self.anchor_world = np.empty((0, 2), dtype=float)
-        self.row_points = self.anchor_world
-        self.segment_bounds: List[Tuple[float, float]] = []
-        self.segment_splines: List[object] = []
-        self.lateral_spline = None
-        # Debug: store last window candidates and rejected hypotheses for visualization
-        self._last_rejected: List[dict] = []
-        self._last_accepted: List[dict] = []
+            for cluster, rel_indices in clusters_with_idx:
+                mapped = [int(candidate_idx_map[i]) for i in rel_indices]
+                if any(mi in assigned_candidate_indices for mi in mapped):
+                    continue
+
+                cluster_rel = cluster - pair_center
+                cluster_along = cluster_rel @ shared_dir
+                cluster_lateral = cluster_rel @ pair_perp
+
+                left_mask = (cluster_along >= 0.0) & (cluster_along <= forward_max_dist) & (np.abs(cluster_lateral - left_ref) <= orthogonal_max_dist)
+                right_mask = (cluster_along >= 0.0) & (cluster_along <= forward_max_dist) & (np.abs(cluster_lateral - right_ref) <= orthogonal_max_dist)
+                if not np.any(left_mask) and not np.any(right_mask):
+                    continue
+
+                both_mask = left_mask & right_mask
+                left_only_mask = left_mask & (~right_mask)
+                right_only_mask = right_mask & (~left_mask)
+                if np.any(both_mask):
+                    choose_left_both = np.abs(cluster_lateral[both_mask] - left_ref) <= np.abs(cluster_lateral[both_mask] - right_ref)
+                    left_only_mask = left_only_mask | (both_mask & choose_left_both)
+                    right_only_mask = right_only_mask | (both_mask & (~choose_left_both))
+
+                left_indices = np.where(left_only_mask)[0]
+                right_indices = np.where(right_only_mask)[0]
+                if len(left_indices) > 0:
+                    step_left_clusters.append(cluster[left_indices])
+                    assigned_candidate_indices.update([mapped[i] for i in left_indices])
+                if len(right_indices) > 0:
+                    step_right_clusters.append(cluster[right_indices])
+                    assigned_candidate_indices.update([mapped[i] for i in right_indices])
 
         if len(self.points) < 4:
             return
@@ -1174,6 +1183,24 @@ class MaizeNavigator(Node):
                 clusters.append((cluster, np.array(member_indices, dtype=int)))
         return clusters
 
+    def _points_in_marching_quad(
+        self,
+        points: np.ndarray,
+        origin: np.ndarray,
+        forward_dir: np.ndarray,
+        lateral_center: float,
+        forward_max_dist: float,
+        lateral_half_width: float,
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        if len(points) == 0:
+            return np.zeros(0, dtype=bool), np.empty((0, 2), dtype=float)
+        perp_dir = np.array([-forward_dir[1], forward_dir[0]], dtype=float)
+        rel = points - origin
+        along = rel @ forward_dir
+        lateral = rel @ perp_dir
+        mask = (along >= 0.0) & (along <= forward_max_dist) & (np.abs(lateral - lateral_center) <= lateral_half_width)
+        return mask, lateral
+
     def _direction_from_points(self, points: np.ndarray, fallback_dir: np.ndarray) -> np.ndarray:
         if len(points) < 2:
             return self._normalize_vector(np.asarray(fallback_dir, dtype=float))
@@ -1347,34 +1374,42 @@ class MaizeNavigator(Node):
 
             # Track indices into remaining_points already assigned this step
             assigned_indices_set = set()
+            left_ref = float((left_start - pair_center) @ pair_perp)
+            right_ref = float((right_start - pair_center) @ pair_perp)
 
             for cluster, rel_indices in clusters_with_idx:
                 # skip if any member was already assigned
                 if any(int(i) in assigned_indices_set for i in rel_indices):
                     continue
 
-                centroid = np.mean(cluster, axis=0)
+                cluster_rel = cluster - pair_center
+                cluster_along = cluster_rel @ shared_dir
+                cluster_lateral = cluster_rel @ pair_perp
 
-                centroid_rel = centroid - pair_center
-                centroid_along = float(centroid_rel @ shared_dir)
-                centroid_orth = float(centroid_rel @ pair_perp)
+                left_mask = (cluster_along >= 0.0) & (cluster_along <= current_forward_max_dist) & (np.abs(cluster_lateral - left_ref) <= orthogonal_max_dist)
+                right_mask = (cluster_along >= 0.0) & (cluster_along <= current_forward_max_dist) & (np.abs(cluster_lateral - right_ref) <= orthogonal_max_dist)
 
-                left_ref = float((left_start - pair_center) @ pair_perp)
-                right_ref = float((right_start - pair_center) @ pair_perp)
-
-                if centroid_along < 0.0 or centroid_along > current_forward_max_dist or abs(centroid_orth) > orthogonal_max_dist:
+                if not np.any(left_mask) and not np.any(right_mask):
                     continue
 
-                d_left = abs(centroid_orth - left_ref)
-                d_right = abs(centroid_orth - right_ref)
+                both_mask = left_mask & right_mask
+                left_only_mask = left_mask & (~right_mask)
+                right_only_mask = right_mask & (~left_mask)
+                if np.any(both_mask):
+                    choose_left_both = np.abs(cluster_lateral[both_mask] - left_ref) <= np.abs(cluster_lateral[both_mask] - right_ref)
+                    left_only_mask = left_only_mask | (both_mask & choose_left_both)
+                    right_only_mask = right_only_mask | (both_mask & (~choose_left_both))
 
-                mapped_indices = [int(i) for i in rel_indices]
-                if d_left <= d_right:
-                    assigned_left.append(cluster)
+                left_indices = np.where(left_only_mask)[0]
+                right_indices = np.where(right_only_mask)[0]
+                if len(left_indices) > 0:
+                    assigned_left.append(cluster[left_indices])
+                    mapped_indices = [int(rel_indices[i]) for i in left_indices]
                     assigned_indices_set.update(mapped_indices)
                     consumed_indices.extend(mapped_indices)
-                else:
-                    assigned_right.append(cluster)
+                if len(right_indices) > 0:
+                    assigned_right.append(cluster[right_indices])
+                    mapped_indices = [int(rel_indices[i]) for i in right_indices]
                     assigned_indices_set.update(mapped_indices)
                     consumed_indices.extend(mapped_indices)
 
