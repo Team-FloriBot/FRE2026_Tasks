@@ -127,6 +127,8 @@ class PlantSpline:
         # Das entspricht dem stabilen Referenzansatz viel näher als ein freier 2D-Parametrisierungsspline.
         try:
             k = min(max_k, len(fit_t) - 1)
+            if logger:
+                logger.info(f"Fitting spline with k = {k}")
             lateral_spread = float(np.std(fit_lateral))
             s_used = float(s) * max(0.35, 1.0 + 0.20 * lateral_spread)
             self.lateral_spline = UnivariateSpline(fit_t, fit_lateral, k=k, s=s_used)
