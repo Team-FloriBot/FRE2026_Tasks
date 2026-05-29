@@ -15,8 +15,8 @@ maize_navigator:
     row_search_max_dist: 1.5
     row_search_width: 0.50
     row_exclusion_distance: 0.30
-    spline_s: 60.0
-    max_spline_k: 10
+    spline_s: 30.0
+    max_spline_k: 5
     min_lane_width: 0.55
     max_lane_width: 1.20
 

@@ -126,14 +126,22 @@ class PlantSpline:
         # 1D-Fit: nur die laterale Abweichung über der Hauptachse wird modelliert.
         # Das entspricht dem stabilen Referenzansatz viel näher als ein freier 2D-Parametrisierungsspline.
         try:
-            k = min(max_k, len(fit_t) - 1)
+            # SciPy UnivariateSpline supports only low-order splines (k <= 5).
+            # Clamp both by data size and library limits so invalid k values do not kill the fit.
+            requested_k = int(max_k)
+            k = min(max(1, requested_k), 5, len(fit_t) - 1)
             if logger:
-                logger.info(f"Fitting spline with k = {k}")
+                if k != requested_k:
+                    logger.info(f"Fitting spline with k = {k} (requested {requested_k})")
+                else:
+                    logger.info(f"Fitting spline with k = {k}")
             lateral_spread = float(np.std(fit_lateral))
             s_used = float(s) * max(0.35, 1.0 + 0.20 * lateral_spread)
             self.lateral_spline = UnivariateSpline(fit_t, fit_lateral, k=k, s=s_used)
             self.valid = True
-        except Exception:
+        except Exception as exc:
+            if logger:
+                logger.info(f"Spline fit failed: {exc}")
             self.valid = False
             return
 
@@ -217,8 +225,8 @@ class NavigatorParams:
     row_search_max_dist: float = 2.2
     row_search_width: float = 0.50
     row_exclusion_distance: float = 0.30
-    spline_s: float = 60.0
-    max_spline_k: int = 3
+    spline_s: float = 30.0
+    max_spline_k: int = 5
     min_lane_width: float = 0.5
     max_lane_width: float = 1.5
     
