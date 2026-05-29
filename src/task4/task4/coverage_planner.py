@@ -100,7 +100,7 @@ class CoveragePlanner(Node):
             point_out = do_transform_point(point_in, transform)
             transformed_coords.append((point_out.point.x, point_out.point.y))
 
-# --- 2. SCHRITT: Fields2Cover Pipeline (Exakte API-Anpassung) ---
+        # --- 2. SCHRITT: Fields2Cover Pipeline (Exakte API-Anpassung) ---
         try:
             ring = f2c.LinearRing()
             for pt in transformed_coords:
@@ -146,30 +146,48 @@ class CoveragePlanner(Node):
         except Exception as e:
             raise RuntimeError(f"Fields2Cover Kern-Fehler: {e}")
 
-    def publish_ros_path(self, f2c_path, frame_id):
+def publish_ros_path(self, f2c_path, frame_id):
         ros_path = Path()
         ros_path.header.frame_id = frame_id
         ros_path.header.stamp = self.get_clock().now().to_msg()
 
-        for state in f2c_path.states:
-            pose = PoseStamped()
-            pose.header = ros_path.header
-            pose.pose.position.x = state.point.getX()
-            pose.pose.position.y = state.point.getY()
-            pose.pose.position.z = 0.0
-            
-            # Orientierung (Yaw) berechnen
-            q = quaternion_from_euler(0, 0, state.angle)
-            pose.pose.orientation.x = q[0]
-            pose.pose.orientation.y = q[1]
-            pose.pose.orientation.z = q[2]
-            pose.pose.orientation.w = q[3]
-            
-            ros_path.poses.append(pose)
+        # --- Ermitteln, wie die Zustände im Pfad gespeichert sind ---
+        states = []
+        if hasattr(f2c_path, 'states'):
+            states = f2c_path.states
+        elif hasattr(f2c_path, 'getStates'):
+            states = f2c_path.getStates()
+        else:
+            # Falls das Path-Objekt selbst der Vektor/die Liste ist (SWIG-Standard)
+            states = f2c_path
+
+        try:
+            for state in states:
+                pose = PoseStamped()
+                pose.header = ros_path.header
+                pose.pose.position.x = state.point.getX()
+                pose.pose.position.y = state.point.getY()
+                pose.pose.position.z = 0.0
+                
+                # Orientierung (Yaw) berechnen
+                q = quaternion_from_euler(0, 0, state.angle)
+                pose.pose.orientation.x = q[0]
+                pose.pose.orientation.y = q[1]
+                pose.pose.orientation.z = q[2]
+                pose.pose.orientation.w = q[3]
+                
+                ros_path.poses.append(pose)
+        except Exception as e:
+            self.get_logger().error(f"Fehler beim Parsen der Pfad-Zustände: {e}")
+            # Falls auch 'state.point' oder 'state.angle' anders heißen, 
+            # loggen wir hier die Attribute des ersten Elements zur Diagnose
+            if len(states) > 0:
+                self.get_logger().info(f"Attribute eines PathState-Objekts: {dir(states[0])}")
+            return
 
         self.path_pub.publish(ros_path)
         self.get_logger().info(f"Pfad mit {len(ros_path.poses)} Wegpunkten erfolgreich auf /plan publiziert!")
-
+        
 def main(args=None):
     rclpy.init(args=args)
     node = CoveragePlanner()
