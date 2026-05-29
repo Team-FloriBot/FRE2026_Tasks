@@ -12,11 +12,11 @@ maize_navigator:
     control_frequency: 30.0
 
     expected_row_width: 0.75
-    row_search_max_dist: 1.5
+    row_search_max_dist: 1.25
     row_search_width: 0.50
     row_exclusion_distance: 0.30
-    spline_s: 30.0
-    max_spline_k: 5
+    spline_s: 20.0
+    max_spline_k: 10
     min_lane_width: 0.55
     max_lane_width: 1.20
 
