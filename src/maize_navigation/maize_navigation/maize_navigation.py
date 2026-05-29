@@ -408,6 +408,11 @@ class MaizeNavigator(Node):
             self.get_logger().info(f"Could not select a row pair from peaks: {peaks}", throttle_duration_sec=2.0)
             return
 
+        self.get_logger().info(
+            f"Selected peak pair: upper={best_left:.3f}, lower={best_right:.3f}, sep={abs(best_left - best_right):.3f}, expected={self.p.expected_row_width:.3f}",
+            throttle_duration_sec=2.0,
+        )
+
         if abs(best_left - best_right) < self.p.min_lane_width or abs(best_left - best_right) > self.p.max_lane_width:
             self.get_logger().info(
                 f"Rejecting row pair by width: sep={abs(best_left - best_right):.2f}, expected={self.p.expected_row_width:.2f}",
@@ -431,7 +436,7 @@ class MaizeNavigator(Node):
             self.row_entry_pose = self.robot_pose
             self.state = MissionState.FOLLOW_ROW
             self.get_logger().info(
-                f"Rows found. IDs: L={self.current_left_row_id}, R={self.current_right_row_id}. Width: {best_left - best_right:.2f}m. Following..."
+                f"Rows found. IDs: L={self.current_left_row_id}, R={self.current_right_row_id}. Assigned to peak order {self.row_ids_in_order}. Width: {best_left - best_right:.2f}m. Following..."
             )
 
     def handle_follow_row(self):
