@@ -78,6 +78,7 @@ class PlantSpline:
         self.anchor_t = np.array([], dtype=float)
         self.anchor_lateral = np.array([], dtype=float)
         self.anchor_world = np.empty((0, 2), dtype=float)
+        self.row_points = self.anchor_world
         self.segment_bounds: List[Tuple[float, float]] = []
         self.segment_splines: List[object] = []
         self.lateral_spline = None
@@ -196,6 +197,7 @@ class PlantSpline:
             float((self.line_end - self.mean) @ self.perp_dir),
         ], dtype=float)
         self.anchor_world = np.array([self.line_start, self.line_end], dtype=float)
+        self.row_points = self.anchor_world
         self.segment_bounds = [(float(self.t_min), float(self.t_max))]
         self.segment_splines = []
         self.lateral_spline = None
@@ -319,6 +321,7 @@ class PlantSpline:
             return False
 
         self.anchor_world = np.asarray(anchors_world, dtype=float)
+        self.row_points = self.anchor_world
         self.anchor_t = np.asarray(anchors_t, dtype=float)
         self.anchor_lateral = np.asarray(anchors_l, dtype=float)
 
@@ -852,29 +855,18 @@ class MaizeNavigator(Node):
             self.state = MissionState.EXIT_ROW
             return
 
-        # 5. Pure Pursuit on mid-spline with local cross-track correction
-        t_lookahead = (t_l + t_r) / 2.0 + self.p.lookahead_dist
-        t_l_eval = max(self.left_row_spline.t_min, min(t_lookahead, self.left_row_spline.t_max))
-        t_r_eval = max(self.right_row_spline.t_min, min(t_lookahead, self.right_row_spline.t_max))
-        
-        p_l = np.array(self.left_row_spline.evaluate(t_l_eval))
-        p_r = np.array(self.right_row_spline.evaluate(t_r_eval))
-        p_target = (p_l + p_r) / 2.0
-        
-        # Local lateral error correction
-        curr_p_l = np.array(self.left_row_spline.evaluate(t_l))
-        curr_p_r = np.array(self.right_row_spline.evaluate(t_r))
-        curr_mid = (curr_p_l + curr_p_r) / 2.0
-        
-        c, s = math.cos(-self.robot_pose.yaw), math.sin(-self.robot_pose.yaw)
-        local_dy = s * (curr_mid[0] - self.robot_pose.x) + c * (curr_mid[1] - self.robot_pose.y)
-        
-        if abs(local_dy) > 0.05:
-            target_yaw = self.robot_pose.yaw + math.pi / 2.0
-            p_target[0] += math.cos(target_yaw) * local_dy * 0.5
-            p_target[1] += math.sin(target_yaw) * local_dy * 0.5
-        
-        self.drive_to_point(p_target)
+        # 5. Drive on the midpoint polyline between the two recognized rows.
+        midline = self.build_midline_polyline(self.left_row_spline, self.right_row_spline, num=60)
+        if len(midline) < 2:
+            return
+
+        robot_point = np.array([self.robot_pose.x, self.robot_pose.y], dtype=float)
+        closest_idx = int(np.argmin(np.linalg.norm(midline - robot_point, axis=1)))
+        mid_lookahead = self.point_at_polyline_distance(midline, closest_idx, self.p.lookahead_dist)
+        if mid_lookahead is None:
+            mid_lookahead = midline[-1]
+
+        self.drive_to_point(np.asarray(mid_lookahead, dtype=float))
 
     def find_points_along_tangent(
         self,
@@ -1053,6 +1045,32 @@ class MaizeNavigator(Node):
         local_x, local_y = c * dx - s * dy, s * dx + c * dy
         mask = (local_x > 0.3) & (local_x < distance) & (np.abs(local_y) < width/2.0)
         return points[mask]
+
+    def build_midline_polyline(self, left_spline: PlantSpline, right_spline: PlantSpline, num: int = 60) -> np.ndarray:
+        if left_spline is None or right_spline is None or not left_spline.valid or not right_spline.valid:
+            return np.empty((0, 2), dtype=float)
+        left_points = left_spline.get_points(num=num)
+        right_points = right_spline.get_points(num=num)
+        if len(left_points) == 0 or len(right_points) == 0:
+            return np.empty((0, 2), dtype=float)
+        count = min(len(left_points), len(right_points))
+        return 0.5 * (left_points[:count] + right_points[:count])
+
+    def point_at_polyline_distance(self, polyline: np.ndarray, start_idx: int, distance_ahead: float) -> Optional[np.ndarray]:
+        if len(polyline) < 2:
+            return None
+        start_idx = int(np.clip(start_idx, 0, len(polyline) - 1))
+        travelled = 0.0
+        for idx in range(start_idx, len(polyline) - 1):
+            segment = polyline[idx + 1] - polyline[idx]
+            seg_len = float(np.linalg.norm(segment))
+            if seg_len < 1e-9:
+                continue
+            if travelled + seg_len >= distance_ahead:
+                ratio = (distance_ahead - travelled) / seg_len
+                return polyline[idx] + ratio * segment
+            travelled += seg_len
+        return polyline[-1]
 
     def estimate_front_point_threshold(self, pose: Pose2D) -> int:
         """Estimate the minimum number of points expected ahead of the robot.
@@ -1341,7 +1359,8 @@ class MaizeNavigator(Node):
         m.ns, m.id, m.type, m.action = "splines", id, Marker.LINE_STRIP, Marker.ADD
         m.scale.x = 0.04
         m.color.r, m.color.g, m.color.b, m.color.a = color[0], color[1], color[2], alpha
-        for p in spline.get_points():
+        row_points = getattr(spline, "row_points", spline.anchor_world)
+        for p in row_points:
             m.points.append(Point(x=float(p[0]), y=float(p[1]), z=0.0))
         return m
 
