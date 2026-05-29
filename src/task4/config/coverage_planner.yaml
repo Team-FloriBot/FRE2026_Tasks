@@ -1,32 +1,18 @@
 coverage_planner:
   ros__parameters:
-    # Field boundary as flat array of coordinates [x1, y1, x2, y2, x3, y3, ...]
-    # Minimum 3 points required to form a polygon
-    field_boundary_posts: [0.0, 0.0, 10.0, 0.0, 10.0, 8.0, 0.0, 8.0]
+    # 2D Koordinaten des Feldes als flache Liste [x1, y1, x2, y2, x3, y3, ...]
+    # Beispielhaft ein 10x10 Meter Feld
+    polygon_coords: [0.0, 0.0, 10.0, 0.0, 10.0, 10.0, 0.0, 10.0]
     
-    # Coverage planning settings
-    working_width_m: 0.75  # Working width (spur width) - configurable parameter
-    safety_margin_m: 0.15  # Safety margin to field boundary - configurable parameter
-    overlap_m: 0.10  # Overlap between passes
+    # Roboter Parameter
+    operating_width: 0.5  # Die effektive Arbeitsbreite in Metern
+    robot_width: 0.6      # Die physische Breite des Roboters in Metern
+    turn_radius: 1.0      # Minimaler Wenderadius für Dubins-Kurven (für Kinematik entscheidend)
     
-    # Path planning settings
-    min_turn_radius: 0.5  # Minimum turn radius for the robot
-    max_path_length: 1000  # Maximum number of path points
+    # Feld Parameter
+    headland_width: 1.5   # Breite des Vorgewendes zum Wenden in Metern
+    swath_angle_deg: 0.0  # Winkel der Fahrgassen in Grad (0 = parallel zur X-Achse)
     
-    # Output settings
-    global_plan_topic: "/plan"
-    local_plan_topic: "/local_plan"
-    target_topic: "/target"
-    field_boundary_topic_out: "/field_boundary_visual"
-    
-    # Robot settings
-    base_frame: "base_link"
-    map_frame: "map"
-    
-    # Processing settings
-    update_rate: 5.0  # Hz
-    replan_distance: 2.0  # Replan when robot is this far from planned path
-    
-    # Fields2Cover integration settings
-    f2c_algorithm: "HillClimbing"  # Algorithm: Greedy, HillClimbing, Random
-    f2c_max_turns: 10  # Maximum number of turns for some algorithms
+    # Routing
+    routing_pattern: "boustrophedon"  # Unterstützt: "boustrophedon", "snake"
+    frame_id: "map"                   # TF Frame, in dem das Polygon definiert ist
