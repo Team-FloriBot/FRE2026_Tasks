@@ -1283,7 +1283,8 @@ class MaizeNavigator(Node):
         left_start = np.array(left_chain[-1], dtype=float)
         right_start = np.array(right_chain[-1], dtype=float)
         # Start with the robot heading directly; later iterations can refine the direction.
-        shared_dir = self._normalize_vector(np.array([math.cos(initial_heading_yaw), math.sin(initial_heading_yaw)], dtype=float))
+        heading_vec = self._normalize_vector(np.array([math.cos(initial_heading_yaw), math.sin(initial_heading_yaw)], dtype=float))
+        shared_dir = np.array(heading_vec, copy=True)
 
         pair_center = 0.5 * (left_start + right_start)
         remaining_points = self.get_map_points_in_roi(Pose2D(pair_center[0], pair_center[1], initial_heading_yaw), 6.0)
@@ -1341,9 +1342,7 @@ class MaizeNavigator(Node):
             if len(right_pts) > 0:
                 added_right_points.append(right_pts)
 
-            left_dir = self._direction_from_points(left_pts - left_start, shared_dir) if len(left_pts) > 0 else shared_dir
-            right_dir = self._direction_from_points(right_pts - right_start, shared_dir) if len(right_pts) > 0 else shared_dir
-            shared_dir = self._normalize_vector(left_dir + right_dir)
+            shared_dir = np.array(heading_vec, copy=True)
 
             new_left_start = left_start + step_distance * shared_dir
             new_right_start = right_start + step_distance * shared_dir
