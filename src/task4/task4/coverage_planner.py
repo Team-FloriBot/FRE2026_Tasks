@@ -96,6 +96,12 @@ class CoveragePlanner(Node):
             point_out = do_transform_point(point_in, transform)
             transformed_coords.append((point_out.point.x, point_out.point.y))
 
+        robot_x = transform.transform.translation.x
+        robot_y = transform.transform.translation.y
+        
+        # Fields2Cover Point für den Start erstellen
+        robot_start_point = f2c.Point(robot_x, robot_y)
+
         # 2. Fields2Cover Pipeline
         try:
             ring = f2c.LinearRing()
@@ -109,28 +115,32 @@ class CoveragePlanner(Node):
             robot = f2c.Robot(rob_width, op_width)
             robot.max_curv = 1.0 / turn_rad
 
-            # Vorgewende
             hl_gen = f2c.HG_Const_gen()
             no_hl = hl_gen.generateHeadlands(cells, hl_width)
 
-            # Gassen generieren
             sg = f2c.SG_BruteForce()
             swaths = sg.generateSwaths(swath_angle, op_width, no_hl.getCell(0))
 
-            # Routing (Gassen sortieren)
+            # Routing Muster bestimmen
             if pattern == 'snake':
                 rp = f2c.RP_Snake()
             else:
                 rp = f2c.RP_Boustrophedon()
             
-            sorted_swaths = rp.genSortedSwaths(swaths)
+            # KORREKTUR: Startpunkt an den Sortierer übergeben!
+            # Versucht, die Gassen passend zur Roboterposition zu sortieren.
+            try:
+                sorted_swaths = rp.genSortedSwaths(swaths, robot_start_point)
+            except TypeError:
+                # Falls deine Python-Bindings die Überladung mit Point nicht unterstützen:
+                self.get_logger().warning("genSortedSwaths akzeptiert keinen Startpunkt in dieser Version. Nutze Standard-Sortierung.")
+                sorted_swaths = rp.genSortedSwaths(swaths)
 
-            # Pfadplanung
+            # Pfadplanung (bleibt gleich)
             pp = f2c.PP_PathPlanning()
             dubins = f2c.PP_DubinsCurves()
             f2c_path = pp.planPath(robot, sorted_swaths, dubins)
 
-            # Aufruf der korrigierten Publisher-Methode über self
             self.publish_ros_path(f2c_path, target_frame)
 
         except Exception as e:
