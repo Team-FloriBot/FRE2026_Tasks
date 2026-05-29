@@ -207,8 +207,8 @@ class NavigatorParams:
     occ_threshold: int = 50
     
     # Driving params
-    follow_speed: float = 0.25
-    turn_speed: float = 0.20
+    follow_speed: float = 0.1
+    turn_speed: float = 0.1
     exit_distance: float = 0.5
     min_turn_radius: float = 0.5
     lookahead_dist: float = 0.6

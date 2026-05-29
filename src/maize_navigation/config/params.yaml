@@ -47,10 +47,10 @@ maize_navigator:
     enter_stable_frames_required: 3
     acquire_timeout_sec: 8.0
 
-    follow_speed: 0.25
-    slow_speed: 0.12
-    enter_speed: 0.2
-    turn_speed: 0.2
+    follow_speed: 0.1
+    slow_speed: 0.1
+    enter_speed: 0.1
+    turn_speed: 0.1
 
     max_linear_speed: 0.45
     max_angular_speed: 1.40
