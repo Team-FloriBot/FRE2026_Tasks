@@ -1355,25 +1355,21 @@ class MaizeNavigator(Node):
 
                 centroid = np.mean(cluster, axis=0)
 
-                rel_left = centroid - left_start
-                rel_right = centroid - right_start
-                along_left = float(rel_left @ shared_dir)
-                along_right = float(rel_right @ shared_dir)
-                orth_left = float(abs(rel_left @ pair_perp))
-                orth_right = float(abs(rel_right @ pair_perp))
+                centroid_rel = centroid - pair_center
+                centroid_along = float(centroid_rel @ shared_dir)
+                centroid_orth = float(centroid_rel @ pair_perp)
 
-                valid_left = along_left >= 0.0 and along_left <= current_forward_max_dist and orth_left <= orthogonal_max_dist
-                valid_right = along_right >= 0.0 and along_right <= current_forward_max_dist and orth_right <= orthogonal_max_dist
+                left_ref = float((left_start - pair_center) @ pair_perp)
+                right_ref = float((right_start - pair_center) @ pair_perp)
 
-                if not valid_left and not valid_right:
+                if centroid_along < 0.0 or centroid_along > current_forward_max_dist or abs(centroid_orth) > orthogonal_max_dist:
                     continue
-                if valid_left and valid_right:
-                    choose_left = orth_left <= orth_right
-                else:
-                    choose_left = valid_left
+
+                d_left = abs(centroid_orth - left_ref)
+                d_right = abs(centroid_orth - right_ref)
 
                 mapped_indices = [int(i) for i in rel_indices]
-                if choose_left:
+                if d_left <= d_right:
                     assigned_left.append(cluster)
                     assigned_indices_set.update(mapped_indices)
                     consumed_indices.extend(mapped_indices)
