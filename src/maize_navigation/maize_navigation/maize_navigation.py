@@ -1282,7 +1282,17 @@ class MaizeNavigator(Node):
 
         left_start = np.array(left_chain[-1], dtype=float)
         right_start = np.array(right_chain[-1], dtype=float)
-        shared_dir = self._normalize_vector(np.array([math.cos(initial_heading_yaw), math.sin(initial_heading_yaw)], dtype=float))
+        # Prefer the row direction (perpendicular to the across-vector between starts)
+        # but keep its sign aligned with the robot's heading so the lines point forward.
+        across = right_start - left_start
+        if float(np.linalg.norm(across)) < 1e-6:
+            shared_dir = self._normalize_vector(np.array([math.cos(initial_heading_yaw), math.sin(initial_heading_yaw)], dtype=float))
+        else:
+            row_dir = self._normalize_vector(np.array([-across[1], across[0]], dtype=float))
+            heading_vec = np.array([math.cos(initial_heading_yaw), math.sin(initial_heading_yaw)], dtype=float)
+            if np.dot(row_dir, heading_vec) < 0:
+                row_dir = -row_dir
+            shared_dir = row_dir
 
         pair_center = 0.5 * (left_start + right_start)
         remaining_points = self.get_map_points_in_roi(Pose2D(pair_center[0], pair_center[1], initial_heading_yaw), 6.0)
