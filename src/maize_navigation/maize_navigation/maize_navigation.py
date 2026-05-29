@@ -216,7 +216,9 @@ class NavigatorParams:
     row_search_width: float = 0.50
     row_exclusion_distance: float = 0.30
     spline_s: float = 60.0
-    max_spline_k: int = 10
+    max_spline_k: int = 3
+    min_lane_width: float = 0.5
+    max_lane_width: float = 1.5
     
     # Control
     pos_kp: float = 2.0
@@ -248,6 +250,7 @@ class MaizeNavigator(Node):
         self.current_right_row_id: Optional[int] = None
         self.next_row_id: int = 1
         self.known_rows: dict[int, PlantSpline] = {}
+        self.row_ids_in_order: List[int] = []
         self.row_exclusion_distance: float = self.p.row_exclusion_distance
         
         # State specific variables
@@ -287,8 +290,8 @@ class MaizeNavigator(Node):
         p.spline_s = get_param("spline_s", p.spline_s)
         p.max_spline_k = get_param("max_spline_k", p.max_spline_k)
         p.lookahead_dist = get_param("lookahead_dist", p.lookahead_dist)
-        p.min_lane_width = get_param("min_lane_width", 0.5)
-        p.max_lane_width = get_param("max_lane_width", 1.5)
+        p.min_lane_width = get_param("min_lane_width", p.min_lane_width)
+        p.max_lane_width = get_param("max_lane_width", p.max_lane_width)
         return p
 
     def parse_pattern(self, pattern_str: str) -> List[Tuple[int, str]]:
@@ -301,6 +304,11 @@ class MaizeNavigator(Node):
         except:
             self.get_logger().error(f"Invalid pattern: {pattern_str}")
         return steps
+
+    def remember_row(self, row_id: int, spline: PlantSpline) -> None:
+        self.known_rows[row_id] = spline
+        if row_id not in self.row_ids_in_order:
+            self.row_ids_in_order.append(row_id)
 
     def map_callback(self, msg: OccupancyGrid):
         self.latest_map = msg
@@ -381,18 +389,20 @@ class MaizeNavigator(Node):
         best_right = None
         best_score = float('inf')
 
-        # Prefer a pair whose separation matches the expected row width.
-        # This works even if both rows currently lie on the same side of the robot.
-        for i in range(len(peaks)):
-            for j in range(i + 1, len(peaks)):
-                p1 = peaks[i]
-                p2 = peaks[j]
-                sep = abs(p2 - p1)
-                score = abs(sep - self.p.expected_row_width)
-                if score < best_score:
-                    best_score = score
-                    best_left = max(p1, p2)
-                    best_right = min(p1, p2)
+        # Use adjacent peaks so peak 1 maps to spline 1, peak 2 to spline 2, etc.
+        # This keeps the row order stable even if all peaks are on the same side.
+        sorted_peaks = sorted(peaks)
+        for i in range(len(sorted_peaks) - 1):
+            p1 = sorted_peaks[i]
+            p2 = sorted_peaks[i + 1]
+            sep = abs(p2 - p1)
+            if sep < self.p.min_lane_width or sep > self.p.max_lane_width:
+                continue
+            score = abs(sep - self.p.expected_row_width)
+            if score < best_score:
+                best_score = score
+                best_left = p2
+                best_right = p1
 
         if best_left is None or best_right is None:
             self.get_logger().info(f"Could not select a row pair from peaks: {peaks}", throttle_duration_sec=2.0)
@@ -416,8 +426,8 @@ class MaizeNavigator(Node):
             self.next_row_id += 1
             self.current_right_row_id = self.next_row_id
             self.next_row_id += 1
-            self.known_rows[self.current_left_row_id] = self.left_row_spline
-            self.known_rows[self.current_right_row_id] = self.right_row_spline
+            self.remember_row(self.current_left_row_id, self.left_row_spline)
+            self.remember_row(self.current_right_row_id, self.right_row_spline)
             self.row_entry_pose = self.robot_pose
             self.state = MissionState.FOLLOW_ROW
             self.get_logger().info(
@@ -473,7 +483,7 @@ class MaizeNavigator(Node):
                 if ok:
                     self.left_row_spline = temp_spline
                     if self.current_left_row_id is not None:
-                        self.known_rows[self.current_left_row_id] = self.left_row_spline
+                        self.remember_row(self.current_left_row_id, self.left_row_spline)
             else:
                 self.get_logger().info("Rejecting left temp_spline: spline fit invalid")
 
@@ -515,7 +525,7 @@ class MaizeNavigator(Node):
                 if ok:
                     self.right_row_spline = temp_spline
                     if self.current_right_row_id is not None:
-                        self.known_rows[self.current_right_row_id] = self.right_row_spline
+                        self.remember_row(self.current_right_row_id, self.right_row_spline)
             else:
                 self.get_logger().info("Rejecting right temp_spline: spline fit invalid")
 
@@ -815,7 +825,8 @@ class MaizeNavigator(Node):
 
     def publish_visuals(self):
         markers = MarkerArray()
-        for row_id in sorted(self.known_rows.keys()):
+        ordered_ids = self.row_ids_in_order if self.row_ids_in_order else sorted(self.known_rows.keys())
+        for row_id in ordered_ids:
             spline = self.known_rows[row_id]
             if spline is None or not spline.valid:
                 continue
