@@ -66,8 +66,8 @@ private:
   void declare_parameters()
   {
     // Topics
-    declare_parameter("path_topic", "/path");
-    declare_parameter("odom_topic", "/odom");
+    declare_parameter("path_topic", "/plan");
+    declare_parameter("odom_topic", "/map");
     declare_parameter("cmd_vel_topic", "/cmd_vel");
     
     // Frames
