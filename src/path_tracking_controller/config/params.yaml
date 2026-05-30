@@ -5,7 +5,7 @@ pure_pursuit_node:
     odom_topic: "/odom"
     cmd_vel_topic: "/cmd_vel"
 
-    global_frame: "odom"
+    global_frame: "map"
     base_link_frame: "base_link"
 
     lookahead_min: 0.5
