@@ -17,7 +17,7 @@ public:
     PurePursuitNode() : Node("pure_pursuit_node")
     {
         // Publisher & Subscriber
-        cmd_vel_pub_ = this->create_publisher<geometry_msgs::msg::Twist>(cmd_vel_topic, 10);
+        cmd_vel_pub_ = this->create_publisher<geometry_msgs::msg::Twist>("/cmd_vel", 10);
         path_sub_ = this->create_subscription<nav_msgs::msg::Path>(
             path_topic, 10, std::bind(&PurePursuitNode::path_callback, this, std::placeholders::_1));
         debug_pub_ =
@@ -47,7 +47,6 @@ public:
         // Load parameters
         global_frame_ = this->get_parameter("global_frame").as_string();
         base_link_frame_ = this->get_parameter("base_link_frame").as_string();
-        cmd_vel_topic = this->get_parameter("cmd_vel_topic").as_string();
         path_topic = this->get_parameter("path_topic").as_string();
         lookahead_min_ = this->get_parameter("lookahead_min").as_double();
         lookahead_max_ = this->get_parameter("lookahead_max").as_double();

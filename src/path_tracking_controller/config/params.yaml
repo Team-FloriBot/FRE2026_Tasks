@@ -2,8 +2,6 @@ pure_pursuit_node:
   ros__parameters:
 
     path_topic: "/plan"
-    odom_topic: "/odom"
-    cmd_vel_topic: "/cmd_vel"
 
     global_frame: "odom"
     base_link_frame: "base_link"
