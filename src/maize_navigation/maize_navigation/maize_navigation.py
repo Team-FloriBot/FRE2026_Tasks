@@ -2240,6 +2240,14 @@ class MissionManager:
         self.headland_required_shift: float = 0.0
         self.headland_measured_shift: float = 0.0
         self.headland_exit_forward_distance: float = 0.0
+        # Deterministische Gerade entlang des Vorgewendes fuer 2L/2R.
+        # Nach der Ausfahrkurve wird die aktuelle Pose gelatcht; danach wird
+        # stumpf (row_shift_count-1)*row_width geradeaus gefahren, bevor die
+        # Einfahrkurve startet. Damit kann die lokale Map-/LiDAR-Erkennung den
+        # Roboter nicht mehr in die erste Nachbargasse ziehen.
+        self.headland_shift_start_pose_map: Optional[Pose2D] = None
+        self.headland_shift_start_yaw_map: Optional[float] = None
+        self.headland_shift_forward_distance: float = 0.0
         self.headland_reference_row_yaw_map: Optional[float] = None
         self.entry_row_stable_frames: int = 0
         self.entry_reference_side_ok: bool = False
@@ -2370,6 +2378,9 @@ class MissionManager:
         self.headland_required_shift = 0.0
         self.headland_measured_shift = 0.0
         self.headland_exit_forward_distance = 0.0
+        self.headland_shift_start_pose_map = None
+        self.headland_shift_start_yaw_map = None
+        self.headland_shift_forward_distance = 0.0
         self.headland_reference_row_yaw_map = None
         self.entry_row_stable_frames = 0
         self.entry_reference_side_ok = False
@@ -2504,6 +2515,28 @@ class MissionManager:
         dy = pose_map.y - self.headland_start_pose_map.y
         yaw0 = self.headland_start_pose_map.yaw
         self.headland_exit_forward_distance = math.cos(yaw0) * dx + math.sin(yaw0) * dy
+
+    def _update_headland_shift_forward_distance(self, pose_map: Optional[Pose2D]) -> None:
+        if pose_map is None or self.headland_shift_start_pose_map is None:
+            return
+
+        yaw0 = self.headland_shift_start_yaw_map
+        if yaw0 is None:
+            yaw0 = self.headland_shift_start_pose_map.yaw
+
+        dx = pose_map.x - self.headland_shift_start_pose_map.x
+        dy = pose_map.y - self.headland_shift_start_pose_map.y
+        # Signed forward distance in the vehicle heading that existed directly
+        # after the 90 degree exit arc. This is intentionally independent of
+        # map row PCA flips and independent of local row detections.
+        self.headland_shift_forward_distance = math.cos(float(yaw0)) * dx + math.sin(float(yaw0)) * dy
+
+    def _multirow_deterministic_straight_target(self) -> float:
+        # 1L/1R: no straight part between the two 90 degree arcs.
+        # 2L/2R: exactly one row spacing straight, so one gap is skipped.
+        # nL/nR: n-1 spacings straight.
+        step = max(1, int(self.p.row_shift_count))
+        return max(0.0, float(step - 1) * float(self.p.expected_row_width))
 
     def _effective_entry_curve_yaw_change(self) -> float:
         if self.p.entry_curve_yaw_change > 0.0:
@@ -3127,7 +3160,10 @@ class MissionManager:
             yaw_progress = self.headland_direction * wrap_to_pi(pose_map.yaw - float(self.exit_curve_start_yaw))
             if yaw_progress >= self.p.exit_curve_yaw_change:
                 self.transition(MissionState.HEADLAND_SHIFT, "exit curve yaw reached")
-                return planner.plan_headland_shift_base_link(reason="HEADLAND_SHIFT")
+                self.headland_shift_start_pose_map = pose_map
+                self.headland_shift_start_yaw_map = pose_map.yaw
+                self.headland_shift_forward_distance = 0.0
+                return planner.plan_headland_shift_base_link(reason="HEADLAND_SHIFT_MULTIROW_STRAIGHT" if int(self.p.row_shift_count) >= 2 else "HEADLAND_SHIFT")
 
             return planner.plan_constant_curve_base_link(
                 self.headland_direction,
@@ -3176,45 +3212,38 @@ class MissionManager:
                 self._refresh_multirow_shift_sign_correction()
                 remaining = self._headland_pre_entry_shift_target() - abs(self.headland_measured_shift)
 
-            if (int(self.p.row_shift_count) >= 2 and self._multirow_map_preentry_reached(pose_map)) or (int(self.p.row_shift_count) < 2 and remaining <= self.p.headland_shift_tolerance):
+            if int(self.p.row_shift_count) >= 2:
+                if self.headland_shift_start_pose_map is None:
+                    self.headland_shift_start_pose_map = pose_map
+                    self.headland_shift_start_yaw_map = pose_map.yaw
+                    self.headland_shift_forward_distance = 0.0
+
+                self._update_headland_shift_forward_distance(pose_map)
+                straight_target = self._multirow_deterministic_straight_target()
+
+                # Das ist die eigentliche 2R-Regel:
+                # Nach der 90°-Ausfahrkurve wird genau (step-1) * row_width
+                # geradeaus gefahren. Bei 2R also exakt eine Gassenbreite.
+                # Keine SLAM-Zielgerade, kein Pure-Pursuit, kein Nachziehen in
+                # die erste lokale Gasse. Erst danach beginnt die Einfahrkurve.
+                if self.headland_shift_forward_distance >= straight_target - max(0.02, float(self.p.headland_shift_tolerance)):
+                    self.transition(MissionState.ENTRY_CURVE, "deterministic multirow straight distance reached")
+                    return planner.plan_constant_curve_base_link(
+                        self.headland_direction,
+                        self.p.entry_curve_speed,
+                        self.p.entry_curve_angular_speed,
+                        reason="ENTRY_CURVE",
+                    )
+
+                return planner.plan_headland_shift_base_link(reason="HEADLAND_SHIFT_MULTIROW_STRAIGHT")
+
+            if remaining <= self.p.headland_shift_tolerance:
                 self.transition(MissionState.ENTRY_CURVE, "required headland shift reached")
                 return planner.plan_constant_curve_base_link(
                     self.headland_direction,
                     self.p.entry_curve_speed,
                     self.p.entry_curve_angular_speed,
                     reason="ENTRY_CURVE",
-                )
-
-            # Bei 2L/2R darf der Roboter nach dem Ausfahrbogen nicht weiter in
-            # Richtung Map-Heading eindrehen. Genau das zeigte der Log: direkt
-            # nach EXIT_CURVE folgte HEADLAND_SHIFT_MAP mit negativem
-            # Winkelanteil, obwohl der Roboter parallel am Reihenende entlang
-            # weiterfahren und eine Gasse ueberspringen sollte. Solange die
-            # gezählte Zielgasse noch nicht gelatcht ist, wird daher stur in der
-            # aktuellen Fahrzeugrichtung weitergefahren; die SLAM-Reihen werden
-            # weiter oben trotzdem in jedem Zyklus ausgewertet und koennen den
-            # Multirow-Latch setzen.
-            if int(self.p.row_shift_count) >= 2 and not self.multirow_counted_target_latched:
-                return planner.plan_headland_shift_base_link(reason="HEADLAND_SHIFT_MULTIROW_SCAN")
-
-            # For 2L/2R and larger multi-row turns, do not command only a map
-            # heading. The v8 logs showed the target lane correctly latched at
-            # about -1.5 m while the robot still cut into the first right gap.
-            # The reason is that HEADLAND_SHIFT_MAP constrained yaw but not the
-            # lateral coordinate. Once the counted target is locked, generate the
-            # path directly to the latched pre-entry v-line in the fixed map row
-            # basis. This makes the robot physically continue past the first gap.
-            if (
-                int(self.p.row_shift_count) >= 2
-                and self.multirow_counted_target_latched
-                and self.multirow_latched_row_yaw_map is not None
-                and self.multirow_latched_preentry_global_v is not None
-            ):
-                return planner.plan_headland_shift_map_to_lateral_target(
-                    pose_map,
-                    float(self.multirow_latched_row_yaw_map),
-                    float(self.multirow_latched_preentry_global_v),
-                    reason="HEADLAND_SHIFT_MULTIROW_TARGET",
                 )
 
             desired_shift_yaw = self._desired_headland_shift_yaw(pose_map, map_detector)
@@ -4295,6 +4324,8 @@ class MaizeNavigator(Node):
             f" | headland_required_shift={self.mission.headland_required_shift:.3f}"
             f" | headland_measured_shift={self.mission.headland_measured_shift:.3f}"
             f" | headland_exit_forward={self.mission.headland_exit_forward_distance:.3f}"
+            f" | headland_shift_forward={self.mission.headland_shift_forward_distance:.3f}"
+            f" | headland_shift_forward_target={self.mission._multirow_deterministic_straight_target():.3f}"
             f" | headland_pre_entry_target={self.mission._headland_pre_entry_shift_target():.3f}"
             f" | headland_total_yaw_progress={self.mission._headland_total_yaw_progress(pose_map):.3f}"
             f" | map_row_yaw={self.map_row_detector.last_row_yaw_map if self.map_row_detector.last_row_yaw_map is not None else 'None'}"
