@@ -322,6 +322,10 @@ class NavigatorParams:
 
     headland_shift_speed: float = 0.22
     headland_shift_tolerance: float = 0.04
+    # Lookahead for bounded pursuit during multi-row headland shift.
+    # Must exist in NavigatorParams because compute_cmd_odom uses it for
+    # HEADLAND_SHIFT_MULTIROW_TARGET.
+    headland_shift_lookahead_distance: float = 0.45
     # Schutztoleranz: Wenn der seitliche Versatz beim Einfahrbogen darueber hinausgeht,
     # wird der Bogen abgebrochen. Das verhindert, dass 1L/1R eine weitere Reihe ueberspringt.
     headland_shift_overshoot_tolerance: float = 0.08
@@ -385,7 +389,7 @@ class NavigatorParams:
     # enden kann. Die Breitenprüfung ist hier etwas toleranter, weil die
     # sichtbaren Reihenenden ungleich weit herausragen können.
     map_multirow_require_counted_rows: bool = True
-    map_counted_row_min_width_ratio: float = 0.55
+    map_counted_row_min_width_ratio: float = 0.45
     # Mehrreihen-Zielgassen duerfen nur dann gelatcht werden, wenn die
     # gezählte Zielgasse wirklich nahe am Pattern-Soll liegt. Die allgemeine
     # map_lane_accept_tolerance=0.45 ist fuer 2R zu weich und akzeptierte im
