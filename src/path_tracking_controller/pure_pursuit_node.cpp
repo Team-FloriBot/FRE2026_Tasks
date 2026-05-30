@@ -88,6 +88,7 @@ private:
     nav_msgs::msg::Path current_path_;
     size_t current_path_index_ = 0;
     bool path_received_ = false;
+    bool is_first_path_tick_ = true; // <--- NEU: Kontrolliert die initiale Suche
 
     void path_callback(const nav_msgs::msg::Path::SharedPtr msg)
     {
@@ -98,6 +99,7 @@ private:
         current_path_ = *msg;
         current_path_index_ = 0; 
         path_received_ = true;
+        is_first_path_tick_ = true; // Bei neuem Pfad die globale Suche einmalig erlauben
         RCLCPP_INFO(this->get_logger(), "Pfad mit %zu Punkten empfangen (Frame: %s)", 
                     current_path_.poses.size(), current_path_.header.frame_id.c_str());
     }
@@ -122,20 +124,25 @@ private:
         }
     }
 
-    // ---- Vorwärts gerichtete Suche (KORRIGIERT FÜR SCHLEIFEN) ----
+    // ---- Vorwärts gerichtete Suche (SEQUENTIELL GESICHERT) ----
     size_t find_nearest_point_forward(const geometry_msgs::msg::PoseStamped & pose)
     {
         size_t best_idx = current_path_index_;
         double best_dist = std::numeric_limits<double>::max();
         
         size_t start_idx = current_path_index_;
-        size_t end_idx = std::min(current_path_index_ + static_cast<size_t>(search_window_), current_path_.poses.size());
+        size_t end_idx = current_path_.poses.size();
         
-        // FIX: Wenn wir ganz am Anfang stehen, darf die Suche NICHT das Ende des Pfades prüfen.
-        // Da Start- und Endpunkt identisch sind, würde er sonst sofort ans Ende springen.
-        if (current_path_index_ < 10 && current_path_.poses.size() > 30)
+        // FIX: Nur beim ersten Tick nach Pfadempfang suchen wir überall. 
+        // Danach tracken wir den Roboter lokal im Bereich von max. 25 Punkten vor ihm.
+        // Das verhindert jegliches Vorwärtsspringen an Schleifen oder Nachbarreihen!
+        if (!is_first_path_tick_)
         {
-            end_idx = std::min(end_idx, current_path_.poses.size() - 20);
+            end_idx = std::min(current_path_index_ + 25, current_path_.poses.size());
+        }
+        else
+        {
+            is_first_path_tick_ = false; // Initiale Suche abgeschlossen
         }
         
         for(size_t i = start_idx; i < end_idx; ++i)
@@ -178,11 +185,11 @@ private:
             }
             accumulated += seg;
         }
+        // Wenn das Pfadende näher als die Lookahead-Distanz ist, clippen wir auf das Ziel
         lookahead = current_path_.poses.back().pose.position;
         return true;
     }
 
-    // ---- Kontrolle (KORRIGIERT FÜR SCHLEIFEN) ----
     bool compute_control(const geometry_msgs::msg::Point & lookahead_global, double & speed, double & omega)
     {
         geometry_msgs::msg::PoseStamped lookahead_pose;
@@ -213,10 +220,10 @@ private:
 
         double v_curve = max_speed_ / (1.0 + curvature_gain_ * std::abs(curvature));
         
-        // FIX: Bremsrampe vor dem Ziel nur aktivieren, wenn wir auch wirklich kurz vor dem Ende des Pfad-Arrays stehen!
+        // Bremsrampe vor dem Ziel nur aktivieren, wenn das Array-Ende wirklich nah ist
         double v_goal = max_speed_;
         size_t remaining_points = current_path_.poses.size() - 1 - current_path_index_;
-        if (remaining_points < 40)
+        if (remaining_points < 30)
         {
             double goal_dist = std::hypot(
                 current_path_.poses.back().pose.position.x - current_path_.poses[current_path_index_].pose.position.x,
@@ -233,8 +240,9 @@ private:
     {
         if (current_path_.poses.empty()) return false;
         
+        // Erst wenn wir indexseitig fast am Ende des Pfad-Arrays sind, darf gestoppt werden!
         size_t remaining_points = current_path_.poses.size() - 1 - current_path_index_;
-        if (remaining_points > 15) 
+        if (remaining_points > 10) 
         {
             return false;
         }
