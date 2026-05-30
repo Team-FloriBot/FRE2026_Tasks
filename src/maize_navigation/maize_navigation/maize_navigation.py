@@ -396,21 +396,30 @@ class MaizeNavigator(Node):
         previous_valid_point: Optional[np.ndarray] = None
 
         for _ in range(self.p.row_max_march_steps):
-            point3 = line_points[2]
+            search_point3 = line_points[2]
             big_rect_length = self.big_rectangle_length()
             fit_points = self.points_in_oriented_rectangle(
                 map_points,
-                point3,
+                search_point3,
                 direction,
                 big_rect_length,
                 self.p.row_rectangle_width,
             )
-            field_count = self.count_points_in_fields_3_to_5(map_points, line_points, direction)
+
+            corrected_direction = direction
+            corrected_point3 = np.array(search_point3, copy=True)
+            if len(fit_points) >= self.p.row_min_fit_points:
+                fit_origin, fitted_direction = self.fit_line(fit_points, direction)
+                corrected_direction = fitted_direction
+                corrected_point3 = self.project_point_to_line(search_point3, fit_origin, fitted_direction)
+
+            corrected_line_points = self.build_initial_line_from_point3(corrected_point3, corrected_direction)
+            field_count = self.count_points_in_fields_3_to_5(map_points, corrected_line_points, corrected_direction)
 
             local_point3_points = self.points_in_oriented_rectangle(
                 map_points,
-                point3,
-                direction,
+                corrected_point3,
+                corrected_direction,
                 self.p.row_point_window_length,
                 self.p.row_rectangle_width,
             )
@@ -420,25 +429,21 @@ class MaizeNavigator(Node):
                 result.end_point = previous_valid_point if previous_valid_point is not None else exact_points[-1]
                 break
 
-            fitted_direction = direction
-            if len(fit_points) >= self.p.row_min_fit_points:
-                fitted_direction = self.fit_direction(fit_points, direction)
-
             if len(local_point3_points) > 0:
                 row_point = np.mean(local_point3_points, axis=0)
                 previous_valid_point = row_point
             else:
-                row_point = np.array(point3, copy=True)
+                row_point = np.array(corrected_point3, copy=True)
 
             exact_points.append(row_point)
             result.debug_segments.append(
                 SegmentDebug(
-                    line_points=np.array(line_points, copy=True),
-                    direction=np.array(direction, copy=True),
-                    big_rect_center=np.array(point3, copy=True),
+                    line_points=np.array(corrected_line_points, copy=True),
+                    direction=np.array(corrected_direction, copy=True),
+                    big_rect_center=np.array(search_point3, copy=True),
                     big_rect_length=big_rect_length,
                     big_rect_width=self.p.row_rectangle_width,
-                    point3_rect_center=np.array(point3, copy=True),
+                    point3_rect_center=np.array(corrected_point3, copy=True),
                     point3_rect_length=self.p.row_point_window_length,
                     point3_rect_width=self.p.row_rectangle_width,
                     support_count=len(fit_points),
@@ -446,8 +451,8 @@ class MaizeNavigator(Node):
                 )
             )
 
-            direction = fitted_direction
-            line_points = self.build_next_line_from_old_point3(point3, direction)
+            direction = corrected_direction
+            line_points = self.build_next_line_from_old_point3(corrected_point3, direction)
 
         result.points = np.asarray(exact_points, dtype=float) if exact_points else np.empty((0, 2), dtype=float)
         result.current_line_points = np.asarray(line_points, dtype=float)
@@ -483,10 +488,11 @@ class MaizeNavigator(Node):
             )
         return total
 
-    def fit_direction(self, points: np.ndarray, fallback_direction: np.ndarray) -> np.ndarray:
+    def fit_line(self, points: np.ndarray, fallback_direction: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
         fallback_direction = self.normalize(fallback_direction)
+        fallback_origin = np.mean(points, axis=0) if len(points) > 0 else np.array([0.0, 0.0], dtype=float)
         if len(points) < 2:
-            return fallback_direction
+            return fallback_origin, fallback_direction
 
         fit_points = points
         if len(points) > 2:
@@ -521,7 +527,7 @@ class MaizeNavigator(Node):
         centered = fit_points - np.mean(fit_points, axis=0)
         cov = np.cov(centered.T)
         if np.ndim(cov) != 2:
-            return fallback_direction
+            return np.mean(fit_points, axis=0), fallback_direction
 
         eigenvalues, eigenvectors = np.linalg.eigh(cov)
         direction = np.real(eigenvectors[:, int(np.argmax(eigenvalues))])
@@ -530,7 +536,14 @@ class MaizeNavigator(Node):
             direction = -direction
 
         # Light damping keeps the marching direction from swinging on sparse/noisy cells.
-        return self.normalize(0.75 * fallback_direction + 0.25 * direction)
+        direction = self.normalize(0.75 * fallback_direction + 0.25 * direction)
+        origin = np.mean(fit_points, axis=0)
+        return np.asarray(origin, dtype=float), direction
+
+    def project_point_to_line(self, point: np.ndarray, line_origin: np.ndarray, line_direction: np.ndarray) -> np.ndarray:
+        line_direction = self.normalize(line_direction)
+        rel = np.asarray(point, dtype=float) - np.asarray(line_origin, dtype=float)
+        return np.asarray(line_origin, dtype=float) + float(rel @ line_direction) * line_direction
 
     def points_in_oriented_rectangle(
         self,
