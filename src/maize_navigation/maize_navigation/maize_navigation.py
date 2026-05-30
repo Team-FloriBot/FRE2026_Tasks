@@ -379,6 +379,13 @@ class NavigatorParams:
     # Pflanzenreihe in die Gasse hineinragt; dann bleibt das pattern-relative
     # Zielzentrum massgebend.
     map_counted_lane_inward_bias_tolerance: float = 0.08
+    # Bei Mehrreihen-Manovern (2L/2R/...) muss die Zielgasse aus
+    # gezählten Maisreihen der SLAM-Map bestätigt sein. Extrapolation darf
+    # dann nicht als Freigabe für das Einbiegen dienen, weil sonst 2R als 1R
+    # enden kann. Die Breitenprüfung ist hier etwas toleranter, weil die
+    # sichtbaren Reihenenden ungleich weit herausragen können.
+    map_multirow_require_counted_rows: bool = True
+    map_counted_row_min_width_ratio: float = 0.55
     # Bei Mehrreihensprüngen ist die Map-Querposition am Einfahren weniger
     # belastbar als die lokale Reihenhypothese: durch U-Turn-Geometrie,
     # Schlupf und Reihenanfangs-Asymmetrie kann der gemessene Versatz um
@@ -971,7 +978,16 @@ class MapRowDetector:
             measured_width = abs(outer_row_v - inner_row_v)
             width_min = max(0.05, float(self.p.min_lane_width))
             width_max = max(width_min, float(self.p.max_lane_width))
-            width_ok = width_min <= measured_width <= width_max
+            if step >= 2:
+                # Fuer 2R/2L ist die Reihenanzahl wichtiger als eine starre
+                # absolute Gassenbreite. Im Log lagen die gezählten Reihen bei
+                # ca. 0.48...0.52 m Abstand und wurden wegen min_lane_width=0.55
+                # verworfen, obwohl sie die korrekte zweite Gasse markierten.
+                counted_min = max(0.05, float(self.p.map_counted_row_min_width_ratio) * float(self.p.expected_row_width))
+                width_ok = counted_min <= measured_width <= width_max
+            else:
+                counted_min = width_min
+                width_ok = width_min <= measured_width <= width_max
             # signed_outward_error > 0: counted lane is farther outward than the
             # pattern target. signed_outward_error < 0: counted lane is shifted
             # inward, i.e. back toward the currently driven lane. For multi-row
@@ -979,7 +995,11 @@ class MapRowDetector:
             # protruding front row can pull the target center into the crop.
             signed_outward_error = sign * (detected_offset - expected_offset)
             inward_bias_limit = max(0.0, float(self.p.map_counted_lane_inward_bias_tolerance))
-            inward_bias_ok = not (step >= 2 and signed_outward_error < -inward_bias_limit)
+            # Bei Mehrreihen-Manovern wird die Zielgasse durch die gezählten
+            # Pflanzenreihen selbst definiert. Ein leicht nach innen verschobenes
+            # Zentrum ist am ungleich langen Reihenende normal und darf 2R nicht
+            # wieder auf eine extrapolierte 1R-ähnliche Bahn zurückwerfen.
+            inward_bias_ok = True if step >= 2 else not (signed_outward_error < -inward_bias_limit)
 
             if error <= tolerance and width_ok and inward_bias_ok:
                 width = float(measured_width)
@@ -990,7 +1010,7 @@ class MapRowDetector:
                     f"center={center_v:.3f}, expected={expected_offset:.3f}, "
                     f"error={error:.3f}, width={measured_width:.3f}, "
                     f"signed_outward_error={signed_outward_error:.3f}, "
-                    f"width_range=[{width_min:.3f},{width_max:.3f}], tolerance={tolerance:.3f}, "
+                    f"width_range=[{counted_min:.3f},{width_max:.3f}], tolerance={tolerance:.3f}, "
                     f"side_rows=[{self.last_candidate_rows_text}]"
                 )
                 return MapLane(
@@ -1000,7 +1020,7 @@ class MapRowDetector:
                     right_row_v=float(min(inner_row_v, outer_row_v)),
                     width=float(width),
                     confidence=0.98,
-                    source="detected_reference_row_linefit",
+                    source="detected_counted_row_lines",
                 )
 
             self.last_target_reason = (
@@ -1011,7 +1031,7 @@ class MapRowDetector:
                 f"error={error:.3f}, width={measured_width:.3f}, "
                 f"width_ok={width_ok}, inward_bias_ok={inward_bias_ok}, "
                 f"signed_outward_error={signed_outward_error:.3f}, "
-                f"width_range=[{width_min:.3f},{width_max:.3f}], "
+                f"width_range=[{counted_min:.3f},{width_max:.3f}], "
                 f"tolerance={tolerance:.3f}, side_rows=[{self.last_candidate_rows_text}]"
             )
 
@@ -1048,6 +1068,12 @@ class MapRowDetector:
                 f"no fitted reference row on requested side: direction={direction.upper()}, "
                 f"step={step}, rows={len(row_positions)}"
             )
+
+        if step >= 2 and self.p.map_multirow_require_counted_rows:
+            self.last_target_reason += (
+                "; multirow requires counted SLAM row lines, rejecting lane/extrapolation fallback"
+            )
+            return None
 
         # Secondary fallback: use a fitted lane only if its relative offset matches the pattern.
         lanes_sorted = sorted(lanes, key=lambda lane: lane.center_v)
@@ -2499,12 +2525,42 @@ class MissionManager:
         if row.confidence < min_conf:
             return False
 
+        if not self._multirow_counted_target_locked():
+            return False
+
         if not self._entry_row_relaxed_geometry_ok(row):
             return False
 
         progress = self._headland_total_yaw_progress(pose_map)
         min_progress = max(0.0, float(self.p.multirow_local_takeover_min_yaw_progress))
         return progress >= min_progress
+
+    def _multirow_counted_target_locked(self) -> bool:
+        if int(self.p.row_shift_count) < 2:
+            return True
+        if not self.p.map_multirow_require_counted_rows:
+            return True
+
+        reason = str(self.last_target_lane_reason)
+        if "row-line counted target accepted" not in reason:
+            return False
+
+        tolerance = max(0.05, float(self.p.map_lane_accept_tolerance))
+        return abs(float(self.target_offset_error)) <= tolerance
+
+    def _multirow_map_preentry_reached(self) -> bool:
+        if int(self.p.row_shift_count) < 2:
+            return False
+        if not self._multirow_counted_target_locked():
+            return False
+
+        # Abstand der per SLAM gezählten Zielgassenmitte zur aktuellen Roboterposition
+        # in Reihen-Querkoordinate. Vor dem Einfahrbogen soll nur noch der
+        # Queranteil des Einfahrbogens übrig sein.
+        remaining_to_target = abs(float(self.detected_target_offset))
+        entry_lateral = abs(float(self._predicted_entry_lateral_shift()))
+        tol = max(0.05, float(self.p.headland_shift_tolerance) + float(self.p.map_lane_accept_tolerance) * 0.25)
+        return remaining_to_target <= entry_lateral + tol
 
     def _entry_yaw_or_local_row_ok(self, row: RowModel, pose_map: Optional[Pose2D]) -> bool:
         if self._entry_yaw_ok(pose_map):
@@ -2582,6 +2638,8 @@ class MissionManager:
         # bleibt ACQUIRE_ROW am Reihenanfang stehen, wenn nur eine Begrenzungsreihe
         # im Sichtfeld liegt.
         if int(self.p.row_shift_count) >= 2 and shift_ok and yaw_ok:
+            if not self._multirow_counted_target_locked():
+                return False
             return self._entry_row_relaxed_geometry_ok(row)
 
         return False
@@ -2822,7 +2880,7 @@ class MissionManager:
                 self._update_headland_measured_shift(pose_map)
                 remaining = self._headland_pre_entry_shift_target() - abs(self.headland_measured_shift)
 
-            if remaining <= self.p.headland_shift_tolerance:
+            if (int(self.p.row_shift_count) >= 2 and self._multirow_map_preentry_reached()) or (int(self.p.row_shift_count) < 2 and remaining <= self.p.headland_shift_tolerance):
                 self.transition(MissionState.ENTRY_CURVE, "required headland shift reached")
                 return planner.plan_constant_curve_base_link(
                     self.headland_direction,
@@ -3496,6 +3554,8 @@ class MaizeNavigator(Node):
         p.multirow_local_takeover_min_yaw_progress = float(declare("multirow_local_takeover_min_yaw_progress", p.multirow_local_takeover_min_yaw_progress))
         p.multirow_local_takeover_min_confidence = float(declare("multirow_local_takeover_min_confidence", p.multirow_local_takeover_min_confidence))
         p.map_counted_lane_inward_bias_tolerance = float(declare("map_counted_lane_inward_bias_tolerance", p.map_counted_lane_inward_bias_tolerance))
+        p.map_multirow_require_counted_rows = bool(declare("map_multirow_require_counted_rows", p.map_multirow_require_counted_rows))
+        p.map_counted_row_min_width_ratio = float(declare("map_counted_row_min_width_ratio", p.map_counted_row_min_width_ratio))
         p.neighbor_reference_turn_enabled = bool(declare("neighbor_reference_turn_enabled", p.neighbor_reference_turn_enabled))
         p.neighbor_reference_entry_requires_shift = bool(declare("neighbor_reference_entry_requires_shift", p.neighbor_reference_entry_requires_shift))
         p.neighbor_reference_requires_same_side_row = bool(declare("neighbor_reference_requires_same_side_row", p.neighbor_reference_requires_same_side_row))
