@@ -308,8 +308,8 @@ class MaizeNavigator(Node):
         self.cmd_pub = self.create_publisher(Twist, self.p.cmd_vel_topic, 10)
         self.marker_pub = self.create_publisher(MarkerArray, "navigation_markers", 10)
 
-        self.start_srv = self.create_service(Trigger, "start_navigation", self.start_cb)
-        self.stop_srv = self.create_service(Trigger, "stop_navigation", self.stop_cb)
+        self.start_srv = self.create_service(Trigger, "/start_navigation", self.start_cb)
+        self.stop_srv = self.create_service(Trigger, "/stop_navigation", self.stop_cb)
 
         self.timer = self.create_timer(1.0 / self.p.control_frequency, self.control_loop)
         self.get_logger().info("Maize Navigator ready")
@@ -360,6 +360,7 @@ class MaizeNavigator(Node):
         self.latest_map = msg
 
     def start_cb(self, req, res):
+        self.get_logger().info("start_navigation service called")
         self.state = MissionState.INITIALIZING
         self.current_pattern_idx = 0
         self.end_confirm_frames = 0
@@ -368,13 +369,16 @@ class MaizeNavigator(Node):
         self.turn_start_pose = None
         self.current_corridor = None
         self.target_corridor_ids = None
+        self.get_logger().info("navigation state set to INITIALIZING")
         res.success = True
         res.message = "Navigation started"
         return res
 
     def stop_cb(self, req, res):
+        self.get_logger().info("stop_navigation service called")
         self.state = MissionState.IDLE
         self.cmd_pub.publish(Twist())
+        self.get_logger().info("navigation state set to IDLE")
         res.success = True
         res.message = "Navigation stopped"
         return res
