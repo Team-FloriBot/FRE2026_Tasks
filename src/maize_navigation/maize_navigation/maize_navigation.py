@@ -1950,6 +1950,28 @@ class PathFollower:
         if target is None:
             return cmd
 
+        if path.reason == "HEADLAND_SHIFT_MULTIROW_STRAIGHT":
+            # Deterministic straight leg for 2L/2R/...:
+            # follow the fixed map heading stored in the path yaw. This keeps the
+            # robot exactly perpendicular to the row direction while the state
+            # machine measures the traveled distance along the same axis.
+            goal = path.points[-1]
+            desired_yaw = float(goal.yaw)
+            yaw_err = wrap_to_pi(desired_yaw - float(pose.yaw))
+
+            base_v = clamp(goal.v, 0.0, self.p.max_linear_speed)
+            heading_scale = 1.0 if abs(yaw_err) < 0.20 else max(0.55, math.cos(min(abs(yaw_err), math.pi / 2.0)))
+            v = base_v * heading_scale
+
+            w_limit = min(0.25, float(self.p.turn_max_angular_speed), float(self.p.follow_max_angular_speed))
+            w = clamp(float(self.p.headland_heading_kp) * yaw_err, -w_limit, w_limit)
+            w = self.rate_limit(w, self.last_w_odom)
+            self.last_w_odom = w
+
+            cmd.linear.x = v
+            cmd.angular.z = w
+            return cmd
+
         # Multi-row headland shifts (2L/2R/...) are gated by the latched SLAM
         # target lane in the mission state machine. This segment must neither
         # be normal pure-pursuit (v9 cut into the first visible right gap) nor
@@ -2247,6 +2269,10 @@ class MissionManager:
         # Roboter nicht mehr in die erste Nachbargasse ziehen.
         self.headland_shift_start_pose_map: Optional[Pose2D] = None
         self.headland_shift_start_yaw_map: Optional[float] = None
+        # Feste Vorgewende-Achse fuer 2L/2R: exakt senkrecht zur gelatchten
+        # Reihenrichtung. Die Gerade wird nicht in aktueller Fahrzeugrichtung,
+        # sondern entlang dieser Map-Achse gefahren.
+        self.headland_shift_axis_yaw_map: Optional[float] = None
         self.headland_shift_forward_distance: float = 0.0
         self.headland_reference_row_yaw_map: Optional[float] = None
         self.entry_row_stable_frames: int = 0
@@ -2380,6 +2406,7 @@ class MissionManager:
         self.headland_exit_forward_distance = 0.0
         self.headland_shift_start_pose_map = None
         self.headland_shift_start_yaw_map = None
+        self.headland_shift_axis_yaw_map = None
         self.headland_shift_forward_distance = 0.0
         self.headland_reference_row_yaw_map = None
         self.entry_row_stable_frames = 0
@@ -2520,15 +2547,17 @@ class MissionManager:
         if pose_map is None or self.headland_shift_start_pose_map is None:
             return
 
-        yaw0 = self.headland_shift_start_yaw_map
+        yaw0 = self.headland_shift_axis_yaw_map
+        if yaw0 is None:
+            yaw0 = self.headland_shift_start_yaw_map
         if yaw0 is None:
             yaw0 = self.headland_shift_start_pose_map.yaw
 
         dx = pose_map.x - self.headland_shift_start_pose_map.x
         dy = pose_map.y - self.headland_shift_start_pose_map.y
-        # Signed forward distance in the vehicle heading that existed directly
-        # after the 90 degree exit arc. This is intentionally independent of
-        # map row PCA flips and independent of local row detections.
+        # Signed distance along the fixed headland axis. For 2L/2R this axis is
+        # latched to row_yaw +/- 90 deg, therefore the robot changes gaps exactly
+        # perpendicular to the row ends instead of drifting in its current body yaw.
         self.headland_shift_forward_distance = math.cos(float(yaw0)) * dx + math.sin(float(yaw0)) * dy
 
     def _multirow_deterministic_straight_target(self) -> float:
@@ -3218,21 +3247,33 @@ class MissionManager:
                     self.headland_shift_start_yaw_map = pose_map.yaw
                     self.headland_shift_forward_distance = 0.0
 
+                desired_shift_yaw = self._desired_headland_shift_yaw(pose_map, map_detector)
+                if self.headland_shift_axis_yaw_map is None:
+                    self.headland_shift_axis_yaw_map = desired_shift_yaw if desired_shift_yaw is not None else self.headland_shift_start_yaw_map
+
                 self._update_headland_shift_forward_distance(pose_map)
                 straight_target = self._multirow_deterministic_straight_target()
 
-                # Das ist die eigentliche 2R-Regel:
-                # Nach der 90°-Ausfahrkurve wird genau (step-1) * row_width
-                # geradeaus gefahren. Bei 2R also exakt eine Gassenbreite.
-                # Keine SLAM-Zielgerade, kein Pure-Pursuit, kein Nachziehen in
-                # die erste lokale Gasse. Erst danach beginnt die Einfahrkurve.
+                # 2R-Regel:
+                # Nach dem ersten 90°-Bogen wird (step-1)*row_width entlang
+                # der festen Vorgewende-Achse gefahren. Diese Achse ist aus der
+                # SLAM-Reihenrichtung abgeleitet: row_yaw +/- 90°. Damit ist die
+                # Gerade geometrisch quer zu den Reihenenden und nicht nur
+                # "geradeaus in Fahrzeugrichtung".
                 if self.headland_shift_forward_distance >= straight_target - max(0.02, float(self.p.headland_shift_tolerance)):
-                    self.transition(MissionState.ENTRY_CURVE, "deterministic multirow straight distance reached")
+                    self.transition(MissionState.ENTRY_CURVE, "deterministic multirow perpendicular distance reached")
                     return planner.plan_constant_curve_base_link(
                         self.headland_direction,
                         self.p.entry_curve_speed,
                         self.p.entry_curve_angular_speed,
                         reason="ENTRY_CURVE",
+                    )
+
+                if self.headland_shift_axis_yaw_map is not None:
+                    return planner.plan_headland_shift_map_heading(
+                        pose_map,
+                        float(self.headland_shift_axis_yaw_map),
+                        reason="HEADLAND_SHIFT_MULTIROW_STRAIGHT",
                     )
 
                 return planner.plan_headland_shift_base_link(reason="HEADLAND_SHIFT_MULTIROW_STRAIGHT")
