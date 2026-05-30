@@ -96,10 +96,13 @@ class NavigatorParams:
     row_max_march_steps: int = 120
     row_min_fit_points: int = 3
 
-    follow_speed: float = 0.35
-    lookahead_distance: float = 0.75
-    yaw_kp: float = 1.2
-    max_angular_speed: float = 0.90
+    follow_speed: float = 0.20
+    lookahead_distance: float = 1.10
+    yaw_kp: float = 0.6
+    max_angular_speed: float = 0.40
+    min_follow_turn_radius: float = 1.0
+    angular_rate_limit: float = 1.2
+    target_filter_alpha: float = 0.35
     path_goal_xy_tolerance: float = 0.20
 
     pattern: str = "1L 2R"
@@ -120,6 +123,8 @@ class MaizeNavigator(Node):
         self.right_row: Optional[RowMarchModel] = None
         self.midline: np.ndarray = np.empty((0, 2), dtype=float)
         self.row_end_point: Optional[np.ndarray] = None
+        self.last_cmd_angular_z: float = 0.0
+        self.last_target_point: Optional[np.ndarray] = None
 
         self.tf_buffer = tf2_ros.Buffer()
         self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
@@ -170,6 +175,9 @@ class MaizeNavigator(Node):
         p.lookahead_distance = float(get_param("lookahead_distance", p.lookahead_distance))
         p.yaw_kp = float(get_param("yaw_kp", p.yaw_kp))
         p.max_angular_speed = float(get_param("follow_max_angular_speed", p.max_angular_speed))
+        p.min_follow_turn_radius = float(get_param("min_follow_turn_radius", p.min_follow_turn_radius))
+        p.angular_rate_limit = float(get_param("angular_rate_limit", p.angular_rate_limit))
+        p.target_filter_alpha = float(get_param("target_filter_alpha", p.target_filter_alpha))
         p.path_goal_xy_tolerance = float(get_param("path_goal_xy_tolerance", p.path_goal_xy_tolerance))
 
         p.pattern = str(get_param("pattern", p.pattern))
@@ -187,6 +195,9 @@ class MaizeNavigator(Node):
         self.p.row_rectangle_width = max(0.05, self.p.row_rectangle_width)
         self.p.row_point_window_length = max(0.05, self.p.row_point_window_length)
         self.p.row_max_march_steps = max(1, self.p.row_max_march_steps)
+        self.p.min_follow_turn_radius = max(0.1, self.p.min_follow_turn_radius)
+        self.p.angular_rate_limit = max(0.01, self.p.angular_rate_limit)
+        self.p.target_filter_alpha = float(np.clip(self.p.target_filter_alpha, 0.01, 1.0))
 
     def map_callback(self, msg: OccupancyGrid) -> None:
         self.latest_map = msg
@@ -196,6 +207,7 @@ class MaizeNavigator(Node):
         self.right_row = None
         self.midline = np.empty((0, 2), dtype=float)
         self.row_end_point = None
+        self.reset_controller_state()
         self.state = MissionState.INITIALIZING
         res.success = True
         res.message = "Navigation started"
@@ -203,10 +215,15 @@ class MaizeNavigator(Node):
 
     def stop_cb(self, req, res):
         self.state = MissionState.IDLE
+        self.reset_controller_state()
         self.cmd_pub.publish(Twist())
         res.success = True
         res.message = "Navigation stopped"
         return res
+
+    def reset_controller_state(self) -> None:
+        self.last_cmd_angular_z = 0.0
+        self.last_target_point = None
 
     def get_robot_pose(self) -> Optional[Pose2D]:
         try:
@@ -272,6 +289,7 @@ class MaizeNavigator(Node):
             dist_to_end = float(np.linalg.norm(robot_xy - self.row_end_point))
             if dist_to_end <= self.p.path_goal_xy_tolerance:
                 self.get_logger().info("First row end reached. Stopping; row switching is disabled for this version.")
+                self.reset_controller_state()
                 self.cmd_pub.publish(Twist())
                 self.state = MissionState.FINISHED
                 return
@@ -588,15 +606,35 @@ class MaizeNavigator(Node):
         return polyline[-1]
 
     def drive_to_point(self, target: np.ndarray) -> None:
-        dx = float(target[0] - self.robot_pose.x)
-        dy = float(target[1] - self.robot_pose.y)
+        target = np.asarray(target, dtype=float)
+        if self.last_target_point is None:
+            filtered_target = target
+        else:
+            alpha = self.p.target_filter_alpha
+            filtered_target = (1.0 - alpha) * self.last_target_point + alpha * target
+        self.last_target_point = np.asarray(filtered_target, dtype=float)
+
+        dx = float(filtered_target[0] - self.robot_pose.x)
+        dy = float(filtered_target[1] - self.robot_pose.y)
         target_yaw = math.atan2(dy, dx)
         yaw_error = wrap_to_pi(target_yaw - self.robot_pose.yaw)
 
         cmd = Twist()
         speed_factor = float(np.clip(1.0 - abs(yaw_error) / 0.7, 0.25, 1.0))
         cmd.linear.x = self.p.follow_speed * speed_factor
-        cmd.angular.z = float(np.clip(self.p.yaw_kp * yaw_error, -self.p.max_angular_speed, self.p.max_angular_speed))
+        radius_limited_angular = abs(cmd.linear.x) / self.p.min_follow_turn_radius
+        max_angular = min(self.p.max_angular_speed, radius_limited_angular)
+        angular_raw = float(np.clip(self.p.yaw_kp * yaw_error, -max_angular, max_angular))
+
+        dt = 1.0 / max(1e-6, self.p.control_frequency)
+        max_delta = self.p.angular_rate_limit * dt
+        angular_limited = float(np.clip(
+            angular_raw,
+            self.last_cmd_angular_z - max_delta,
+            self.last_cmd_angular_z + max_delta,
+        ))
+        self.last_cmd_angular_z = angular_limited
+        cmd.angular.z = angular_limited
         self.cmd_pub.publish(cmd)
 
     def get_map_points_in_roi(self, pose: Pose2D, size: float) -> np.ndarray:
@@ -638,6 +676,14 @@ class MaizeNavigator(Node):
         if len(self.midline) > 0:
             markers.markers.append(self.create_line_marker("march_midline", marker_id, self.midline, (0.15, 0.45, 1.0, 1.0), 0.055, stamp))
             marker_id += 1
+        if self.last_target_point is not None:
+            markers.markers.append(self.create_sphere_marker("filtered_target_point", marker_id, self.last_target_point, (1.0, 0.05, 1.0, 1.0), 0.18, stamp))
+            marker_id += 1
+            if self.robot_pose is not None:
+                robot_point = np.array([self.robot_pose.x, self.robot_pose.y], dtype=float)
+                target_line = np.vstack((robot_point, self.last_target_point))
+                markers.markers.append(self.create_line_marker("robot_to_filtered_target", marker_id, target_line, (1.0, 0.05, 1.0, 0.75), 0.025, stamp))
+                marker_id += 1
         if self.row_end_point is not None:
             markers.markers.append(self.create_sphere_marker("row_end", marker_id, self.row_end_point, (1.0, 0.0, 0.0, 1.0), 0.22, stamp))
 
