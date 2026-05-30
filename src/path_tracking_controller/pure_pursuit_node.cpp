@@ -32,6 +32,7 @@ public:
         // Parameter
         this->declare_parameter<std::string>("global_frame", "odom");
         this->declare_parameter<std::string>("base_link_frame", "base_link");
+        this->declare_parameter<std::string>("path_topic", "/plan");
         this->declare_parameter<double>("lookahead_min", 0.5);
         this->declare_parameter<double>("lookahead_max", 2.5);
         this->declare_parameter<double>("lookahead_gain", 1.0);
