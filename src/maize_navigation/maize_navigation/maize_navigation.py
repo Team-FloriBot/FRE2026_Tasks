@@ -386,6 +386,16 @@ class NavigatorParams:
     # sichtbaren Reihenenden ungleich weit herausragen können.
     map_multirow_require_counted_rows: bool = True
     map_counted_row_min_width_ratio: float = 0.55
+    # Mehrreihen-Zielgassen duerfen nur dann gelatcht werden, wenn die
+    # gezählte Zielgasse wirklich nahe am Pattern-Soll liegt. Die allgemeine
+    # map_lane_accept_tolerance=0.45 ist fuer 2R zu weich und akzeptierte im
+    # Log eine erste rechte Gasse bei -1.08 m als 2R-Ziel.
+    map_multirow_counted_target_tolerance: float = 0.22
+    # Die erste gezählte Reihenlinie auf der Zielseite muss plausibel die
+    # Begrenzungsreihe der aktuellen Gasse sein. Ist sie viel zu nah an v=0,
+    # stammt die Zählung vom Reihenende/Referenzwechsel und kann 2R auf 1R
+    # verkürzen.
+    map_multirow_reference_row_min_ratio: float = 0.65
     # Bei Mehrreihensprüngen ist die Map-Querposition am Einfahren weniger
     # belastbar als die lokale Reihenhypothese: durch U-Turn-Geometrie,
     # Schlupf und Reihenanfangs-Asymmetrie kann der gemessene Versatz um
@@ -925,6 +935,11 @@ class MapRowDetector:
         sign = 1 if direction.upper() == "L" else -1
         expected_offset = sign * step * self.p.expected_row_width
         tolerance = max(0.05, float(self.p.map_lane_accept_tolerance))
+        if step >= 2:
+            tolerance = min(
+                tolerance,
+                max(0.05, float(self.p.map_multirow_counted_target_tolerance)),
+            )
 
         self.last_expected_target_offset = float(expected_offset)
         self.last_detected_target_offset = 0.0
@@ -1001,7 +1016,17 @@ class MapRowDetector:
             # wieder auf eine extrapolierte 1R-ähnliche Bahn zurückwerfen.
             inward_bias_ok = True if step >= 2 else not (signed_outward_error < -inward_bias_limit)
 
-            if error <= tolerance and width_ok and inward_bias_ok:
+            reference_min = 0.0
+            reference_ok = True
+            if step >= 2:
+                reference_min = max(
+                    0.05,
+                    float(self.p.map_multirow_reference_row_min_ratio)
+                    * float(self.p.expected_row_width),
+                )
+                reference_ok = abs(float(side_rows[0])) >= reference_min
+
+            if error <= tolerance and width_ok and inward_bias_ok and reference_ok:
                 width = float(measured_width)
                 self.last_target_reason = (
                     f"row-line counted target accepted: direction={direction.upper()}, "
@@ -1011,6 +1036,7 @@ class MapRowDetector:
                     f"error={error:.3f}, width={measured_width:.3f}, "
                     f"signed_outward_error={signed_outward_error:.3f}, "
                     f"width_range=[{counted_min:.3f},{width_max:.3f}], tolerance={tolerance:.3f}, "
+                    f"reference_ok={reference_ok}, reference_min={reference_min:.3f}, "
                     f"side_rows=[{self.last_candidate_rows_text}]"
                 )
                 return MapLane(
@@ -1030,6 +1056,7 @@ class MapRowDetector:
                 f"center={center_v:.3f}, expected={expected_offset:.3f}, "
                 f"error={error:.3f}, width={measured_width:.3f}, "
                 f"width_ok={width_ok}, inward_bias_ok={inward_bias_ok}, "
+                f"reference_ok={reference_ok}, reference_min={reference_min:.3f}, "
                 f"signed_outward_error={signed_outward_error:.3f}, "
                 f"width_range=[{counted_min:.3f},{width_max:.3f}], "
                 f"tolerance={tolerance:.3f}, side_rows=[{self.last_candidate_rows_text}]"
@@ -2711,8 +2738,19 @@ class MissionManager:
         if "row-line counted target accepted" not in reason:
             return
 
-        tolerance = max(0.05, float(self.p.map_lane_accept_tolerance))
+        tolerance = min(
+            max(0.05, float(self.p.map_lane_accept_tolerance)),
+            max(0.05, float(self.p.map_multirow_counted_target_tolerance)),
+        )
         if abs(float(self.target_offset_error)) > tolerance:
+            return
+
+        reference_min = max(
+            0.05,
+            float(self.p.map_multirow_reference_row_min_ratio)
+            * float(self.p.expected_row_width),
+        )
+        if abs(float(self.reference_row_v)) < reference_min:
             return
 
         # The selected center has to be on the commanded side. This prevents a
@@ -3821,6 +3859,8 @@ class MaizeNavigator(Node):
         p.map_counted_lane_inward_bias_tolerance = float(declare("map_counted_lane_inward_bias_tolerance", p.map_counted_lane_inward_bias_tolerance))
         p.map_multirow_require_counted_rows = bool(declare("map_multirow_require_counted_rows", p.map_multirow_require_counted_rows))
         p.map_counted_row_min_width_ratio = float(declare("map_counted_row_min_width_ratio", p.map_counted_row_min_width_ratio))
+        p.map_multirow_counted_target_tolerance = float(declare("map_multirow_counted_target_tolerance", p.map_multirow_counted_target_tolerance))
+        p.map_multirow_reference_row_min_ratio = float(declare("map_multirow_reference_row_min_ratio", p.map_multirow_reference_row_min_ratio))
         p.neighbor_reference_turn_enabled = bool(declare("neighbor_reference_turn_enabled", p.neighbor_reference_turn_enabled))
         p.neighbor_reference_entry_requires_shift = bool(declare("neighbor_reference_entry_requires_shift", p.neighbor_reference_entry_requires_shift))
         p.neighbor_reference_requires_same_side_row = bool(declare("neighbor_reference_requires_same_side_row", p.neighbor_reference_requires_same_side_row))
