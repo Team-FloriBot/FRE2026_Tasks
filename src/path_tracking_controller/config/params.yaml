@@ -23,4 +23,4 @@ pure_pursuit_node:
     goal_tolerance: 0.15       # Toleranz für Zielerkennung [m]
     
     # ========== Regelung ==========
-    control_rate: 30           # Regelrate [Hz]
+    control_rate: 10           # Regelrate [Hz]

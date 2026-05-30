@@ -12,7 +12,7 @@ def generate_launch_description():
         # Launch-Argument für Konfigurationsdatei
         DeclareLaunchArgument(
             'config',
-            default_value=['$(find-pkg-share path_tracking_controller)/params.yaml'],
+            default_value=['$(find-pkg-share path_tracking_controller)/config/params.yaml'],
             description='Pfad zur Konfigurationsdatei für den Pure Pursuit Controller'),
             
         # Pure Pursuit Controller Node
