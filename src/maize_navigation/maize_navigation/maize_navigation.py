@@ -1913,23 +1913,38 @@ class PathFollower:
         if target is None:
             return cmd
 
-        # Multi-row headland shifts (2L/2R/...) are distance-gated by the
-        # latched SLAM target lane in the mission state machine. Do not run
-        # pure pursuit and do not run a strong yaw-hold controller here.
+        # Multi-row headland shifts (2L/2R/...) are gated by the latched SLAM
+        # target lane in the mission state machine. This segment must neither
+        # be normal pure-pursuit (v9 cut into the first visible right gap) nor
+        # a hard heading-hold (v10 spun with raw_cmd angular.z about 1.4 rad/s),
+        # nor dead-straight open-loop (v11 kept angular.z=0 and the measured
+        # shift moved back toward zero, so no row was entered).
         #
-        # v10 used yaw-hold on the map-frame target heading. In the logs this
-        # produced raw_cmd=(0.055, 1.400) and headland_total_yaw_progress>5 rad:
-        # the robot spun in a circle instead of continuing to the second right
-        # lane. The exit arc already places the robot approximately parallel to
-        # the row ends, so the safe controller for this leg is: drive straight
-        # in the current heading and let _multirow_map_preentry_reached() decide
-        # when the latched second-lane pre-entry coordinate has been reached.
+        # Use a bounded pursuit controller toward the latched pre-entry line:
+        # it steers gently toward the generated map target, but angular speed is
+        # deliberately limited well below the turn controller. The state machine
+        # still decides when the pre-entry coordinate for the second lane has
+        # been reached and then switches to ENTRY_CURVE.
         if path.reason == "HEADLAND_SHIFT_MULTIROW_TARGET":
+            lookahead = max(0.25, min(0.70, float(self.p.headland_shift_lookahead_distance)))
+            target = self.find_lookahead_odom(path.points, pose, lookahead_distance=lookahead) or path.points[-1]
+            desired_yaw = math.atan2(float(target.y) - float(pose.y), float(target.x) - float(pose.x))
+            yaw_err = wrap_to_pi(desired_yaw - float(pose.yaw))
+
             goal = path.points[-1]
-            v = clamp(goal.v, 0.0, self.p.max_linear_speed)
+            base_v = clamp(goal.v, 0.0, self.p.max_linear_speed)
+            # Keep moving while correcting, but slow down if the target line is
+            # far off the current heading. This prevents both spinning and a
+            # large cut into the first neighbouring gap.
+            heading_scale = max(0.35, math.cos(min(abs(yaw_err), math.pi / 2.0)))
+            v = base_v * heading_scale
+            w_limit = min(0.45, float(self.p.turn_max_angular_speed), float(self.p.follow_max_angular_speed))
+            w = clamp(1.15 * yaw_err, -w_limit, w_limit)
+            w = self.rate_limit(w, self.last_w_odom)
+            self.last_w_odom = w
+
             cmd.linear.x = v
-            cmd.angular.z = 0.0
-            self.last_w_odom = 0.0
+            cmd.angular.z = w
             return cmd
 
         goal = path.points[-1]
@@ -2764,7 +2779,18 @@ class MissionManager:
         if preentry is not None:
             current = self._multirow_corrected_headland_shift()
             direction = 1.0 if float(preentry) >= 0.0 else -1.0
-            return direction * float(current) >= direction * float(preentry) - tol
+            pattern_reached = direction * float(current) >= direction * float(preentry) - tol
+
+            # Backup completion test in the fixed latched map-row basis. This
+            # avoids getting stuck when the corrected pattern-relative shift is
+            # degraded by a changing local PCA row-yaw estimate while the global
+            # pre-entry line itself has already been reached.
+            remaining_global = self._multirow_remaining_to_preentry(pose_map)
+            global_reached = False
+            if remaining_global is not None:
+                global_reached = direction * float(remaining_global) <= tol
+
+            return bool(pattern_reached or global_reached)
 
         travelled = abs(float(self.headland_measured_shift))
         target = self._headland_pre_entry_shift_target()
