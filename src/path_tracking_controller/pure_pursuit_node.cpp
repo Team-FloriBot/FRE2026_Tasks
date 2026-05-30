@@ -43,7 +43,6 @@ public:
         min_speed_ = this->get_parameter("min_speed").as_double();
         curvature_gain_ = this->get_parameter("curvature_gain").as_double();
         max_angular_velocity_ = this->get_parameter("max_angular_velocity").as_double();
-        goal_slowdown_distance_ = this->get_parameter("goal_slowdown_distance").as_double();
         goal_tolerance_ = this->get_parameter("goal_tolerance").as_double();
         search_window_ = this->get_parameter("search_window").as_int();
         control_rate_ = this->get_parameter("control_rate").as_double();
@@ -79,14 +78,12 @@ private:
     double lookahead_min_, lookahead_max_, lookahead_gain_;
     double max_speed_, min_speed_;
     double curvature_gain_, max_angular_velocity_;
-    double goal_slowdown_distance_;
     double goal_tolerance_;
     int search_window_;
     double control_rate_;
 
     // ---- Path & State ----
     nav_msgs::msg::Path current_path_;
-    size_t current_path_index_ = 0;
     bool path_received_ = false;
     bool is_first_path_tick_ = true; // <--- NEU: Kontrolliert die initiale Suche
 
@@ -96,12 +93,15 @@ private:
             RCLCPP_WARN(this->get_logger(), "Empfangener Pfad ist leer!");
             return;
         }
+
         current_path_ = *msg;
-        current_path_index_ = 0; 
         path_received_ = true;
-        is_first_path_tick_ = true; // Bei neuem Pfad die globale Suche einmalig erlauben
-        RCLCPP_INFO(this->get_logger(), "Pfad mit %zu Punkten empfangen (Frame: %s)", 
-                    current_path_.poses.size(), current_path_.header.frame_id.c_str());
+        is_first_path_tick_ = true;
+
+        RCLCPP_INFO(this->get_logger(),
+            "Pfad mit %zu Punkten empfangen (Frame: %s)",
+            current_path_.poses.size(),
+            current_path_.header.frame_id.c_str());
     }
 
     bool get_vehicle_pose(const std::string & target_frame, geometry_msgs::msg::PoseStamped & pose)
@@ -125,39 +125,28 @@ private:
     }
 
     // ---- Vorwärts gerichtete Suche (SEQUENTIELL GESICHERT) ----
-    size_t find_nearest_point_forward(const geometry_msgs::msg::PoseStamped & pose)
+    size_t find_nearest_point_cyclic(const geometry_msgs::msg::PoseStamped & pose)
     {
-        size_t best_idx = current_path_index_;
+        size_t N = current_path_.poses.size();
+        size_t best_idx = 0;
         double best_dist = std::numeric_limits<double>::max();
-        
-        size_t start_idx = current_path_index_;
-        size_t end_idx = current_path_.poses.size();
-        
-        // FIX: Nur beim ersten Tick nach Pfadempfang suchen wir überall. 
-        // Danach tracken wir den Roboter lokal im Bereich von max. 25 Punkten vor ihm.
-        // Das verhindert jegliches Vorwärtsspringen an Schleifen oder Nachbarreihen!
-        if (!is_first_path_tick_)
+
+        // komplette zyklische Suche
+        for (size_t i = 0; i < N; ++i)
         {
-            end_idx = std::min(current_path_index_ + 25, current_path_.poses.size());
-        }
-        else
-        {
-            is_first_path_tick_ = false; // Initiale Suche abgeschlossen
-        }
-        
-        for(size_t i = start_idx; i < end_idx; ++i)
-        {
-            double dx = current_path_.poses[i].pose.position.x - pose.pose.position.x;
-            double dy = current_path_.poses[i].pose.position.y - pose.pose.position.y;
+            const auto & p = current_path_.poses[i].pose.position;
+            double dx = p.x - pose.pose.position.x;
+            double dy = p.y - pose.pose.position.y;
             double dist = dx*dx + dy*dy;
-            if(dist < best_dist)
+
+            if (dist < best_dist)
             {
                 best_dist = dist;
                 best_idx = i;
             }
         }
-        current_path_index_ = std::max(current_path_index_, best_idx);
-        return current_path_index_;
+
+        return best_idx;
     }
 
     double compute_lookahead_distance()
@@ -166,27 +155,37 @@ private:
         return std::clamp(ld, lookahead_min_, lookahead_max_);
     }
 
-    bool find_lookahead_point(size_t nearest_idx, double lookahead_distance, geometry_msgs::msg::Point & lookahead)
+    bool find_lookahead_point_cyclic(size_t nearest_idx,
+                                    double lookahead_distance,
+                                    geometry_msgs::msg::Point & lookahead)
     {
+        size_t N = current_path_.poses.size();
         double accumulated = 0.0;
-        for(size_t i=nearest_idx; i<current_path_.poses.size()-1; ++i)
+
+        for (size_t step = 0; step < N; ++step)
         {
+            size_t i = (nearest_idx + step) % N;
+            size_t j = (i + 1) % N;
+
             const auto & p0 = current_path_.poses[i].pose.position;
-            const auto & p1 = current_path_.poses[i+1].pose.position;
-            double seg = std::hypot(p1.x-p0.x, p1.y-p0.y);
-            if(accumulated + seg >= lookahead_distance)
+            const auto & p1 = current_path_.poses[j].pose.position;
+
+            double seg = std::hypot(p1.x - p0.x, p1.y - p0.y);
+
+            if (accumulated + seg >= lookahead_distance)
             {
-                double remaining = lookahead_distance - accumulated;
-                double ratio = remaining / seg;
-                lookahead.x = p0.x + ratio*(p1.x-p0.x);
-                lookahead.y = p0.y + ratio*(p1.y-p0.y);
+                double r = (lookahead_distance - accumulated) / seg;
+                lookahead.x = p0.x + r * (p1.x - p0.x);
+                lookahead.y = p0.y + r * (p1.y - p0.y);
                 lookahead.z = 0.0;
                 return true;
             }
+
             accumulated += seg;
         }
-        // Wenn das Pfadende näher als die Lookahead-Distanz ist, clippen wir auf das Ziel
-        lookahead = current_path_.poses.back().pose.position;
+
+        // fallback (sollte selten passieren)
+        lookahead = current_path_.poses[nearest_idx].pose.position;
         return true;
     }
 
@@ -222,34 +221,10 @@ private:
         
         // Bremsrampe vor dem Ziel nur aktivieren, wenn das Array-Ende wirklich nah ist
         double v_goal = max_speed_;
-        size_t remaining_points = current_path_.poses.size() - 1 - current_path_index_;
-        if (remaining_points < 30)
-        {
-            double goal_dist = std::hypot(
-                current_path_.poses.back().pose.position.x - current_path_.poses[current_path_index_].pose.position.x,
-                current_path_.poses.back().pose.position.y - current_path_.poses[current_path_index_].pose.position.y);
-            v_goal = max_speed_ * std::min(1.0, goal_dist / goal_slowdown_distance_);
-        }
         
         speed = std::clamp(std::min(v_curve, v_goal), min_speed_, max_speed_);
         omega = std::clamp(speed * curvature, -max_angular_velocity_, max_angular_velocity_);
         return true;
-    }
-
-    bool check_goal_reached(const geometry_msgs::msg::PoseStamped & pose)
-    {
-        if (current_path_.poses.empty()) return false;
-        
-        // Erst wenn wir indexseitig fast am Ende des Pfad-Arrays sind, darf gestoppt werden!
-        size_t remaining_points = current_path_.poses.size() - 1 - current_path_index_;
-        if (remaining_points > 10) 
-        {
-            return false;
-        }
-
-        const auto & goal = current_path_.poses.back().pose.position;
-        double dist = std::hypot(goal.x - pose.pose.position.x, goal.y - pose.pose.position.y);
-        return dist < goal_tolerance_;
     }
 
     void publish_zero_twist()
@@ -301,27 +276,25 @@ private:
 
     void control_loop()
     {
-        if(!path_received_ || current_path_.poses.empty()) return;
+        if (!path_received_ || current_path_.poses.empty())
+            return;
 
         geometry_msgs::msg::PoseStamped vehicle_pose;
-        if(!get_vehicle_pose(current_path_.header.frame_id, vehicle_pose)) return;
-
-        size_t nearest_idx = find_nearest_point_forward(vehicle_pose);
-
-        if(check_goal_reached(vehicle_pose))
-        {
-            RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 2000, "Ziel erreicht! Stoppe Fahrzeug.");
-            publish_zero_twist();
+        if (!get_vehicle_pose(current_path_.header.frame_id, vehicle_pose))
             return;
-        }
+
+        size_t nearest_idx = find_nearest_point_cyclic(vehicle_pose);
 
         double ld = compute_lookahead_distance();
+
         geometry_msgs::msg::Point lookahead;
-        if(!find_lookahead_point(nearest_idx, ld, lookahead)) return;
+        if (!find_lookahead_point_cyclic(nearest_idx, ld, lookahead))
+            return;
 
         double speed, omega;
-        if(!compute_control(lookahead, speed, omega)) {
-            publish_zero_twist(); 
+        if (!compute_control(lookahead, speed, omega))
+        {
+            publish_zero_twist();
             return;
         }
 
@@ -329,7 +302,7 @@ private:
         cmd.linear.x = speed;
         cmd.angular.z = omega;
         cmd_vel_pub_->publish(cmd);
-        
+
         publish_debug(vehicle_pose, lookahead, nearest_idx);
     }
 };
