@@ -80,6 +80,7 @@ private:
     // ---- Parameters ----
     std::string global_frame_;
     std::string base_link_frame_;
+    std::string path_topic;
     double lookahead_min_, lookahead_max_, lookahead_gain_;
     double max_speed_, min_speed_;
     double curvature_gain_, max_angular_velocity_;
