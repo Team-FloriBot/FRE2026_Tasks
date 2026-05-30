@@ -1765,6 +1765,53 @@ class LocalPlanner:
             )
         return LocalPath(points, True, self.p.map_frame, reason)
 
+    def plan_headland_shift_map_to_lateral_target(
+        self,
+        pose: Pose2D,
+        row_yaw: float,
+        target_v: float,
+        speed: Optional[float] = None,
+        reason: str = "HEADLAND_SHIFT_MULTIROW_TARGET",
+    ) -> LocalPath:
+        """Drive on an explicit map-frame line to a latched multi-row pre-entry lateral coordinate.
+
+        For 2L/2R the counted SLAM target lane is already known. A plain heading
+        command can still let pure pursuit cut into the first neighbouring gap
+        because it does not constrain the lateral coordinate. This path keeps the
+        along-row coordinate approximately constant and samples directly towards
+        the latched pre-entry v-coordinate in the fixed row basis.
+        """
+        v_cmd = self.p.headland_shift_speed if speed is None else speed
+        v_cmd = clamp(abs(v_cmd), 0.0, self.p.max_linear_speed)
+
+        cy = math.cos(float(row_yaw))
+        sy = math.sin(float(row_yaw))
+        current_u = cy * float(pose.x) + sy * float(pose.y)
+        current_v = -sy * float(pose.x) + cy * float(pose.y)
+        dv_total = float(target_v) - current_v
+
+        # Positive v means row_yaw + 90 deg, negative v means row_yaw - 90 deg.
+        direction = 1.0 if dv_total >= 0.0 else -1.0
+        desired_yaw = wrap_to_pi(float(row_yaw) + direction * math.pi / 2.0)
+
+        # Keep a useful lookahead even when we are close to the target; the state
+        # machine decides when to switch to ENTRY_CURVE.
+        max_len = max(0.35, min(1.80, abs(dv_total)))
+        points: List[PathPoint] = []
+        for d in np.linspace(0.10, max_len, 28):
+            step_v = current_v + direction * float(d)
+            # Do not overshoot the latched pre-entry line in the generated path.
+            if direction > 0.0:
+                step_v = min(step_v, float(target_v))
+            else:
+                step_v = max(step_v, float(target_v))
+
+            x = cy * current_u - sy * step_v
+            y = sy * current_u + cy * step_v
+            points.append(PathPoint(float(x), float(y), float(desired_yaw), float(v_cmd)))
+
+        return LocalPath(points, True, self.p.map_frame, reason)
+
 
 class PathFollower:
     def __init__(self, params: NavigatorParams):
@@ -3040,6 +3087,26 @@ class MissionManager:
                     self.p.entry_curve_speed,
                     self.p.entry_curve_angular_speed,
                     reason="ENTRY_CURVE",
+                )
+
+            # For 2L/2R and larger multi-row turns, do not command only a map
+            # heading. The v8 logs showed the target lane correctly latched at
+            # about -1.5 m while the robot still cut into the first right gap.
+            # The reason is that HEADLAND_SHIFT_MAP constrained yaw but not the
+            # lateral coordinate. Once the counted target is locked, generate the
+            # path directly to the latched pre-entry v-line in the fixed map row
+            # basis. This makes the robot physically continue past the first gap.
+            if (
+                int(self.p.row_shift_count) >= 2
+                and self.multirow_counted_target_latched
+                and self.multirow_latched_row_yaw_map is not None
+                and self.multirow_latched_preentry_global_v is not None
+            ):
+                return planner.plan_headland_shift_map_to_lateral_target(
+                    pose_map,
+                    float(self.multirow_latched_row_yaw_map),
+                    float(self.multirow_latched_preentry_global_v),
+                    reason="HEADLAND_SHIFT_MULTIROW_TARGET",
                 )
 
             desired_shift_yaw = self._desired_headland_shift_yaw(pose_map, map_detector)
