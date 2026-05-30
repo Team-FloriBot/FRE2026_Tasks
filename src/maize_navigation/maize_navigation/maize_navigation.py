@@ -2578,12 +2578,38 @@ class MissionManager:
         current_v = self._map_v_coordinate(pose_map, float(self.multirow_latched_row_yaw_map))
         return float(self.multirow_latched_preentry_global_v) - current_v
 
+    def _refresh_multirow_shift_sign_correction(self) -> None:
+        """Keep travelled shift in the same signed basis as the counted 2L/2R target.
+
+        The row axis from the SLAM/PCA detector is axial. When the headland
+        reference row yaw is latched, headland_measured_shift may change sign
+        although the robot is still physically driving to the same side. In the
+        failing 2R logs the target was latched at about -1.5 m, but the measured
+        shift became +0.79 m after the map row basis was latched. A one-time
+        correction computed before that basis change is therefore stale.
+
+        Recompute the correction from the current measured shift and the locked
+        target every time it is used. This is deterministic because the locked
+        target offset is fixed for the whole multi-row maneuver.
+        """
+        if not self.multirow_counted_target_latched:
+            self.multirow_shift_sign_correction = 1.0
+            return
+
+        target = float(self.multirow_latched_target_offset)
+        measured = float(self.headland_measured_shift)
+        if abs(target) <= 0.05 or abs(measured) <= 0.05:
+            return
+
+        self.multirow_shift_sign_correction = 1.0 if measured * target >= 0.0 else -1.0
+
     def _multirow_corrected_headland_shift(self) -> float:
         # headland_measured_shift is calculated in an axial PCA row basis. That
         # basis may be flipped by pi relative to the signed lane offsets returned
-        # by select_target_lane(). The correction is latched once with the counted
-        # 2L/2R target and maps the travelled headland shift back into the same
-        # signed coordinate system as detected_target_offset/expected_target_offset.
+        # by select_target_lane(). Always refresh the correction after the map
+        # row-yaw reference has been latched; otherwise 2R can look like +0.8 m
+        # travelled although the counted target is -1.5 m.
+        self._refresh_multirow_shift_sign_correction()
         return float(self.multirow_shift_sign_correction) * float(self.headland_measured_shift)
 
     def _multirow_relative_preentry_shift(self) -> Optional[float]:
@@ -2624,18 +2650,12 @@ class MissionManager:
         self.multirow_latched_target_offset = float(self.detected_target_offset)
         self.multirow_latched_target_error = float(self.target_offset_error)
 
-        # Critical for 2R/2L: the map-row PCA axis is axial. In the logs for 2R
-        # the counted target was negative (-1.48 m), while headland_measured_shift
-        # became positive (+0.80 m) after the row-yaw basis was latched. If this
-        # sign mismatch is used directly, the controller believes it is already
-        # near the first gap and the straight headland leg is shortened. Latch a
-        # sign correction so travelled shift and counted target live in the same
-        # signed row-offset coordinate system.
-        measured = float(self.headland_measured_shift)
-        if abs(measured) > 0.05 and abs(float(self.multirow_latched_target_offset)) > 0.05:
-            self.multirow_shift_sign_correction = 1.0 if measured * float(self.multirow_latched_target_offset) >= 0.0 else -1.0
-        else:
-            self.multirow_shift_sign_correction = 1.0
+        # Do not permanently latch the shift sign here. At this point the
+        # headland reference row-yaw may have just been captured, and
+        # headland_measured_shift can still be expressed in the previous basis.
+        # The correction is refreshed dynamically in
+        # _multirow_corrected_headland_shift().
+        self._refresh_multirow_shift_sign_correction()
 
         if pose_map is None:
             return
@@ -3010,6 +3030,7 @@ class MissionManager:
                 self._capture_headland_reference_row_yaw(map_detector)
                 self._update_multirow_counted_target_latch(pose_map)
                 self._update_headland_measured_shift(pose_map)
+                self._refresh_multirow_shift_sign_correction()
                 remaining = self._headland_pre_entry_shift_target() - abs(self.headland_measured_shift)
 
             if (int(self.p.row_shift_count) >= 2 and self._multirow_map_preentry_reached(pose_map)) or (int(self.p.row_shift_count) < 2 and remaining <= self.p.headland_shift_tolerance):
@@ -4110,8 +4131,8 @@ class MaizeNavigator(Node):
             f" | target_offset_error={self.mission.target_offset_error:.3f}"
             f" | multirow_counted_target_latched={self.mission.multirow_counted_target_latched}"
             f" | multirow_latched_target_offset={self.mission.multirow_latched_target_offset:.3f}"
-            f" | multirow_shift_sign_correction={self.mission.multirow_shift_sign_correction:.1f}"
             f" | multirow_corrected_shift={self.mission._multirow_corrected_headland_shift():.3f}"
+            f" | multirow_shift_sign_correction={self.mission.multirow_shift_sign_correction:.1f}"
             f" | multirow_latched_preentry_v={self.mission.multirow_latched_preentry_global_v if self.mission.multirow_latched_preentry_global_v is not None else 'None'}"
             f" | target_lane_reason='{self.mission.last_target_lane_reason}'"
             f" | reference_row_v={self.mission.reference_row_v:.3f}"
