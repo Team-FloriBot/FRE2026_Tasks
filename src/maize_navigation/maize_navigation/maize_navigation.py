@@ -463,6 +463,23 @@ class NavigatorParams:
     map_row_max_lines: int = 12
     map_row_line_merge_distance: float = 0.22
 
+    # Zusaetzliche SLAM-Reihenerkennung ueber Quer-Histogramm.
+    # Diese Variante ist fuer punktfoermige, lueckenhafte Maiskarten robuster
+    # als ein reiner globaler Linienfit. Die Karte wird zuerst in die
+    # Reihenbasis (u entlang der Reihe, v quer zur Reihe) transformiert; Peaks
+    # im v-Histogramm sind Pflanzenreihen. Fehlende Peaks werden mit dem
+    # erwarteten Reihenabstand ergaenzt, damit 2R/2L diskret gezaehlt werden kann.
+    map_row_histogram_enabled: bool = True
+    map_row_histogram_bin: float = 0.05
+    map_row_histogram_smoothing_bins: int = 3
+    map_row_peak_min_points: int = 6
+    map_row_peak_window_ratio: float = 0.32
+    map_row_peak_min_distance_ratio: float = 0.45
+    map_row_spacing_regularization: bool = True
+    map_row_spacing_tolerance_ratio: float = 0.35
+    map_row_insert_missing_peaks: bool = True
+    map_row_insert_missing_max_gap_rows: int = 3
+
     # SLAM-Zielgassen duerfen das Pattern nur korrigieren, nicht beliebig weit ueberschreiben.
     # Beispiel: 1L erwartet ca. +expected_row_width. Eine erkannte Lane bei +3 m wird verworfen.
     map_lane_accept_tolerance: float = 0.45
@@ -501,15 +518,21 @@ class MapRowDetector:
         self.last_field_row_yaw_confidence: float = 0.0
 
     def detect_lanes(self, grid: Optional[OccupancyGrid], pose: Pose2D) -> Tuple[List[MapLane], List[MapRowBand], str]:
-        """Detect plant row lines from occupied SLAM-map cells and derive lane centerlines.
+        """Detect plant rows from occupied SLAM-map cells and derive lane centerlines.
 
-        The map is transformed into the robot-local frame:
-        u = forward along the currently driven row direction,
-        v = left/right across the rows.
+        The map is transformed into a row-oriented local coordinate system:
+        u = along the crop rows, v = lateral across the crop rows.
 
-        We do not search for free space. We fit lines through occupied plant cells.
-        Neighboring plant-row lines form a lane. The lane center_v is therefore
-        the center between two fitted plant rows.
+        Two complementary detectors are used:
+        1. RANSAC line fitting on occupied plant cells.
+        2. A v-histogram peak detector. This is intentionally dominant for the
+           FRE-style maize map, where rows are visible as dotted, slightly curved
+           structures rather than clean continuous lines.
+
+        The output MapRowBand list represents plant-row positions in v. Adjacent
+        row positions define lane centers. Target selection later counts these
+        row positions on the commanded side, so a 2R turn is a discrete two-row
+        jump instead of a free geometric guess during the headland turn.
         """
         if grid is None:
             return [], [], "no OccupancyGrid"
@@ -521,82 +544,94 @@ class MapRowDetector:
         if u is None or v is None:
             return [], [], reason
 
-        if len(u) < self.p.map_row_min_line_inliers:
+        min_points = min(
+            max(4, int(self.p.map_row_min_line_inliers)),
+            max(4, int(self.p.map_row_peak_min_points)),
+        )
+        if len(u) < min_points:
             return [], [], f"not enough occupied cells in local map window: {len(u)}"
 
-        row_lines = self._fit_row_lines(u, v)
-        row_lines = self._merge_row_lines(row_lines)
-        row_lines.sort(key=lambda line: line.lateral_v)
+        line_bands: List[MapRowBand] = []
+        row_lines: List[MapRowLine] = []
+        if len(u) >= max(4, int(self.p.map_row_min_line_inliers)):
+            row_lines = self._fit_row_lines(u, v)
+            row_lines = self._merge_row_lines(row_lines)
+            row_lines.sort(key=lambda line: line.lateral_v)
+            line_bands = [
+                MapRowBand(
+                    valid=True,
+                    lateral_v=float(line.lateral_v),
+                    u_min=-0.5 * float(line.length),
+                    u_max=0.5 * float(line.length),
+                    points=int(line.inliers),
+                )
+                for line in row_lines
+            ]
 
-        # Keep MapRowBand for existing diagnostics/visual language. Each band now
-        # represents one fitted plant-row line, not a pure lateral histogram band.
-        bands = [
-            MapRowBand(
-                valid=True,
-                lateral_v=float(line.lateral_v),
-                u_min=-0.5 * float(line.length),
-                u_max=0.5 * float(line.length),
-                points=int(line.inliers),
+        histogram_bands: List[MapRowBand] = []
+        if self.p.map_row_histogram_enabled:
+            histogram_bands = self._fit_row_bands_histogram(u, v)
+
+        # Merge both estimates. The histogram detector gives robust row counts;
+        # the line detector adds stability where rows are locally straight.
+        bands = self._merge_row_bands(line_bands + histogram_bands)
+        if self.p.map_row_spacing_regularization:
+            bands = self._regularize_row_bands(bands)
+
+        bands = [band for band in bands if band.valid and math.isfinite(band.lateral_v)]
+        bands.sort(key=lambda band: band.lateral_v)
+
+        if len(bands) < 2:
+            return [], bands, (
+                f"not enough row positions: linefit_rows={len(row_lines)}, "
+                f"hist_rows={len(histogram_bands)}, merged={len(bands)}"
             )
-            for line in row_lines
-        ]
-
-        if len(row_lines) < 2:
-            return [], bands, f"not enough row lines fitted: {len(row_lines)}"
 
         lanes: List[MapLane] = []
+        width_min = max(0.05, float(self.p.min_lane_width))
+        width_max = max(width_min, float(self.p.max_lane_width))
+        expected = max(0.05, float(self.p.expected_row_width))
 
-        for right, left in zip(row_lines[:-1], row_lines[1:]):
-            width_v = left.lateral_v - right.lateral_v
-
-            if not (self.p.min_lane_width <= width_v <= self.p.max_lane_width):
+        for right, left in zip(bands[:-1], bands[1:]):
+            width_v = float(left.lateral_v - right.lateral_v)
+            if not (width_min <= width_v <= width_max):
                 continue
 
-            slope_error = abs(left.a - right.a)
-            parallel_score = clamp(1.0 - slope_error / 0.35, 0.0, 1.0)
-
-            width_error = abs(width_v - self.p.expected_row_width)
-            width_score = clamp(1.0 - width_error / max(self.p.expected_row_width, 1e-3), 0.0, 1.0)
-
-            length_score = clamp(
-                min(left.length, right.length) / max(self.p.map_row_min_line_length, 1e-3),
+            width_error = abs(width_v - expected)
+            width_score = clamp(1.0 - width_error / expected, 0.0, 1.0)
+            length = min(float(left.u_max - left.u_min), float(right.u_max - right.u_min))
+            length_score = clamp(length / max(float(self.p.map_row_min_band_length), 1e-3), 0.0, 1.0)
+            point_score = clamp(
+                min(float(left.points), float(right.points)) / max(float(self.p.map_row_peak_min_points), 1.0),
                 0.0,
                 1.0,
             )
-
-            inlier_score = clamp(
-                min(left.inliers, right.inliers) / max(float(self.p.map_row_min_line_inliers), 1.0),
-                0.0,
-                1.0,
-            )
-
-            confidence = clamp(
-                0.30 * parallel_score
-                + 0.30 * width_score
-                + 0.25 * length_score
-                + 0.15 * inlier_score,
-                0.0,
-                1.0,
-            )
+            confidence = clamp(0.45 * width_score + 0.30 * length_score + 0.25 * point_score, 0.0, 1.0)
 
             lanes.append(
                 MapLane(
                     valid=True,
-                    center_v=0.5 * (right.lateral_v + left.lateral_v),
-                    left_row_v=left.lateral_v,
-                    right_row_v=right.lateral_v,
+                    center_v=0.5 * (float(right.lateral_v) + float(left.lateral_v)),
+                    left_row_v=float(left.lateral_v),
+                    right_row_v=float(right.lateral_v),
                     width=width_v,
                     confidence=confidence,
-                    source="detected_linefit",
+                    source="detected_map_row_peaks",
                 )
             )
 
         lanes.sort(key=lambda lane: lane.center_v)
 
-        if len(lanes) == 0:
-            return [], bands, f"row lines fitted, but no valid lane gap: lines={len(row_lines)}"
+        if not lanes:
+            return [], bands, (
+                f"row positions found, but no valid lane gap: rows={len(bands)}, "
+                f"linefit_rows={len(row_lines)}, hist_rows={len(histogram_bands)}"
+            )
 
-        return lanes, bands, f"ok: linefit rows={len(row_lines)}, lanes={len(lanes)}"
+        return lanes, bands, (
+            f"ok: rows={len(bands)}, lanes={len(lanes)}, "
+            f"linefit_rows={len(row_lines)}, hist_rows={len(histogram_bands)}"
+        )
 
     def _update_field_row_orientation(self, dx_all: np.ndarray, dy_all: np.ndarray, pose: Pose2D) -> None:
         """Estimate a coarse, field-fixed row axis from a large map window.
@@ -902,6 +937,157 @@ class MapRowDetector:
                 merged.append(line)
 
         return merged
+
+    def _fit_row_bands_histogram(self, u: np.ndarray, v: np.ndarray) -> List[MapRowBand]:
+        """Find plant-row positions as peaks in the lateral v histogram."""
+        if len(v) == 0:
+            return []
+
+        bin_width = max(0.02, float(self.p.map_row_histogram_bin))
+        v_min = float(np.min(v))
+        v_max = float(np.max(v))
+        if not math.isfinite(v_min) or not math.isfinite(v_max) or v_max <= v_min:
+            return []
+
+        # Pad by one bin so edge rows are not lost.
+        edges = np.arange(v_min - bin_width, v_max + 2.0 * bin_width, bin_width)
+        if len(edges) < 4:
+            return []
+
+        hist, edges = np.histogram(v, bins=edges)
+        smooth = hist.astype(float)
+        smoothing_bins = max(1, int(self.p.map_row_histogram_smoothing_bins))
+        if smoothing_bins > 1:
+            kernel = np.ones(smoothing_bins, dtype=float) / float(smoothing_bins)
+            smooth = np.convolve(smooth, kernel, mode="same")
+
+        centers = 0.5 * (edges[:-1] + edges[1:])
+        threshold = max(1.0, float(self.p.map_row_peak_min_points))
+        min_distance = max(
+            0.05,
+            float(self.p.map_row_peak_min_distance_ratio) * float(self.p.expected_row_width),
+        )
+
+        candidates = []
+        for i in range(1, len(smooth) - 1):
+            if smooth[i] < threshold:
+                continue
+            if smooth[i] < smooth[i - 1] or smooth[i] < smooth[i + 1]:
+                continue
+            candidates.append((float(smooth[i]), float(centers[i])))
+
+        # Strongest peaks first, then non-maximum suppression in v.
+        candidates.sort(key=lambda item: item[0], reverse=True)
+        selected: List[Tuple[float, float]] = []
+        for score, center in candidates:
+            if all(abs(center - existing_center) >= min_distance for _, existing_center in selected):
+                selected.append((score, center))
+
+        selected.sort(key=lambda item: item[1])
+
+        bands: List[MapRowBand] = []
+        half_window = max(
+            bin_width,
+            float(self.p.map_row_peak_window_ratio) * float(self.p.expected_row_width),
+        )
+        min_points = max(1, int(self.p.map_row_peak_min_points))
+        min_length = max(0.0, float(self.p.map_row_min_band_length))
+
+        for _, peak_v in selected:
+            mask = np.abs(v - peak_v) <= half_window
+            if int(np.count_nonzero(mask)) < min_points:
+                continue
+            uu = u[mask]
+            vv = v[mask]
+            if len(uu) == 0:
+                continue
+            length = float(np.max(uu) - np.min(uu))
+            if length < min_length:
+                # Histogram peaks at row ends can still be useful for counting,
+                # but reject extremely short clusters to avoid isolated outliers.
+                continue
+            bands.append(
+                MapRowBand(
+                    valid=True,
+                    lateral_v=float(np.median(vv)),
+                    u_min=float(np.min(uu)),
+                    u_max=float(np.max(uu)),
+                    points=int(len(uu)),
+                )
+            )
+
+        return bands
+
+    def _merge_row_bands(self, bands: List[MapRowBand]) -> List[MapRowBand]:
+        valid = [band for band in bands if band.valid and math.isfinite(band.lateral_v)]
+        valid.sort(key=lambda band: band.lateral_v)
+        if not valid:
+            return []
+
+        merge_distance = max(
+            0.05,
+            min(
+                float(self.p.map_row_line_merge_distance),
+                0.35 * float(self.p.expected_row_width),
+            ),
+        )
+        merged: List[MapRowBand] = []
+        for band in valid:
+            if not merged or abs(float(band.lateral_v) - float(merged[-1].lateral_v)) > merge_distance:
+                merged.append(band)
+                continue
+
+            prev = merged[-1]
+            w_prev = max(1, int(prev.points))
+            w_new = max(1, int(band.points))
+            total = float(w_prev + w_new)
+            merged[-1] = MapRowBand(
+                valid=True,
+                lateral_v=(w_prev * float(prev.lateral_v) + w_new * float(band.lateral_v)) / total,
+                u_min=min(float(prev.u_min), float(band.u_min)),
+                u_max=max(float(prev.u_max), float(band.u_max)),
+                points=int(prev.points + band.points),
+            )
+
+        return merged
+
+    def _regularize_row_bands(self, bands: List[MapRowBand]) -> List[MapRowBand]:
+        """Insert missing row positions when neighbouring peaks imply skipped rows."""
+        valid = [band for band in bands if band.valid and math.isfinite(band.lateral_v)]
+        valid.sort(key=lambda band: band.lateral_v)
+        if len(valid) < 2:
+            return valid
+
+        spacing = max(0.05, float(self.p.expected_row_width))
+        tol = max(0.05, float(self.p.map_row_spacing_tolerance_ratio) * spacing)
+        max_insert_rows = max(0, int(self.p.map_row_insert_missing_max_gap_rows))
+        insert_missing = bool(self.p.map_row_insert_missing_peaks) and max_insert_rows > 0
+
+        out: List[MapRowBand] = [valid[0]]
+        for nxt in valid[1:]:
+            prev = out[-1]
+            gap = float(nxt.lateral_v) - float(prev.lateral_v)
+            if insert_missing and gap > spacing + tol:
+                missing = int(round(gap / spacing)) - 1
+                missing = max(0, min(missing, max_insert_rows))
+                if missing > 0:
+                    local_spacing = gap / float(missing + 1)
+                    # Only fill gaps that are still plausibly integer multiples
+                    # of the expected crop spacing.
+                    if abs(local_spacing - spacing) <= tol:
+                        for k in range(1, missing + 1):
+                            out.append(
+                                MapRowBand(
+                                    valid=True,
+                                    lateral_v=float(prev.lateral_v) + k * local_spacing,
+                                    u_min=max(float(prev.u_min), float(nxt.u_min)),
+                                    u_max=min(float(prev.u_max), float(nxt.u_max)),
+                                    points=max(1, min(int(prev.points), int(nxt.points)) // 2),
+                                )
+                            )
+            out.append(nxt)
+
+        return self._merge_row_bands(out)
 
     def _make_band(self, u_values: np.ndarray, v_values: np.ndarray) -> MapRowBand:
         # Kept for compatibility with older debug semantics.
