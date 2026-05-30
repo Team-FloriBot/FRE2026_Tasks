@@ -48,7 +48,6 @@ public:
         global_frame_ = this->get_parameter("global_frame").as_string();
         base_link_frame_ = this->get_parameter("base_link_frame").as_string();
         cmd_vel_topic = this->get_parameter("cmd_vel_topic").as_string();
-        odom_topic = this->get_parameter("odom_topic").as_string();
         path_topic = this->get_parameter("path_topic").as_string();
         lookahead_min_ = this->get_parameter("lookahead_min").as_double();
         lookahead_max_ = this->get_parameter("lookahead_max").as_double();
