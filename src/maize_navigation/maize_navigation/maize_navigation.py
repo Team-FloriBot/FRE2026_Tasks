@@ -1913,34 +1913,23 @@ class PathFollower:
         if target is None:
             return cmd
 
-        # Multi-row headland shifts (2L/2R/...) must not be followed as a
-        # normal pure-pursuit lateral line. The v9 logs showed that the target
-        # lane was correctly latched at about -1.5 m and the special path was
-        # active, but pure pursuit still cut the trajectory into the first
-        # neighbouring gap. During HEADLAND_SHIFT_MULTIROW_TARGET the state
-        # machine already decides when the lateral pre-entry shift is reached;
-        # the controller should therefore hold the headland yaw and drive
-        # straight across the row ends instead of chasing an offset line.
+        # Multi-row headland shifts (2L/2R/...) are distance-gated by the
+        # latched SLAM target lane in the mission state machine. Do not run
+        # pure pursuit and do not run a strong yaw-hold controller here.
+        #
+        # v10 used yaw-hold on the map-frame target heading. In the logs this
+        # produced raw_cmd=(0.055, 1.400) and headland_total_yaw_progress>5 rad:
+        # the robot spun in a circle instead of continuing to the second right
+        # lane. The exit arc already places the robot approximately parallel to
+        # the row ends, so the safe controller for this leg is: drive straight
+        # in the current heading and let _multirow_map_preentry_reached() decide
+        # when the latched second-lane pre-entry coordinate has been reached.
         if path.reason == "HEADLAND_SHIFT_MULTIROW_TARGET":
             goal = path.points[-1]
-            desired_yaw = goal.yaw
-            yaw_err = wrap_to_pi(desired_yaw - pose.yaw)
-
             v = clamp(goal.v, 0.0, self.p.max_linear_speed)
-            abs_yaw_err = abs(yaw_err)
-            if abs_yaw_err > 0.45:
-                v *= 0.25
-            elif abs_yaw_err > 0.25:
-                v *= 0.50
-            elif abs_yaw_err > 0.12:
-                v *= 0.75
-
-            w = clamp(1.8 * yaw_err, -self.p.turn_max_angular_speed, self.p.turn_max_angular_speed)
-            w = self.rate_limit(w, self.last_w_odom)
-            self.last_w_odom = w
-
             cmd.linear.x = v
-            cmd.angular.z = w
+            cmd.angular.z = 0.0
+            self.last_w_odom = 0.0
             return cmd
 
         goal = path.points[-1]
