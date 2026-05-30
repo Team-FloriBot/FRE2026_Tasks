@@ -458,6 +458,9 @@ class MaizeNavigator(Node):
         self.left_start_chain: Optional[np.ndarray] = None
         self.right_start_chain: Optional[np.ndarray] = None
         self.field_direction_yaw: Optional[float] = None
+        self._debug_last_left_rectangles: List[Tuple[np.ndarray, np.ndarray, float, float]] = []
+        self._debug_last_right_rectangles: List[Tuple[np.ndarray, np.ndarray, float, float]] = []
+        self._debug_last_pair_rectangles: List[Tuple[np.ndarray, np.ndarray, float, float]] = []
         self.current_left_row_id: Optional[int] = None
         self.current_right_row_id: Optional[int] = None
         self.next_row_id: int = 1
@@ -1212,6 +1215,9 @@ class MaizeNavigator(Node):
 
         added_left_points: List[np.ndarray] = []
         added_right_points: List[np.ndarray] = []
+        debug_left_rectangles: List[Tuple[np.ndarray, np.ndarray, float, float]] = []
+        debug_right_rectangles: List[Tuple[np.ndarray, np.ndarray, float, float]] = []
+        debug_pair_rectangles: List[Tuple[np.ndarray, np.ndarray, float, float]] = []
         empty_progress = 0.0
         steps = 0
         max_steps = int(math.ceil(max_empty_advance / knot_spacing)) + 12
@@ -1229,6 +1235,7 @@ class MaizeNavigator(Node):
                 max_along=float(self.p.row_rectangle_length) / 2.0,
             )
             pair_support = remaining_points[support_mask]
+            debug_pair_rectangles.append((np.array(pair_center, copy=True), np.array(field_dir, copy=True), float(self.p.row_rectangle_length), float(self.p.row_rectangle_width)))
             left_points = self._local_rectangle_points(
                 remaining_points,
                 left_start,
@@ -1243,6 +1250,8 @@ class MaizeNavigator(Node):
                 rect_length=float(self.p.row_point_window_length),
                 rect_width=float(self.p.row_rectangle_width),
             )
+            debug_left_rectangles.append((np.array(left_start, copy=True), np.array(field_dir, copy=True), float(self.p.row_point_window_length), float(self.p.row_rectangle_width)))
+            debug_right_rectangles.append((np.array(right_start, copy=True), np.array(field_dir, copy=True), float(self.p.row_point_window_length), float(self.p.row_rectangle_width)))
 
             if len(pair_support) < int(self.p.row_min_support_points) and len(left_points) == 0 and len(right_points) == 0:
                 empty_progress += knot_spacing
@@ -1306,6 +1315,9 @@ class MaizeNavigator(Node):
         new_pts_l = np.vstack(added_left_points) if added_left_points else np.empty((0, 2), dtype=float)
         new_pts_r = np.vstack(added_right_points) if added_right_points else np.empty((0, 2), dtype=float)
         heading_yaw = float(math.atan2(field_dir[1], field_dir[0]))
+        self._debug_last_left_rectangles = debug_left_rectangles
+        self._debug_last_right_rectangles = debug_right_rectangles
+        self._debug_last_pair_rectangles = debug_pair_rectangles
         return left_chain, right_chain, new_pts_l, new_pts_r, heading_yaw
 
     def handle_exit_row(self):
@@ -1406,6 +1418,10 @@ class MaizeNavigator(Node):
             markers.markers.append(self.create_row_points_marker(row_id, color, alpha=alpha, row_points=row_points, is_current=is_current))
             if spline.segment_bounds and len(spline.segment_bounds) > 1:
                 markers.markers.append(self.create_segment_boundary_marker(spline, row_id, is_current=is_current))
+            if self.p.publish_debug and is_current:
+                markers.markers.extend(self.create_debug_rectangle_markers(row_id))
+                markers.markers.append(self.create_chain_anchor_marker(row_id, is_left=True))
+                markers.markers.append(self.create_chain_anchor_marker(row_id, is_left=False))
             # publish debug markers for rejected/considered hypotheses
             if self.p.publish_debug and hasattr(spline, "_last_rejected") and len(spline._last_rejected) > 0:
                 for idx, beam in enumerate(spline._last_rejected[:12]):
@@ -1432,6 +1448,194 @@ class MaizeNavigator(Node):
                         m2.points.append(Point(x=float(x), y=float(y), z=0.0))
                     markers.markers.append(m2)
         self.marker_pub.publish(markers)
+
+    def create_debug_rectangle_markers(self, row_id: int) -> List[Marker]:
+        markers: List[Marker] = []
+        stamp = self.get_clock().now().to_msg()
+
+        for idx, (center, direction, length, width) in enumerate(self._debug_last_pair_rectangles[-20:]):
+            markers.extend(self._rectangle_marker_bundle(
+                center=center,
+                direction=direction,
+                length=length,
+                width=width,
+                ns=f"debug_pair_rectangles_{row_id}",
+                marker_id=40000 + row_id * 100 + idx,
+                color=(0.1, 0.7, 1.0, 0.25),
+                stamp=stamp,
+            ))
+
+        for idx, (center, direction, length, width) in enumerate(self._debug_last_left_rectangles[-20:]):
+            markers.extend(self._rectangle_marker_bundle(
+                center=center,
+                direction=direction,
+                length=length,
+                width=width,
+                ns=f"debug_left_rectangles_{row_id}",
+                marker_id=41000 + row_id * 100 + idx,
+                color=(0.15, 1.0, 0.25, 0.35),
+                stamp=stamp,
+            ))
+            if idx == len(self._debug_last_left_rectangles[-20:]) - 1:
+                markers.append(self._direction_arrow_marker(
+                    center=center,
+                    direction=direction,
+                    length=max(length, width),
+                    ns=f"debug_left_direction_{row_id}",
+                    marker_id=43000 + row_id,
+                    color=(0.0, 1.0, 0.3, 0.95),
+                    stamp=stamp,
+                ))
+
+        for idx, (center, direction, length, width) in enumerate(self._debug_last_right_rectangles[-20:]):
+            markers.extend(self._rectangle_marker_bundle(
+                center=center,
+                direction=direction,
+                length=length,
+                width=width,
+                ns=f"debug_right_rectangles_{row_id}",
+                marker_id=42000 + row_id * 100 + idx,
+                color=(1.0, 0.6, 0.1, 0.35),
+                stamp=stamp,
+            ))
+            if idx == len(self._debug_last_right_rectangles[-20:]) - 1:
+                markers.append(self._direction_arrow_marker(
+                    center=center,
+                    direction=direction,
+                    length=max(length, width),
+                    ns=f"debug_right_direction_{row_id}",
+                    marker_id=44000 + row_id,
+                    color=(1.0, 0.45, 0.0, 0.95),
+                    stamp=stamp,
+                ))
+
+        if self._debug_last_pair_rectangles:
+            center, direction, length, width = self._debug_last_pair_rectangles[-1]
+            markers.append(self._direction_arrow_marker(
+                center=center,
+                direction=direction,
+                length=max(length, width),
+                ns=f"debug_pair_direction_{row_id}",
+                marker_id=45000 + row_id,
+                color=(0.2, 0.8, 1.0, 0.95),
+                stamp=stamp,
+            ))
+
+        return markers
+
+    def _rectangle_marker_bundle(
+        self,
+        center: np.ndarray,
+        direction: np.ndarray,
+        length: float,
+        width: float,
+        ns: str,
+        marker_id: int,
+        color: Tuple[float, float, float, float],
+        stamp,
+    ) -> List[Marker]:
+        outline = Marker(header=Header(frame_id=self.p.map_frame, stamp=stamp))
+        outline.ns = ns
+        outline.id = marker_id
+        outline.type = Marker.LINE_STRIP
+        outline.action = Marker.ADD
+        outline.scale.x = 0.03
+        outline.color.r, outline.color.g, outline.color.b, outline.color.a = color
+
+        center = np.asarray(center, dtype=float)
+        direction = self._normalize_vector(np.asarray(direction, dtype=float))
+        perp = np.array([-direction[1], direction[0]], dtype=float)
+        half_length = 0.5 * float(length)
+        half_width = 0.5 * float(width)
+
+        corners = [
+            center - half_length * direction - half_width * perp,
+            center + half_length * direction - half_width * perp,
+            center + half_length * direction + half_width * perp,
+            center - half_length * direction + half_width * perp,
+            center - half_length * direction - half_width * perp,
+        ]
+        for corner in corners:
+            outline.points.append(Point(x=float(corner[0]), y=float(corner[1]), z=0.0))
+
+        cross = Marker(header=Header(frame_id=self.p.map_frame, stamp=stamp))
+        cross.ns = f"{ns}_crosshair"
+        cross.id = marker_id + 5000
+        cross.type = Marker.LINE_LIST
+        cross.action = Marker.ADD
+        cross.scale.x = 0.025
+        cross.color.r, cross.color.g, cross.color.b, cross.color.a = color
+        cross_len = max(0.08, 0.25 * float(length))
+        line_a = center - cross_len * direction
+        line_b = center + cross_len * direction
+        line_c = center - 0.5 * float(width) * perp
+        line_d = center + 0.5 * float(width) * perp
+        cross.points.append(Point(x=float(line_a[0]), y=float(line_a[1]), z=0.0))
+        cross.points.append(Point(x=float(line_b[0]), y=float(line_b[1]), z=0.0))
+        cross.points.append(Point(x=float(line_c[0]), y=float(line_c[1]), z=0.0))
+        cross.points.append(Point(x=float(line_d[0]), y=float(line_d[1]), z=0.0))
+        return [outline, cross]
+
+    def _direction_arrow_marker(
+        self,
+        center: np.ndarray,
+        direction: np.ndarray,
+        length: float,
+        ns: str,
+        marker_id: int,
+        color: Tuple[float, float, float, float],
+        stamp,
+    ) -> Marker:
+        marker = Marker(header=Header(frame_id=self.p.map_frame, stamp=stamp))
+        marker.ns = ns
+        marker.id = marker_id
+        marker.type = Marker.ARROW
+        marker.action = Marker.ADD
+        marker.scale.x = 0.03
+        marker.scale.y = 0.06
+        marker.scale.z = 0.10
+        marker.color.r, marker.color.g, marker.color.b, marker.color.a = color
+
+        center = np.asarray(center, dtype=float)
+        direction = self._normalize_vector(np.asarray(direction, dtype=float))
+        tail = center - 0.5 * float(length) * direction
+        head = center + 0.5 * float(length) * direction
+        marker.points.append(Point(x=float(tail[0]), y=float(tail[1]), z=0.0))
+        marker.points.append(Point(x=float(head[0]), y=float(head[1]), z=0.0))
+        return marker
+
+    def create_chain_anchor_marker(self, row_id: int, is_left: bool) -> Marker:
+        if is_left:
+            chain = self.left_start_chain
+            ns = f"debug_left_chain_anchor_{row_id}"
+            marker_id = 46000 + row_id
+            color = (0.0, 1.0, 0.25, 0.95)
+        else:
+            chain = self.right_start_chain
+            ns = f"debug_right_chain_anchor_{row_id}"
+            marker_id = 47000 + row_id
+            color = (1.0, 0.5, 0.0, 0.95)
+
+        marker = Marker(header=Header(frame_id=self.p.map_frame, stamp=self.get_clock().now().to_msg()))
+        marker.ns = ns
+        marker.id = marker_id
+        marker.type = Marker.SPHERE
+        marker.action = Marker.ADD
+        marker.scale.x = 0.14
+        marker.scale.y = 0.14
+        marker.scale.z = 0.14
+        marker.color.r, marker.color.g, marker.color.b, marker.color.a = color
+
+        if chain is None or len(chain) == 0:
+            marker.action = Marker.DELETE
+            return marker
+
+        point = np.asarray(chain[0], dtype=float)
+        marker.pose.position.x = float(point[0])
+        marker.pose.position.y = float(point[1])
+        marker.pose.position.z = 0.0
+        marker.pose.orientation.w = 1.0
+        return marker
 
     def get_row_points_for_visualization(self, row_id: int, spline: PlantSpline) -> np.ndarray:
         if row_id == self.current_left_row_id and self.left_start_chain is not None and len(self.left_start_chain) > 0:
