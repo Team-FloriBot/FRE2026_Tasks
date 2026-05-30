@@ -134,11 +134,12 @@ maize_navigator:
     map_row_use_pca_orientation: true
     map_row_pca_radius: 5.0
     map_row_pca_min_points: 80
-    map_field_orientation_enabled: true
+    map_field_orientation_enabled: false
     map_field_orientation_radius: 12.0
     map_field_orientation_min_points: 160
     map_field_orientation_min_confidence: 0.25
     map_field_orientation_alpha: 0.12
+    map_field_orientation_max_local_deviation: 0.55
     map_row_lateral_bin: 0.10
     map_row_min_band_points: 12
     map_row_min_band_length: 1.2
