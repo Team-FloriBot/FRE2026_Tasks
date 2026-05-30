@@ -244,11 +244,9 @@ class MaizeNavigator(Node):
 
         left_peak, right_peak = peak_pair
         forward = self.yaw_to_vector(self.robot_pose.yaw)
-        lateral = np.array([-forward[1], forward[0]], dtype=float)
-        robot_xy = np.array([self.robot_pose.x, self.robot_pose.y], dtype=float)
 
-        left_point3 = robot_xy + left_peak * lateral
-        right_point3 = robot_xy + right_peak * lateral
+        left_point3 = self.start_point3_from_peak(points, self.robot_pose, left_peak)
+        right_point3 = self.start_point3_from_peak(points, self.robot_pose, right_peak)
         self.left_row = RowMarchModel("left", left_point3, forward)
         self.right_row = RowMarchModel("right", right_point3, forward)
 
@@ -327,6 +325,45 @@ class MaizeNavigator(Node):
             throttle_duration_sec=2.0,
         )
         return best_pair
+
+    def start_point3_from_peak(self, points: np.ndarray, pose: Pose2D, peak_y: float) -> np.ndarray:
+        forward = self.yaw_to_vector(pose.yaw)
+        lateral = np.array([-forward[1], forward[0]], dtype=float)
+        robot_xy = np.array([pose.x, pose.y], dtype=float)
+        fallback = robot_xy + peak_y * lateral
+
+        if len(points) == 0:
+            return fallback
+
+        rel = points - robot_xy
+        local_x = rel @ forward
+        local_y = rel @ lateral
+
+        peak_half_width = max(self.p.hist_bin_size, 0.5 * self.p.row_rectangle_width)
+        band_mask = (local_x >= 0.0) & (np.abs(local_y - peak_y) <= peak_half_width)
+        band_points = points[band_mask]
+        band_x = local_x[band_mask]
+
+        if len(band_points) == 0:
+            self.get_logger().info(
+                f"No occupied start points ahead for peak {peak_y:.3f}; using robot-height fallback",
+                throttle_duration_sec=2.0,
+            )
+            return fallback
+
+        first_x = float(np.min(band_x))
+        start_window = max(self.p.row_point_window_length, self.p.hist_bin_size)
+        start_mask = band_x <= first_x + start_window
+        start_points = band_points[start_mask]
+        if len(start_points) == 0:
+            return fallback
+
+        point3 = np.mean(start_points, axis=0)
+        self.get_logger().info(
+            f"Initial point 3 for peak {peak_y:.3f}: first_x={first_x:.2f}, n={len(start_points)}",
+            throttle_duration_sec=2.0,
+        )
+        return np.asarray(point3, dtype=float)
 
     def recompute_rows(self) -> None:
         if self.left_row is None or self.right_row is None:
