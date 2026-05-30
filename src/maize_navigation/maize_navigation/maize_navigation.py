@@ -2139,6 +2139,13 @@ class MissionManager:
         self.multirow_counted_target_latched: bool = False
         self.multirow_latched_target_offset: float = 0.0
         self.multirow_latched_target_error: float = 0.0
+        # Global map lock for multi-row targets. The relative target offset from
+        # the detector changes while the robot moves along the headland. For
+        # 2R/2L this can make the first neighbouring gap look like the target.
+        # Therefore latch the counted target as a fixed map-v coordinate.
+        self.multirow_latched_row_yaw_map: Optional[float] = None
+        self.multirow_latched_target_global_v: Optional[float] = None
+        self.multirow_latched_preentry_global_v: Optional[float] = None
         self.reference_row_v: float = 0.0
         self.target_row_v: float = 0.0
         self.candidate_rows_text: str = ""
@@ -2255,6 +2262,9 @@ class MissionManager:
         self.multirow_counted_target_latched = False
         self.multirow_latched_target_offset = 0.0
         self.multirow_latched_target_error = 0.0
+        self.multirow_latched_row_yaw_map = None
+        self.multirow_latched_target_global_v = None
+        self.multirow_latched_preentry_global_v = None
         self.reference_row_v = 0.0
         self.target_row_v = 0.0
         self.candidate_rows_text = ""
@@ -2316,6 +2326,9 @@ class MissionManager:
             self.multirow_counted_target_latched = False
             self.multirow_latched_target_offset = 0.0
             self.multirow_latched_target_error = 0.0
+            self.multirow_latched_row_yaw_map = None
+            self.multirow_latched_target_global_v = None
+            self.multirow_latched_preentry_global_v = None
 
         if new_state == MissionState.HEADLAND_SHIFT:
             self.entry_curve_start_yaw = None
@@ -2548,7 +2561,22 @@ class MissionManager:
         min_progress = max(0.0, float(self.p.multirow_local_takeover_min_yaw_progress))
         return progress >= min_progress
 
-    def _update_multirow_counted_target_latch(self) -> None:
+    def _map_v_coordinate(self, pose_map: Pose2D, row_yaw: float) -> float:
+        """Signed lateral map coordinate in the fixed row basis."""
+        return -math.sin(float(row_yaw)) * float(pose_map.x) + math.cos(float(row_yaw)) * float(pose_map.y)
+
+    def _multirow_remaining_to_preentry(self, pose_map: Optional[Pose2D]) -> Optional[float]:
+        if (
+            pose_map is None
+            or self.multirow_latched_row_yaw_map is None
+            or self.multirow_latched_preentry_global_v is None
+        ):
+            return None
+
+        current_v = self._map_v_coordinate(pose_map, float(self.multirow_latched_row_yaw_map))
+        return float(self.multirow_latched_preentry_global_v) - current_v
+
+    def _update_multirow_counted_target_latch(self, pose_map: Optional[Pose2D] = None) -> None:
         if int(self.p.row_shift_count) < 2:
             return
         if not self.p.map_multirow_require_counted_rows:
@@ -2569,9 +2597,29 @@ class MissionManager:
         if direction * float(self.detected_target_offset) <= 0.0:
             return
 
+        # If a good target is already locked, do not overwrite the global target
+        # with later detections from a different local reference row.
+        if self.multirow_counted_target_latched and self.multirow_latched_target_global_v is not None:
+            return
+
         self.multirow_counted_target_latched = True
         self.multirow_latched_target_offset = float(self.detected_target_offset)
         self.multirow_latched_target_error = float(self.target_offset_error)
+
+        if pose_map is None:
+            return
+
+        row_yaw = self.headland_reference_row_yaw_map
+        if row_yaw is None:
+            return
+
+        current_v = self._map_v_coordinate(pose_map, float(row_yaw))
+        target_global_v = current_v + float(self.detected_target_offset)
+        preentry_global_v = target_global_v - float(self._predicted_entry_lateral_shift())
+
+        self.multirow_latched_row_yaw_map = float(row_yaw)
+        self.multirow_latched_target_global_v = float(target_global_v)
+        self.multirow_latched_preentry_global_v = float(preentry_global_v)
 
     def _multirow_counted_target_locked(self) -> bool:
         if int(self.p.row_shift_count) < 2:
@@ -2582,20 +2630,28 @@ class MissionManager:
         self._update_multirow_counted_target_latch()
         return bool(self.multirow_counted_target_latched)
 
-    def _multirow_map_preentry_reached(self) -> bool:
+    def _multirow_map_preentry_reached(self, pose_map: Optional[Pose2D] = None) -> bool:
         if int(self.p.row_shift_count) < 2:
             return False
         if not self._multirow_counted_target_locked():
             return False
 
-        # For 2L/2R and larger patterns, the actual travelled cross-track shift
-        # must decide when the straight headland segment is complete. Using the
-        # currently re-estimated target offset is unstable because the reference
-        # row changes while driving past row ends; this produced premature entry
-        # into the first neighbouring lane for 2R.
-        travelled = self.headland_direction * float(self.headland_measured_shift)
-        target = self._headland_pre_entry_shift_target()
         tol = max(0.03, float(self.p.headland_shift_tolerance))
+
+        remaining = self._multirow_remaining_to_preentry(pose_map)
+        if remaining is not None:
+            # remaining is expressed in the fixed map row basis. It is positive
+            # for L targets and negative for R targets. Stop only when the
+            # pre-entry line of the latched counted target has actually been
+            # reached or crossed. This prevents entering the first right gap
+            # during a 2R step.
+            return self.headland_direction * float(remaining) <= tol
+
+        # Fallback if no global latch coordinate is available: use travelled
+        # distance magnitude, because the sign of headland_measured_shift can
+        # flip with the axial PCA row orientation.
+        travelled = abs(float(self.headland_measured_shift))
+        target = self._headland_pre_entry_shift_target()
         return travelled >= target - tol
 
     def _entry_yaw_or_local_row_ok(self, row: RowModel, pose_map: Optional[Pose2D]) -> bool:
@@ -2729,11 +2785,22 @@ class MissionManager:
             return None
 
         # Querfahrt im Vorgewende: exakt senkrecht zur aus der Map bekannten
-        # Reihenrichtung. Fuer L ist das die positive v-Achse, fuer R die
-        # negative v-Achse. Kein Umschalten auf die jeweils naehere Gegenrichtung,
-        # denn das kann bei 3R die physikalisch falsche Seite waehlen.
+        # Reihenrichtung. Bei mehrreihigen Manövern wird die Richtung nicht mehr
+        # blind aus L/R abgeleitet, sondern aus der fest gelatchten Zielgerade.
+        # Damit bleibt 2R auf dem Weg zur zweiten rechten Gasse, auch wenn das
+        # Vorzeichen der PCA-Row-Basis lokal flippt.
         row_yaw = float(self.headland_reference_row_yaw_map)
-        desired = wrap_to_pi(row_yaw + self.headland_direction * math.pi / 2.0)
+
+        remaining = self._multirow_remaining_to_preentry(pose_map)
+        if int(self.p.row_shift_count) >= 2 and remaining is not None:
+            if abs(float(remaining)) <= max(0.03, float(self.p.headland_shift_tolerance)):
+                direction = self.headland_direction
+            else:
+                direction = 1.0 if float(remaining) > 0.0 else -1.0
+        else:
+            direction = self.headland_direction
+
+        desired = wrap_to_pi(row_yaw + direction * math.pi / 2.0)
         return desired
 
     def _target_entry_row_yaw_from_map(self, pose_map: Optional[Pose2D], map_detector: Optional[MapRowDetector]) -> Optional[float]:
@@ -2912,12 +2979,12 @@ class MissionManager:
                 self.reference_row_v = map_detector.last_reference_row_v
                 self.target_row_v = map_detector.last_target_row_v
                 self.candidate_rows_text = map_detector.last_candidate_rows_text
-                self._update_multirow_counted_target_latch()
                 self._capture_headland_reference_row_yaw(map_detector)
+                self._update_multirow_counted_target_latch(pose_map)
                 self._update_headland_measured_shift(pose_map)
                 remaining = self._headland_pre_entry_shift_target() - abs(self.headland_measured_shift)
 
-            if (int(self.p.row_shift_count) >= 2 and self._multirow_map_preentry_reached()) or (int(self.p.row_shift_count) < 2 and remaining <= self.p.headland_shift_tolerance):
+            if (int(self.p.row_shift_count) >= 2 and self._multirow_map_preentry_reached(pose_map)) or (int(self.p.row_shift_count) < 2 and remaining <= self.p.headland_shift_tolerance):
                 self.transition(MissionState.ENTRY_CURVE, "required headland shift reached")
                 return planner.plan_constant_curve_base_link(
                     self.headland_direction,
@@ -4015,6 +4082,7 @@ class MaizeNavigator(Node):
             f" | target_offset_error={self.mission.target_offset_error:.3f}"
             f" | multirow_counted_target_latched={self.mission.multirow_counted_target_latched}"
             f" | multirow_latched_target_offset={self.mission.multirow_latched_target_offset:.3f}"
+            f" | multirow_latched_preentry_v={self.mission.multirow_latched_preentry_global_v if self.mission.multirow_latched_preentry_global_v is not None else 'None'}"
             f" | target_lane_reason='{self.mission.last_target_lane_reason}'"
             f" | reference_row_v={self.mission.reference_row_v:.3f}"
             f" | target_row_v={self.mission.target_row_v:.3f}"
