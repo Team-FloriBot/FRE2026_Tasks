@@ -65,6 +65,9 @@ maize_navigator:
     slow_speed: 0.12
     enter_speed: 0.22
     turn_speed: 0.24
+    heading_kp: 1.2
+    lateral_kp: 1.0
+    stanley_min_speed: 0.10
 
     max_linear_speed: 0.45
     max_angular_speed: 1.40

@@ -99,6 +99,9 @@ class NavigatorParams:
     follow_speed: float = 0.35
     lookahead_distance: float = 0.75
     yaw_kp: float = 1.2
+    heading_kp: float = 1.2
+    lateral_kp: float = 1.0
+    stanley_min_speed: float = 0.10
     max_angular_speed: float = 0.90
     path_goal_xy_tolerance: float = 0.20
 
@@ -169,6 +172,9 @@ class MaizeNavigator(Node):
         p.follow_speed = float(get_param("follow_speed", p.follow_speed))
         p.lookahead_distance = float(get_param("lookahead_distance", p.lookahead_distance))
         p.yaw_kp = float(get_param("yaw_kp", p.yaw_kp))
+        p.heading_kp = float(get_param("heading_kp", p.heading_kp))
+        p.lateral_kp = float(get_param("lateral_kp", p.lateral_kp))
+        p.stanley_min_speed = float(get_param("stanley_min_speed", p.stanley_min_speed))
         p.max_angular_speed = float(get_param("follow_max_angular_speed", p.max_angular_speed))
         p.path_goal_xy_tolerance = float(get_param("path_goal_xy_tolerance", p.path_goal_xy_tolerance))
 
@@ -187,6 +193,7 @@ class MaizeNavigator(Node):
         self.p.row_rectangle_width = max(0.05, self.p.row_rectangle_width)
         self.p.row_point_window_length = max(0.05, self.p.row_point_window_length)
         self.p.row_max_march_steps = max(1, self.p.row_max_march_steps)
+        self.p.stanley_min_speed = max(0.01, self.p.stanley_min_speed)
 
     def map_callback(self, msg: OccupancyGrid) -> None:
         self.latest_map = msg
@@ -277,10 +284,7 @@ class MaizeNavigator(Node):
                 return
 
         closest_idx = int(np.argmin(np.linalg.norm(self.midline - robot_xy, axis=1)))
-        target = self.point_at_polyline_distance(self.midline, closest_idx, self.p.lookahead_distance)
-        if target is None:
-            target = self.midline[-1]
-        self.drive_to_point(np.asarray(target, dtype=float))
+        self.drive_on_midline(self.midline, closest_idx)
 
     def find_start_peak_pair(self, points: np.ndarray, pose: Pose2D) -> Optional[Tuple[float, float]]:
         forward = self.yaw_to_vector(pose.yaw)
@@ -586,6 +590,60 @@ class MaizeNavigator(Node):
                 return polyline[idx] + ratio * segment
             travelled += seg_len
         return polyline[-1]
+
+    def drive_on_midline(self, midline: np.ndarray, closest_idx: int) -> None:
+        if len(midline) < 2:
+            return
+
+        robot_xy = np.array([self.robot_pose.x, self.robot_pose.y], dtype=float)
+        closest_point, segment_direction = self.closest_point_and_direction_on_polyline(midline, robot_xy, closest_idx)
+        midline_yaw = math.atan2(segment_direction[1], segment_direction[0])
+        heading_error = wrap_to_pi(midline_yaw - self.robot_pose.yaw)
+
+        cross_track_vector = robot_xy - closest_point
+        lateral_left = np.array([-segment_direction[1], segment_direction[0]], dtype=float)
+        lateral_error = -float(cross_track_vector @ lateral_left)
+
+        speed_factor = float(np.clip(1.0 - abs(heading_error) / 0.7, 0.25, 1.0))
+        speed = self.p.follow_speed * speed_factor
+        stanley_speed = max(abs(speed), self.p.stanley_min_speed)
+
+        angular = (
+            self.p.heading_kp * heading_error
+            + math.atan2(self.p.lateral_kp * lateral_error, stanley_speed)
+        )
+
+        cmd = Twist()
+        cmd.linear.x = speed
+        cmd.angular.z = float(np.clip(angular, -self.p.max_angular_speed, self.p.max_angular_speed))
+        self.cmd_pub.publish(cmd)
+
+    def closest_point_and_direction_on_polyline(
+        self,
+        polyline: np.ndarray,
+        point: np.ndarray,
+        start_idx_hint: int,
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        best_point = np.asarray(polyline[int(np.clip(start_idx_hint, 0, len(polyline) - 1))], dtype=float)
+        best_direction = self.normalize(polyline[min(len(polyline) - 1, 1)] - polyline[0])
+        best_dist2 = float("inf")
+
+        for idx in range(len(polyline) - 1):
+            a = polyline[idx]
+            b = polyline[idx + 1]
+            ab = b - a
+            seg_len2 = float(np.dot(ab, ab))
+            if seg_len2 < 1e-9:
+                continue
+            u = float(np.clip(np.dot(point - a, ab) / seg_len2, 0.0, 1.0))
+            candidate = a + u * ab
+            dist2 = float(np.sum((point - candidate) ** 2))
+            if dist2 < best_dist2:
+                best_dist2 = dist2
+                best_point = candidate
+                best_direction = self.normalize(ab)
+
+        return np.asarray(best_point, dtype=float), np.asarray(best_direction, dtype=float)
 
     def drive_to_point(self, target: np.ndarray) -> None:
         dx = float(target[0] - self.robot_pose.x)
