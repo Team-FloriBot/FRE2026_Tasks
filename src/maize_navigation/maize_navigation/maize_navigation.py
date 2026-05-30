@@ -2132,6 +2132,13 @@ class MissionManager:
         self.expected_target_offset: float = 0.0
         self.detected_target_offset: float = 0.0
         self.target_offset_error: float = 0.0
+        # For multi-row headland turns (2L/2R/...), the counted SLAM target
+        # must be latched once it has been seen. Otherwise the reference row
+        # changes while driving along the headland and the controller can drift
+        # back into the first neighbouring lane although the pattern is 2R/2L.
+        self.multirow_counted_target_latched: bool = False
+        self.multirow_latched_target_offset: float = 0.0
+        self.multirow_latched_target_error: float = 0.0
         self.reference_row_v: float = 0.0
         self.target_row_v: float = 0.0
         self.candidate_rows_text: str = ""
@@ -2245,6 +2252,9 @@ class MissionManager:
         self.expected_target_offset = 0.0
         self.detected_target_offset = 0.0
         self.target_offset_error = 0.0
+        self.multirow_counted_target_latched = False
+        self.multirow_latched_target_offset = 0.0
+        self.multirow_latched_target_error = 0.0
         self.reference_row_v = 0.0
         self.target_row_v = 0.0
         self.candidate_rows_text = ""
@@ -2303,6 +2313,9 @@ class MissionManager:
             self.headland_measured_shift = 0.0
             self.headland_exit_forward_distance = 0.0
             self.headland_reference_row_yaw_map = None
+            self.multirow_counted_target_latched = False
+            self.multirow_latched_target_offset = 0.0
+            self.multirow_latched_target_error = 0.0
 
         if new_state == MissionState.HEADLAND_SHIFT:
             self.entry_curve_start_yaw = None
@@ -2535,18 +2548,39 @@ class MissionManager:
         min_progress = max(0.0, float(self.p.multirow_local_takeover_min_yaw_progress))
         return progress >= min_progress
 
+    def _update_multirow_counted_target_latch(self) -> None:
+        if int(self.p.row_shift_count) < 2:
+            return
+        if not self.p.map_multirow_require_counted_rows:
+            return
+
+        reason = str(self.last_target_lane_reason)
+        if "row-line counted target accepted" not in reason:
+            return
+
+        tolerance = max(0.05, float(self.p.map_lane_accept_tolerance))
+        if abs(float(self.target_offset_error)) > tolerance:
+            return
+
+        # The selected center has to be on the commanded side. This prevents a
+        # later noisy re-reference around the first neighbouring lane from
+        # replacing the already counted 2R/2L target.
+        direction = 1.0 if self.headland_direction >= 0.0 else -1.0
+        if direction * float(self.detected_target_offset) <= 0.0:
+            return
+
+        self.multirow_counted_target_latched = True
+        self.multirow_latched_target_offset = float(self.detected_target_offset)
+        self.multirow_latched_target_error = float(self.target_offset_error)
+
     def _multirow_counted_target_locked(self) -> bool:
         if int(self.p.row_shift_count) < 2:
             return True
         if not self.p.map_multirow_require_counted_rows:
             return True
 
-        reason = str(self.last_target_lane_reason)
-        if "row-line counted target accepted" not in reason:
-            return False
-
-        tolerance = max(0.05, float(self.p.map_lane_accept_tolerance))
-        return abs(float(self.target_offset_error)) <= tolerance
+        self._update_multirow_counted_target_latch()
+        return bool(self.multirow_counted_target_latched)
 
     def _multirow_map_preentry_reached(self) -> bool:
         if int(self.p.row_shift_count) < 2:
@@ -2554,13 +2588,15 @@ class MissionManager:
         if not self._multirow_counted_target_locked():
             return False
 
-        # Abstand der per SLAM gezählten Zielgassenmitte zur aktuellen Roboterposition
-        # in Reihen-Querkoordinate. Vor dem Einfahrbogen soll nur noch der
-        # Queranteil des Einfahrbogens übrig sein.
-        remaining_to_target = abs(float(self.detected_target_offset))
-        entry_lateral = abs(float(self._predicted_entry_lateral_shift()))
-        tol = max(0.05, float(self.p.headland_shift_tolerance) + float(self.p.map_lane_accept_tolerance) * 0.25)
-        return remaining_to_target <= entry_lateral + tol
+        # For 2L/2R and larger patterns, the actual travelled cross-track shift
+        # must decide when the straight headland segment is complete. Using the
+        # currently re-estimated target offset is unstable because the reference
+        # row changes while driving past row ends; this produced premature entry
+        # into the first neighbouring lane for 2R.
+        travelled = self.headland_direction * float(self.headland_measured_shift)
+        target = self._headland_pre_entry_shift_target()
+        tol = max(0.03, float(self.p.headland_shift_tolerance))
+        return travelled >= target - tol
 
     def _entry_yaw_or_local_row_ok(self, row: RowModel, pose_map: Optional[Pose2D]) -> bool:
         if self._entry_yaw_ok(pose_map):
@@ -2876,6 +2912,7 @@ class MissionManager:
                 self.reference_row_v = map_detector.last_reference_row_v
                 self.target_row_v = map_detector.last_target_row_v
                 self.candidate_rows_text = map_detector.last_candidate_rows_text
+                self._update_multirow_counted_target_latch()
                 self._capture_headland_reference_row_yaw(map_detector)
                 self._update_headland_measured_shift(pose_map)
                 remaining = self._headland_pre_entry_shift_target() - abs(self.headland_measured_shift)
@@ -3976,6 +4013,8 @@ class MaizeNavigator(Node):
             f" | expected_target_offset={self.mission.expected_target_offset:.3f}"
             f" | detected_target_offset={self.mission.detected_target_offset:.3f}"
             f" | target_offset_error={self.mission.target_offset_error:.3f}"
+            f" | multirow_counted_target_latched={self.mission.multirow_counted_target_latched}"
+            f" | multirow_latched_target_offset={self.mission.multirow_latched_target_offset:.3f}"
             f" | target_lane_reason='{self.mission.last_target_lane_reason}'"
             f" | reference_row_v={self.mission.reference_row_v:.3f}"
             f" | target_row_v={self.mission.target_row_v:.3f}"
