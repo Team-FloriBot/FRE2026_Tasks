@@ -9,6 +9,7 @@
 #include <cmath>
 #include <limits>
 #include <algorithm>
+#include <visualization_msgs/msg/marker_array.hpp>
 
 class PurePursuitNode : public rclcpp::Node
 {
@@ -19,6 +20,10 @@ public:
         cmd_vel_pub_ = this->create_publisher<geometry_msgs::msg::Twist>("/cmd_vel", 10);
         path_sub_ = this->create_subscription<nav_msgs::msg::Path>(
             "/plan", 10, std::bind(&PurePursuitNode::path_callback, this, std::placeholders::_1));
+        debug_pub_ =
+            this->create_publisher<
+                visualization_msgs::msg::MarkerArray>(
+                "/pure_pursuit/debug", 10);
 
         // TF Buffer & Listener
         tf_buffer_ = std::make_shared<tf2_ros::Buffer>(this->get_clock());
@@ -64,6 +69,7 @@ public:
 private:
     // ---- ROS Interfaces ----
     rclcpp::Publisher<geometry_msgs::msg::Twist>::SharedPtr cmd_vel_pub_;
+    rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr debug_pub_;
     rclcpp::Subscription<nav_msgs::msg::Path>::SharedPtr path_sub_;
     std::shared_ptr<tf2_ros::Buffer> tf_buffer_;
     std::shared_ptr<tf2_ros::TransformListener> tf_listener_;
@@ -216,6 +222,64 @@ private:
         cmd_vel_pub_->publish(cmd);
     }
 
+    void publish_debug(
+        const geometry_msgs::msg::PoseStamped & vehicle,
+        const geometry_msgs::msg::Point & lookahead,
+        size_t nearest_idx)
+    {
+        visualization_msgs::msg::MarkerArray arr;
+
+        auto make_sphere = [&](int id, double x, double y,
+                              double r, double g, double b)
+        {
+            visualization_msgs::msg::Marker m;
+            m.header.frame_id = "odom";
+            m.header.stamp = this->now();
+            m.ns = "pp_debug";
+            m.id = id;
+            m.type = visualization_msgs::msg::Marker::SPHERE;
+            m.action = visualization_msgs::msg::Marker::ADD;
+
+            m.pose.position.x = x;
+            m.pose.position.y = y;
+            m.pose.position.z = 0.0;
+
+            m.scale.x = 0.3;
+            m.scale.y = 0.3;
+            m.scale.z = 0.3;
+
+            m.color.a = 1.0;
+            m.color.r = r;
+            m.color.g = g;
+            m.color.b = b;
+
+            return m;
+        };
+
+        // 🔴 Vehicle
+        arr.markers.push_back(
+            make_sphere(0,
+                vehicle.pose.position.x,
+                vehicle.pose.position.y,
+                1.0, 0.0, 0.0));
+
+        // 🟢 Lookahead
+        arr.markers.push_back(
+            make_sphere(1,
+                lookahead.x,
+                lookahead.y,
+                0.0, 1.0, 0.0));
+
+        // 🔵 Nearest point
+        arr.markers.push_back(
+            make_sphere(2,
+                current_path_.poses[nearest_idx].pose.position.x,
+                current_path_.poses[nearest_idx].pose.position.y,
+                0.0, 0.0, 1.0));
+
+        debug_pub_->publish(arr);
+    }
+
     // ---- Hauptkontrollschleife ----
     void control_loop()
     {
@@ -243,6 +307,7 @@ private:
         cmd.linear.x = speed;
         cmd.angular.z = omega;
         cmd_vel_pub_->publish(cmd);
+        publish_debug(vehicle_pose, lookahead, nearest_idx);
     }
 };
 
