@@ -99,11 +99,6 @@ class NavigatorParams:
     follow_speed: float = 0.35
     lookahead_distance: float = 0.75
     yaw_kp: float = 1.2
-    heading_kp: float = 1.2
-    lateral_kp: float = 1.0
-    stanley_min_speed: float = 0.10
-    midline_smoothing_window: int = 5
-    controller_heading_lookahead: float = 0.75
     max_angular_speed: float = 0.90
     path_goal_xy_tolerance: float = 0.20
 
@@ -123,7 +118,6 @@ class MaizeNavigator(Node):
 
         self.left_row: Optional[RowMarchModel] = None
         self.right_row: Optional[RowMarchModel] = None
-        self.raw_midline: np.ndarray = np.empty((0, 2), dtype=float)
         self.midline: np.ndarray = np.empty((0, 2), dtype=float)
         self.row_end_point: Optional[np.ndarray] = None
 
@@ -175,11 +169,6 @@ class MaizeNavigator(Node):
         p.follow_speed = float(get_param("follow_speed", p.follow_speed))
         p.lookahead_distance = float(get_param("lookahead_distance", p.lookahead_distance))
         p.yaw_kp = float(get_param("yaw_kp", p.yaw_kp))
-        p.heading_kp = float(get_param("heading_kp", p.heading_kp))
-        p.lateral_kp = float(get_param("lateral_kp", p.lateral_kp))
-        p.stanley_min_speed = float(get_param("stanley_min_speed", p.stanley_min_speed))
-        p.midline_smoothing_window = int(get_param("midline_smoothing_window", p.midline_smoothing_window))
-        p.controller_heading_lookahead = float(get_param("controller_heading_lookahead", p.controller_heading_lookahead))
         p.max_angular_speed = float(get_param("follow_max_angular_speed", p.max_angular_speed))
         p.path_goal_xy_tolerance = float(get_param("path_goal_xy_tolerance", p.path_goal_xy_tolerance))
 
@@ -198,11 +187,6 @@ class MaizeNavigator(Node):
         self.p.row_rectangle_width = max(0.05, self.p.row_rectangle_width)
         self.p.row_point_window_length = max(0.05, self.p.row_point_window_length)
         self.p.row_max_march_steps = max(1, self.p.row_max_march_steps)
-        self.p.stanley_min_speed = max(0.01, self.p.stanley_min_speed)
-        self.p.midline_smoothing_window = max(1, self.p.midline_smoothing_window)
-        if self.p.midline_smoothing_window % 2 == 0:
-            self.p.midline_smoothing_window += 1
-        self.p.controller_heading_lookahead = max(0.05, self.p.controller_heading_lookahead)
 
     def map_callback(self, msg: OccupancyGrid) -> None:
         self.latest_map = msg
@@ -210,7 +194,6 @@ class MaizeNavigator(Node):
     def start_cb(self, req, res):
         self.left_row = None
         self.right_row = None
-        self.raw_midline = np.empty((0, 2), dtype=float)
         self.midline = np.empty((0, 2), dtype=float)
         self.row_end_point = None
         self.state = MissionState.INITIALIZING
@@ -294,7 +277,10 @@ class MaizeNavigator(Node):
                 return
 
         closest_idx = int(np.argmin(np.linalg.norm(self.midline - robot_xy, axis=1)))
-        self.drive_on_midline(self.midline, closest_idx)
+        target = self.point_at_polyline_distance(self.midline, closest_idx, self.p.lookahead_distance)
+        if target is None:
+            target = self.midline[-1]
+        self.drive_to_point(np.asarray(target, dtype=float))
 
     def find_start_peak_pair(self, points: np.ndarray, pose: Pose2D) -> Optional[Tuple[float, float]]:
         forward = self.yaw_to_vector(pose.yaw)
@@ -384,15 +370,13 @@ class MaizeNavigator(Node):
             return
         map_points = self.get_all_map_points()
         if len(map_points) == 0:
-            self.raw_midline = np.empty((0, 2), dtype=float)
             self.midline = np.empty((0, 2), dtype=float)
             self.row_end_point = None
             return
 
         self.left_row.result = self.march_row(self.left_row, map_points)
         self.right_row.result = self.march_row(self.right_row, map_points)
-        self.raw_midline = self.build_midline(self.left_row.result.points, self.right_row.result.points)
-        self.midline = self.smooth_polyline(self.raw_midline, self.p.midline_smoothing_window)
+        self.midline = self.build_midline(self.left_row.result.points, self.right_row.result.points)
 
         if self.left_row.result.ended and self.right_row.result.ended:
             left_end = self.left_row.result.end_point
@@ -585,27 +569,6 @@ class MaizeNavigator(Node):
         count = min(len(left_points), len(right_points))
         return 0.5 * (left_points[:count] + right_points[:count])
 
-    def smooth_polyline(self, polyline: np.ndarray, window_size: int) -> np.ndarray:
-        if len(polyline) == 0:
-            return np.empty((0, 2), dtype=float)
-        if len(polyline) < 4 or window_size <= 1:
-            return np.asarray(polyline, dtype=float).copy()
-
-        window_size = int(max(1, window_size))
-        if window_size % 2 == 0:
-            window_size += 1
-        half_window = window_size // 2
-        smoothed = np.asarray(polyline, dtype=float).copy()
-
-        for idx in range(1, len(polyline) - 1):
-            start = max(0, idx - half_window)
-            end = min(len(polyline), idx + half_window + 1)
-            smoothed[idx] = np.mean(polyline[start:end], axis=0)
-
-        smoothed[0] = polyline[0]
-        smoothed[-1] = polyline[-1]
-        return smoothed
-
     def point_at_polyline_distance(self, polyline: np.ndarray, start_idx: int, distance_ahead: float) -> Optional[np.ndarray]:
         if len(polyline) == 0:
             return None
@@ -623,65 +586,6 @@ class MaizeNavigator(Node):
                 return polyline[idx] + ratio * segment
             travelled += seg_len
         return polyline[-1]
-
-    def drive_on_midline(self, midline: np.ndarray, closest_idx: int) -> None:
-        if len(midline) < 2:
-            return
-
-        robot_xy = np.array([self.robot_pose.x, self.robot_pose.y], dtype=float)
-        closest_point, segment_direction = self.closest_point_and_direction_on_polyline(midline, robot_xy, closest_idx)
-        heading_point = self.point_at_polyline_distance(midline, closest_idx, self.p.controller_heading_lookahead)
-        if heading_point is not None and float(np.linalg.norm(heading_point - closest_point)) > 1e-6:
-            heading_direction = self.normalize(heading_point - closest_point)
-        else:
-            heading_direction = segment_direction
-        midline_yaw = math.atan2(heading_direction[1], heading_direction[0])
-        heading_error = wrap_to_pi(midline_yaw - self.robot_pose.yaw)
-
-        cross_track_vector = robot_xy - closest_point
-        lateral_left = np.array([-heading_direction[1], heading_direction[0]], dtype=float)
-        lateral_error = -float(cross_track_vector @ lateral_left)
-
-        speed_factor = float(np.clip(1.0 - abs(heading_error) / 0.7, 0.25, 1.0))
-        speed = self.p.follow_speed * speed_factor
-        stanley_speed = max(abs(speed), self.p.stanley_min_speed)
-
-        angular = (
-            self.p.heading_kp * heading_error
-            + math.atan2(self.p.lateral_kp * lateral_error, stanley_speed)
-        )
-
-        cmd = Twist()
-        cmd.linear.x = speed
-        cmd.angular.z = float(np.clip(angular, -self.p.max_angular_speed, self.p.max_angular_speed))
-        self.cmd_pub.publish(cmd)
-
-    def closest_point_and_direction_on_polyline(
-        self,
-        polyline: np.ndarray,
-        point: np.ndarray,
-        start_idx_hint: int,
-    ) -> Tuple[np.ndarray, np.ndarray]:
-        best_point = np.asarray(polyline[int(np.clip(start_idx_hint, 0, len(polyline) - 1))], dtype=float)
-        best_direction = self.normalize(polyline[min(len(polyline) - 1, 1)] - polyline[0])
-        best_dist2 = float("inf")
-
-        for idx in range(len(polyline) - 1):
-            a = polyline[idx]
-            b = polyline[idx + 1]
-            ab = b - a
-            seg_len2 = float(np.dot(ab, ab))
-            if seg_len2 < 1e-9:
-                continue
-            u = float(np.clip(np.dot(point - a, ab) / seg_len2, 0.0, 1.0))
-            candidate = a + u * ab
-            dist2 = float(np.sum((point - candidate) ** 2))
-            if dist2 < best_dist2:
-                best_dist2 = dist2
-                best_point = candidate
-                best_direction = self.normalize(ab)
-
-        return np.asarray(best_point, dtype=float), np.asarray(best_direction, dtype=float)
 
     def drive_to_point(self, target: np.ndarray) -> None:
         dx = float(target[0] - self.robot_pose.x)
@@ -731,11 +635,8 @@ class MaizeNavigator(Node):
             marker_id = self.add_row_markers(markers, marker_id, self.left_row, (0.1, 0.95, 0.2, 1.0), stamp)
         if self.right_row is not None:
             marker_id = self.add_row_markers(markers, marker_id, self.right_row, (1.0, 0.55, 0.05, 1.0), stamp)
-        if len(self.raw_midline) > 0:
-            markers.markers.append(self.create_line_marker("raw_midline", marker_id, self.raw_midline, (0.65, 0.65, 1.0, 0.45), 0.025, stamp))
-            marker_id += 1
         if len(self.midline) > 0:
-            markers.markers.append(self.create_line_marker("smooth_drive_midline", marker_id, self.midline, (0.15, 0.45, 1.0, 1.0), 0.06, stamp))
+            markers.markers.append(self.create_line_marker("march_midline", marker_id, self.midline, (0.15, 0.45, 1.0, 1.0), 0.055, stamp))
             marker_id += 1
         if self.row_end_point is not None:
             markers.markers.append(self.create_sphere_marker("row_end", marker_id, self.row_end_point, (1.0, 0.0, 0.0, 1.0), 0.22, stamp))
