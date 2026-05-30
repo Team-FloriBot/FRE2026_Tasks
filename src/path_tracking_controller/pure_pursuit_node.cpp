@@ -1,4 +1,3 @@
-// pure_pursuit_node.cpp
 #include <rclcpp/rclcpp.hpp>
 #include <geometry_msgs/msg/pose_stamped.hpp>
 #include <geometry_msgs/msg/twist.hpp>
@@ -16,20 +15,7 @@ class PurePursuitNode : public rclcpp::Node
 public:
     PurePursuitNode() : Node("pure_pursuit_node")
     {
-        // Publisher & Subscriber
-        cmd_vel_pub_ = this->create_publisher<geometry_msgs::msg::Twist>("/cmd_vel", 10);
-        path_sub_ = this->create_subscription<nav_msgs::msg::Path>(
-            path_topic, 10, std::bind(&PurePursuitNode::path_callback, this, std::placeholders::_1));
-        debug_pub_ =
-            this->create_publisher<
-                visualization_msgs::msg::MarkerArray>(
-                "/pure_pursuit/debug", 10);
-
-        // TF Buffer & Listener
-        tf_buffer_ = std::make_shared<tf2_ros::Buffer>(this->get_clock());
-        tf_listener_ = std::make_shared<tf2_ros::TransformListener>(*tf_buffer_);
-
-        // Parameter
+        // 1. ZUERST Parameter deklarieren
         this->declare_parameter<std::string>("global_frame", "odom");
         this->declare_parameter<std::string>("base_link_frame", "base_link");
         this->declare_parameter<std::string>("path_topic", "/plan");
@@ -45,10 +31,10 @@ public:
         this->declare_parameter<int>("search_window", 200);
         this->declare_parameter<double>("control_rate", 20.0);
 
-        // Load parameters
+        // 2. Parameter einlesen (damit sie für Subscriber/Publisher bereitstehen!)
         global_frame_ = this->get_parameter("global_frame").as_string();
         base_link_frame_ = this->get_parameter("base_link_frame").as_string();
-        path_topic = this->get_parameter("path_topic").as_string();
+        path_topic_ = this->get_parameter("path_topic").as_string();
         lookahead_min_ = this->get_parameter("lookahead_min").as_double();
         lookahead_max_ = this->get_parameter("lookahead_max").as_double();
         lookahead_gain_ = this->get_parameter("lookahead_gain").as_double();
@@ -60,6 +46,16 @@ public:
         goal_tolerance_ = this->get_parameter("goal_tolerance").as_double();
         search_window_ = this->get_parameter("search_window").as_int();
         control_rate_ = this->get_parameter("control_rate").as_double();
+
+        // 3. JETZT Interfaces mit den geladenen Variablen erstellen
+        cmd_vel_pub_ = this->create_publisher<geometry_msgs::msg::Twist>("/cmd_vel", 10);
+        path_sub_ = this->create_subscription<nav_msgs::msg::Path>(
+            path_topic_, 10, std::bind(&PurePursuitNode::path_callback, this, std::placeholders::_1));
+        debug_pub_ = this->create_publisher<visualization_msgs::msg::MarkerArray>("/pure_pursuit/debug", 10);
+
+        // TF Buffer & Listener
+        tf_buffer_ = std::make_shared<tf2_ros::Buffer>(this->get_clock());
+        tf_listener_ = std::make_shared<tf2_ros::TransformListener>(*tf_buffer_);
 
         // Timer
         std::chrono::duration<double> double_duration(1.0 / control_rate_);
@@ -80,7 +76,7 @@ private:
     // ---- Parameters ----
     std::string global_frame_;
     std::string base_link_frame_;
-    std::string path_topic;
+    std::string path_topic_; // <--- HIER hat es gefehlt!
     double lookahead_min_, lookahead_max_, lookahead_gain_;
     double max_speed_, min_speed_;
     double curvature_gain_, max_angular_velocity_;
@@ -102,7 +98,7 @@ private:
             return;
         }
         current_path_ = *msg;
-        current_path_index_ = 0; // IMMER auf 0 setzen bei neuem Pfad!
+        current_path_index_ = 0; 
         path_received_ = true;
         RCLCPP_INFO(this->get_logger(), "Pfad mit %zu Punkten empfangen (Frame: %s)", 
                     current_path_.poses.size(), current_path_.header.frame_id.c_str());
@@ -113,7 +109,6 @@ private:
     {
         try
         {
-            // Wir fragen die Transformation in den Frame ab, den der Pfad uns vorgibt!
             auto tf = tf_buffer_->lookupTransform(target_frame, base_link_frame_, tf2::TimePointZero);
             pose.header = tf.header;
             pose.pose.position.x = tf.transform.translation.x;
@@ -136,8 +131,6 @@ private:
         size_t best_idx = current_path_index_;
         double best_dist = std::numeric_limits<double>::max();
         
-        // Wenn wir am Start (0) sind, suchen wir auf dem GESAMTEN Pfad, 
-        // um den Roboter sicher zu fangen. Danach nutzen wir das Suchfenster.
         size_t start_idx = current_path_index_;
         size_t end_idx = (current_path_index_ == 0) ? 
                         current_path_.poses.size() : 
@@ -193,7 +186,6 @@ private:
     bool compute_control(const geometry_msgs::msg::Point & lookahead_global, double & speed, double & omega)
     {
         geometry_msgs::msg::PoseStamped lookahead_pose;
-        // Wichtig: Nutze den Frame des Pfades!
         lookahead_pose.header.frame_id = current_path_.header.frame_id;
         lookahead_pose.header.stamp = this->now();
         lookahead_pose.pose.position = lookahead_global;
@@ -233,17 +225,14 @@ private:
     // ---- Zielprüfung ----
     bool check_goal_reached(const geometry_msgs::msg::PoseStamped & pose)
     {
-        // Sicherheitsprüfung: Wenn wir noch am Anfang oder in der Mitte des Pfades sind,
-        // können wir das Ziel unmöglich erreicht haben – selbst wenn wir nah am Endpunkt stehen!
         if (current_path_.poses.empty()) return false;
         
         size_t remaining_points = current_path_.poses.size() - 1 - current_path_index_;
-        if (remaining_points > 15) // Erst wenn weniger als 15 Punkte übrig sind, prüfen wir das Ziel
+        if (remaining_points > 15) 
         {
             return false;
         }
 
-        // Wenn wir am Ende des Pfades sind, prüfen wir die echte Distanz zum letzten Punkt
         const auto & goal = current_path_.poses.back().pose.position;
         double dist = std::hypot(goal.x - pose.pose.position.x, goal.y - pose.pose.position.y);
         return dist < goal_tolerance_;
@@ -290,25 +279,13 @@ private:
         };
 
         // 🔴 Vehicle
-        arr.markers.push_back(
-            make_sphere(0,
-                vehicle.pose.position.x,
-                vehicle.pose.position.y,
-                1.0, 0.0, 0.0));
+        arr.markers.push_back(make_sphere(0, vehicle.pose.position.x, vehicle.pose.position.y, 1.0, 0.0, 0.0));
 
         // 🟢 Lookahead
-        arr.markers.push_back(
-            make_sphere(1,
-                lookahead.x,
-                lookahead.y,
-                0.0, 1.0, 0.0));
+        arr.markers.push_back(make_sphere(1, lookahead.x, lookahead.y, 0.0, 1.0, 0.0));
 
         // 🔵 Nearest point
-        arr.markers.push_back(
-            make_sphere(2,
-                current_path_.poses[nearest_idx].pose.position.x,
-                current_path_.poses[nearest_idx].pose.position.y,
-                0.0, 0.0, 1.0));
+        arr.markers.push_back(make_sphere(2, current_path_.poses[nearest_idx].pose.position.x, current_path_.poses[nearest_idx].pose.position.y, 0.0, 0.0, 1.0));
 
         debug_pub_->publish(arr);
     }
@@ -319,7 +296,6 @@ private:
         if(!path_received_ || current_path_.poses.empty()) return;
 
         geometry_msgs::msg::PoseStamped vehicle_pose;
-        // ÜBERGABE: Wir holen die Fahrzeugpose im Koordinatensystem des Pfades!
         if(!get_vehicle_pose(current_path_.header.frame_id, vehicle_pose)) return;
 
         size_t nearest_idx = find_nearest_point_forward(vehicle_pose);
@@ -337,7 +313,7 @@ private:
 
         double speed, omega;
         if(!compute_control(lookahead, speed, omega)) {
-            publish_zero_twist(); // Sicherheitshalber stoppen bei Berechnungsfehler
+            publish_zero_twist(); 
             return;
         }
 
