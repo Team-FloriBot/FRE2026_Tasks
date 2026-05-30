@@ -377,9 +377,6 @@ class NavigatorParams:
     # Deshalb ist der Zusatzversatz standardmaessig 0.0; ein positiver Wert
     # waere nur eine bewusst eingestellte Sicherheitsreserve.
     multirow_entry_extra_shift: float = 0.0
-    # Shorten the deterministic straight leg between the two 90 degree arcs.
-    # This compensates controller/path-following delay at the transition to ENTRY_CURVE.
-    multirow_straight_trim: float = 0.15
     # Wenn die per Reihenzaehlung erkannte Zielgasse bei 2R/2L nach innen
     # gegenueber dem Pattern-Sollzentrum verschoben ist, wird sie nicht als
     # Zielzentrum akzeptiert. Das tritt am Reihenende auf, wenn die vordere
@@ -2755,14 +2752,10 @@ class MissionManager:
 
     def _multirow_deterministic_straight_target(self) -> float:
         # 1L/1R: no straight part between the two 90 degree arcs.
-        # 2L/2R: one nominal row spacing straight, shortened by a small trim so
-        # the transition delay does not carry the robot into the next crop row.
-        # nL/nR: n-1 spacings straight, with the same transition trim.
+        # 2L/2R: exactly one row spacing straight, so one gap is skipped.
+        # nL/nR: n-1 spacings straight.
         step = max(1, int(self.p.row_shift_count))
-        nominal = float(step - 1) * float(self.p.expected_row_width)
-        if step >= 2:
-            nominal -= max(0.0, float(self.p.multirow_straight_trim))
-        return max(0.0, nominal)
+        return max(0.0, float(step - 1) * float(self.p.expected_row_width))
 
     def _effective_entry_curve_yaw_change(self) -> float:
         if self.p.entry_curve_yaw_change > 0.0:
@@ -3118,15 +3111,17 @@ class MissionManager:
         # übernehmen.
         return self._entry_local_row_takeover_ok(row, pose_map)
 
-    def _multirow_safe_acquire_steering_ok(self, row: RowModel, shift_ok: bool, pose_map: Optional[Pose2D] = None) -> bool:
-        # v4 rollback: Die v3-Freigabe hat in ACQUIRE_ROW/ENTER_ROW lokale
-        # Reihenhypothesen trotz nicht erfuellter Shift-/Geometrie-Gates als
-        # Lenkreferenz zugelassen. In den Logs danach wurde die Zielreihe wieder
-        # verfehlt. Deshalb wird das Verhalten der besser funktionierenden
-        # Trim-Version wiederhergestellt: Solange die Full-Lane-/Shift-Guards
-        # nicht erfuellt sind, bleibt ACQUIRE_ROW im WAIT_FULL_LANE-Pfad und
-        # folgt keiner einzelnen, potenziell falschen Begrenzungsreihe.
-        return False
+    def _multirow_safe_acquire_steering_ok(self, row: RowModel, shift_ok: bool) -> bool:
+        if int(self.p.row_shift_count) < 2:
+            return False
+        if not shift_ok:
+            return False
+        if not row.valid:
+            return False
+        return row.confidence >= max(
+            float(self.p.entry_row_min_confidence),
+            float(self.p.multirow_local_takeover_min_confidence),
+        )
 
     def _neighbor_target_offset_ok(self) -> bool:
         if int(self.p.row_shift_count) != 1:
@@ -3878,11 +3873,14 @@ class MissionManager:
                     self.acquire_start_time = self.node.get_clock().now()
 
             # Critical safety guard: do not let ACQUIRE_ROW follow a single or
-            # geometrically invalid row too early. For multi-row turns the row
-            # controller is enabled only after shift/yaw/reference/geometry
-            # guards are satisfied.
+            # geometrically invalid row too early. Bei 3R war der Sollversatz
+            # jedoch bereits erreicht/überschritten und die lokale Reihe stabil;
+            # weiteres Geradeausfahren ohne Reihenregelung ließ den Roboter aus
+            # der Gasse driften. Für Mehrreihensprünge wird dann langsam mit der
+            # lokalen Reihenhypothese nachgeführt, statt stur geradeaus weiter zu
+            # fahren.
             if self.p.headland_maneuver_enabled and self.headland_required_shift != 0.0 and not acquire_row_ok:
-                if self._multirow_safe_acquire_steering_ok(row, acquire_shift_ok, pose_map):
+                if self._multirow_safe_acquire_steering_ok(row, acquire_shift_ok):
                     return planner.plan_acquire_row(row)
                 return planner.plan_headland_shift_base_link(
                     speed=min(self.p.enter_speed, self.p.slow_speed),
@@ -3953,10 +3951,12 @@ class MissionManager:
                 self.transition(MissionState.FOLLOW_ROW, "stable final row following")
                 return planner.plan_follow_row(row)
 
-            # Same guard as ACQUIRE_ROW: do not follow a partial/invalid lane
-            # after multi-row turns until the full guards are satisfied.
+            # Same guard as ACQUIRE_ROW. Bei Mehrreihensprüngen darf eine stabile
+            # lokale Reihe nach erreichtem Sollversatz weiter als Lenkreferenz
+            # dienen, auch wenn die vollständige Gassengeometrie noch nicht
+            # bestätigt ist.
             if self.p.headland_maneuver_enabled and self.headland_required_shift != 0.0 and not enter_guards_ok:
-                if self._multirow_safe_acquire_steering_ok(row, shift_ok_for_follow, pose_map):
+                if self._multirow_safe_acquire_steering_ok(row, shift_ok_for_follow):
                     return planner.plan_enter_row(row)
                 return planner.plan_headland_shift_base_link(
                     speed=min(self.p.enter_speed, self.p.slow_speed),
@@ -4041,11 +4041,6 @@ class MaizeNavigator(Node):
         self.timer = self.create_timer(period, self.control_loop)
 
         self.get_logger().info("maize_navigator started")
-        self.get_logger().info(
-            "maprow_update_version=2026-05-30-multirow-trim-v4-rollback, "
-            f"multirow_straight_trim={self.p.multirow_straight_trim:.3f}, "
-            f"multirow_straight_target={max(0.0, (max(1, int(self.p.row_shift_count)) - 1) * float(self.p.expected_row_width) - (max(0.0, float(self.p.multirow_straight_trim)) if int(self.p.row_shift_count) >= 2 else 0.0)):.3f}"
-        )
         self.get_logger().info(
             f"scan_topic={self.p.scan_topic}, cmd_vel_topic={self.p.cmd_vel_topic}, "
             f"map_topic={self.p.map_topic}, map_frame={self.p.map_frame}"
@@ -4157,7 +4152,6 @@ class MaizeNavigator(Node):
         p.entry_relaxed_center_b_tolerance = float(declare("entry_relaxed_center_b_tolerance", p.entry_relaxed_center_b_tolerance))
         p.entry_relaxed_row_yaw_tolerance = float(declare("entry_relaxed_row_yaw_tolerance", p.entry_relaxed_row_yaw_tolerance))
         p.multirow_entry_extra_shift = float(declare("multirow_entry_extra_shift", p.multirow_entry_extra_shift))
-        p.multirow_straight_trim = float(declare("multirow_straight_trim", p.multirow_straight_trim))
         p.multirow_entry_shift_overshoot_rows = float(declare("multirow_entry_shift_overshoot_rows", p.multirow_entry_shift_overshoot_rows))
         p.multirow_local_takeover_min_yaw_progress = float(declare("multirow_local_takeover_min_yaw_progress", p.multirow_local_takeover_min_yaw_progress))
         p.multirow_local_takeover_min_confidence = float(declare("multirow_local_takeover_min_confidence", p.multirow_local_takeover_min_confidence))
