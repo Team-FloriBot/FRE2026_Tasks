@@ -138,73 +138,7 @@ class PlantSpline:
         if not self._build_knot_path(unique_t, unique_lateral, heading_yaw=heading_yaw, logger=logger):
             self._build_linear_fallback(logger)
 
-    def _spawn_extension(self) -> "PlantSpline":
-        clone = object.__new__(PlantSpline)
-        clone.valid = self.valid
-        clone.t_min = self.t_min
-        clone.t_max = self.t_max
-        clone.linear_mode = self.linear_mode
-        clone.points = np.array(self.points, copy=True)
-        clone.main_dir = np.array(self.main_dir, copy=True) if self.main_dir is not None else None
-        clone.perp_dir = np.array(self.perp_dir, copy=True) if self.perp_dir is not None else None
-        clone.mean = np.array(self.mean, copy=True) if self.mean is not None else None
-        clone.segment_splines = list(self.segment_splines)
-        clone.segment_bounds = list(self.segment_bounds)
-        clone.lateral_spline = self.lateral_spline
-        if hasattr(self, "anchor_world"):
-            clone.anchor_world = np.array(self.anchor_world, copy=True)
-        if hasattr(self, "anchor_t"):
-            clone.anchor_t = np.array(self.anchor_t, copy=True)
-        if hasattr(self, "anchor_lateral"):
-            clone.anchor_lateral = np.array(self.anchor_lateral, copy=True)
-        if hasattr(self, "row_points"):
-            clone.row_points = np.array(self.row_points, copy=True)
-        if self.linear_mode:
-            clone.line_start = np.array(self.line_start, copy=True)
-            clone.line_end = np.array(self.line_end, copy=True)
-        if hasattr(self, "t"):
-            clone.t = np.array(self.t, copy=True)
-        if hasattr(self, "lateral"):
-            clone.lateral = np.array(self.lateral, copy=True)
-        return clone
-
-    def extend_with_points(
-        self,
-        new_points: np.ndarray,
-        heading_yaw: float = 0.0,
-        window_length: float = 0.65,
-        window_step: float = 0.28,
-        beam_width: int = 4,
-        candidate_limit: int = 5,
-        support_radius: float = 0.16,
-        cluster_radius: float = 0.18,
-        support_weight: float = 2.8,
-        prediction_weight: float = 2.2,
-        smoothness_weight: float = 1.1,
-        gap_penalty: float = 0.9,
-        logger: Optional[Node] = None,
-    ) -> "PlantSpline":
-        if new_points is None or len(new_points) == 0:
-            return self
-        if self.points is None or len(self.points) == 0:
-            combined = np.asarray(new_points, dtype=float)
-        else:
-            combined = np.vstack((self.points, np.asarray(new_points, dtype=float)))
-        return PlantSpline(
-            combined,
-            heading_yaw=heading_yaw,
-            window_length=window_length,
-            window_step=window_step,
-            beam_width=beam_width,
-            candidate_limit=candidate_limit,
-            support_radius=support_radius,
-            cluster_radius=cluster_radius,
-            support_weight=support_weight,
-            prediction_weight=prediction_weight,
-            smoothness_weight=smoothness_weight,
-            gap_penalty=gap_penalty,
-            logger=logger,
-        )
+    # Legacy extension helper removed — rectangle-based marching used instead.
 
     def _build_linear_fallback(self, logger: Optional[Node] = None) -> None:
         self.linear_mode = True
@@ -277,112 +211,9 @@ class PlantSpline:
             logger.info(f"Built knot row with {len(self.anchor_t)} knots at ~{knot_spacing:.2f} m spacing")
         return True
 
-    def _fit_ransac_line(self, points: np.ndarray, fallback_dir: np.ndarray, iterations: int = 48, inlier_threshold: float = 0.06) -> Tuple[np.ndarray, np.ndarray]:
-        if len(points) < 2:
-            direction = self._normalize_vector(np.asarray(fallback_dir, dtype=float))
-            origin = np.mean(points, axis=0) if len(points) > 0 else np.array([0.0, 0.0], dtype=float)
-            return origin, direction
+    # Legacy RANSAC helper removed from PlantSpline — MaizeNavigator provides its own fitter.
 
-        best_inliers: np.ndarray = np.zeros(len(points), dtype=bool)
-        best_count = -1
-        best_origin = np.mean(points, axis=0)
-        best_dir = self._normalize_vector(np.asarray(fallback_dir, dtype=float))
-        fallback_dir = self._normalize_vector(np.asarray(fallback_dir, dtype=float))
-
-        for _ in range(iterations):
-            idx_a, idx_b = np.random.choice(len(points), size=2, replace=False)
-            a = points[idx_a]
-            b = points[idx_b]
-            direction = b - a
-            norm = float(np.linalg.norm(direction))
-            if norm < 1e-9:
-                continue
-            direction = direction / norm
-            if np.dot(direction, fallback_dir) < 0:
-                direction = -direction
-            rel = points - a
-            perp = np.array([-direction[1], direction[0]], dtype=float)
-            distances = np.abs(rel @ perp)
-            inliers = distances <= inlier_threshold
-            count = int(np.sum(inliers))
-            if count > best_count:
-                best_count = count
-                best_inliers = inliers
-                best_origin = np.mean(points[inliers], axis=0) if count > 0 else np.mean(points, axis=0)
-                best_dir = direction
-
-        if best_count < 0:
-            return best_origin, best_dir
-
-        inlier_points = points[best_inliers] if np.any(best_inliers) else points
-        centered = inlier_points - np.mean(inlier_points, axis=0)
-        cov = np.cov(centered.T)
-        _, eigenvectors = np.linalg.eig(cov)
-        direction = np.real(eigenvectors[:, int(np.argmax(np.real(np.linalg.eigvals(cov))))]) if len(inlier_points) >= 2 else best_dir
-        direction = self._normalize_vector(direction)
-        if np.dot(direction, fallback_dir) < 0:
-            direction = -direction
-        origin = np.mean(inlier_points, axis=0)
-        return origin, direction
-
-    def build_knot_chain_ransac(self, start_points: np.ndarray, local_points: np.ndarray, heading_yaw: float, knot_spacing: float = 0.30, max_empty_advance: float = 2.0, logger: Optional[Node] = None) -> Tuple[np.ndarray, bool]:
-        start_points = np.asarray(start_points, dtype=float)
-        local_points = np.asarray(local_points, dtype=float)
-        if len(start_points) == 0:
-            return np.empty((0, 2), dtype=float), False
-
-        if len(start_points) >= 2:
-            base_dir = self._normalize_vector(start_points[-1] - start_points[0])
-        else:
-            base_dir = np.array([math.cos(heading_yaw), math.sin(heading_yaw)], dtype=float)
-        if np.linalg.norm(base_dir) < 1e-9:
-            base_dir = np.array([math.cos(heading_yaw), math.sin(heading_yaw)], dtype=float)
-
-        current_point = np.array(start_points[-1], copy=True)
-        current_dir = self._normalize_vector(base_dir)
-        knots: List[np.ndarray] = [np.array(p, copy=True) for p in start_points]
-        empty_progress = 0.0
-        max_steps = int(math.ceil(max_empty_advance / knot_spacing)) + 12
-
-        for _ in range(max_steps):
-            forward = self._normalize_vector(current_dir)
-            perp = np.array([-forward[1], forward[0]], dtype=float)
-            rel = local_points - current_point
-            along = rel @ forward
-            lateral = rel @ perp
-            window_mask = (along >= 0.0) & (along <= knot_spacing) & (np.abs(lateral) <= knot_spacing)
-            window_points = local_points[window_mask]
-
-            if len(window_points) == 0:
-                empty_progress += knot_spacing
-                if logger:
-                    logger.info(f"RANSAC knot step empty: empty_progress={empty_progress:.2f}m")
-                if empty_progress > max_empty_advance:
-                    break
-                current_point = current_point + forward * knot_spacing
-                knots.append(np.array(current_point, copy=True))
-                continue
-
-            empty_progress = 0.0
-            ransac_origin, ransac_dir = self._fit_ransac_line(window_points, forward)
-            if np.dot(ransac_dir, forward) < 0:
-                ransac_dir = -ransac_dir
-
-            mean_point = np.mean(window_points, axis=0)
-            offset = float((mean_point - ransac_origin) @ np.array([-ransac_dir[1], ransac_dir[0]], dtype=float))
-            projected_point = mean_point - offset * np.array([-ransac_dir[1], ransac_dir[0]], dtype=float)
-
-            if logger:
-                logger.info(f"RANSAC knot step: n={len(window_points)}, offset={offset:.3f}, dir_yaw={math.degrees(math.atan2(ransac_dir[1], ransac_dir[0])):.1f}deg")
-
-            current_point = np.array(projected_point, copy=True)
-            knots.append(np.array(current_point, copy=True))
-            current_dir = self._normalize_vector(0.5 * forward + 0.5 * ransac_dir)
-
-        if len(knots) < 2:
-            return np.empty((0, 2), dtype=float), False
-
-        return np.asarray(knots, dtype=float), empty_progress > max_empty_advance
+    # Legacy RANSAC knot-chain builder removed — rectangle-based marching used in navigator.
 
     def _interpolate_lateral(self, t: float) -> float:
         if len(self.anchor_t) == 0:
@@ -555,7 +386,6 @@ class MissionState(Enum):
 
 @dataclass
 class NavigatorParams:
-    scan_topic: str = "/sensors/merged_scan"
     cmd_vel_topic: str = "/cmd_vel"
     base_frame: str = "base_link"
     odom_frame: str = "odom"
@@ -576,8 +406,7 @@ class NavigatorParams:
     exit_distance: float = 0.5
     min_turn_radius: float = 0.5
     lookahead_dist: float = 0.6
-    row_search_max_dist: float = 2.0
-    row_search_width: float = 0.50
+    # legacy row search params removed: row_search_max_dist, row_search_width
     row_exclusion_distance: float = 0.30
     row_extension_max_spline_distance: float = 0.50
     row_window_length: float = 0.65
@@ -592,9 +421,15 @@ class NavigatorParams:
     row_end_front_point_ratio: float = 0.08
     min_lane_width: float = 0.5
     max_lane_width: float = 1.5
+    row_segment_point_count: int = 5
+    row_segment_point_spacing: float = 0.3
+    row_rectangle_width: float = 0.5
+    row_rectangle_length: float = 1.5
+    row_point_window_length: float = 0.3
+    row_empty_grace_distance: float = 2.0
+    row_min_support_points: int = 3
     
     # Control
-    pos_kp: float = 2.0
     yaw_kp: float = 1.2
     
     # Pattern
@@ -662,8 +497,7 @@ class MaizeNavigator(Node):
         p.follow_speed = get_param("follow_speed", p.follow_speed)
         p.min_turn_radius = get_param("min_turn_radius", p.min_turn_radius)
         p.exit_distance = get_param("exit_distance", p.exit_distance)
-        p.row_search_max_dist = get_param("row_search_max_dist", p.row_search_max_dist)
-        p.row_search_width = get_param("row_search_width", p.row_search_width)
+        # legacy row_search params removed
         p.row_exclusion_distance = get_param("row_exclusion_distance", p.row_exclusion_distance)
         p.row_extension_max_spline_distance = get_param("row_extension_max_spline_distance", p.row_extension_max_spline_distance)
         p.row_window_length = get_param("row_window_length", p.row_window_length)
@@ -680,6 +514,13 @@ class MaizeNavigator(Node):
         p.lookahead_dist = get_param("lookahead_dist", p.lookahead_dist)
         p.min_lane_width = get_param("min_lane_width", p.min_lane_width)
         p.max_lane_width = get_param("max_lane_width", p.max_lane_width)
+        p.row_segment_point_count = get_param("row_segment_point_count", p.row_segment_point_count)
+        p.row_segment_point_spacing = get_param("row_segment_point_spacing", p.row_segment_point_spacing)
+        p.row_rectangle_width = get_param("row_rectangle_width", p.row_rectangle_width)
+        p.row_rectangle_length = get_param("row_rectangle_length", p.row_rectangle_length)
+        p.row_point_window_length = get_param("row_point_window_length", p.row_point_window_length)
+        p.row_empty_grace_distance = get_param("row_empty_grace_distance", p.row_empty_grace_distance)
+        p.row_min_support_points = get_param("row_min_support_points", p.row_min_support_points)
         return p
 
     def parse_pattern(self, pattern_str: str) -> List[Tuple[int, str]]:
@@ -895,77 +736,49 @@ class MaizeNavigator(Node):
         self.left_start_chain = new_left_chain
         self.right_start_chain = new_right_chain
 
-        if len(new_pts_l) > 0:
-            self.left_row_points = self.accumulate_unique_points(
-                self.left_row_points, new_pts_l, exclude_row_id=self.current_left_row_id
-            )
-            temp_spline = self.left_row_spline.extend_with_points(
-                new_pts_l,
-                heading_yaw=shared_heading_yaw,
-                window_length=self.p.row_window_length,
-                window_step=self.p.row_window_step,
-                beam_width=self.p.row_window_beam_width,
-                candidate_limit=self.p.row_window_candidate_limit,
-                support_radius=self.p.row_extension_max_spline_distance,
-                cluster_radius=self.p.row_cluster_radius,
-                support_weight=self.p.row_window_support_weight,
-                prediction_weight=self.p.row_window_prediction_weight,
-                smoothness_weight=self.p.row_window_smoothness_weight,
-                gap_penalty=self.p.row_window_gap_penalty,
-                logger=self.get_logger(),
-            )
-            if temp_spline.valid:
-                ok = True
-                if self.right_row_spline and self.right_row_spline.valid:
-                    dists = self.spline_point_distances(temp_spline.get_points(num=60), self.right_row_spline)
-                    if len(dists) > 0 and np.min(dists) < max(self.row_exclusion_distance, self.p.expected_row_width * 0.45):
-                        ok = False
-                        self.get_logger().info(f"Rejecting left temp_spline: too close to right row (min_dist={np.min(dists):.3f})")
-                if ok and self.right_row_spline and self.right_row_spline.valid:
-                    if not self.validate_row_pair_geometry(temp_spline, self.right_row_spline):
-                        ok = False
-                        self.get_logger().info("Rejecting left temp_spline: invalid left/right row geometry")
-                if ok:
-                    self.left_row_spline = temp_spline
-                    self.left_row_spline.row_points = np.array(self.left_start_chain, copy=True)
-                    if self.current_left_row_id is not None:
-                        self.remember_row(self.current_left_row_id, self.left_row_spline)
+        self.left_row_points = np.array(self.left_start_chain, copy=True)
+        self.right_row_points = np.array(self.right_start_chain, copy=True)
 
-        if len(new_pts_r) > 0:
-            self.right_row_points = self.accumulate_unique_points(
-                self.right_row_points, new_pts_r, exclude_row_id=self.current_right_row_id
-            )
-            temp_spline = self.right_row_spline.extend_with_points(
-                new_pts_r,
-                heading_yaw=shared_heading_yaw,
-                window_length=self.p.row_window_length,
-                window_step=self.p.row_window_step,
-                beam_width=self.p.row_window_beam_width,
-                candidate_limit=self.p.row_window_candidate_limit,
-                support_radius=self.p.row_extension_max_spline_distance,
-                cluster_radius=self.p.row_cluster_radius,
-                support_weight=self.p.row_window_support_weight,
-                prediction_weight=self.p.row_window_prediction_weight,
-                smoothness_weight=self.p.row_window_smoothness_weight,
-                gap_penalty=self.p.row_window_gap_penalty,
-                logger=self.get_logger(),
-            )
-            if temp_spline.valid:
-                ok = True
-                if self.left_row_spline and self.left_row_spline.valid:
-                    dists = self.spline_point_distances(temp_spline.get_points(num=60), self.left_row_spline)
-                    if len(dists) > 0 and np.min(dists) < max(self.row_exclusion_distance, self.p.expected_row_width * 0.45):
-                        ok = False
-                        self.get_logger().info(f"Rejecting right temp_spline: too close to left row (min_dist={np.min(dists):.3f})")
-                if ok and self.left_row_spline and self.left_row_spline.valid:
-                    if not self.validate_row_pair_geometry(self.left_row_spline, temp_spline):
-                        ok = False
-                        self.get_logger().info("Rejecting right temp_spline: invalid left/right row geometry")
-                if ok:
-                    self.right_row_spline = temp_spline
-                    self.right_row_spline.row_points = np.array(self.right_start_chain, copy=True)
-                    if self.current_right_row_id is not None:
-                        self.remember_row(self.current_right_row_id, self.right_row_spline)
+        temp_left_spline = PlantSpline(
+            self.left_row_points,
+            heading_yaw=shared_heading_yaw,
+            logger=self.get_logger(),
+        )
+        temp_right_spline = PlantSpline(
+            self.right_row_points,
+            heading_yaw=shared_heading_yaw,
+            logger=self.get_logger(),
+        )
+
+        if temp_left_spline.valid and temp_right_spline.valid:
+            ok = True
+            if self.right_row_spline and self.right_row_spline.valid:
+                dists = self.spline_point_distances(temp_left_spline.get_points(num=60), self.right_row_spline)
+                if len(dists) > 0 and np.min(dists) < max(self.row_exclusion_distance, self.p.expected_row_width * 0.45):
+                    ok = False
+                    self.get_logger().info(f"Rejecting left temp_spline: too close to right row (min_dist={np.min(dists):.3f})")
+                if ok and not self.validate_row_pair_geometry(temp_left_spline, self.right_row_spline):
+                    ok = False
+                    self.get_logger().info("Rejecting left temp_spline: invalid left/right row geometry")
+
+            if ok and self.left_row_spline and self.left_row_spline.valid:
+                dists = self.spline_point_distances(temp_right_spline.get_points(num=60), temp_left_spline)
+                if len(dists) > 0 and np.min(dists) < max(self.row_exclusion_distance, self.p.expected_row_width * 0.45):
+                    ok = False
+                    self.get_logger().info(f"Rejecting right temp_spline: too close to left row (min_dist={np.min(dists):.3f})")
+                if ok and not self.validate_row_pair_geometry(temp_left_spline, temp_right_spline):
+                    ok = False
+                    self.get_logger().info("Rejecting right temp_spline: invalid left/right row geometry")
+
+            if ok:
+                self.left_row_spline = temp_left_spline
+                self.left_row_spline.row_points = np.array(self.left_row_points, copy=True)
+                self.right_row_spline = temp_right_spline
+                self.right_row_spline.row_points = np.array(self.right_row_points, copy=True)
+                if self.current_left_row_id is not None:
+                    self.remember_row(self.current_left_row_id, self.left_row_spline)
+                if self.current_right_row_id is not None:
+                    self.remember_row(self.current_right_row_id, self.right_row_spline)
 
         # 3. Project robot on updated, highly robust splines
         t_l = self.left_row_spline.project(p_robot)
@@ -1235,6 +1048,78 @@ class MaizeNavigator(Node):
             return np.array([1.0, 0.0], dtype=float)
         return vec / norm
 
+    def _segment_offsets(self) -> np.ndarray:
+        count = max(3, int(self.p.row_segment_point_count))
+        spacing = float(self.p.row_segment_point_spacing)
+        center_idx = count // 2
+        offsets = np.array([(idx - center_idx) * spacing for idx in range(count)], dtype=float)
+        return offsets
+
+    def _build_segment_points(self, anchor: np.ndarray, direction: np.ndarray) -> np.ndarray:
+        anchor = np.asarray(anchor, dtype=float)
+        direction = self._normalize_vector(np.asarray(direction, dtype=float))
+        offsets = self._segment_offsets()
+        return np.array([anchor + offset * direction for offset in offsets], dtype=float)
+
+    def _oriented_rectangle_mask(
+        self,
+        points: np.ndarray,
+        center: np.ndarray,
+        direction: np.ndarray,
+        half_length: float,
+        half_width: float,
+        min_along: Optional[float] = None,
+        max_along: Optional[float] = None,
+    ) -> np.ndarray:
+        if len(points) == 0:
+            return np.zeros(0, dtype=bool)
+        center = np.asarray(center, dtype=float)
+        direction = self._normalize_vector(np.asarray(direction, dtype=float))
+        perp = np.array([-direction[1], direction[0]], dtype=float)
+        rel = points - center
+        along = rel @ direction
+        lateral = rel @ perp
+        low = -float(half_length) if min_along is None else float(min_along)
+        high = float(half_length) if max_along is None else float(max_along)
+        return (along >= low) & (along <= high) & (np.abs(lateral) <= half_width)
+
+    def _local_rectangle_points(
+        self,
+        points: np.ndarray,
+        center: np.ndarray,
+        direction: np.ndarray,
+        rect_length: float,
+        rect_width: float,
+        min_along: Optional[float] = None,
+        max_along: Optional[float] = None,
+    ) -> np.ndarray:
+        mask = self._oriented_rectangle_mask(points, center, direction, rect_length / 2.0, rect_width / 2.0, min_along=min_along, max_along=max_along)
+        return points[mask]
+
+    def _fit_rectangle_direction(self, points: np.ndarray, fallback_dir: np.ndarray, logger: Optional[Node] = None) -> np.ndarray:
+        if len(points) < 2:
+            return self._normalize_vector(np.asarray(fallback_dir, dtype=float))
+        _, direction = self._fit_ransac_line(points, fallback_dir, iterations=48, inlier_threshold=max(0.04, float(self.p.row_rectangle_width) * 0.18))
+        direction = self._normalize_vector(direction)
+        fallback_dir = self._normalize_vector(np.asarray(fallback_dir, dtype=float))
+        if np.dot(direction, fallback_dir) < 0:
+            direction = -direction
+        if logger:
+            logger.info(f"Rectangle fit direction yaw={math.degrees(math.atan2(direction[1], direction[0])):.1f}deg")
+        return direction
+
+    def _small_rectangle_mean(self, points: np.ndarray, anchor: np.ndarray, direction: np.ndarray) -> Optional[np.ndarray]:
+        local = self._local_rectangle_points(
+            points,
+            anchor,
+            direction,
+            rect_length=float(self.p.row_point_window_length),
+            rect_width=float(self.p.row_rectangle_width),
+        )
+        if len(local) == 0:
+            return None
+        return np.mean(local, axis=0)
+
     def _fit_ransac_line(self, points: np.ndarray, fallback_dir: np.ndarray, iterations: int = 48, inlier_threshold: float = 0.06) -> Tuple[np.ndarray, np.ndarray]:
         points = np.asarray(points, dtype=float)
         if len(points) < 2:
@@ -1301,10 +1186,10 @@ class MaizeNavigator(Node):
         right_chain: np.ndarray,
         initial_heading_yaw: float,
     ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, float]:
-        knot_spacing = 0.30
-        row_half_width = max(0.18, float(self.p.row_extension_max_spline_distance))
+        knot_spacing = float(self.p.row_segment_point_spacing)
+        row_half_width = max(0.18, float(self.p.row_rectangle_width) / 2.0)
         corridor_half_width = max(0.35, float(self.p.expected_row_width * 0.80))
-        max_empty_advance = 2.0
+        max_empty_advance = float(self.p.row_empty_grace_distance)
 
         left_chain = np.asarray(left_chain, dtype=float)
         right_chain = np.asarray(right_chain, dtype=float)
@@ -1316,8 +1201,6 @@ class MaizeNavigator(Node):
         right_start = np.array(right_chain[-1], dtype=float)
         pair_center = 0.5 * (left_start + right_start)
         pair_vector = right_start - left_start
-        pair_perp = self._normalize_vector(np.array([-pair_vector[1], pair_vector[0]], dtype=float))
-
         field_dir = self._normalize_vector(np.array([math.cos(initial_heading_yaw), math.sin(initial_heading_yaw)], dtype=float))
         if np.dot(field_dir, pair_vector) < 0:
             field_dir = -field_dir
@@ -1335,29 +1218,36 @@ class MaizeNavigator(Node):
 
         while steps < max_steps:
             steps += 1
-            pair_perp = self._normalize_vector(np.array([-field_dir[1], field_dir[0]], dtype=float))
-            left_ref = float((left_start - pair_center) @ pair_perp)
-            right_ref = float((right_start - pair_center) @ pair_perp)
             pair_center = 0.5 * (left_start + right_start)
+            support_mask = self._oriented_rectangle_mask(
+                remaining_points,
+                pair_center,
+                field_dir,
+                half_length=float(self.p.row_rectangle_length) / 2.0,
+                half_width=float(self.p.row_rectangle_width) / 2.0,
+                min_along=0.0,
+                max_along=float(self.p.row_rectangle_length) / 2.0,
+            )
+            pair_support = remaining_points[support_mask]
+            left_points = self._local_rectangle_points(
+                remaining_points,
+                left_start,
+                field_dir,
+                rect_length=float(self.p.row_point_window_length),
+                rect_width=float(self.p.row_rectangle_width),
+            )
+            right_points = self._local_rectangle_points(
+                remaining_points,
+                right_start,
+                field_dir,
+                rect_length=float(self.p.row_point_window_length),
+                rect_width=float(self.p.row_rectangle_width),
+            )
 
-            rel = remaining_points - pair_center
-            along = rel @ field_dir
-            orth = rel @ pair_perp
-
-            forward_mask = (along >= 0.0) & (along <= knot_spacing)
-            corridor_mask = (np.abs(orth) <= corridor_half_width)
-            current_mask = forward_mask & corridor_mask
-            current_points = remaining_points[current_mask]
-
-            left_mask = current_mask & (np.abs(orth - left_ref) <= row_half_width)
-            right_mask = current_mask & (np.abs(orth - right_ref) <= row_half_width)
-            left_points = remaining_points[left_mask]
-            right_points = remaining_points[right_mask]
-
-            if len(left_points) == 0 and len(right_points) == 0:
+            if len(pair_support) < int(self.p.row_min_support_points) and len(left_points) == 0 and len(right_points) == 0:
                 empty_progress += knot_spacing
                 if self.get_logger():
-                    self.get_logger().info(f"RANSAC step empty: empty_progress={empty_progress:.2f}m")
+                    self.get_logger().info(f"Rectangle step empty: empty_progress={empty_progress:.2f}m")
                 if empty_progress > max_empty_advance:
                     break
                 left_start = left_start + field_dir * knot_spacing
@@ -1367,34 +1257,25 @@ class MaizeNavigator(Node):
                 continue
 
             empty_progress = 0.0
-
-            direction_source = current_points if len(current_points) >= 2 else np.vstack((left_points, right_points))
+            direction_source = pair_support if len(pair_support) >= 2 else np.vstack((left_points, right_points))
             if len(direction_source) >= 2:
-                ransac_origin, ransac_dir = self._fit_ransac_line(direction_source, field_dir, iterations=40, inlier_threshold=max(0.05, knot_spacing * 0.25))
-            else:
-                ransac_origin = pair_center
-                ransac_dir = np.array(field_dir, copy=True)
-            if np.dot(ransac_dir, field_dir) < 0:
-                ransac_dir = -ransac_dir
-            pair_perp = self._normalize_vector(np.array([-field_dir[1], field_dir[0]], dtype=float))
+                fitted_dir = self._fit_rectangle_direction(direction_source, field_dir, logger=self.get_logger())
+                field_dir = self._normalize_vector(0.82 * field_dir + 0.18 * fitted_dir)
 
-            def build_knot(row_points: np.ndarray, row_start: np.ndarray, row_ref: float) -> Tuple[np.ndarray, bool]:
-                if len(row_points) == 0:
-                    return row_start + field_dir * knot_spacing, False
-                row_mean = np.mean(row_points, axis=0)
-                row_offset = float((row_mean - ransac_origin) @ pair_perp)
-                knot = row_mean - row_offset * pair_perp
-                projected = float((knot - ransac_origin) @ field_dir)
-                target_along = max(knot_spacing, projected)
-                knot = ransac_origin + target_along * field_dir + row_ref * pair_perp
-                return knot, True
+            left_mean = self._small_rectangle_mean(remaining_points, left_start, field_dir)
+            right_mean = self._small_rectangle_mean(remaining_points, right_start, field_dir)
 
-            left_knot, left_ok = build_knot(left_points, left_start, left_ref)
-            right_knot, right_ok = build_knot(right_points, right_start, right_ref)
+            if left_mean is None:
+                left_mean = np.array(left_start, copy=True)
+            if right_mean is None:
+                right_mean = np.array(right_start, copy=True)
+
+            left_knot = np.array(left_mean, copy=True)
+            right_knot = np.array(right_mean, copy=True)
 
             if self.get_logger():
                 self.get_logger().info(
-                    f"RANSAC knot step: left_n={len(left_points)}, right_n={len(right_points)}, dir_yaw={math.degrees(math.atan2(field_dir[1], field_dir[0])):.1f}deg"
+                    f"Rectangle knot step: left_n={len(left_points)}, right_n={len(right_points)}, support={len(pair_support)}, dir_yaw={math.degrees(math.atan2(field_dir[1], field_dir[0])):.1f}deg"
                 )
 
             left_start = np.array(left_knot, copy=True)
@@ -1402,14 +1283,23 @@ class MaizeNavigator(Node):
             left_chain = np.vstack((left_chain, left_start))
             right_chain = np.vstack((right_chain, right_start))
 
-            if left_ok:
+            if len(left_points) > 0:
                 added_left_points.append(left_points)
-            if right_ok:
+            if len(right_points) > 0:
                 added_right_points.append(right_points)
 
-            keep_mask = np.ones(len(remaining_points), dtype=bool)
-            keep_mask[current_mask] = False
-            remaining_points = remaining_points[keep_mask]
+            if len(pair_support) > 0:
+                remaining_points = remaining_points[~support_mask]
+            else:
+                remaining_points = remaining_points[~self._oriented_rectangle_mask(
+                    remaining_points,
+                    pair_center,
+                    field_dir,
+                    half_length=float(self.p.row_rectangle_length) / 2.0,
+                    half_width=float(self.p.row_rectangle_width) / 2.0,
+                    min_along=0.0,
+                    max_along=float(self.p.row_rectangle_length) / 2.0,
+                )]
             if len(remaining_points) == 0:
                 break
 

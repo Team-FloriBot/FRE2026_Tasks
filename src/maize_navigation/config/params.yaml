@@ -1,6 +1,5 @@
 maize_navigator:
   ros__parameters:
-    scan_topic: "/sensors/merged_scan"
     cmd_vel_topic: "/cmd_vel"
     base_frame: "base_link"
     odom_frame: "odom"
@@ -12,8 +11,7 @@ maize_navigator:
     control_frequency: 30.0
 
     expected_row_width: 0.75
-    row_search_max_dist: 2.00
-    row_search_width: 0.50
+    # legacy row_search params removed
     row_exclusion_distance: 0.30
     row_extension_max_spline_distance: 0.50
     row_window_length: 2.00
