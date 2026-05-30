@@ -17,9 +17,9 @@ public:
     PurePursuitNode() : Node("pure_pursuit_node")
     {
         // Publisher & Subscriber
-        cmd_vel_pub_ = this->create_publisher<geometry_msgs::msg::Twist>("/cmd_vel", 10);
+        cmd_vel_pub_ = this->create_publisher<geometry_msgs::msg::Twist>(cmd_vel_topic, 10);
         path_sub_ = this->create_subscription<nav_msgs::msg::Path>(
-            "/plan", 10, std::bind(&PurePursuitNode::path_callback, this, std::placeholders::_1));
+            path_topic, 10, std::bind(&PurePursuitNode::path_callback, this, std::placeholders::_1));
         debug_pub_ =
             this->create_publisher<
                 visualization_msgs::msg::MarkerArray>(
@@ -47,6 +47,9 @@ public:
         // Load parameters
         global_frame_ = this->get_parameter("global_frame").as_string();
         base_link_frame_ = this->get_parameter("base_link_frame").as_string();
+        cmd_vel_topic = this->get_parameter("cmd_vel_topic").as_string();
+        odom_topic = this->get_parameter("odom_topic").as_string();
+        path_topic = this->get_parameter("path_topic").as_string();
         lookahead_min_ = this->get_parameter("lookahead_min").as_double();
         lookahead_max_ = this->get_parameter("lookahead_max").as_double();
         lookahead_gain_ = this->get_parameter("lookahead_gain").as_double();
@@ -94,18 +97,24 @@ private:
     // ---- Path Callback ----
     void path_callback(const nav_msgs::msg::Path::SharedPtr msg)
     {
+        if (msg->poses.empty()) {
+            RCLCPP_WARN(this->get_logger(), "Empfangener Pfad ist leer!");
+            return;
+        }
         current_path_ = *msg;
-        if(!path_received_) current_path_index_ = 0;
+        current_path_index_ = 0; // IMMER auf 0 setzen bei neuem Pfad!
         path_received_ = true;
-        RCLCPP_INFO(this->get_logger(), "Pfad mit %zu Punkten empfangen", current_path_.poses.size());
+        RCLCPP_INFO(this->get_logger(), "Pfad mit %zu Punkten empfangen (Frame: %s)", 
+                    current_path_.poses.size(), current_path_.header.frame_id.c_str());
     }
 
     // ---- Vehicle Pose ----
-    bool get_vehicle_pose(geometry_msgs::msg::PoseStamped & pose)
+    bool get_vehicle_pose(const std::string & target_frame, geometry_msgs::msg::PoseStamped & pose)
     {
         try
         {
-            auto tf = tf_buffer_->lookupTransform(global_frame_, base_link_frame_, tf2::TimePointZero);
+            // Wir fragen die Transformation in den Frame ab, den der Pfad uns vorgibt!
+            auto tf = tf_buffer_->lookupTransform(target_frame, base_link_frame_, tf2::TimePointZero);
             pose.header = tf.header;
             pose.pose.position.x = tf.transform.translation.x;
             pose.pose.position.y = tf.transform.translation.y;
@@ -115,7 +124,8 @@ private:
         }
         catch(const tf2::TransformException & ex)
         {
-            RCLCPP_WARN(this->get_logger(), "%s", ex.what());
+            RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 1000, 
+                                "TF-Fehler bei Fahrzeug-Pose: %s", ex.what());
             return false;
         }
     }
@@ -125,8 +135,15 @@ private:
     {
         size_t best_idx = current_path_index_;
         double best_dist = std::numeric_limits<double>::max();
-        size_t end_idx = std::min(current_path_index_ + static_cast<size_t>(search_window_), current_path_.poses.size());
-        for(size_t i=current_path_index_; i<end_idx; ++i)
+        
+        // Wenn wir am Start (0) sind, suchen wir auf dem GESAMTEN Pfad, 
+        // um den Roboter sicher zu fangen. Danach nutzen wir das Suchfenster.
+        size_t start_idx = current_path_index_;
+        size_t end_idx = (current_path_index_ == 0) ? 
+                        current_path_.poses.size() : 
+                        std::min(current_path_index_ + static_cast<size_t>(search_window_), current_path_.poses.size());
+        
+        for(size_t i = start_idx; i < end_idx; ++i)
         {
             double dx = current_path_.poses[i].pose.position.x - pose.pose.position.x;
             double dy = current_path_.poses[i].pose.position.y - pose.pose.position.y;
@@ -176,17 +193,21 @@ private:
     bool compute_control(const geometry_msgs::msg::Point & lookahead_global, double & speed, double & omega)
     {
         geometry_msgs::msg::PoseStamped lookahead_pose;
-        lookahead_pose.header.frame_id = global_frame_;
+        // Wichtig: Nutze den Frame des Pfades!
+        lookahead_pose.header.frame_id = current_path_.header.frame_id;
+        lookahead_pose.header.stamp = this->now();
         lookahead_pose.pose.position = lookahead_global;
 
         geometry_msgs::msg::PoseStamped lookahead_base;
         try
         {
-            auto tf = tf_buffer_->lookupTransform(base_link_frame_, global_frame_, tf2::TimePointZero);
+            auto tf = tf_buffer_->lookupTransform(base_link_frame_, current_path_.header.frame_id, tf2::TimePointZero);
             tf2::doTransform(lookahead_pose, lookahead_base, tf);
         }
-        catch(...)
+        catch(const tf2::TransformException & ex)
         {
+            RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 1000, 
+                                "TF-Fehler bei Lookahead-Transformation: %s", ex.what());
             return false;
         }
 
@@ -202,6 +223,7 @@ private:
         double goal_dist = std::hypot(
             current_path_.poses.back().pose.position.x - current_path_.poses[current_path_index_].pose.position.x,
             current_path_.poses.back().pose.position.y - current_path_.poses[current_path_index_].pose.position.y);
+        
         double v_goal = max_speed_ * std::min(1.0, goal_dist / goal_slowdown_distance_);
         speed = std::clamp(std::min(v_curve,v_goal), min_speed_, max_speed_);
         omega = std::clamp(speed * curvature, -max_angular_velocity_, max_angular_velocity_);
@@ -211,6 +233,17 @@ private:
     // ---- Zielprüfung ----
     bool check_goal_reached(const geometry_msgs::msg::PoseStamped & pose)
     {
+        // Sicherheitsprüfung: Wenn wir noch am Anfang oder in der Mitte des Pfades sind,
+        // können wir das Ziel unmöglich erreicht haben – selbst wenn wir nah am Endpunkt stehen!
+        if (current_path_.poses.empty()) return false;
+        
+        size_t remaining_points = current_path_.poses.size() - 1 - current_path_index_;
+        if (remaining_points > 15) // Erst wenn weniger als 15 Punkte übrig sind, prüfen wir das Ziel
+        {
+            return false;
+        }
+
+        // Wenn wir am Ende des Pfades sind, prüfen wir die echte Distanz zum letzten Punkt
         const auto & goal = current_path_.poses.back().pose.position;
         double dist = std::hypot(goal.x - pose.pose.position.x, goal.y - pose.pose.position.y);
         return dist < goal_tolerance_;
@@ -233,7 +266,7 @@ private:
                               float r, float g, float b)
         {
             visualization_msgs::msg::Marker m;
-            m.header.frame_id = "odom";
+            m.header.frame_id = current_path_.header.frame_id;
             m.header.stamp = this->now();
             m.ns = "pp_debug";
             m.id = id;
@@ -286,12 +319,14 @@ private:
         if(!path_received_ || current_path_.poses.empty()) return;
 
         geometry_msgs::msg::PoseStamped vehicle_pose;
-        if(!get_vehicle_pose(vehicle_pose)) return;
+        // ÜBERGABE: Wir holen die Fahrzeugpose im Koordinatensystem des Pfades!
+        if(!get_vehicle_pose(current_path_.header.frame_id, vehicle_pose)) return;
 
         size_t nearest_idx = find_nearest_point_forward(vehicle_pose);
 
         if(check_goal_reached(vehicle_pose))
         {
+            RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 2000, "Ziel erreicht! Stoppe Fahrzeug.");
             publish_zero_twist();
             return;
         }
@@ -301,12 +336,16 @@ private:
         if(!find_lookahead_point(nearest_idx, ld, lookahead)) return;
 
         double speed, omega;
-        if(!compute_control(lookahead, speed, omega)) return;
+        if(!compute_control(lookahead, speed, omega)) {
+            publish_zero_twist(); // Sicherheitshalber stoppen bei Berechnungsfehler
+            return;
+        }
 
         geometry_msgs::msg::Twist cmd;
         cmd.linear.x = speed;
         cmd.angular.z = omega;
         cmd_vel_pub_->publish(cmd);
+        
         publish_debug(vehicle_pose, lookahead, nearest_idx);
     }
 };
