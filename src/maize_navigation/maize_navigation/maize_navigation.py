@@ -1235,6 +1235,57 @@ class MaizeNavigator(Node):
             return np.array([1.0, 0.0], dtype=float)
         return vec / norm
 
+    def _fit_ransac_line(self, points: np.ndarray, fallback_dir: np.ndarray, iterations: int = 48, inlier_threshold: float = 0.06) -> Tuple[np.ndarray, np.ndarray]:
+        points = np.asarray(points, dtype=float)
+        if len(points) < 2:
+            direction = self._normalize_vector(np.asarray(fallback_dir, dtype=float))
+            origin = np.mean(points, axis=0) if len(points) > 0 else np.array([0.0, 0.0], dtype=float)
+            return origin, direction
+
+        best_inliers: np.ndarray = np.zeros(len(points), dtype=bool)
+        best_count = -1
+        best_origin = np.mean(points, axis=0)
+        best_dir = self._normalize_vector(np.asarray(fallback_dir, dtype=float))
+        fallback_dir = self._normalize_vector(np.asarray(fallback_dir, dtype=float))
+
+        for _ in range(iterations):
+            idx_a, idx_b = np.random.choice(len(points), size=2, replace=False)
+            a = points[idx_a]
+            b = points[idx_b]
+            direction = b - a
+            norm = float(np.linalg.norm(direction))
+            if norm < 1e-9:
+                continue
+            direction = direction / norm
+            if np.dot(direction, fallback_dir) < 0:
+                direction = -direction
+            rel = points - a
+            perp = np.array([-direction[1], direction[0]], dtype=float)
+            distances = np.abs(rel @ perp)
+            inliers = distances <= inlier_threshold
+            count = int(np.sum(inliers))
+            if count > best_count:
+                best_count = count
+                best_inliers = inliers
+                best_origin = np.mean(points[inliers], axis=0) if count > 0 else np.mean(points, axis=0)
+                best_dir = direction
+
+        if best_count < 0:
+            return best_origin, best_dir
+
+        inlier_points = points[best_inliers] if np.any(best_inliers) else points
+        centered = inlier_points - np.mean(inlier_points, axis=0)
+        cov = np.cov(centered.T)
+        if np.ndim(cov) < 2:
+            return best_origin, best_dir
+        eigenvalues, eigenvectors = np.linalg.eig(cov)
+        direction = np.real(eigenvectors[:, int(np.argmax(np.real(eigenvalues)))]) if len(inlier_points) >= 2 else best_dir
+        direction = self._normalize_vector(direction)
+        if np.dot(direction, fallback_dir) < 0:
+            direction = -direction
+        origin = np.mean(inlier_points, axis=0)
+        return origin, direction
+
     def mean_yaw(self, yaws: List[float]) -> float:
         if len(yaws) == 0:
             return 0.0
