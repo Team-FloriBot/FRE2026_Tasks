@@ -1913,6 +1913,36 @@ class PathFollower:
         if target is None:
             return cmd
 
+        # Multi-row headland shifts (2L/2R/...) must not be followed as a
+        # normal pure-pursuit lateral line. The v9 logs showed that the target
+        # lane was correctly latched at about -1.5 m and the special path was
+        # active, but pure pursuit still cut the trajectory into the first
+        # neighbouring gap. During HEADLAND_SHIFT_MULTIROW_TARGET the state
+        # machine already decides when the lateral pre-entry shift is reached;
+        # the controller should therefore hold the headland yaw and drive
+        # straight across the row ends instead of chasing an offset line.
+        if path.reason == "HEADLAND_SHIFT_MULTIROW_TARGET":
+            goal = path.points[-1]
+            desired_yaw = goal.yaw
+            yaw_err = wrap_to_pi(desired_yaw - pose.yaw)
+
+            v = clamp(goal.v, 0.0, self.p.max_linear_speed)
+            abs_yaw_err = abs(yaw_err)
+            if abs_yaw_err > 0.45:
+                v *= 0.25
+            elif abs_yaw_err > 0.25:
+                v *= 0.50
+            elif abs_yaw_err > 0.12:
+                v *= 0.75
+
+            w = clamp(1.8 * yaw_err, -self.p.turn_max_angular_speed, self.p.turn_max_angular_speed)
+            w = self.rate_limit(w, self.last_w_odom)
+            self.last_w_odom = w
+
+            cmd.linear.x = v
+            cmd.angular.z = w
+            return cmd
+
         goal = path.points[-1]
         goal_dist = math.hypot(goal.x - pose.x, goal.y - pose.y)
         goal_yaw_err = wrap_to_pi(goal.yaw - pose.yaw)
