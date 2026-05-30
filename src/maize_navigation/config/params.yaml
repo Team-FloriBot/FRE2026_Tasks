@@ -68,6 +68,8 @@ maize_navigator:
     heading_kp: 1.2
     lateral_kp: 1.0
     stanley_min_speed: 0.10
+    midline_smoothing_window: 5
+    controller_heading_lookahead: 0.75
 
     max_linear_speed: 0.45
     max_angular_speed: 1.40
