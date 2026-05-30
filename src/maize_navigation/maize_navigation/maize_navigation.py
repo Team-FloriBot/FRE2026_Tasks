@@ -377,6 +377,12 @@ class NavigatorParams:
     # Deshalb ist der Zusatzversatz standardmaessig 0.0; ein positiver Wert
     # waere nur eine bewusst eingestellte Sicherheitsreserve.
     multirow_entry_extra_shift: float = 0.0
+    # Kompensation fuer reale Dynamik/Controller-Latenz im geraden Mittelstueck
+    # von 2L/2R. Im Testlog wurde bei Soll 0.750 m erst bei 0.864 m in
+    # ENTRY_CURVE gewechselt; dadurch lag der Roboter zu weit aussen und traf
+    # die naechste Maisreihe. Der deterministische Sollwert wird deshalb leicht
+    # vorgezogen: 2L/2R fahren nominal eine Reihenbreite minus Trim.
+    multirow_straight_trim: float = 0.15
     # Wenn die per Reihenzaehlung erkannte Zielgasse bei 2R/2L nach innen
     # gegenueber dem Pattern-Sollzentrum verschoben ist, wird sie nicht als
     # Zielzentrum akzeptiert. Das tritt am Reihenende auf, wenn die vordere
@@ -2752,10 +2758,17 @@ class MissionManager:
 
     def _multirow_deterministic_straight_target(self) -> float:
         # 1L/1R: no straight part between the two 90 degree arcs.
-        # 2L/2R: exactly one row spacing straight, so one gap is skipped.
-        # nL/nR: n-1 spacings straight.
+        # 2L/2R: nominally one row spacing straight, so one gap is skipped.
+        # In practice the robot still travels during planning/controller latency
+        # and while the entry arc starts. The logged successful-but-too-wide run
+        # reached ENTRY_CURVE at 0.864 m with a nominal target of 0.750 m.
+        # Trim the deterministic straight segment so the entry arc starts before
+        # the outer maize row instead of on it.
         step = max(1, int(self.p.row_shift_count))
-        return max(0.0, float(step - 1) * float(self.p.expected_row_width))
+        nominal = max(0.0, float(step - 1) * float(self.p.expected_row_width))
+        if step >= 2:
+            nominal -= max(0.0, float(self.p.multirow_straight_trim))
+        return max(0.0, nominal)
 
     def _effective_entry_curve_yaw_change(self) -> float:
         if self.p.entry_curve_yaw_change > 0.0:
