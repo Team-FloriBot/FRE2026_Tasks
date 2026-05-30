@@ -35,6 +35,10 @@ public:
     // ========== Parameter laden ==========
     declare_parameters();
     load_parameters();
+
+    // ========== TF2-Listener vorbereiten ==========
+    tf_buffer_ = std::make_unique<tf2_ros::Buffer>(this->get_clock());
+    tf_listener_ = std::make_unique<tf2_ros::TransformListener>(*tf_buffer_);
     
     // ========== Subscriber erstellen ==========
     path_sub_ = this->create_subscription<nav_msgs::msg::Path>(
@@ -48,10 +52,7 @@ public:
     // ========== Publisher erstellen ==========
     cmd_vel_pub_ = this->create_publisher<geometry_msgs::msg::Twist>(cmd_vel_topic_, 10);
     marker_pub_ = this->create_publisher<visualization_msgs::msg::Marker>("~/debug_marker", 10);
-    
-    // ========== TF2-Listener vorbereiten ==========
-    tf_buffer_ = std::make_unique<tf2_ros::Buffer>(this->get_clock());
-    tf_listener_ = std::make_unique<tf2_ros::TransformListener>(*tf_buffer_);
+  
     
     // ========== Timer für Regelkreis ==========
     control_timer_ = this->create_wall_timer(
@@ -87,7 +88,7 @@ private:
     declare_parameter("goal_tolerance", 0.15);
     
     // Regelung
-    declare_parameter("control_rate", 30);
+    declare_parameter("control_rate", 10.0);
   }
   
   void load_parameters()

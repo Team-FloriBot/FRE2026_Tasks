@@ -2,26 +2,34 @@ from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
+from launch_ros.substitutions import FindPackageShare
+from launch.substitutions import PathJoinSubstitution
 
 
 def generate_launch_description():
-    # Konfigurationsdatei
-    config_file = LaunchConfiguration('config')
-    
+
+    default_config = PathJoinSubstitution([
+        FindPackageShare("path_tracking_controller"),
+        "config",
+        "params.yaml"
+    ])
+
+    config_arg = DeclareLaunchArgument(
+        "config",
+        default_value=default_config,
+        description="Parameter file for Pure Pursuit Controller"
+    )
+
+    pure_pursuit_node = Node(
+        package="path_tracking_controller",
+        executable="pure_pursuit_node",
+        name="pure_pursuit_node",
+        parameters=[LaunchConfiguration("config")],
+        output="screen",
+        arguments=["--ros-args", "--log-level", "info"]
+    )
+
     return LaunchDescription([
-        # Launch-Argument für Konfigurationsdatei
-        DeclareLaunchArgument(
-            'config',
-            default_value=['$(find-pkg-share path_tracking_controller)/config/params.yaml'],
-            description='Pfad zur Konfigurationsdatei für den Pure Pursuit Controller'),
-            
-        # Pure Pursuit Controller Node
-        Node(
-            package='path_tracking_controller',
-            executable='pure_pursuit_node',
-            name='pure_pursuit_node',
-            parameters=[config_file],
-            output='screen',
-            arguments=['--ros-args', '--log-level', 'info']
-        ),
+        config_arg,
+        pure_pursuit_node
     ])
