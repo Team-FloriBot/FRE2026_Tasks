@@ -998,11 +998,17 @@ class MapRowDetector:
             width_min = max(0.05, float(self.p.min_lane_width))
             width_max = max(width_min, float(self.p.max_lane_width))
             if step >= 2:
-                # Fuer 2R/2L ist die Reihenanzahl wichtiger als eine starre
-                # absolute Gassenbreite. Im Log lagen die gezählten Reihen bei
-                # ca. 0.48...0.52 m Abstand und wurden wegen min_lane_width=0.55
-                # verworfen, obwohl sie die korrekte zweite Gasse markierten.
-                counted_min = max(0.05, float(self.p.map_counted_row_min_width_ratio) * float(self.p.expected_row_width))
+                # Fuer 2R/2L zaehlt die Reihenfolge der Pflanzenreihen. Am
+                # Reihenende koennen die aus der SLAM-Map gefitteten Abstaende
+                # lokal deutlich kleiner sein als die nominale Gassenbreite.
+                # Der aktuelle Log-Fall hatte ein korrektes 2R-Zentrum
+                # center=-1.324 m bei expected=-1.500 m, wurde aber nur wegen
+                # width=0.376 m verworfen. Deshalb darf die Breite bei
+                # Mehrreihen-Manovern nicht wieder die korrekte Zaehllogik
+                # aushebeln. Untergrenze hart auf 0.40*row_width begrenzen,
+                # auch wenn ein altes params.yaml noch 0.55 setzt.
+                configured_min = float(self.p.map_counted_row_min_width_ratio) * float(self.p.expected_row_width)
+                counted_min = max(0.05, min(configured_min, 0.40 * float(self.p.expected_row_width)))
                 width_ok = counted_min <= measured_width <= width_max
             else:
                 counted_min = width_min
@@ -1969,8 +1975,11 @@ class PathFollower:
             # large cut into the first neighbouring gap.
             heading_scale = max(0.35, math.cos(min(abs(yaw_err), math.pi / 2.0)))
             v = base_v * heading_scale
-            w_limit = min(0.45, float(self.p.turn_max_angular_speed), float(self.p.follow_max_angular_speed))
-            w = clamp(1.15 * yaw_err, -w_limit, w_limit)
+            # Nur sanft korrigieren. Das Fahrzeug soll parallel am
+            # Reihenende weiterfahren und nicht erneut wie in v10/v14 in die
+            # naechste Gasse hineindrehen.
+            w_limit = min(0.22, float(self.p.turn_max_angular_speed), float(self.p.follow_max_angular_speed))
+            w = clamp(0.70 * yaw_err, -w_limit, w_limit)
             w = self.rate_limit(w, self.last_w_odom)
             self.last_w_odom = w
 
@@ -3175,6 +3184,18 @@ class MissionManager:
                     self.p.entry_curve_angular_speed,
                     reason="ENTRY_CURVE",
                 )
+
+            # Bei 2L/2R darf der Roboter nach dem Ausfahrbogen nicht weiter in
+            # Richtung Map-Heading eindrehen. Genau das zeigte der Log: direkt
+            # nach EXIT_CURVE folgte HEADLAND_SHIFT_MAP mit negativem
+            # Winkelanteil, obwohl der Roboter parallel am Reihenende entlang
+            # weiterfahren und eine Gasse ueberspringen sollte. Solange die
+            # gezählte Zielgasse noch nicht gelatcht ist, wird daher stur in der
+            # aktuellen Fahrzeugrichtung weitergefahren; die SLAM-Reihen werden
+            # weiter oben trotzdem in jedem Zyklus ausgewertet und koennen den
+            # Multirow-Latch setzen.
+            if int(self.p.row_shift_count) >= 2 and not self.multirow_counted_target_latched:
+                return planner.plan_headland_shift_base_link(reason="HEADLAND_SHIFT_MULTIROW_SCAN")
 
             # For 2L/2R and larger multi-row turns, do not command only a map
             # heading. The v8 logs showed the target lane correctly latched at
