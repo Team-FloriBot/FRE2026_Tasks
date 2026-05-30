@@ -3236,30 +3236,28 @@ class MissionManager:
         # Vorzeichen der PCA-Row-Basis lokal flippt.
         row_yaw = float(self.headland_reference_row_yaw_map)
 
-        # For multi-row turns the L/R command cannot be mapped directly to
-        # row_yaw +/- 90 deg, because the PCA row axis is axial and may be
-        # flipped by pi relative to the signed counted target offset. The log
-        # failure showed exactly this: 2R was correctly latched at -1.507 m,
-        # but the raw map-v shift after the exit arc was +0.785 m and the
-        # previous code drove row_yaw - 90 deg, reducing this shift back toward
-        # zero. That pulls the robot into 1R.
-        #
-        # Convert the locked target offset into the raw map-v basis and then
-        # drive in the sign of that raw target. Positive raw-v corresponds to
-        # row_yaw + 90 deg, negative raw-v to row_yaw - 90 deg. Do not replace
-        # this heading by the opposite axial direction just because it is closer
-        # to the current yaw; that reverses the lateral crossing direction.
-        direction = float(self.headland_direction)
-        if int(self.p.row_shift_count) >= 2 and self.multirow_counted_target_latched:
-            self._refresh_multirow_shift_sign_correction()
-            corr = float(self.multirow_shift_sign_correction)
-            if abs(corr) < 1e-6:
-                corr = 1.0
-            raw_target = float(self.multirow_latched_target_offset) / corr
-            if abs(raw_target) > 0.05:
-                direction = 1.0 if raw_target >= 0.0 else -1.0
+        # Keep the straight headland leg in the commanded L/R direction. The
+        # previous logic reversed the desired heading when the global remaining
+        # value changed sign. On 2R this can pull the robot back toward the first
+        # right gap instead of committing to the second counted gap. Stopping is
+        # handled separately by _multirow_map_preentry_reached().
+        direction = self.headland_direction
 
         desired = wrap_to_pi(row_yaw + direction * math.pi / 2.0)
+
+        # Die Vorgewende-Achse ist axial: yaw und yaw+pi beschreiben dieselbe
+        # Gerade. Fuer die Fahrtrichtung muss aber die Richtung genommen werden,
+        # die zur aktuellen Roboterorientierung passt. Sonst versucht der
+        # Controller im HEADLAND_SHIFT_MULTIROW_STRAIGHT eine 180-Grad-Korrektur
+        # und dreht waehrend der eigentlich geraden Querfahrt weiter. Genau das
+        # war im v17-Log sichtbar: headland_shift_forward lief zwar bis ca.
+        # 0.72 m, aber headland_total_yaw_progress stieg dabei bis ca. 3.1 rad.
+        # Dadurch war die Gerade kein reines Ueberspringen mehr.
+        if int(self.p.row_shift_count) >= 2 and pose_map is not None:
+            alt = wrap_to_pi(desired + math.pi)
+            if abs(wrap_to_pi(alt - float(pose_map.yaw))) < abs(wrap_to_pi(desired - float(pose_map.yaw))):
+                desired = alt
+
         return desired
 
     def _target_entry_row_yaw_from_map(self, pose_map: Optional[Pose2D], map_detector: Optional[MapRowDetector]) -> Optional[float]:
@@ -3466,10 +3464,7 @@ class MissionManager:
                 # SLAM-Reihenrichtung abgeleitet: row_yaw +/- 90°. Damit ist die
                 # Gerade geometrisch quer zu den Reihenenden und nicht nur
                 # "geradeaus in Fahrzeugrichtung".
-                if (
-                    self._multirow_counted_target_locked()
-                    and self.headland_shift_forward_distance >= straight_target - max(0.02, float(self.p.headland_shift_tolerance))
-                ):
+                if self.headland_shift_forward_distance >= straight_target - max(0.02, float(self.p.headland_shift_tolerance)):
                     self.transition(MissionState.ENTRY_CURVE, "deterministic multirow perpendicular distance reached")
                     return planner.plan_constant_curve_base_link(
                         self.headland_direction,
