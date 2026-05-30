@@ -116,7 +116,7 @@ maize_navigator:
     map_multirow_require_counted_rows: true
     map_counted_row_min_width_ratio: 0.40
     map_multirow_counted_target_tolerance: 0.22
-    map_multirow_reference_row_min_ratio: 0.65
+    map_multirow_reference_row_min_ratio: 0.45
 
     # Direkter Nachbargassenwechsel 1L/1R:
     # Zielreihe erst akzeptieren, wenn der Versatz erreicht ist und
@@ -145,20 +145,35 @@ maize_navigator:
     map_field_orientation_min_confidence: 0.25
     map_field_orientation_alpha: 0.12
     map_field_orientation_max_local_deviation: 0.55
-    map_row_lateral_bin: 0.10
-    map_row_min_band_points: 12
-    map_row_min_band_length: 1.2
+    map_row_lateral_bin: 0.05
+    map_row_min_band_points: 6
+    map_row_min_band_length: 0.8
     map_row_max_extrapolated_lanes: 3
+
+    # Histogramm-basierte Reihenerkennung fuer punktfoermige, leicht gekruemmte Maiskarten.
+    # Die belegten Map-Zellen werden in die Reihenbasis transformiert. Peaks im Quer-
+    # Histogramm sind Pflanzenreihen; groessere Luecken werden mit expected_row_width
+    # ergaenzt, damit 2R/2L als diskreter Reihenindex gezaehlt werden kann.
+    map_row_histogram_enabled: true
+    map_row_histogram_bin: 0.05
+    map_row_histogram_smoothing_bins: 3
+    map_row_peak_min_points: 6
+    map_row_peak_window_ratio: 0.32
+    map_row_peak_min_distance_ratio: 0.45
+    map_row_spacing_regularization: true
+    map_row_spacing_tolerance_ratio: 0.35
+    map_row_insert_missing_peaks: true
+    map_row_insert_missing_max_gap_rows: 3
 
     # SLAM-Reihenerkennung ueber Linienfit durch belegte Map-Zellen.
     # Daraus werden Pflanzenreihen und anschliessend Gassenmittelpunkte berechnet.
     map_row_line_ransac_iterations: 180
-    map_row_line_distance: 0.12
-    map_row_min_line_inliers: 18
-    map_row_min_line_length: 1.20
+    map_row_line_distance: 0.15
+    map_row_min_line_inliers: 10
+    map_row_min_line_length: 0.80
     map_row_max_abs_line_slope: 0.70
-    map_row_max_lines: 12
-    map_row_line_merge_distance: 0.22
+    map_row_max_lines: 14
+    map_row_line_merge_distance: 0.18
 
     # SLAM darf die Zielgasse nur korrigieren, wenn sie zum Pattern passt.
     # 1L erwartet ca. +0.75 m, 2R ca. -1.50 m, 3R ca. -2.25 m.
