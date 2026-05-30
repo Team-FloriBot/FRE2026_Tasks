@@ -11,21 +11,12 @@ maize_navigator:
     control_frequency: 30.0
 
     expected_row_width: 0.75
-    # legacy row_search params removed
-    row_exclusion_distance: 0.30
-    row_extension_max_spline_distance: 0.50
-    row_window_length: 2.00
-    row_window_step: 0.50
-    row_window_beam_width: 6
-    row_window_candidate_limit: 6
-    row_window_support_weight: 3.2
-    row_window_prediction_weight: 1.6
-    row_window_smoothness_weight: 1.8
-    row_window_gap_penalty: 1.4
-    row_cluster_radius: 0.18
-    row_end_front_point_ratio: 0.08
     min_lane_width: 0.55
     max_lane_width: 1.20
+
+    hist_roi_size: 5.0
+    hist_bin_size: 0.05
+    hist_peak_min_points: 3
 
     roi_x_min: 0.25
     roi_x_max: 2.0
@@ -43,6 +34,17 @@ maize_navigator:
     min_visible_length: 0.35
     max_abs_line_slope: 0.9
     centerline_max_abs_slope: 0.7
+
+    # Rechteck-Marching-Reihenerkennung:
+    # Die initiale linke/rechte Reihe kommt einmalig aus Histogrammpeaks.
+    # Danach werden beide Reihen bei jedem Kartenupdate von dieser Initialgeraden neu berechnet.
+    row_segment_point_count: 5
+    row_segment_point_spacing: 0.30
+    row_rectangle_width: 0.50
+    row_point_window_length: 0.30
+    row_end_min_points_fields_3_to_5: 2
+    row_max_march_steps: 120
+    row_min_fit_points: 3
 
     tracker_alpha: 0.18
     confidence_decay: 0.95

@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import math
-import random
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import List, Optional, Tuple
@@ -12,23 +11,19 @@ import numpy as np
 
 import rclpy
 from rclpy.node import Node
-from rclpy.duration import Duration
 
-from geometry_msgs.msg import Twist, PoseStamped, Point, Quaternion
-from nav_msgs.msg import OccupancyGrid, Path
-from sensor_msgs.msg import LaserScan
-from std_msgs.msg import Float32, String, Header
+from geometry_msgs.msg import Point, Twist
+from nav_msgs.msg import OccupancyGrid
+from std_msgs.msg import Header
 from std_srvs.srv import Trigger
 from visualization_msgs.msg import Marker, MarkerArray
 
 import tf2_ros
-from tf_transformations import euler_from_quaternion, quaternion_from_euler
+from tf_transformations import euler_from_quaternion
 
-
-# --- Utils ---
 
 def wrap_to_pi(angle: float) -> float:
-    return (angle + math.pi) % (2 * math.pi) - math.pi
+    return (angle + math.pi) % (2.0 * math.pi) - math.pi
 
 
 @dataclass
@@ -38,512 +33,169 @@ class Pose2D:
     yaw: float
 
 
-# --- Data Structures for Sliding Window Paths ---
-
-class PlantSpline:
-    def __init__(
-        self,
-        points: np.ndarray,
-        heading_yaw: float = 0.0,
-        window_length: float = 0.65,
-        window_step: float = 0.28,
-        beam_width: int = 4,
-        candidate_limit: int = 5,
-        support_radius: float = 0.16,
-        cluster_radius: float = 0.18,
-        support_weight: float = 2.8,
-        prediction_weight: float = 2.2,
-        smoothness_weight: float = 1.1,
-        gap_penalty: float = 0.9,
-        logger: Optional[Node] = None,
-    ) -> None:
-        # Parameters
-        self.window_length = float(window_length)
-        self.window_step = float(window_step)
-        self.beam_width = int(beam_width)
-        self.candidate_limit = int(candidate_limit)
-        self.support_radius = float(support_radius)
-        self.cluster_radius = float(cluster_radius)
-        self.support_weight = float(support_weight)
-        self.prediction_weight = float(prediction_weight)
-        self.smoothness_weight = float(smoothness_weight)
-        self.gap_penalty = float(gap_penalty)
-
-        # State
-        self.valid = False
-        self.linear_mode = False
-        self.t_min = 0.0
-        self.t_max = 0.0
-        self.perp_dir = None
-
-        # Points
-        if points is None:
-            self.points = np.empty((0, 2), dtype=float)
-        else:
-            self.points = np.asarray(points, dtype=float)
-
-        if len(self.points) < 4:
-            return
-
-        # PCA to find main direction
-        self.mean = np.mean(self.points, axis=0)
-        centered = self.points - self.mean
-        cov = np.cov(centered.T)
-        eigenvalues, eigenvectors = np.linalg.eig(cov)
-        # ensure real values (cov is symmetric, but eig may return complex dtype)
-        eigenvalues = np.real(eigenvalues)
-        eigenvectors = np.real(eigenvectors)
-        heading_vec = np.array([math.cos(heading_yaw), math.sin(heading_yaw)])
-        self.main_dir = eigenvectors[:, np.argmax(eigenvalues)]
-        # Stabilize PCA direction if eigenvalue ratio indicates weak principal axis
-        try:
-            max_eig = float(np.max(eigenvalues))
-            min_eig = float(np.min(eigenvalues))
-            eig_ratio = max_eig / (min_eig if min_eig > 1e-9 else 1e-9)
-            if eig_ratio < 3.0:
-                # blend a bit with the heading to avoid arbitrary flips for near-isotropic clouds
-                try:
-                    self.main_dir = self._normalize_vector(self.main_dir + 0.3 * heading_vec)
-                except Exception:
-                    self.main_dir = self.main_dir
-        except Exception:
-            pass
-        self.perp_dir = np.array([-self.main_dir[1], self.main_dir[0]])
-        if np.dot(self.main_dir, heading_vec) < 0:
-            self.main_dir = -self.main_dir
-            self.perp_dir = -self.perp_dir
-
-        projections = centered @ self.main_dir
-        lateral = centered @ self.perp_dir
-        sort_idx = np.argsort(projections)
-        self.points = self.points[sort_idx]
-        self.t = projections[sort_idx]
-        self.lateral = lateral[sort_idx]
-
-        unique_t, unique_idx = np.unique(self.t, return_index=True)
-        if len(unique_t) < 4:
-            return
-
-        self.t_min = float(unique_t[0])
-        self.t_max = float(unique_t[-1])
-
-        if logger:
-            logger.info(f"Building sliding-window row model with {len(unique_t)} unique points, t range: [{self.t_min:.2f}, {self.t_max:.2f}]")
-
-        unique_lateral = self.lateral[unique_idx]
-        if len(unique_t) < 6:
-            self._build_linear_fallback(logger)
-            return
-
-        if not self._build_knot_path(unique_t, unique_lateral, heading_yaw=heading_yaw, logger=logger):
-            self._build_linear_fallback(logger)
-
-    # Legacy extension helper removed — rectangle-based marching used instead.
-
-    def _build_linear_fallback(self, logger: Optional[Node] = None) -> None:
-        self.linear_mode = True
-        self.valid = True
-        self.line_start = self.mean + self.t_min * self.main_dir
-        self.line_end = self.mean + self.t_max * self.main_dir
-        self.anchor_t = np.array([self.t_min, self.t_max], dtype=float)
-        self.anchor_lateral = np.array([
-            float((self.line_start - self.mean) @ self.perp_dir),
-            float((self.line_end - self.mean) @ self.perp_dir),
-        ], dtype=float)
-        self.anchor_world = np.array([self.line_start, self.line_end], dtype=float)
-        self.row_points = self.anchor_world
-        self.segment_bounds = [(float(self.t_min), float(self.t_max))]
-        self.segment_splines = []
-        self.lateral_spline = None
-        if logger:
-            logger.info(f"Using linear fallback (n={len(self.points)})")
-
-    def _build_knot_path(self, fit_t: np.ndarray, fit_lateral: np.ndarray, heading_yaw: float = 0.0, logger: Optional[Node] = None) -> bool:
-        knot_spacing = 0.30
-        half_window = 0.5 * knot_spacing
-
-        if len(fit_t) < 2:
-            return False
-
-        t_min = float(np.min(fit_t))
-        t_max = float(np.max(fit_t))
-        knot_ts = [t_min]
-        current_t = t_min + knot_spacing
-        while current_t < t_max - 1e-6:
-            knot_ts.append(float(current_t))
-            current_t += knot_spacing
-        if knot_ts[-1] < t_max:
-            knot_ts.append(t_max)
-
-        knot_world: List[np.ndarray] = []
-        knot_t: List[float] = []
-        knot_lateral: List[float] = []
-        for knot_t_val in knot_ts:
-            mask = (fit_t >= knot_t_val - half_window) & (fit_t <= knot_t_val + half_window)
-            if np.any(mask):
-                local_t = fit_t[mask]
-                local_l = fit_lateral[mask]
-                # weighted center around the knot; keeps local curvature without over-smoothing
-                weights = np.exp(-((local_t - knot_t_val) / max(0.08, 0.35 * knot_spacing)) ** 2)
-                if float(np.sum(weights)) < 1e-9:
-                    weights = np.ones_like(local_t)
-                t_center = float(np.sum(local_t * weights) / np.sum(weights))
-                l_center = float(np.sum(local_l * weights) / np.sum(weights))
-            else:
-                t_center = float(knot_t_val)
-                l_center = float(np.interp(knot_t_val, fit_t, fit_lateral))
-            knot_t.append(t_center)
-            knot_lateral.append(l_center)
-            knot_world.append(self.mean + t_center * self.main_dir + l_center * self.perp_dir)
-
-        if len(knot_world) < 2:
-            return False
-
-        self.anchor_t = np.asarray(knot_t, dtype=float)
-        self.anchor_lateral = np.asarray(knot_lateral, dtype=float)
-        self.anchor_world = np.asarray(knot_world, dtype=float)
-        self.row_points = np.asarray(knot_world, dtype=float)
-        self.segment_bounds = [(float(self.anchor_t[i]), float(self.anchor_t[i + 1])) for i in range(len(self.anchor_t) - 1)]
-        self.segment_splines = []
-        self.lateral_spline = None
-        self.valid = True
-        if logger:
-            logger.info(f"Built knot row with {len(self.anchor_t)} knots at ~{knot_spacing:.2f} m spacing")
-        return True
-
-    # Legacy RANSAC helper removed from PlantSpline — MaizeNavigator provides its own fitter.
-
-    # Legacy RANSAC knot-chain builder removed — rectangle-based marching used in navigator.
-
-    def _interpolate_lateral(self, t: float) -> float:
-        if len(self.anchor_t) == 0:
-            return 0.0
-        if len(self.anchor_t) == 1:
-            return float(self.anchor_lateral[0])
-        t_clamped = float(np.clip(t, self.anchor_t[0], self.anchor_t[-1]))
-        return float(np.interp(t_clamped, self.anchor_t, self.anchor_lateral))
-
-    def _project_to_polyline(self, point: np.ndarray) -> float:
-        if len(self.anchor_world) < 2:
-            centered = point - self.mean
-            return float(centered @ self.main_dir)
-
-        best_t = float(self.anchor_t[0])
-        best_dist2 = float("inf")
-        for i in range(len(self.anchor_world) - 1):
-            a = self.anchor_world[i]
-            b = self.anchor_world[i + 1]
-            ab = b - a
-            denom = float(np.dot(ab, ab))
-            if denom < 1e-9:
-                continue
-            u = float(np.clip(np.dot(point - a, ab) / denom, 0.0, 1.0))
-            proj = a + u * ab
-            dist2 = float(np.sum((point - proj) ** 2))
-            if dist2 < best_dist2:
-                best_dist2 = dist2
-                best_t = float(self.anchor_t[i] + u * (self.anchor_t[i + 1] - self.anchor_t[i]))
-        return best_t
-
-    def _local_direction(self, t: float) -> np.ndarray:
-        if len(self.anchor_t) < 2:
-            return self.main_dir
-        idx = int(np.searchsorted(self.anchor_t, t, side="right") - 1)
-        idx = int(np.clip(idx, 0, len(self.anchor_t) - 2))
-        dt = float(self.anchor_t[idx + 1] - self.anchor_t[idx])
-        slope = 0.0 if abs(dt) < 1e-6 else float((self.anchor_lateral[idx + 1] - self.anchor_lateral[idx]) / dt)
-        return self.main_dir + slope * self.perp_dir
-
-    def _segment_candidates(self, t: float) -> List[int]:
-        if len(self.anchor_t) < 2:
-            return []
-        candidates = [i for i, (t_start, t_end) in enumerate(self.segment_bounds) if t_start <= t <= t_end]
-        if candidates:
-            return candidates
-        centers = [0.5 * (t_start + t_end) for t_start, t_end in self.segment_bounds]
-        return [int(np.argmin([abs(t - c) for c in centers]))]
-
-    def _evaluate_lateral(self, t: float) -> float:
-        return self._interpolate_lateral(t)
-
-    def _evaluate_lateral_derivative(self, t: float) -> float:
-        if len(self.anchor_t) < 2:
-            return 0.0
-        direction = self._local_direction(t)
-        denom = float(np.dot(self.perp_dir, self.perp_dir))
-        if denom < 1e-9:
-            return 0.0
-        return float(np.dot(direction - self.main_dir, self.perp_dir) / denom)
-
-    def _knot_segment(self, t: float) -> Tuple[int, float, float]:
-        if len(self.anchor_t) < 2:
-            return 0, 0.0, 1.0
-        t_clamped = float(np.clip(t, self.anchor_t[0], self.anchor_t[-1]))
-        idx = int(np.searchsorted(self.anchor_t, t_clamped, side="right") - 1)
-        idx = int(np.clip(idx, 0, len(self.anchor_t) - 2))
-        t0 = float(self.anchor_t[idx])
-        t1 = float(self.anchor_t[idx + 1])
-        dt = max(1e-6, t1 - t0)
-        u = float(np.clip((t_clamped - t0) / dt, 0.0, 1.0))
-        return idx, u, dt
-
-    def _knot_derivative(self, idx: int) -> np.ndarray:
-        if len(self.anchor_world) < 2:
-            return np.array(self.main_dir, copy=True)
-        if idx <= 0:
-            dt = max(1e-6, float(self.anchor_t[1] - self.anchor_t[0]))
-            deriv = (self.anchor_world[1] - self.anchor_world[0]) / dt
-        elif idx >= len(self.anchor_world) - 1:
-            dt = max(1e-6, float(self.anchor_t[-1] - self.anchor_t[-2]))
-            deriv = (self.anchor_world[-1] - self.anchor_world[-2]) / dt
-        else:
-            dt = max(1e-6, float(self.anchor_t[idx + 1] - self.anchor_t[idx - 1]))
-            deriv = (self.anchor_world[idx + 1] - self.anchor_world[idx - 1]) / dt
-        norm = float(np.linalg.norm(deriv))
-        if norm < 1e-9:
-            return np.array(self.main_dir, copy=True)
-        return deriv / norm
-
-    def _evaluate_world_curve(self, t: float) -> np.ndarray:
-        if len(self.anchor_world) < 2:
-            centered = self.mean + t * self.main_dir
-            return np.array(centered, dtype=float)
-
-        idx, u, dt = self._knot_segment(t)
-        p0 = np.asarray(self.anchor_world[idx], dtype=float)
-        p1 = np.asarray(self.anchor_world[idx + 1], dtype=float)
-        m0 = self._knot_derivative(idx) * dt
-        m1 = self._knot_derivative(idx + 1) * dt
-
-        u2 = u * u
-        u3 = u2 * u
-        h00 = 2.0 * u3 - 3.0 * u2 + 1.0
-        h10 = u3 - 2.0 * u2 + u
-        h01 = -2.0 * u3 + 3.0 * u2
-        h11 = u3 - u2
-        return h00 * p0 + h10 * m0 + h01 * p1 + h11 * m1
-
-    def _local_direction(self, t: float) -> np.ndarray:
-        if len(self.anchor_t) < 2:
-            return self.main_dir
-        idx, _, _ = self._knot_segment(t)
-        return self._knot_derivative(idx)
-
-    def evaluate(self, t: float) -> Tuple[float, float]:
-        if self.linear_mode and hasattr(self, "line_start") and hasattr(self, "line_end"):
-            if self.t_max <= self.t_min:
-                p = self.line_start
-            else:
-                alpha = (t - self.t_min) / (self.t_max - self.t_min)
-                alpha = float(np.clip(alpha, 0.0, 1.0))
-                p = self.line_start + alpha * (self.line_end - self.line_start)
-            return float(p[0]), float(p[1])
-        p = self._evaluate_world_curve(t)
-        return float(p[0]), float(p[1])
-
-    def get_direction(self, t: float) -> float:
-        if self.linear_mode and hasattr(self, "line_start") and hasattr(self, "line_end"):
-            direction = self.line_end - self.line_start
-            return math.atan2(direction[1], direction[0])
-        direction = self._local_direction(t)
-        dx, dy = float(direction[0]), float(direction[1])
-        return math.atan2(dy, dx)
-
-    def get_global_direction(self) -> float:
-        if len(self.anchor_world) >= 2:
-            direction = self.anchor_world[-1] - self.anchor_world[0]
-            return float(math.atan2(direction[1], direction[0]))
-        return float(math.atan2(self.main_dir[1], self.main_dir[0]))
-
-    def get_points(self, num: int = 50) -> np.ndarray:
-        if len(self.anchor_t) < 2:
-            if self.linear_mode and hasattr(self, "line_start") and hasattr(self, "line_end"):
-                t_vals = np.linspace(self.t_min, self.t_max, num)
-                return np.array([self.evaluate(t) for t in t_vals])
-            return np.empty((0, 2), dtype=float)
-        t_vals = np.linspace(float(self.anchor_t[0]), float(self.anchor_t[-1]), num)
-        if self.linear_mode and hasattr(self, "line_start") and hasattr(self, "line_end"):
-            pts = [self.evaluate(t) for t in t_vals]
-            return np.array(pts)
-        return np.array([self.evaluate(t) for t in t_vals])
-    
-    def project(self, point: np.ndarray) -> float:
-        return self._project_to_polyline(point)
+@dataclass
+class SegmentDebug:
+    line_points: np.ndarray
+    direction: np.ndarray
+    big_rect_center: np.ndarray
+    big_rect_length: float
+    big_rect_width: float
+    point3_rect_center: np.ndarray
+    point3_rect_length: float
+    point3_rect_width: float
+    support_count: int
+    end_field_count: int
 
 
-# --- Mission States ---
+@dataclass
+class RowMarchResult:
+    points: np.ndarray = field(default_factory=lambda: np.empty((0, 2), dtype=float))
+    debug_segments: List[SegmentDebug] = field(default_factory=list)
+    current_line_points: np.ndarray = field(default_factory=lambda: np.empty((0, 2), dtype=float))
+    ended: bool = False
+    end_point: Optional[np.ndarray] = None
+
+
+@dataclass
+class RowMarchModel:
+    side: str
+    initial_point3: np.ndarray
+    initial_direction: np.ndarray
+    result: RowMarchResult = field(default_factory=RowMarchResult)
+
 
 class MissionState(Enum):
     IDLE = 0
-    INITIALIZING = 1      # Create histogram, find start rows
-    FOLLOW_ROW = 2       # Drive on mid-spline
-    EXIT_ROW = 3         # Drive past row end
-    TURN_OUT = 4         # 90 deg curve away from row
-    SHIFT = 5            # Lateral shift along headland
-    TURN_IN = 6          # 90 deg curve into new row
-    FINISHED = 7
+    INITIALIZING = 1
+    FOLLOW_ROW = 2
+    FINISHED = 3
 
 
 @dataclass
 class NavigatorParams:
     cmd_vel_topic: str = "/cmd_vel"
     base_frame: str = "base_link"
-    odom_frame: str = "odom"
-    map_topic: str = "/map"
     map_frame: str = "map"
-    
+    map_topic: str = "/map"
+
     control_frequency: float = 30.0
     expected_row_width: float = 0.75
-    
-    # Histogram params
+    min_lane_width: float = 0.55
+    max_lane_width: float = 1.20
+
     hist_roi_size: float = 5.0
     hist_bin_size: float = 0.05
+    hist_peak_min_points: int = 3
     occ_threshold: int = 50
-    
-    # Driving params
-    follow_speed: float = 0.1
-    turn_speed: float = 0.1
-    exit_distance: float = 0.5
-    min_turn_radius: float = 0.5
-    lookahead_dist: float = 0.6
-    # legacy row search params removed: row_search_max_dist, row_search_width
-    row_exclusion_distance: float = 0.30
-    row_extension_max_spline_distance: float = 0.50
-    row_window_length: float = 0.65
-    row_window_step: float = 0.28
-    row_window_beam_width: int = 4
-    row_window_candidate_limit: int = 5
-    row_window_support_weight: float = 2.8
-    row_window_prediction_weight: float = 2.2
-    row_window_smoothness_weight: float = 1.1
-    row_window_gap_penalty: float = 0.9
-    row_cluster_radius: float = 0.18
-    row_end_front_point_ratio: float = 0.08
-    min_lane_width: float = 0.5
-    max_lane_width: float = 1.5
+
     row_segment_point_count: int = 5
     row_segment_point_spacing: float = 0.3
     row_rectangle_width: float = 0.5
-    row_rectangle_length: float = 1.5
     row_point_window_length: float = 0.3
-    row_empty_grace_distance: float = 2.0
-    row_min_support_points: int = 3
-    
-    # Control
+    row_end_min_points_fields_3_to_5: int = 2
+    row_max_march_steps: int = 120
+    row_min_fit_points: int = 3
+
+    follow_speed: float = 0.35
+    lookahead_distance: float = 0.75
     yaw_kp: float = 1.2
-    
-    # Pattern
+    max_angular_speed: float = 0.90
+    path_goal_xy_tolerance: float = 0.20
+
     pattern: str = "1L 2R"
     publish_debug: bool = True
 
 
 class MaizeNavigator(Node):
-    def __init__(self):
+    def __init__(self) -> None:
         super().__init__("maize_navigator")
         self.p = self.load_params()
-        
+        self.validate_params()
+
         self.state = MissionState.IDLE
-        self.current_pattern_idx = 0
-        self.pattern_steps = self.parse_pattern(self.p.pattern)
-        
         self.latest_map: Optional[OccupancyGrid] = None
         self.robot_pose: Optional[Pose2D] = None
-        
-        # We store and dynamically extend the compiled historical points of each active row
-        self.left_row_points: Optional[np.ndarray] = None
-        self.right_row_points: Optional[np.ndarray] = None
-        
-        self.left_row_spline: Optional[PlantSpline] = None
-        self.right_row_spline: Optional[PlantSpline] = None
-        self.left_start_chain: Optional[np.ndarray] = None
-        self.right_start_chain: Optional[np.ndarray] = None
-        self.field_direction_yaw: Optional[float] = None
-        self._debug_last_pair_rectangles: List[Tuple[np.ndarray, np.ndarray, float, float]] = []
-        self.current_left_row_id: Optional[int] = None
-        self.current_right_row_id: Optional[int] = None
-        self.next_row_id: int = 1
-        self.known_rows: dict[int, PlantSpline] = {}
-        self.row_ids_in_order: List[int] = []
-        self.row_exclusion_distance: float = self.p.row_exclusion_distance
-        
-        # State specific variables
-        self.exit_start_pose: Optional[Pose2D] = None
-        self.turn_start_pose: Optional[Pose2D] = None
-        self.target_row_y_offset: float = 0.0
-        self.row_entry_pose: Optional[Pose2D] = None
-        self.row_end_confirm_frames: int = 0
-        
+
+        self.left_row: Optional[RowMarchModel] = None
+        self.right_row: Optional[RowMarchModel] = None
+        self.midline: np.ndarray = np.empty((0, 2), dtype=float)
+        self.row_end_point: Optional[np.ndarray] = None
+
         self.tf_buffer = tf2_ros.Buffer()
         self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
-        
-        # Publishers/Subscribers
+
         self.map_sub = self.create_subscription(OccupancyGrid, self.p.map_topic, self.map_callback, 10)
         self.cmd_pub = self.create_publisher(Twist, self.p.cmd_vel_topic, 10)
         self.marker_pub = self.create_publisher(MarkerArray, "navigation_markers", 10)
-        
+
         self.start_srv = self.create_service(Trigger, "start_navigation", self.start_cb)
         self.stop_srv = self.create_service(Trigger, "stop_navigation", self.stop_cb)
-        
         self.timer = self.create_timer(1.0 / self.p.control_frequency, self.control_loop)
-        self.get_logger().info("Maize Navigator Initialized with Sliding Windows")
+
+        self.get_logger().info("Maize Navigator initialized with rectangle marching row detection")
 
     def load_params(self) -> NavigatorParams:
         p = NavigatorParams()
-        def get_param(name, default):
+
+        def get_param(name: str, default):
             self.declare_parameter(name, default)
             return self.get_parameter(name).value
-            
-        p.pattern = get_param("pattern", p.pattern)
-        p.expected_row_width = get_param("expected_row_width", p.expected_row_width)
-        p.follow_speed = get_param("follow_speed", p.follow_speed)
-        p.min_turn_radius = get_param("min_turn_radius", p.min_turn_radius)
-        p.exit_distance = get_param("exit_distance", p.exit_distance)
-        # legacy row_search params removed
-        p.row_exclusion_distance = get_param("row_exclusion_distance", p.row_exclusion_distance)
-        p.row_extension_max_spline_distance = get_param("row_extension_max_spline_distance", p.row_extension_max_spline_distance)
-        p.row_window_length = get_param("row_window_length", p.row_window_length)
-        p.row_window_step = get_param("row_window_step", p.row_window_step)
-        p.row_window_beam_width = get_param("row_window_beam_width", p.row_window_beam_width)
-        p.row_window_candidate_limit = get_param("row_window_candidate_limit", p.row_window_candidate_limit)
-        p.row_window_support_weight = get_param("row_window_support_weight", p.row_window_support_weight)
-        p.row_window_prediction_weight = get_param("row_window_prediction_weight", p.row_window_prediction_weight)
-        p.row_window_smoothness_weight = get_param("row_window_smoothness_weight", p.row_window_smoothness_weight)
-        p.row_window_gap_penalty = get_param("row_window_gap_penalty", p.row_window_gap_penalty)
-        p.row_cluster_radius = get_param("row_cluster_radius", p.row_cluster_radius)
-        p.row_end_front_point_ratio = get_param("row_end_front_point_ratio", p.row_end_front_point_ratio)
-        p.publish_debug = get_param("publish_debug", p.publish_debug)
-        p.lookahead_dist = get_param("lookahead_dist", p.lookahead_dist)
-        p.min_lane_width = get_param("min_lane_width", p.min_lane_width)
-        p.max_lane_width = get_param("max_lane_width", p.max_lane_width)
-        p.row_segment_point_count = get_param("row_segment_point_count", p.row_segment_point_count)
-        p.row_segment_point_spacing = get_param("row_segment_point_spacing", p.row_segment_point_spacing)
-        p.row_rectangle_width = get_param("row_rectangle_width", p.row_rectangle_width)
-        p.row_rectangle_length = get_param("row_rectangle_length", p.row_rectangle_length)
-        p.row_point_window_length = get_param("row_point_window_length", p.row_point_window_length)
-        p.row_empty_grace_distance = get_param("row_empty_grace_distance", p.row_empty_grace_distance)
-        p.row_min_support_points = get_param("row_min_support_points", p.row_min_support_points)
+
+        p.cmd_vel_topic = str(get_param("cmd_vel_topic", p.cmd_vel_topic))
+        p.base_frame = str(get_param("base_frame", p.base_frame))
+        p.map_frame = str(get_param("map_frame", p.map_frame))
+        p.map_topic = str(get_param("map_topic", p.map_topic))
+        p.control_frequency = float(get_param("control_frequency", p.control_frequency))
+
+        p.expected_row_width = float(get_param("expected_row_width", p.expected_row_width))
+        p.min_lane_width = float(get_param("min_lane_width", p.min_lane_width))
+        p.max_lane_width = float(get_param("max_lane_width", p.max_lane_width))
+
+        p.hist_roi_size = float(get_param("hist_roi_size", p.hist_roi_size))
+        p.hist_bin_size = float(get_param("hist_bin_size", p.hist_bin_size))
+        p.hist_peak_min_points = int(get_param("hist_peak_min_points", p.hist_peak_min_points))
+        p.occ_threshold = int(get_param("map_row_occupancy_threshold", p.occ_threshold))
+
+        p.row_segment_point_count = int(get_param("row_segment_point_count", p.row_segment_point_count))
+        p.row_segment_point_spacing = float(get_param("row_segment_point_spacing", p.row_segment_point_spacing))
+        p.row_rectangle_width = float(get_param("row_rectangle_width", p.row_rectangle_width))
+        p.row_point_window_length = float(get_param("row_point_window_length", p.row_point_window_length))
+        p.row_end_min_points_fields_3_to_5 = int(
+            get_param("row_end_min_points_fields_3_to_5", p.row_end_min_points_fields_3_to_5)
+        )
+        p.row_max_march_steps = int(get_param("row_max_march_steps", p.row_max_march_steps))
+        p.row_min_fit_points = int(get_param("row_min_fit_points", p.row_min_fit_points))
+
+        p.follow_speed = float(get_param("follow_speed", p.follow_speed))
+        p.lookahead_distance = float(get_param("lookahead_distance", p.lookahead_distance))
+        p.yaw_kp = float(get_param("yaw_kp", p.yaw_kp))
+        p.max_angular_speed = float(get_param("follow_max_angular_speed", p.max_angular_speed))
+        p.path_goal_xy_tolerance = float(get_param("path_goal_xy_tolerance", p.path_goal_xy_tolerance))
+
+        p.pattern = str(get_param("pattern", p.pattern))
+        p.publish_debug = bool(get_param("publish_debug", p.publish_debug))
         return p
 
-    def parse_pattern(self, pattern_str: str) -> List[Tuple[int, str]]:
-        steps = []
-        try:
-            for part in pattern_str.split():
-                num = int(part[:-1])
-                side = part[-1].upper()
-                steps.append((num, side))
-        except:
-            self.get_logger().error(f"Invalid pattern: {pattern_str}")
-        return steps
+    def validate_params(self) -> None:
+        if self.p.row_segment_point_count < 5:
+            self.get_logger().warn("row_segment_point_count must be at least 5; using 5")
+            self.p.row_segment_point_count = 5
+        if self.p.row_segment_point_count % 2 == 0:
+            self.get_logger().warn("row_segment_point_count must be odd; adding one")
+            self.p.row_segment_point_count += 1
+        self.p.row_segment_point_spacing = max(0.05, self.p.row_segment_point_spacing)
+        self.p.row_rectangle_width = max(0.05, self.p.row_rectangle_width)
+        self.p.row_point_window_length = max(0.05, self.p.row_point_window_length)
+        self.p.row_max_march_steps = max(1, self.p.row_max_march_steps)
 
-    def remember_row(self, row_id: int, spline: PlantSpline) -> None:
-        self.known_rows[row_id] = spline
-        if row_id not in self.row_ids_in_order:
-            self.row_ids_in_order.append(row_id)
-
-    def map_callback(self, msg: OccupancyGrid):
+    def map_callback(self, msg: OccupancyGrid) -> None:
         self.latest_map = msg
 
     def start_cb(self, req, res):
+        self.left_row = None
+        self.right_row = None
+        self.midline = np.empty((0, 2), dtype=float)
+        self.row_end_point = None
         self.state = MissionState.INITIALIZING
         res.success = True
         res.message = "Navigation started"
@@ -553,6 +205,7 @@ class MaizeNavigator(Node):
         self.state = MissionState.IDLE
         self.cmd_pub.publish(Twist())
         res.success = True
+        res.message = "Navigation stopped"
         return res
 
     def get_robot_pose(self) -> Optional[Pose2D]:
@@ -560,11 +213,11 @@ class MaizeNavigator(Node):
             t = self.tf_buffer.lookup_transform(self.p.map_frame, self.p.base_frame, rclpy.time.Time())
             q = t.transform.rotation
             _, _, yaw = euler_from_quaternion([q.x, q.y, q.z, q.w])
-            return Pose2D(t.transform.translation.x, t.transform.translation.y, yaw)
-        except Exception as e:
+            return Pose2D(float(t.transform.translation.x), float(t.transform.translation.y), float(yaw))
+        except Exception:
             return None
 
-    def control_loop(self):
+    def control_loop(self) -> None:
         self.robot_pose = self.get_robot_pose()
         if self.robot_pose is None or self.latest_map is None:
             return
@@ -573,450 +226,304 @@ class MaizeNavigator(Node):
             self.handle_initializing()
         elif self.state == MissionState.FOLLOW_ROW:
             self.handle_follow_row()
-        elif self.state == MissionState.EXIT_ROW:
-            self.handle_exit_row()
-        elif self.state == MissionState.TURN_OUT:
-            self.handle_turn_out()
-        elif self.state == MissionState.SHIFT:
-            self.handle_shift()
-        elif self.state == MissionState.TURN_IN:
-            self.handle_turn_in()
-        
+        elif self.state == MissionState.FINISHED:
+            self.cmd_pub.publish(Twist())
+
         self.publish_visuals()
 
-    def handle_initializing(self):
-        self.get_logger().info("Detecting rows...", throttle_duration_sec=2.0)
+    def handle_initializing(self) -> None:
         points = self.get_map_points_in_roi(self.robot_pose, self.p.hist_roi_size)
-        if len(points) < 5: 
-            self.get_logger().info(f"Not enough points in ROI: {len(points)}", throttle_duration_sec=2.0)
-            return
-
-        points = self.filter_points_near_known_rows(points)
         if len(points) < 5:
-            self.get_logger().info("All ROI points belong to already known rows.", throttle_duration_sec=2.0)
+            self.get_logger().info(f"Not enough occupied map points for histogram: {len(points)}", throttle_duration_sec=2.0)
             return
 
-        # Histogram logic
-        c, s = math.cos(-self.robot_pose.yaw), math.sin(-self.robot_pose.yaw)
-        dx, dy = points[:, 0] - self.robot_pose.x, points[:, 1] - self.robot_pose.y
-        local_y = s * dx + c * dy
-        
-        bins = np.arange(-self.p.hist_roi_size/2, self.p.hist_roi_size/2, self.p.hist_bin_size)
+        peak_pair = self.find_start_peak_pair(points, self.robot_pose)
+        if peak_pair is None:
+            self.get_logger().info("No valid left/right histogram peak pair found", throttle_duration_sec=2.0)
+            return
+
+        left_peak, right_peak = peak_pair
+        forward = self.yaw_to_vector(self.robot_pose.yaw)
+        lateral = np.array([-forward[1], forward[0]], dtype=float)
+        robot_xy = np.array([self.robot_pose.x, self.robot_pose.y], dtype=float)
+
+        left_point3 = robot_xy + left_peak * lateral
+        right_point3 = robot_xy + right_peak * lateral
+        self.left_row = RowMarchModel("left", left_point3, forward)
+        self.right_row = RowMarchModel("right", right_point3, forward)
+
+        self.recompute_rows()
+        if len(self.midline) < 2:
+            self.get_logger().info("Initial peaks found, but rectangle marching produced no usable midline", throttle_duration_sec=2.0)
+            return
+
+        self.state = MissionState.FOLLOW_ROW
+        self.get_logger().info(
+            f"Initial rows locked once from histogram peaks: left={left_peak:.3f}, right={right_peak:.3f}, width={left_peak - right_peak:.3f}"
+        )
+
+    def handle_follow_row(self) -> None:
+        self.recompute_rows()
+        if len(self.midline) < 2:
+            self.get_logger().warn("No usable midline from rectangle marching; stopping")
+            self.cmd_pub.publish(Twist())
+            return
+
+        robot_xy = np.array([self.robot_pose.x, self.robot_pose.y], dtype=float)
+        if self.row_end_point is not None:
+            dist_to_end = float(np.linalg.norm(robot_xy - self.row_end_point))
+            if dist_to_end <= self.p.path_goal_xy_tolerance:
+                self.get_logger().info("First row end reached. Stopping; row switching is disabled for this version.")
+                self.cmd_pub.publish(Twist())
+                self.state = MissionState.FINISHED
+                return
+
+        closest_idx = int(np.argmin(np.linalg.norm(self.midline - robot_xy, axis=1)))
+        target = self.point_at_polyline_distance(self.midline, closest_idx, self.p.lookahead_distance)
+        if target is None:
+            target = self.midline[-1]
+        self.drive_to_point(np.asarray(target, dtype=float))
+
+    def find_start_peak_pair(self, points: np.ndarray, pose: Pose2D) -> Optional[Tuple[float, float]]:
+        forward = self.yaw_to_vector(pose.yaw)
+        lateral = np.array([-forward[1], forward[0]], dtype=float)
+        robot_xy = np.array([pose.x, pose.y], dtype=float)
+        rel = points - robot_xy
+        local_y = rel @ lateral
+
+        half_roi = 0.5 * self.p.hist_roi_size
+        bins = np.arange(-half_roi, half_roi + self.p.hist_bin_size, self.p.hist_bin_size)
+        if len(bins) < 3:
+            return None
         hist, bin_edges = np.histogram(local_y, bins=bins)
-        
-        peaks = []
-        for i in range(1, len(hist)-1):
-            if hist[i] > 2 and hist[i] >= hist[i-1] and hist[i] >= hist[i+1]:
-                peaks.append((bin_edges[i] + bin_edges[i+1])/2)
-        
-        self.get_logger().info(f"Found {len(points)} points, peaks at: {peaks}", throttle_duration_sec=2.0)
-        
+
+        peaks: List[Tuple[float, int]] = []
+        for idx in range(1, len(hist) - 1):
+            if hist[idx] >= self.p.hist_peak_min_points and hist[idx] >= hist[idx - 1] and hist[idx] >= hist[idx + 1]:
+                center = 0.5 * (bin_edges[idx] + bin_edges[idx + 1])
+                peaks.append((float(center), int(hist[idx])))
+
         if len(peaks) < 2:
-            self.get_logger().info(f"Not enough peaks for row pair selection: {peaks}", throttle_duration_sec=2.0)
-            return
+            self.get_logger().info(f"Histogram peaks: {[round(p[0], 3) for p in peaks]}", throttle_duration_sec=2.0)
+            return None
 
-        best_left = None
-        best_right = None
-        best_score = float('inf')
-
-        # Use adjacent peaks so peak 1 maps to spline 1, peak 2 to spline 2, etc.
-        # This keeps the row order stable even if all peaks are on the same side.
-        sorted_peaks = sorted(peaks)
-        for i in range(len(sorted_peaks) - 1):
-            p1 = sorted_peaks[i]
-            p2 = sorted_peaks[i + 1]
-            sep = abs(p2 - p1)
+        best_pair = None
+        best_score = float("inf")
+        sorted_peaks = sorted(peaks, key=lambda item: item[0])
+        for left_idx in range(len(sorted_peaks) - 1):
+            right_peak = sorted_peaks[left_idx][0]
+            left_peak = sorted_peaks[left_idx + 1][0]
+            sep = left_peak - right_peak
             if sep < self.p.min_lane_width or sep > self.p.max_lane_width:
                 continue
-            score = abs(sep - self.p.expected_row_width)
+            count_bonus = 0.01 * (sorted_peaks[left_idx][1] + sorted_peaks[left_idx + 1][1])
+            score = abs(sep - self.p.expected_row_width) - count_bonus
             if score < best_score:
                 best_score = score
-                best_left = p2
-                best_right = p1
-
-        if best_left is None or best_right is None:
-            self.get_logger().info(f"Could not select a row pair from peaks: {peaks}", throttle_duration_sec=2.0)
-            return
+                best_pair = (left_peak, right_peak)
 
         self.get_logger().info(
-            f"Selected peak pair: upper={best_left:.3f}, lower={best_right:.3f}, sep={abs(best_left - best_right):.3f}, expected={self.p.expected_row_width:.3f}",
+            f"Histogram peaks: {[round(p[0], 3) for p in sorted_peaks]}, selected={best_pair}",
             throttle_duration_sec=2.0,
         )
+        return best_pair
 
-        if abs(best_left - best_right) < self.p.min_lane_width or abs(best_left - best_right) > self.p.max_lane_width:
-            self.get_logger().info(
-                f"Rejecting row pair by width: sep={abs(best_left - best_right):.2f}, expected={self.p.expected_row_width:.2f}",
-                throttle_duration_sec=2.0,
-            )
+    def recompute_rows(self) -> None:
+        if self.left_row is None or self.right_row is None:
             return
-        
-        self.left_row_points = points[np.abs(local_y - best_left) < 0.25]
-        self.right_row_points = points[np.abs(local_y - best_right) < 0.25]
-        
-        self.left_row_spline = PlantSpline(
-            self.left_row_points,
-            heading_yaw=self.robot_pose.yaw,
-            window_length=self.p.row_window_length,
-            window_step=self.p.row_window_step,
-            beam_width=self.p.row_window_beam_width,
-            candidate_limit=self.p.row_window_candidate_limit,
-            support_radius=self.p.row_extension_max_spline_distance,
-            cluster_radius=self.p.row_cluster_radius,
-            support_weight=self.p.row_window_support_weight,
-            prediction_weight=self.p.row_window_prediction_weight,
-            smoothness_weight=self.p.row_window_smoothness_weight,
-            gap_penalty=self.p.row_window_gap_penalty,
-            logger=self.get_logger(),
-        )
-        self.right_row_spline = PlantSpline(
-            self.right_row_points,
-            heading_yaw=self.robot_pose.yaw,
-            window_length=self.p.row_window_length,
-            window_step=self.p.row_window_step,
-            beam_width=self.p.row_window_beam_width,
-            candidate_limit=self.p.row_window_candidate_limit,
-            support_radius=self.p.row_extension_max_spline_distance,
-            cluster_radius=self.p.row_cluster_radius,
-            support_weight=self.p.row_window_support_weight,
-            prediction_weight=self.p.row_window_prediction_weight,
-            smoothness_weight=self.p.row_window_smoothness_weight,
-            gap_penalty=self.p.row_window_gap_penalty,
-            logger=self.get_logger(),
-        )
-        
-        if self.left_row_spline.valid and self.right_row_spline.valid:
-            left_start = np.mean(self.left_row_points, axis=0) if self.left_row_points is not None and len(self.left_row_points) > 0 else np.array(self.left_row_spline.evaluate(self.left_row_spline.t_min), dtype=float)
-            right_start = np.mean(self.right_row_points, axis=0) if self.right_row_points is not None and len(self.right_row_points) > 0 else np.array(self.right_row_spline.evaluate(self.right_row_spline.t_min), dtype=float)
-            self.left_start_chain = np.array([left_start], dtype=float)
-            self.right_start_chain = np.array([right_start], dtype=float)
-            self.left_row_spline.row_points = np.array(self.left_start_chain, copy=True)
-            self.right_row_spline.row_points = np.array(self.right_start_chain, copy=True)
-            self.field_direction_yaw = self.mean_yaw([
-                self.left_row_spline.get_global_direction(),
-                self.right_row_spline.get_global_direction(),
-                self.robot_pose.yaw,
-            ])
-            self.current_left_row_id = self.next_row_id
-            self.next_row_id += 1
-            self.current_right_row_id = self.next_row_id
-            self.next_row_id += 1
-            self.remember_row(self.current_left_row_id, self.left_row_spline)
-            self.remember_row(self.current_right_row_id, self.right_row_spline)
-            self.row_entry_pose = self.robot_pose
-            self.row_end_confirm_frames = 0
-            self.state = MissionState.FOLLOW_ROW
-            self.get_logger().info(
-                f"Rows found. IDs: L={self.current_left_row_id}, R={self.current_right_row_id}. Assigned to peak order {self.row_ids_in_order}. Width: {best_left - best_right:.2f}m. Following..."
-            )
+        map_points = self.get_all_map_points()
+        if len(map_points) == 0:
+            self.midline = np.empty((0, 2), dtype=float)
+            self.row_end_point = None
+            return
 
-    def handle_follow_row(self):
-        # 1. Project robot onto current splines
-        p_robot = np.array([self.robot_pose.x, self.robot_pose.y])
-        t_l = self.left_row_spline.project(p_robot)
-        t_r = self.right_row_spline.project(p_robot)
+        self.left_row.result = self.march_row(self.left_row, map_points)
+        self.right_row.result = self.march_row(self.right_row, map_points)
+        self.midline = self.build_midline(self.left_row.result.points, self.right_row.result.points)
 
-        # 2. Paired line march from the two current startpoints.
-        if self.left_start_chain is None or len(self.left_start_chain) == 0:
-            self.left_start_chain = np.array([np.array(self.left_row_spline.evaluate(self.left_row_spline.t_min), dtype=float)], dtype=float)
-        if self.right_start_chain is None or len(self.right_start_chain) == 0:
-            self.right_start_chain = np.array([np.array(self.right_row_spline.evaluate(self.right_row_spline.t_min), dtype=float)], dtype=float)
-
-        if self.field_direction_yaw is None:
-            self.field_direction_yaw = self.mean_yaw([
-                self.left_row_spline.get_global_direction(),
-                self.right_row_spline.get_global_direction(),
-                self.robot_pose.yaw,
-            ])
-
-        new_left_chain, new_right_chain, new_pts_l, new_pts_r, shared_heading_yaw = self._march_pair_startpoints(
-            self.left_start_chain,
-            self.right_start_chain,
-            self.field_direction_yaw,
-        )
-
-        self.left_start_chain = new_left_chain
-        self.right_start_chain = new_right_chain
-
-        self.left_row_points = np.array(self.left_start_chain, copy=True)
-        self.right_row_points = np.array(self.right_start_chain, copy=True)
-
-        temp_left_spline = PlantSpline(
-            self.left_row_points,
-            heading_yaw=shared_heading_yaw,
-            logger=self.get_logger(),
-        )
-        temp_right_spline = PlantSpline(
-            self.right_row_points,
-            heading_yaw=shared_heading_yaw,
-            logger=self.get_logger(),
-        )
-
-        if temp_left_spline.valid and temp_right_spline.valid:
-            ok = True
-            if self.right_row_spline and self.right_row_spline.valid:
-                dists = self.spline_point_distances(temp_left_spline.get_points(num=60), self.right_row_spline)
-                if len(dists) > 0 and np.min(dists) < max(self.row_exclusion_distance, self.p.expected_row_width * 0.45):
-                    ok = False
-                    self.get_logger().info(f"Rejecting left temp_spline: too close to right row (min_dist={np.min(dists):.3f})")
-                if ok and not self.validate_row_pair_geometry(temp_left_spline, self.right_row_spline):
-                    ok = False
-                    self.get_logger().info("Rejecting left temp_spline: invalid left/right row geometry")
-
-            if ok and self.left_row_spline and self.left_row_spline.valid:
-                dists = self.spline_point_distances(temp_right_spline.get_points(num=60), temp_left_spline)
-                if len(dists) > 0 and np.min(dists) < max(self.row_exclusion_distance, self.p.expected_row_width * 0.45):
-                    ok = False
-                    self.get_logger().info(f"Rejecting right temp_spline: too close to left row (min_dist={np.min(dists):.3f})")
-                if ok and not self.validate_row_pair_geometry(temp_left_spline, temp_right_spline):
-                    ok = False
-                    self.get_logger().info("Rejecting right temp_spline: invalid left/right row geometry")
-
-            if ok:
-                self.left_row_spline = temp_left_spline
-                self.left_row_spline.row_points = np.array(self.left_row_points, copy=True)
-                self.right_row_spline = temp_right_spline
-                self.right_row_spline.row_points = np.array(self.right_row_points, copy=True)
-                if self.current_left_row_id is not None:
-                    self.remember_row(self.current_left_row_id, self.left_row_spline)
-                if self.current_right_row_id is not None:
-                    self.remember_row(self.current_right_row_id, self.right_row_spline)
-
-        # 3. Project robot on updated, highly robust splines
-        t_l = self.left_row_spline.project(p_robot)
-        t_r = self.right_row_spline.project(p_robot)
-
-        # 4. Robust End of row detection using the forward lookahead window
-        points_ahead = self.get_map_points_in_front(self.robot_pose, distance=2.5, width=1.0)
-        dist_in_row = math.hypot(self.robot_pose.x - self.row_entry_pose.x, self.robot_pose.y - self.row_entry_pose.y)
-        min_front_points = self.estimate_front_point_threshold(self.robot_pose)
-        
-        near_spline_end = (t_l > self.left_row_spline.t_max - 0.2) and (t_r > self.right_row_spline.t_max - 0.2)
-        no_points_ahead = len(points_ahead) < min_front_points
-
-        end_candidate = dist_in_row > 2.0 and near_spline_end and no_points_ahead
-        if end_candidate:
-            self.row_end_confirm_frames += 1
+        if self.left_row.result.ended and self.right_row.result.ended:
+            left_end = self.left_row.result.end_point
+            right_end = self.right_row.result.end_point
+            if left_end is not None and right_end is not None:
+                self.row_end_point = 0.5 * (left_end + right_end)
+            elif len(self.midline) > 0:
+                self.row_end_point = self.midline[-1]
         else:
-            self.row_end_confirm_frames = 0
+            self.row_end_point = None
 
-        if self.row_end_confirm_frames >= 4:
-            self.get_logger().info(
-                f"Row end confirmed after debounce. Dist: {dist_in_row:.2f}m, Points ahead: {len(points_ahead)}/{min_front_points}, frames: {self.row_end_confirm_frames}"
+    def march_row(self, model: RowMarchModel, map_points: np.ndarray) -> RowMarchResult:
+        result = RowMarchResult()
+        direction = self.normalize(model.initial_direction)
+        line_points = self.build_initial_line_from_point3(model.initial_point3, direction)
+        exact_points: List[np.ndarray] = []
+        previous_valid_point: Optional[np.ndarray] = None
+
+        for _ in range(self.p.row_max_march_steps):
+            point3 = line_points[2]
+            big_rect_length = self.big_rectangle_length()
+            fit_points = self.points_in_oriented_rectangle(
+                map_points,
+                point3,
+                direction,
+                big_rect_length,
+                self.p.row_rectangle_width,
             )
-            self.exit_start_pose = self.robot_pose
-            self.row_end_confirm_frames = 0
-            self.state = MissionState.EXIT_ROW
-            return
+            field_count = self.count_points_in_fields_3_to_5(map_points, line_points, direction)
 
-        # 5. Drive on the midpoint polyline between the two recognized rows.
-        midline = self.build_midline_polyline(self.left_row_spline, self.right_row_spline, num=60)
-        if len(midline) < 2:
-            return
+            local_point3_points = self.points_in_oriented_rectangle(
+                map_points,
+                point3,
+                direction,
+                self.p.row_point_window_length,
+                self.p.row_rectangle_width,
+            )
 
-        robot_point = np.array([self.robot_pose.x, self.robot_pose.y], dtype=float)
-        closest_idx = int(np.argmin(np.linalg.norm(midline - robot_point, axis=1)))
-        mid_lookahead = self.point_at_polyline_distance(midline, closest_idx, self.p.lookahead_dist)
-        if mid_lookahead is None:
-            mid_lookahead = midline[-1]
+            if len(exact_points) > 0 and field_count <= self.p.row_end_min_points_fields_3_to_5:
+                result.ended = True
+                result.end_point = previous_valid_point if previous_valid_point is not None else exact_points[-1]
+                break
 
-        self.drive_to_point(np.asarray(mid_lookahead, dtype=float))
+            fitted_direction = direction
+            if len(fit_points) >= self.p.row_min_fit_points:
+                fitted_direction = self.fit_direction(fit_points, direction)
 
-    def find_points_along_tangent(
-        self,
-        start_pos: np.ndarray,
-        yaw: float,
-        max_dist: float,
-        width: float,
-        exclude_row_ids: Optional[set[int]] = None,
-        current_spline=None,
-        min_t: Optional[float] = None,
-    ) -> np.ndarray:
-        """Looks for plant points ahead of the spline's end point in the direction of its tangent."""
-        # Query map cells in a generous bounding area
-        points = self.get_map_points_in_roi(Pose2D(start_pos[0], start_pos[1], yaw), max_dist * 2)
-        if len(points) == 0:
-            return points
-            
-        c, s = math.cos(-yaw), math.sin(-yaw)
-        dx = points[:, 0] - start_pos[0]
-        dy = points[:, 1] - start_pos[1]
-        
-        # Transform points to lookahead window local frame (x_local: along tangent, y_local: lateral deviation)
-        lx = c * dx - s * dy
-        ly = s * dx + c * dy
-        
-        # Filter points inside lookahead search window
-        mask = (lx > 0.05) & (lx < max_dist) & (np.abs(ly) < width / 2.0)
-        cand = points[mask]
-
-        # If current_spline provided, require points to project beyond current t_max (avoid backward points).
-        # Allow a wider overlap so slowly updated maps can still extend the row.
-        if current_spline is not None and min_t is not None and len(cand) > 0:
-            proj_t = np.array([current_spline.project(p) for p in cand])
-            eps = 0.35
-            cand = cand[proj_t > (min_t - eps)]
-
-        # Keep tail candidates within a narrow corridor around the current spline.
-        # This prevents appending points from neighboring rows.
-        if current_spline is not None and len(cand) > 0:
-            d_to_spline = self.spline_point_distances(cand, current_spline)
-            if len(d_to_spline) > 0:
-                max_dist = max(0.10, float(self.p.row_extension_max_spline_distance))
-                cand = cand[d_to_spline <= max_dist]
-
-        return self.filter_points_near_known_rows(cand, exclude_row_ids=exclude_row_ids)
-
-    def accumulate_unique_points(self, current_pts: np.ndarray, new_pts: np.ndarray, exclude_row_id: Optional[int] = None) -> np.ndarray:
-        """Filters new points to only append those that aren't already represented in current_pts.
-
-        Also rejects points that are closer to any known row spline (excluding exclude_row_id) than
-        `self.row_exclusion_distance` to avoid stealing points from other rows.
-        """
-        kept = []
-
-        # Estimate along-axis of the current points to allow accepting points
-        # that are further along the row even if they are spatially close
-        if current_pts is None or len(current_pts) == 0:
-            along_dir = None
-            max_proj_cur = -float('inf')
-            cur_origin = None
-        else:
-            cur_origin = current_pts[0]
-            vec = current_pts[-1] - current_pts[0]
-            norm = np.linalg.norm(vec)
-            if norm < 1e-6:
-                along_dir = None
-                max_proj_cur = -float('inf')
+            if len(local_point3_points) > 0:
+                row_point = np.mean(local_point3_points, axis=0)
+                previous_valid_point = row_point
             else:
-                along_dir = vec / norm
-                proj_vals = np.dot(current_pts - cur_origin, along_dir)
-                max_proj_cur = float(np.max(proj_vals))
+                row_point = np.array(point3, copy=True)
 
-        for pt in new_pts:
-            # distance to existing current points
-            if current_pts is None or len(current_pts) == 0:
-                min_cur = float('inf')
-            else:
-                dists = np.linalg.norm(current_pts - pt, axis=1)
-                min_cur = float(np.min(dists))
+            exact_points.append(row_point)
+            result.debug_segments.append(
+                SegmentDebug(
+                    line_points=np.array(line_points, copy=True),
+                    direction=np.array(direction, copy=True),
+                    big_rect_center=np.array(point3, copy=True),
+                    big_rect_length=big_rect_length,
+                    big_rect_width=self.p.row_rectangle_width,
+                    point3_rect_center=np.array(point3, copy=True),
+                    point3_rect_length=self.p.row_point_window_length,
+                    point3_rect_width=self.p.row_rectangle_width,
+                    support_count=len(fit_points),
+                    end_field_count=field_count,
+                )
+            )
 
-            # distance to known rows (exclude the current row id)
-            min_known = float('inf')
-            for row_id, spline in self.known_rows.items():
-                if exclude_row_id is not None and row_id == exclude_row_id:
+            direction = fitted_direction
+            line_points = self.build_next_line_from_old_point3(point3, direction)
+
+        result.points = np.asarray(exact_points, dtype=float) if exact_points else np.empty((0, 2), dtype=float)
+        result.current_line_points = np.asarray(line_points, dtype=float)
+        if result.ended and result.end_point is None and len(result.points) > 0:
+            result.end_point = result.points[-1]
+        return result
+
+    def build_initial_line_from_point3(self, point3: np.ndarray, direction: np.ndarray) -> np.ndarray:
+        spacing = self.p.row_segment_point_spacing
+        direction = self.normalize(direction)
+        return np.array([point3 + (idx - 2) * spacing * direction for idx in range(self.p.row_segment_point_count)], dtype=float)
+
+    def build_next_line_from_old_point3(self, old_point3: np.ndarray, direction: np.ndarray) -> np.ndarray:
+        spacing = self.p.row_segment_point_spacing
+        direction = self.normalize(direction)
+        point2 = np.asarray(old_point3, dtype=float)
+        return np.array([point2 + (idx - 1) * spacing * direction for idx in range(self.p.row_segment_point_count)], dtype=float)
+
+    def big_rectangle_length(self) -> float:
+        return float(self.p.row_segment_point_count) * self.p.row_segment_point_spacing
+
+    def count_points_in_fields_3_to_5(self, map_points: np.ndarray, line_points: np.ndarray, direction: np.ndarray) -> int:
+        total = 0
+        for idx in (2, 3, 4):
+            total += len(
+                self.points_in_oriented_rectangle(
+                    map_points,
+                    line_points[idx],
+                    direction,
+                    self.p.row_point_window_length,
+                    self.p.row_rectangle_width,
+                )
+            )
+        return total
+
+    def fit_direction(self, points: np.ndarray, fallback_direction: np.ndarray) -> np.ndarray:
+        fallback_direction = self.normalize(fallback_direction)
+        if len(points) < 2:
+            return fallback_direction
+
+        fit_points = points
+        if len(points) > 2:
+            best_inliers = np.ones(len(points), dtype=bool)
+            best_count = -1
+            threshold = max(0.05, 0.18 * self.p.row_rectangle_width)
+            rng = np.random.default_rng(42)
+            iterations = min(64, max(16, len(points) * 2))
+
+            for _ in range(iterations):
+                idx_a, idx_b = rng.choice(len(points), size=2, replace=False)
+                a = points[idx_a]
+                b = points[idx_b]
+                candidate = b - a
+                norm = float(np.linalg.norm(candidate))
+                if norm < 1e-9:
                     continue
-                d = self.spline_point_distances(np.array([pt]), spline)
-                if len(d) > 0:
-                    min_known = min(min_known, float(d[0]))
+                candidate = candidate / norm
+                if np.dot(candidate, fallback_direction) < 0.0:
+                    candidate = -candidate
+                perp = np.array([-candidate[1], candidate[0]], dtype=float)
+                distances = np.abs((points - a) @ perp)
+                inliers = distances <= threshold
+                count = int(np.sum(inliers))
+                if count > best_count:
+                    best_count = count
+                    best_inliers = inliers
 
-            accept = False
-            # standard acceptance when point is sufficiently far from existing points
-            if min_cur > 0.02 and min_known > self.row_exclusion_distance:
-                accept = True
-            else:
-                # If point projects further along the current point chain, accept
-                if along_dir is not None and cur_origin is not None:
-                    proj_pt = float(np.dot(pt - cur_origin, along_dir))
-                    if proj_pt > max_proj_cur and min_known > self.row_exclusion_distance:
-                        accept = True
+            if best_count >= self.p.row_min_fit_points:
+                fit_points = points[best_inliers]
 
-            if accept:
-                kept.append(pt)
+        centered = fit_points - np.mean(fit_points, axis=0)
+        cov = np.cov(centered.T)
+        if np.ndim(cov) != 2:
+            return fallback_direction
 
-        if len(kept) > 0:
-            if current_pts is None or len(current_pts) == 0:
-                return np.array(kept)
-            return np.vstack((current_pts, np.array(kept)))
-        return current_pts
+        eigenvalues, eigenvectors = np.linalg.eigh(cov)
+        direction = np.real(eigenvectors[:, int(np.argmax(eigenvalues))])
+        direction = self.normalize(direction)
+        if np.dot(direction, fallback_direction) < 0.0:
+            direction = -direction
 
-    def is_candidate_continuous(self, current_spline: PlantSpline, candidate_spline: PlantSpline, max_delta: float = 0.7) -> bool:
-        if current_spline is None or candidate_spline is None:
-            return False
-        if not current_spline.valid or not candidate_spline.valid:
-            return False
+        # Light damping keeps the marching direction from swinging on sparse/noisy cells.
+        return self.normalize(0.75 * fallback_direction + 0.25 * direction)
 
-        t_ref = min(current_spline.t_max, candidate_spline.t_max)
-        t_ref = max(candidate_spline.t_min, min(t_ref, candidate_spline.t_max))
-        t_cur = max(current_spline.t_min, min(t_ref, current_spline.t_max))
-
-        yaw_old = current_spline.get_direction(t_cur)
-        yaw_new = candidate_spline.get_direction(t_ref)
-        delta = abs(wrap_to_pi(yaw_new - yaw_old))
-        return delta <= max_delta
-
-    def validate_row_pair_geometry(self, left_spline: PlantSpline, right_spline: PlantSpline) -> bool:
-        if self.robot_pose is None:
-            return True
-        if left_spline is None or right_spline is None:
-            return False
-        if not left_spline.valid or not right_spline.valid:
-            return False
-
-        p_robot = np.array([self.robot_pose.x, self.robot_pose.y])
-        t_l = left_spline.project(p_robot)
-        t_r = right_spline.project(p_robot)
-        t_l = max(left_spline.t_min, min(t_l, left_spline.t_max))
-        t_r = max(right_spline.t_min, min(t_r, right_spline.t_max))
-
-        p_l = np.array(left_spline.evaluate(t_l))
-        p_r = np.array(right_spline.evaluate(t_r))
-
-        c, s = math.cos(-self.robot_pose.yaw), math.sin(-self.robot_pose.yaw)
-        dy_l = s * (p_l[0] - self.robot_pose.x) + c * (p_l[1] - self.robot_pose.y)
-        dy_r = s * (p_r[0] - self.robot_pose.x) + c * (p_r[1] - self.robot_pose.y)
-        sep = dy_l - dy_r
-
-        min_sep = max(0.25, 0.45 * self.p.expected_row_width)
-        max_sep = 2.2 * self.p.expected_row_width
-        return sep > min_sep and sep < max_sep
-
-    def spline_point_distances(self, points: np.ndarray, spline: PlantSpline) -> np.ndarray:
-        if len(points) == 0 or spline is None or not spline.valid:
-            return np.array([])
-        spline_points = spline.get_points(num=60)
-        deltas = points[:, None, :] - spline_points[None, :, :]
-        return np.min(np.linalg.norm(deltas, axis=2), axis=1)
-
-    def filter_points_near_known_rows(self, points: np.ndarray, exclude_row_ids: Optional[set[int]] = None, min_dist: Optional[float] = None) -> np.ndarray:
-        if len(points) == 0 or not self.known_rows:
-            return points
-        threshold = self.row_exclusion_distance if min_dist is None else min_dist
-        mask = np.ones(len(points), dtype=bool)
-        for row_id, spline in self.known_rows.items():
-            if exclude_row_ids and row_id in exclude_row_ids:
-                continue
-            distances = self.spline_point_distances(points, spline)
-            if len(distances) > 0:
-                mask &= distances > threshold
-        return points[mask]
-
-    def get_map_points_in_front(self, pose: Pose2D, distance: float, width: float) -> np.ndarray:
-        points = self.get_map_points_in_roi(pose, distance * 2)
-        if len(points) == 0: return points
-        c, s = math.cos(-pose.yaw), math.sin(-pose.yaw)
-        dx, dy = points[:, 0] - pose.x, points[:, 1] - pose.y
-        local_x, local_y = c * dx - s * dy, s * dx + c * dy
-        mask = (local_x > 0.3) & (local_x < distance) & (np.abs(local_y) < width/2.0)
-        return points[mask]
-
-    def build_midline_polyline(self, left_spline: PlantSpline, right_spline: PlantSpline, num: int = 60) -> np.ndarray:
-        if left_spline is None or right_spline is None or not left_spline.valid or not right_spline.valid:
+    def points_in_oriented_rectangle(
+        self,
+        points: np.ndarray,
+        center: np.ndarray,
+        direction: np.ndarray,
+        length: float,
+        width: float,
+    ) -> np.ndarray:
+        if len(points) == 0:
             return np.empty((0, 2), dtype=float)
-        left_row_points = getattr(left_spline, "row_points", None)
-        right_row_points = getattr(right_spline, "row_points", None)
-        if left_row_points is not None and right_row_points is not None and len(left_row_points) >= 2 and len(right_row_points) >= 2:
-            count = min(len(left_row_points), len(right_row_points))
-            return 0.5 * (np.asarray(left_row_points[:count], dtype=float) + np.asarray(right_row_points[:count], dtype=float))
-        left_points = left_spline.get_points(num=num)
-        right_points = right_spline.get_points(num=num)
+        direction = self.normalize(direction)
+        perp = np.array([-direction[1], direction[0]], dtype=float)
+        rel = points - np.asarray(center, dtype=float)
+        along = rel @ direction
+        lateral = rel @ perp
+        mask = (np.abs(along) <= 0.5 * length) & (np.abs(lateral) <= 0.5 * width)
+        return points[mask]
+
+    def build_midline(self, left_points: np.ndarray, right_points: np.ndarray) -> np.ndarray:
         if len(left_points) == 0 or len(right_points) == 0:
             return np.empty((0, 2), dtype=float)
         count = min(len(left_points), len(right_points))
         return 0.5 * (left_points[:count] + right_points[:count])
 
     def point_at_polyline_distance(self, polyline: np.ndarray, start_idx: int, distance_ahead: float) -> Optional[np.ndarray]:
-        if len(polyline) < 2:
+        if len(polyline) == 0:
             return None
+        if len(polyline) == 1:
+            return polyline[0]
         start_idx = int(np.clip(start_idx, 0, len(polyline) - 1))
         travelled = 0.0
         for idx in range(start_idx, len(polyline) - 1):
@@ -1030,464 +537,261 @@ class MaizeNavigator(Node):
             travelled += seg_len
         return polyline[-1]
 
-    def estimate_front_point_threshold(self, pose: Pose2D) -> int:
-        """Estimate the minimum number of points expected ahead of the robot.
+    def drive_to_point(self, target: np.ndarray) -> None:
+        dx = float(target[0] - self.robot_pose.x)
+        dy = float(target[1] - self.robot_pose.y)
+        target_yaw = math.atan2(dy, dx)
+        yaw_error = wrap_to_pi(target_yaw - self.robot_pose.yaw)
 
-        Dense local crops should demand more missing points before a row end is plausible.
-        Sparse crops keep a small floor so the robot can still finish rows in weak maps.
-        """
-        local_points = self.get_map_points_in_roi(pose, self.p.hist_roi_size)
-        if len(local_points) == 0:
-            return 3
-
-        dynamic_threshold = int(round(len(local_points) * float(self.p.row_end_front_point_ratio)))
-        return int(np.clip(dynamic_threshold, 4, 12))
-
-    def _normalize_vector(self, vec: np.ndarray) -> np.ndarray:
-        norm = float(np.linalg.norm(vec))
-        if norm < 1e-9:
-            return np.array([1.0, 0.0], dtype=float)
-        return vec / norm
-
-    def _segment_offsets(self) -> np.ndarray:
-        count = max(3, int(self.p.row_segment_point_count))
-        spacing = float(self.p.row_segment_point_spacing)
-        center_idx = count // 2
-        offsets = np.array([(idx - center_idx) * spacing for idx in range(count)], dtype=float)
-        return offsets
-
-    def _build_segment_points(self, anchor: np.ndarray, direction: np.ndarray) -> np.ndarray:
-        anchor = np.asarray(anchor, dtype=float)
-        direction = self._normalize_vector(np.asarray(direction, dtype=float))
-        offsets = self._segment_offsets()
-        return np.array([anchor + offset * direction for offset in offsets], dtype=float)
-
-    def _oriented_rectangle_mask(
-        self,
-        points: np.ndarray,
-        center: np.ndarray,
-        direction: np.ndarray,
-        half_length: float,
-        half_width: float,
-        min_along: Optional[float] = None,
-        max_along: Optional[float] = None,
-    ) -> np.ndarray:
-        if len(points) == 0:
-            return np.zeros(0, dtype=bool)
-        center = np.asarray(center, dtype=float)
-        direction = self._normalize_vector(np.asarray(direction, dtype=float))
-        perp = np.array([-direction[1], direction[0]], dtype=float)
-        rel = points - center
-        along = rel @ direction
-        lateral = rel @ perp
-        low = -float(half_length) if min_along is None else float(min_along)
-        high = float(half_length) if max_along is None else float(max_along)
-        return (along >= low) & (along <= high) & (np.abs(lateral) <= half_width)
-
-    def _local_rectangle_points(
-        self,
-        points: np.ndarray,
-        center: np.ndarray,
-        direction: np.ndarray,
-        rect_length: float,
-        rect_width: float,
-        min_along: Optional[float] = None,
-        max_along: Optional[float] = None,
-    ) -> np.ndarray:
-        mask = self._oriented_rectangle_mask(points, center, direction, rect_length / 2.0, rect_width / 2.0, min_along=min_along, max_along=max_along)
-        return points[mask]
-
-    def _fit_rectangle_direction(self, points: np.ndarray, fallback_dir: np.ndarray, logger: Optional[Node] = None) -> np.ndarray:
-        if len(points) < 2:
-            return self._normalize_vector(np.asarray(fallback_dir, dtype=float))
-        _, direction = self._fit_ransac_line(points, fallback_dir, iterations=48, inlier_threshold=max(0.04, float(self.p.row_rectangle_width) * 0.18))
-        direction = self._normalize_vector(direction)
-        fallback_dir = self._normalize_vector(np.asarray(fallback_dir, dtype=float))
-        if np.dot(direction, fallback_dir) < 0:
-            direction = -direction
-        if logger:
-            logger.info(f"Rectangle fit direction yaw={math.degrees(math.atan2(direction[1], direction[0])):.1f}deg")
-        return direction
-
-    def _small_rectangle_mean(self, points: np.ndarray, anchor: np.ndarray, direction: np.ndarray) -> Optional[np.ndarray]:
-        local = self._local_rectangle_points(
-            points,
-            anchor,
-            direction,
-            rect_length=float(self.p.row_point_window_length),
-            rect_width=float(self.p.row_rectangle_width),
-        )
-        if len(local) == 0:
-            return None
-        return np.mean(local, axis=0)
-
-    def _fit_ransac_line(self, points: np.ndarray, fallback_dir: np.ndarray, iterations: int = 48, inlier_threshold: float = 0.06) -> Tuple[np.ndarray, np.ndarray]:
-        points = np.asarray(points, dtype=float)
-        if len(points) < 2:
-            direction = self._normalize_vector(np.asarray(fallback_dir, dtype=float))
-            origin = np.mean(points, axis=0) if len(points) > 0 else np.array([0.0, 0.0], dtype=float)
-            return origin, direction
-
-        best_inliers: np.ndarray = np.zeros(len(points), dtype=bool)
-        best_count = -1
-        best_origin = np.mean(points, axis=0)
-        best_dir = self._normalize_vector(np.asarray(fallback_dir, dtype=float))
-        fallback_dir = self._normalize_vector(np.asarray(fallback_dir, dtype=float))
-
-        for _ in range(iterations):
-            idx_a, idx_b = np.random.choice(len(points), size=2, replace=False)
-            a = points[idx_a]
-            b = points[idx_b]
-            direction = b - a
-            norm = float(np.linalg.norm(direction))
-            if norm < 1e-9:
-                continue
-            direction = direction / norm
-            if np.dot(direction, fallback_dir) < 0:
-                direction = -direction
-            rel = points - a
-            perp = np.array([-direction[1], direction[0]], dtype=float)
-            distances = np.abs(rel @ perp)
-            inliers = distances <= inlier_threshold
-            count = int(np.sum(inliers))
-            if count > best_count:
-                best_count = count
-                best_inliers = inliers
-                best_origin = np.mean(points[inliers], axis=0) if count > 0 else np.mean(points, axis=0)
-                best_dir = direction
-
-        if best_count < 0:
-            return best_origin, best_dir
-
-        inlier_points = points[best_inliers] if np.any(best_inliers) else points
-        centered = inlier_points - np.mean(inlier_points, axis=0)
-        cov = np.cov(centered.T)
-        if np.ndim(cov) < 2:
-            return best_origin, best_dir
-        eigenvalues, eigenvectors = np.linalg.eig(cov)
-        direction = np.real(eigenvectors[:, int(np.argmax(np.real(eigenvalues)))]) if len(inlier_points) >= 2 else best_dir
-        direction = self._normalize_vector(direction)
-        if np.dot(direction, fallback_dir) < 0:
-            direction = -direction
-        origin = np.mean(inlier_points, axis=0)
-        return origin, direction
-
-    def mean_yaw(self, yaws: List[float]) -> float:
-        if len(yaws) == 0:
-            return 0.0
-        sx = float(sum(math.cos(yaw) for yaw in yaws))
-        sy = float(sum(math.sin(yaw) for yaw in yaws))
-        if abs(sx) < 1e-9 and abs(sy) < 1e-9:
-            return float(yaws[0])
-        return float(math.atan2(sy, sx))
-
-    def _march_pair_startpoints(
-        self,
-        left_chain: np.ndarray,
-        right_chain: np.ndarray,
-        initial_heading_yaw: float,
-    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, float]:
-        knot_spacing = float(self.p.row_segment_point_spacing)
-        row_half_width = max(0.18, float(self.p.row_rectangle_width) / 2.0)
-        corridor_half_width = max(0.35, float(self.p.expected_row_width * 0.80))
-        max_empty_advance = float(self.p.row_empty_grace_distance)
-
-        left_chain = np.asarray(left_chain, dtype=float)
-        right_chain = np.asarray(right_chain, dtype=float)
-        if len(left_chain) == 0 or len(right_chain) == 0:
-            empty = np.empty((0, 2), dtype=float)
-            return left_chain, right_chain, empty, empty, float(initial_heading_yaw)
-
-        left_start = np.array(left_chain[-1], dtype=float)
-        right_start = np.array(right_chain[-1], dtype=float)
-        pair_center = 0.5 * (left_start + right_start)
-        pair_vector = right_start - left_start
-        field_dir = self._normalize_vector(np.array([math.cos(initial_heading_yaw), math.sin(initial_heading_yaw)], dtype=float))
-        if np.dot(field_dir, pair_vector) < 0:
-            field_dir = -field_dir
-
-        remaining_points = self.get_map_points_in_roi(Pose2D(pair_center[0], pair_center[1], initial_heading_yaw), 6.0)
-        if len(remaining_points) == 0:
-            empty = np.empty((0, 2), dtype=float)
-            return left_chain, right_chain, empty, empty, float(initial_heading_yaw)
-
-        added_left_points: List[np.ndarray] = []
-        added_right_points: List[np.ndarray] = []
-        debug_pair_rectangles: List[Tuple[np.ndarray, np.ndarray, float, float]] = []
-        empty_progress = 0.0
-        steps = 0
-        max_steps = int(math.ceil(max_empty_advance / knot_spacing)) + 12
-
-        while steps < max_steps:
-            steps += 1
-            pair_center = 0.5 * (left_start + right_start)
-            support_mask = self._oriented_rectangle_mask(
-                remaining_points,
-                pair_center,
-                field_dir,
-                half_length=float(self.p.row_rectangle_length) / 2.0,
-                half_width=float(self.p.row_rectangle_width) / 2.0,
-            )
-            pair_support = remaining_points[support_mask]
-            debug_pair_rectangles.append((
-                np.array(pair_center, copy=True),
-                np.array(field_dir, copy=True),
-                float(self.p.row_rectangle_length),
-                float(self.p.row_rectangle_width),
-            ))
-            left_points = self._local_rectangle_points(
-                remaining_points,
-                left_start,
-                field_dir,
-                rect_length=float(self.p.row_point_window_length),
-                rect_width=float(self.p.row_rectangle_width),
-            )
-            right_points = self._local_rectangle_points(
-                remaining_points,
-                right_start,
-                field_dir,
-                rect_length=float(self.p.row_point_window_length),
-                rect_width=float(self.p.row_rectangle_width),
-            )
-
-            if len(pair_support) < int(self.p.row_min_support_points) and len(left_points) == 0 and len(right_points) == 0:
-                empty_progress += knot_spacing
-                if self.get_logger():
-                    self.get_logger().info(f"Rectangle step empty: empty_progress={empty_progress:.2f}m")
-                if empty_progress > max_empty_advance:
-                    break
-                left_start = left_start + field_dir * knot_spacing
-                right_start = right_start + field_dir * knot_spacing
-                left_chain = np.vstack((left_chain, left_start))
-                right_chain = np.vstack((right_chain, right_start))
-                continue
-
-            empty_progress = 0.0
-            direction_source = pair_support if len(pair_support) >= 2 else np.vstack((left_points, right_points))
-            if len(direction_source) >= 2:
-                fitted_dir = self._fit_rectangle_direction(direction_source, field_dir, logger=self.get_logger())
-                field_dir = self._normalize_vector(0.82 * field_dir + 0.18 * fitted_dir)
-
-            left_mean = self._small_rectangle_mean(remaining_points, left_start, field_dir)
-            right_mean = self._small_rectangle_mean(remaining_points, right_start, field_dir)
-
-            if left_mean is None:
-                left_mean = np.array(left_start, copy=True)
-            if right_mean is None:
-                right_mean = np.array(right_start, copy=True)
-
-            left_knot = np.array(left_mean, copy=True)
-            right_knot = np.array(right_mean, copy=True)
-
-            if self.get_logger():
-                self.get_logger().info(
-                    f"Rectangle knot step: left_n={len(left_points)}, right_n={len(right_points)}, support={len(pair_support)}, dir_yaw={math.degrees(math.atan2(field_dir[1], field_dir[0])):.1f}deg"
-                )
-
-            left_start = np.array(left_knot, copy=True)
-            right_start = np.array(right_knot, copy=True)
-            left_chain = np.vstack((left_chain, left_start))
-            right_chain = np.vstack((right_chain, right_start))
-
-            if len(left_points) > 0:
-                added_left_points.append(left_points)
-            if len(right_points) > 0:
-                added_right_points.append(right_points)
-
-            if len(pair_support) > 0:
-                remaining_points = remaining_points[~support_mask]
-            else:
-                remaining_points = remaining_points[~self._oriented_rectangle_mask(
-                    remaining_points,
-                    pair_center,
-                    field_dir,
-                    half_length=float(self.p.row_rectangle_length) / 2.0,
-                    half_width=float(self.p.row_rectangle_width) / 2.0,
-                )]
-            if len(remaining_points) == 0:
-                break
-
-        new_pts_l = np.vstack(added_left_points) if added_left_points else np.empty((0, 2), dtype=float)
-        new_pts_r = np.vstack(added_right_points) if added_right_points else np.empty((0, 2), dtype=float)
-        heading_yaw = float(math.atan2(field_dir[1], field_dir[0]))
-        self._debug_last_pair_rectangles = debug_pair_rectangles
-        return left_chain, right_chain, new_pts_l, new_pts_r, heading_yaw
-
-    def handle_exit_row(self):
-        dist = math.hypot(self.robot_pose.x - self.exit_start_pose.x, self.robot_pose.y - self.exit_start_pose.y)
-        if dist >= self.p.exit_distance:
-            self.get_logger().info("Exit complete. Turning...")
-            self.turn_start_pose = self.robot_pose
-            self.state = MissionState.TURN_OUT
-            return
         cmd = Twist()
-        cmd.linear.x = self.p.follow_speed
-        self.cmd_pub.publish(cmd)
-
-    def handle_turn_out(self):
-        num, side = self.pattern_steps[self.current_pattern_idx]
-        dir = 1.0 if side == "L" else -1.0
-        yaw_diff = abs(wrap_to_pi(self.robot_pose.yaw - self.turn_start_pose.yaw))
-        if yaw_diff >= math.pi / 2.0 - 0.1:
-            self.get_logger().info("Turn out complete. Shifting...")
-            self.target_row_y_offset = num * self.p.expected_row_width
-            self.turn_start_pose = self.robot_pose
-            self.state = MissionState.SHIFT
-            return
-        cmd = Twist()
-        cmd.linear.x = self.p.turn_speed
-        cmd.angular.z = dir * (self.p.turn_speed / self.p.min_turn_radius)
-        self.cmd_pub.publish(cmd)
-
-    def handle_shift(self):
-        dist = math.hypot(self.robot_pose.x - self.turn_start_pose.x, self.robot_pose.y - self.turn_start_pose.y)
-        if dist >= abs(self.target_row_y_offset) - 2 * self.p.min_turn_radius:
-            self.get_logger().info("Shift complete. Turning in...")
-            self.turn_start_pose = self.robot_pose
-            self.state = MissionState.TURN_IN
-            return
-        cmd = Twist()
-        cmd.linear.x = self.p.follow_speed
-        self.cmd_pub.publish(cmd)
-
-    def handle_turn_in(self):
-        num, side = self.pattern_steps[self.current_pattern_idx]
-        dir = 1.0 if side == "L" else -1.0
-        yaw_diff = abs(wrap_to_pi(self.robot_pose.yaw - self.turn_start_pose.yaw))
-        if yaw_diff >= math.pi / 2.0 - 0.1:
-            self.get_logger().info("Entered new row. Re-initializing...")
-            self.current_pattern_idx = (self.current_pattern_idx + 1) % len(self.pattern_steps)
-            self.row_entry_pose = self.robot_pose
-            self.state = MissionState.INITIALIZING
-            return
-        cmd = Twist()
-        cmd.linear.x = self.p.turn_speed
-        cmd.angular.z = dir * (self.p.turn_speed / self.p.min_turn_radius)
-        self.cmd_pub.publish(cmd)
-
-    def drive_to_point(self, target: np.ndarray):
-        dx, dy = target[0] - self.robot_pose.x, target[1] - self.robot_pose.y
-        angle_to_target = math.atan2(dy, dx)
-        yaw_err = wrap_to_pi(angle_to_target - self.robot_pose.yaw)
-        yaw_err = np.clip(yaw_err, -0.4, 0.4)
-        cmd = Twist()
-        speed_factor = np.clip(1.0 - abs(yaw_err)/0.6, 0.3, 1.0)
+        speed_factor = float(np.clip(1.0 - abs(yaw_error) / 0.7, 0.25, 1.0))
         cmd.linear.x = self.p.follow_speed * speed_factor
-        cmd.angular.z = self.p.yaw_kp * yaw_err
-        
-        self.get_logger().info(
-            f"Fahrbefehl: v={cmd.linear.x:.2f}, w={cmd.angular.z:.2f} (yaw_err={yaw_err:.2f}, dist={math.hypot(dx, dy):.2f})",
-            throttle_duration_sec=0.5
-        )
+        cmd.angular.z = float(np.clip(self.p.yaw_kp * yaw_error, -self.p.max_angular_speed, self.p.max_angular_speed))
         self.cmd_pub.publish(cmd)
 
     def get_map_points_in_roi(self, pose: Pose2D, size: float) -> np.ndarray:
-        if self.latest_map is None: return np.array([])
+        points = self.get_all_map_points()
+        if len(points) == 0:
+            return points
+        center = np.array([pose.x, pose.y], dtype=float)
+        half = 0.5 * float(size)
+        rel = points - center
+        mask = (np.abs(rel[:, 0]) <= half) & (np.abs(rel[:, 1]) <= half)
+        return points[mask]
+
+    def get_all_map_points(self) -> np.ndarray:
+        if self.latest_map is None:
+            return np.empty((0, 2), dtype=float)
+
         info = self.latest_map.info
-        grid = np.array(self.latest_map.data).reshape((info.height, info.width))
-        ix = int((pose.x - info.origin.position.x) / info.resolution)
-        iy = int((pose.y - info.origin.position.y) / info.resolution)
-        r = int(size / (2 * info.resolution))
-        y_slice = slice(max(0, iy-r), min(info.height, iy+r))
-        x_slice = slice(max(0, ix-r), min(info.width, ix+r))
-        roi = grid[y_slice, x_slice]
-        occ_y, occ_x = np.where(roi > self.p.occ_threshold)
-        world_x = (occ_x + x_slice.start) * info.resolution + info.origin.position.x
-        world_y = (occ_y + y_slice.start) * info.resolution + info.origin.position.y
+        grid = np.asarray(self.latest_map.data, dtype=np.int16).reshape((info.height, info.width))
+        occ_y, occ_x = np.where(grid >= self.p.occ_threshold)
+        if len(occ_x) == 0:
+            return np.empty((0, 2), dtype=float)
+
+        world_x = (occ_x.astype(float) + 0.5) * info.resolution + info.origin.position.x
+        world_y = (occ_y.astype(float) + 0.5) * info.resolution + info.origin.position.y
         return np.column_stack((world_x, world_y))
 
-    def publish_visuals(self):
+    def publish_visuals(self) -> None:
         markers = MarkerArray()
-        clear_marker = Marker(header=Header(frame_id=self.p.map_frame, stamp=self.get_clock().now().to_msg()))
+        stamp = self.get_clock().now().to_msg()
+        clear_marker = Marker(header=Header(frame_id=self.p.map_frame, stamp=stamp))
         clear_marker.action = Marker.DELETEALL
         markers.markers.append(clear_marker)
-        ordered_ids = self.row_ids_in_order if self.row_ids_in_order else sorted(self.known_rows.keys())
-        for row_id in ordered_ids:
-            spline = self.known_rows[row_id]
-            if spline is None or not spline.valid:
-                continue
-            is_current = row_id in {self.current_left_row_id, self.current_right_row_id}
-            color = [0.0, 1.0, 0.0] if is_current else [0.65, 0.65, 0.65]
-            alpha = 1.0 if is_current else 0.55
-            row_points = self.get_row_points_for_visualization(row_id, spline)
-            markers.markers.append(self.create_spline_marker(spline, row_id, color, alpha=alpha, row_points=row_points))
-            markers.markers.append(self.create_row_points_marker(row_id, color, alpha=alpha, row_points=row_points, is_current=is_current))
-            if spline.segment_bounds and len(spline.segment_bounds) > 1:
-                markers.markers.append(self.create_segment_boundary_marker(spline, row_id, is_current=is_current))
-            if self.p.publish_debug and is_current:
-                markers.markers.extend(self.create_debug_rectangle_markers(row_id))
-                markers.markers.append(self.create_chain_anchor_marker(row_id, is_left=True))
-                markers.markers.append(self.create_chain_anchor_marker(row_id, is_left=False))
-            # publish debug markers for rejected/considered hypotheses
-            if self.p.publish_debug and hasattr(spline, "_last_rejected") and len(spline._last_rejected) > 0:
-                for idx, beam in enumerate(spline._last_rejected[:12]):
-                    m = Marker(header=Header(frame_id=self.p.map_frame, stamp=self.get_clock().now().to_msg()))
-                    m.ns, m.id, m.type, m.action = "spline_rejected", 20000 + row_id * 100 + idx, Marker.LINE_STRIP, Marker.ADD
-                    m.scale.x = 0.03
-                    # more transparent for lower-scoring beams
-                    alpha = 0.18 + 0.55 * float(np.clip((beam.get("score", 0.0) + 5.0) / 10.0, 0.0, 1.0))
-                    m.color.r, m.color.g, m.color.b, m.color.a = 1.0, 0.12, 0.12, alpha
-                    for t_val, l_val in zip(beam.get("t", []), beam.get("l", [])):
-                        x = spline.mean[0] + float(t_val) * spline.main_dir[0] + float(l_val) * spline.perp_dir[0]
-                        y = spline.mean[1] + float(t_val) * spline.main_dir[1] + float(l_val) * spline.perp_dir[1]
-                        m.points.append(Point(x=float(x), y=float(y), z=0.0))
-                    markers.markers.append(m)
-            if self.p.publish_debug and hasattr(spline, "_last_accepted") and len(spline._last_accepted) > 0:
-                for idx, beam in enumerate(spline._last_accepted[:3]):
-                    m2 = Marker(header=Header(frame_id=self.p.map_frame, stamp=self.get_clock().now().to_msg()))
-                    m2.ns, m2.id, m2.type, m2.action = "spline_accepted", 30000 + row_id * 100 + idx, Marker.LINE_STRIP, Marker.ADD
-                    m2.scale.x = 0.05
-                    m2.color.r, m2.color.g, m2.color.b, m2.color.a = 0.15, 1.0, 0.15, 0.95
-                    for t_val, l_val in zip(beam.get("t", []), beam.get("l", [])):
-                        x = spline.mean[0] + float(t_val) * spline.main_dir[0] + float(l_val) * spline.perp_dir[0]
-                        y = spline.mean[1] + float(t_val) * spline.main_dir[1] + float(l_val) * spline.perp_dir[1]
-                        m2.points.append(Point(x=float(x), y=float(y), z=0.0))
-                    markers.markers.append(m2)
+
+        marker_id = 1
+        if self.left_row is not None:
+            marker_id = self.add_row_markers(markers, marker_id, self.left_row, (0.1, 0.95, 0.2, 1.0), stamp)
+        if self.right_row is not None:
+            marker_id = self.add_row_markers(markers, marker_id, self.right_row, (1.0, 0.55, 0.05, 1.0), stamp)
+        if len(self.midline) > 0:
+            markers.markers.append(self.create_line_marker("march_midline", marker_id, self.midline, (0.15, 0.45, 1.0, 1.0), 0.055, stamp))
+            marker_id += 1
+        if self.row_end_point is not None:
+            markers.markers.append(self.create_sphere_marker("row_end", marker_id, self.row_end_point, (1.0, 0.0, 0.0, 1.0), 0.22, stamp))
+
         self.marker_pub.publish(markers)
 
-    def create_debug_rectangle_markers(self, row_id: int) -> List[Marker]:
-        markers: List[Marker] = []
-        stamp = self.get_clock().now().to_msg()
-
-        for idx, (center, direction, length, width) in enumerate(self._debug_last_pair_rectangles[-20:]):
-            markers.extend(self._rectangle_marker_bundle(
-                center=center,
-                direction=direction,
-                length=length,
-                width=width,
-                ns=f"debug_pair_rectangles_{row_id}",
-                marker_id=40000 + row_id * 100 + idx,
-                color=(0.1, 0.7, 1.0, 0.25),
-                stamp=stamp,
-            ))
-
-        return markers
-
-    def _rectangle_marker_bundle(
+    def add_row_markers(
         self,
+        markers: MarkerArray,
+        start_id: int,
+        model: RowMarchModel,
+        color: Tuple[float, float, float, float],
+        stamp,
+    ) -> int:
+        marker_id = start_id
+        result = model.result
+        if len(result.points) > 0:
+            markers.markers.append(self.create_line_marker(f"{model.side}_row_curve", marker_id, result.points, color, 0.045, stamp))
+            marker_id += 1
+            markers.markers.append(self.create_points_marker(f"{model.side}_row_points", marker_id, result.points, color, 0.11, stamp))
+            marker_id += 1
+
+        if len(result.current_line_points) > 0:
+            markers.markers.append(
+                self.create_points_marker(
+                    f"{model.side}_current_five_points",
+                    marker_id,
+                    result.current_line_points,
+                    (1.0, 1.0, 0.1, 0.95),
+                    0.08,
+                    stamp,
+                )
+            )
+            marker_id += 1
+            markers.markers.append(
+                self.create_line_marker(
+                    f"{model.side}_current_line",
+                    marker_id,
+                    result.current_line_points,
+                    (1.0, 1.0, 0.1, 0.85),
+                    0.025,
+                    stamp,
+                )
+            )
+            marker_id += 1
+            for idx, point in enumerate(result.current_line_points[: self.p.row_segment_point_count]):
+                markers.markers.append(
+                    self.create_text_marker(
+                        f"{model.side}_current_point_numbers",
+                        marker_id,
+                        point,
+                        str(idx + 1),
+                        (1.0, 1.0, 1.0, 0.95),
+                        stamp,
+                    )
+                )
+                marker_id += 1
+
+        if self.p.publish_debug:
+            for segment in result.debug_segments[-25:]:
+                markers.markers.append(
+                    self.create_rectangle_marker(
+                        f"{model.side}_fit_rectangles",
+                        marker_id,
+                        segment.big_rect_center,
+                        segment.direction,
+                        segment.big_rect_length,
+                        segment.big_rect_width,
+                        (0.05, 0.75, 1.0, 0.34),
+                        stamp,
+                    )
+                )
+                marker_id += 1
+                markers.markers.append(
+                    self.create_rectangle_marker(
+                        f"{model.side}_point3_rectangles",
+                        marker_id,
+                        segment.point3_rect_center,
+                        segment.direction,
+                        segment.point3_rect_length,
+                        segment.point3_rect_width,
+                        (1.0, 0.1, 0.8, 0.48),
+                        stamp,
+                    )
+                )
+                marker_id += 1
+
+        if result.end_point is not None:
+            markers.markers.append(self.create_sphere_marker(f"{model.side}_end_point", marker_id, result.end_point, (1.0, 0.0, 0.0, 1.0), 0.18, stamp))
+            marker_id += 1
+        return marker_id
+
+    def create_line_marker(
+        self,
+        namespace: str,
+        marker_id: int,
+        points: np.ndarray,
+        color: Tuple[float, float, float, float],
+        scale: float,
+        stamp,
+    ) -> Marker:
+        marker = Marker(header=Header(frame_id=self.p.map_frame, stamp=stamp))
+        marker.ns = namespace
+        marker.id = marker_id
+        marker.type = Marker.LINE_STRIP
+        marker.action = Marker.ADD
+        marker.scale.x = float(scale)
+        marker.color.r, marker.color.g, marker.color.b, marker.color.a = color
+        for point in points:
+            marker.points.append(Point(x=float(point[0]), y=float(point[1]), z=0.0))
+        return marker
+
+    def create_points_marker(
+        self,
+        namespace: str,
+        marker_id: int,
+        points: np.ndarray,
+        color: Tuple[float, float, float, float],
+        scale: float,
+        stamp,
+    ) -> Marker:
+        marker = Marker(header=Header(frame_id=self.p.map_frame, stamp=stamp))
+        marker.ns = namespace
+        marker.id = marker_id
+        marker.type = Marker.SPHERE_LIST
+        marker.action = Marker.ADD
+        marker.scale.x = float(scale)
+        marker.scale.y = float(scale)
+        marker.scale.z = float(scale)
+        marker.color.r, marker.color.g, marker.color.b, marker.color.a = color
+        for point in points:
+            marker.points.append(Point(x=float(point[0]), y=float(point[1]), z=0.0))
+        return marker
+
+    def create_text_marker(
+        self,
+        namespace: str,
+        marker_id: int,
+        point: np.ndarray,
+        text: str,
+        color: Tuple[float, float, float, float],
+        stamp,
+    ) -> Marker:
+        marker = Marker(header=Header(frame_id=self.p.map_frame, stamp=stamp))
+        marker.ns = namespace
+        marker.id = marker_id
+        marker.type = Marker.TEXT_VIEW_FACING
+        marker.action = Marker.ADD
+        marker.scale.z = 0.18
+        marker.color.r, marker.color.g, marker.color.b, marker.color.a = color
+        marker.pose.position.x = float(point[0])
+        marker.pose.position.y = float(point[1])
+        marker.pose.position.z = 0.25
+        marker.pose.orientation.w = 1.0
+        marker.text = text
+        return marker
+
+    def create_sphere_marker(
+        self,
+        namespace: str,
+        marker_id: int,
+        point: np.ndarray,
+        color: Tuple[float, float, float, float],
+        scale: float,
+        stamp,
+    ) -> Marker:
+        marker = Marker(header=Header(frame_id=self.p.map_frame, stamp=stamp))
+        marker.ns = namespace
+        marker.id = marker_id
+        marker.type = Marker.SPHERE
+        marker.action = Marker.ADD
+        marker.scale.x = float(scale)
+        marker.scale.y = float(scale)
+        marker.scale.z = float(scale)
+        marker.color.r, marker.color.g, marker.color.b, marker.color.a = color
+        marker.pose.position.x = float(point[0])
+        marker.pose.position.y = float(point[1])
+        marker.pose.position.z = 0.0
+        marker.pose.orientation.w = 1.0
+        return marker
+
+    def create_rectangle_marker(
+        self,
+        namespace: str,
+        marker_id: int,
         center: np.ndarray,
         direction: np.ndarray,
         length: float,
         width: float,
-        ns: str,
-        marker_id: int,
         color: Tuple[float, float, float, float],
         stamp,
-    ) -> List[Marker]:
-        outline = Marker(header=Header(frame_id=self.p.map_frame, stamp=stamp))
-        outline.ns = ns
-        outline.id = marker_id
-        outline.type = Marker.LINE_STRIP
-        outline.action = Marker.ADD
-        outline.scale.x = 0.03
-        outline.color.r, outline.color.g, outline.color.b, outline.color.a = color
+    ) -> Marker:
+        marker = Marker(header=Header(frame_id=self.p.map_frame, stamp=stamp))
+        marker.ns = namespace
+        marker.id = marker_id
+        marker.type = Marker.LINE_STRIP
+        marker.action = Marker.ADD
+        marker.scale.x = 0.025
+        marker.color.r, marker.color.g, marker.color.b, marker.color.a = color
 
-        center = np.asarray(center, dtype=float)
-        direction = self._normalize_vector(np.asarray(direction, dtype=float))
+        direction = self.normalize(direction)
         perp = np.array([-direction[1], direction[0]], dtype=float)
+        center = np.asarray(center, dtype=float)
         half_length = 0.5 * float(length)
         half_width = 0.5 * float(width)
-
         corners = [
             center - half_length * direction - half_width * perp,
             center + half_length * direction - half_width * perp,
@@ -1496,130 +800,21 @@ class MaizeNavigator(Node):
             center - half_length * direction - half_width * perp,
         ]
         for corner in corners:
-            outline.points.append(Point(x=float(corner[0]), y=float(corner[1]), z=0.0))
-        return [outline]
-
-    def _direction_arrow_marker(
-        self,
-        center: np.ndarray,
-        direction: np.ndarray,
-        length: float,
-        ns: str,
-        marker_id: int,
-        color: Tuple[float, float, float, float],
-        stamp,
-    ) -> Marker:
-        marker = Marker(header=Header(frame_id=self.p.map_frame, stamp=stamp))
-        marker.ns = ns
-        marker.id = marker_id
-        marker.type = Marker.ARROW
-        marker.action = Marker.ADD
-        marker.scale.x = 0.03
-        marker.scale.y = 0.06
-        marker.scale.z = 0.10
-        marker.color.r, marker.color.g, marker.color.b, marker.color.a = color
-
-        center = np.asarray(center, dtype=float)
-        direction = self._normalize_vector(np.asarray(direction, dtype=float))
-        tail = center - 0.5 * float(length) * direction
-        head = center + 0.5 * float(length) * direction
-        marker.points.append(Point(x=float(tail[0]), y=float(tail[1]), z=0.0))
-        marker.points.append(Point(x=float(head[0]), y=float(head[1]), z=0.0))
+            marker.points.append(Point(x=float(corner[0]), y=float(corner[1]), z=0.0))
         return marker
 
-    def create_chain_anchor_marker(self, row_id: int, is_left: bool) -> Marker:
-        if is_left:
-            chain = self.left_start_chain
-            ns = f"debug_left_chain_anchor_{row_id}"
-            marker_id = 46000 + row_id
-            color = (0.0, 1.0, 0.25, 0.95)
-        else:
-            chain = self.right_start_chain
-            ns = f"debug_right_chain_anchor_{row_id}"
-            marker_id = 47000 + row_id
-            color = (1.0, 0.5, 0.0, 0.95)
+    def yaw_to_vector(self, yaw: float) -> np.ndarray:
+        return np.array([math.cos(yaw), math.sin(yaw)], dtype=float)
 
-        marker = Marker(header=Header(frame_id=self.p.map_frame, stamp=self.get_clock().now().to_msg()))
-        marker.ns = ns
-        marker.id = marker_id
-        marker.type = Marker.SPHERE
-        marker.action = Marker.ADD
-        marker.scale.x = 0.14
-        marker.scale.y = 0.14
-        marker.scale.z = 0.14
-        marker.color.r, marker.color.g, marker.color.b, marker.color.a = color
+    def normalize(self, vector: np.ndarray) -> np.ndarray:
+        vector = np.asarray(vector, dtype=float)
+        norm = float(np.linalg.norm(vector))
+        if norm < 1e-9:
+            return np.array([1.0, 0.0], dtype=float)
+        return vector / norm
 
-        if chain is None or len(chain) == 0:
-            marker.action = Marker.DELETE
-            return marker
 
-        point = np.asarray(chain[0], dtype=float)
-        marker.pose.position.x = float(point[0])
-        marker.pose.position.y = float(point[1])
-        marker.pose.position.z = 0.0
-        marker.pose.orientation.w = 1.0
-        return marker
-
-    def get_row_points_for_visualization(self, row_id: int, spline: PlantSpline) -> np.ndarray:
-        if row_id == self.current_left_row_id and self.left_start_chain is not None and len(self.left_start_chain) > 0:
-            return np.asarray(self.left_start_chain, dtype=float)
-        if row_id == self.current_right_row_id and self.right_start_chain is not None and len(self.right_start_chain) > 0:
-            return np.asarray(self.right_start_chain, dtype=float)
-        row_points = getattr(spline, "row_points", None)
-        if row_points is not None and len(row_points) > 0:
-            return np.asarray(row_points, dtype=float)
-        if hasattr(spline, "anchor_world") and spline.anchor_world is not None and len(spline.anchor_world) > 0:
-            return np.asarray(spline.anchor_world, dtype=float)
-        sampled = spline.get_points(num=50)
-        return np.asarray(sampled, dtype=float) if len(sampled) > 0 else np.empty((0, 2), dtype=float)
-
-    def create_spline_marker(self, spline: PlantSpline, id: int, color: list, alpha: float = 1.0, row_points: Optional[np.ndarray] = None) -> Marker:
-        m = Marker(header=Header(frame_id=self.p.map_frame, stamp=self.get_clock().now().to_msg()))
-        m.ns, m.id, m.type, m.action = "splines", id, Marker.LINE_STRIP, Marker.ADD
-        m.scale.x = 0.04
-        m.color.r, m.color.g, m.color.b, m.color.a = color[0], color[1], color[2], alpha
-        if row_points is None:
-            row_points = self.get_row_points_for_visualization(id, spline)
-        for p in row_points:
-            m.points.append(Point(x=float(p[0]), y=float(p[1]), z=0.0))
-        return m
-
-    def create_row_points_marker(self, id: int, color: list, alpha: float, row_points: np.ndarray, is_current: bool) -> Marker:
-        m = Marker(header=Header(frame_id=self.p.map_frame, stamp=self.get_clock().now().to_msg()))
-        m.ns, m.id, m.type, m.action = "row_points", 50000 + id, Marker.SPHERE_LIST, Marker.ADD
-        point_scale = 0.10 if is_current else 0.07
-        m.scale.x = point_scale
-        m.scale.y = point_scale
-        m.scale.z = point_scale
-        m.color.r, m.color.g, m.color.b, m.color.a = color[0], color[1], color[2], max(0.45, alpha)
-        for p in row_points:
-            m.points.append(Point(x=float(p[0]), y=float(p[1]), z=0.0))
-        return m
-
-    def create_segment_boundary_marker(self, spline: PlantSpline, id: int, is_current: bool = False) -> Marker:
-        m = Marker(header=Header(frame_id=self.p.map_frame, stamp=self.get_clock().now().to_msg()))
-        m.ns, m.id, m.type, m.action = "row_segments", 10000 + id, Marker.SPHERE_LIST, Marker.ADD
-        m.scale.x = 0.12 if is_current else 0.08
-        m.scale.y = 0.12 if is_current else 0.08
-        m.scale.z = 0.12 if is_current else 0.08
-        if is_current:
-            m.color.r = 1.0
-            m.color.g = 0.9
-            m.color.b = 0.05
-            m.color.a = 0.98
-        else:
-            m.color.r = 1.0
-            m.color.g = 0.35
-            m.color.b = 0.05
-            m.color.a = 0.72
-
-        for boundary_start, boundary_end in spline.segment_bounds[1:]:
-            t_boundary = 0.5 * (boundary_start + boundary_end)
-            p = spline.evaluate(t_boundary)
-            m.points.append(Point(x=float(p[0]), y=float(p[1]), z=0.0))
-        return m
-
-def main(args=None):
+def main(args=None) -> None:
     rclpy.init(args=args)
     node = MaizeNavigator()
     try:
@@ -1629,6 +824,7 @@ def main(args=None):
     finally:
         node.destroy_node()
         rclpy.shutdown()
+
 
 if __name__ == "__main__":
     main()
