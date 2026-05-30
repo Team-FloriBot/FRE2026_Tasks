@@ -110,6 +110,7 @@ maize_navigator:
     # 1L/1R: Halbkreis in Nachbargasse.
     # 2L/2R: 90°-Bogen, Gerade zum Ueberspringen einer Gasse, 90°-Bogen.
     multirow_entry_extra_shift: 0.0
+    multirow_straight_trim: 0.15
     multirow_entry_shift_overshoot_rows: 1.50
     multirow_local_takeover_min_yaw_progress: 2.00
     multirow_local_takeover_min_confidence: 0.55
