@@ -458,8 +458,6 @@ class MaizeNavigator(Node):
         self.left_start_chain: Optional[np.ndarray] = None
         self.right_start_chain: Optional[np.ndarray] = None
         self.field_direction_yaw: Optional[float] = None
-        self._debug_last_left_rectangles: List[Tuple[np.ndarray, np.ndarray, float, float]] = []
-        self._debug_last_right_rectangles: List[Tuple[np.ndarray, np.ndarray, float, float]] = []
         self._debug_last_pair_rectangles: List[Tuple[np.ndarray, np.ndarray, float, float]] = []
         self.current_left_row_id: Optional[int] = None
         self.current_right_row_id: Optional[int] = None
@@ -1215,8 +1213,6 @@ class MaizeNavigator(Node):
 
         added_left_points: List[np.ndarray] = []
         added_right_points: List[np.ndarray] = []
-        debug_left_rectangles: List[Tuple[np.ndarray, np.ndarray, float, float]] = []
-        debug_right_rectangles: List[Tuple[np.ndarray, np.ndarray, float, float]] = []
         debug_pair_rectangles: List[Tuple[np.ndarray, np.ndarray, float, float]] = []
         empty_progress = 0.0
         steps = 0
@@ -1235,7 +1231,15 @@ class MaizeNavigator(Node):
                 max_along=float(self.p.row_rectangle_length) / 2.0,
             )
             pair_support = remaining_points[support_mask]
-            debug_pair_rectangles.append((np.array(pair_center, copy=True), np.array(field_dir, copy=True), float(self.p.row_rectangle_length), float(self.p.row_rectangle_width)))
+            # Visualize only the real RANSAC input zone: along in [0, L/2] from pair_center.
+            pair_display_length = 0.5 * float(self.p.row_rectangle_length)
+            pair_display_center = pair_center + field_dir * (0.25 * float(self.p.row_rectangle_length))
+            debug_pair_rectangles.append((
+                np.array(pair_display_center, copy=True),
+                np.array(field_dir, copy=True),
+                pair_display_length,
+                float(self.p.row_rectangle_width),
+            ))
             left_points = self._local_rectangle_points(
                 remaining_points,
                 left_start,
@@ -1250,8 +1254,6 @@ class MaizeNavigator(Node):
                 rect_length=float(self.p.row_point_window_length),
                 rect_width=float(self.p.row_rectangle_width),
             )
-            debug_left_rectangles.append((np.array(left_start, copy=True), np.array(field_dir, copy=True), float(self.p.row_point_window_length), float(self.p.row_rectangle_width)))
-            debug_right_rectangles.append((np.array(right_start, copy=True), np.array(field_dir, copy=True), float(self.p.row_point_window_length), float(self.p.row_rectangle_width)))
 
             if len(pair_support) < int(self.p.row_min_support_points) and len(left_points) == 0 and len(right_points) == 0:
                 empty_progress += knot_spacing
@@ -1315,8 +1317,6 @@ class MaizeNavigator(Node):
         new_pts_l = np.vstack(added_left_points) if added_left_points else np.empty((0, 2), dtype=float)
         new_pts_r = np.vstack(added_right_points) if added_right_points else np.empty((0, 2), dtype=float)
         heading_yaw = float(math.atan2(field_dir[1], field_dir[0]))
-        self._debug_last_left_rectangles = debug_left_rectangles
-        self._debug_last_right_rectangles = debug_right_rectangles
         self._debug_last_pair_rectangles = debug_pair_rectangles
         return left_chain, right_chain, new_pts_l, new_pts_r, heading_yaw
 
@@ -1464,50 +1464,6 @@ class MaizeNavigator(Node):
                 color=(0.1, 0.7, 1.0, 0.25),
                 stamp=stamp,
             ))
-
-        for idx, (center, direction, length, width) in enumerate(self._debug_last_left_rectangles[-20:]):
-            markers.extend(self._rectangle_marker_bundle(
-                center=center,
-                direction=direction,
-                length=length,
-                width=width,
-                ns=f"debug_left_rectangles_{row_id}",
-                marker_id=41000 + row_id * 100 + idx,
-                color=(0.15, 1.0, 0.25, 0.35),
-                stamp=stamp,
-            ))
-            if idx == len(self._debug_last_left_rectangles[-20:]) - 1:
-                markers.append(self._direction_arrow_marker(
-                    center=center,
-                    direction=direction,
-                    length=max(length, width),
-                    ns=f"debug_left_direction_{row_id}",
-                    marker_id=43000 + row_id,
-                    color=(0.0, 1.0, 0.3, 0.95),
-                    stamp=stamp,
-                ))
-
-        for idx, (center, direction, length, width) in enumerate(self._debug_last_right_rectangles[-20:]):
-            markers.extend(self._rectangle_marker_bundle(
-                center=center,
-                direction=direction,
-                length=length,
-                width=width,
-                ns=f"debug_right_rectangles_{row_id}",
-                marker_id=42000 + row_id * 100 + idx,
-                color=(1.0, 0.6, 0.1, 0.35),
-                stamp=stamp,
-            ))
-            if idx == len(self._debug_last_right_rectangles[-20:]) - 1:
-                markers.append(self._direction_arrow_marker(
-                    center=center,
-                    direction=direction,
-                    length=max(length, width),
-                    ns=f"debug_right_direction_{row_id}",
-                    marker_id=44000 + row_id,
-                    color=(1.0, 0.45, 0.0, 0.95),
-                    stamp=stamp,
-                ))
 
         if self._debug_last_pair_rectangles:
             center, direction, length, width = self._debug_last_pair_rectangles[-1]
