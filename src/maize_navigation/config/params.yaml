@@ -114,6 +114,8 @@ maize_navigator:
     multirow_local_takeover_min_confidence: 0.55
     map_multirow_require_counted_rows: true
     map_counted_row_min_width_ratio: 0.55
+    map_multirow_counted_target_tolerance: 0.22
+    map_multirow_reference_row_min_ratio: 0.65
 
     # Direkter Nachbargassenwechsel 1L/1R:
     # Zielreihe erst akzeptieren, wenn der Versatz erreicht ist und
