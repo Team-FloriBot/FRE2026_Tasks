@@ -3248,6 +3248,20 @@ class MissionManager:
                 else True
             )
 
+            # Bei direktem Nachbargassenwechsel 1L/1R kann die lokale
+            # Zielgasse bereits eindeutig und stabil sein, obwohl der absolute
+            # map-basierte Shift noch knapp unter dem Sollfenster liegt. In
+            # ENTRY_CURVE und ACQUIRE_ROW wird dieser Fall bereits freigegeben;
+            # ENTER_ROW muss dieselbe Freigabe verwenden, sonst bleibt der
+            # Roboter trotz erkannter Gasse in ENTER_ROW_WAIT_FULL_LANE.
+            if self.p.headland_maneuver_enabled and self._neighbor_local_takeover_ok(row, pose_map):
+                shift_ok_for_follow = True
+                yaw_ok_for_follow = True
+                reference_ok_for_follow = True
+                geometry_ok_for_follow = True
+                self.entry_shift_ok = True
+                self.entry_reference_side_ok = True
+
             enter_guards_ok = (
                 row.valid
                 and row.confidence >= self.p.min_follow_confidence
