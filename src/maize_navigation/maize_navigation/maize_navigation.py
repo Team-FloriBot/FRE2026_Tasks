@@ -422,11 +422,12 @@ class NavigatorParams:
     # Sie wird fuer die Vorgewendefahrt verwendet, damit die Querfahrt exakt
     # 90 Grad zur Feld-/Reihenrichtung bleibt, auch wenn einzelne Reihenenden
     # unterschiedlich weit herausragen.
-    map_field_orientation_enabled: bool = True
+    map_field_orientation_enabled: bool = False
     map_field_orientation_radius: float = 12.0
     map_field_orientation_min_points: int = 160
     map_field_orientation_min_confidence: float = 0.25
     map_field_orientation_alpha: float = 0.12
+    map_field_orientation_max_local_deviation: float = 0.55
     map_row_lateral_bin: float = 0.10
     map_row_min_band_points: int = 12
     map_row_min_band_length: float = 1.2
@@ -2599,17 +2600,21 @@ class MissionManager:
         if map_detector is None:
             return
 
-        row_yaw: Optional[float] = None
-        if (
-            map_detector.last_field_row_yaw_map is not None
-            and map_detector.last_field_row_yaw_confidence >= max(0.0, float(self.p.headland_map_heading_min_confidence))
-        ):
-            row_yaw = float(map_detector.last_field_row_yaw_map)
-        elif (
-            map_detector.last_row_yaw_map is not None
-            and map_detector.last_row_yaw_confidence >= max(0.0, float(self.p.headland_map_heading_min_confidence))
-        ):
-            row_yaw = float(map_detector.last_row_yaw_map)
+        min_conf = max(0.0, float(self.p.headland_map_heading_min_confidence))
+        local_yaw: Optional[float] = None
+        local_conf = 0.0
+        if map_detector.last_row_yaw_map is not None and map_detector.last_row_yaw_confidence >= min_conf:
+            local_yaw = float(map_detector.last_row_yaw_map)
+            local_conf = float(map_detector.last_row_yaw_confidence)
+
+        # Wichtig: Für die eigentliche Vorgewende-Geometrie wird ausschließlich
+        # die lokale Reihenachse aus den Map-Reihenlinien verwendet. Die grobe
+        # Feldorientierung kann an ungleich langen Reihenenden um fast 90° kippen
+        # und hat im Log field_row_yaw≈0.08 rad geliefert, während map_row_yaw
+        # ≈1.21 rad betrug. Das machte aus 1L effektiv 2L und führte zu einem
+        # schrägen Eintritt. Deshalb darf field_row_yaw hier nicht mehr als
+        # Fallback oder Ersatz für map_row_yaw verwendet werden.
+        row_yaw: Optional[float] = local_yaw
 
         if row_yaw is None:
             return
@@ -3500,6 +3505,7 @@ class MaizeNavigator(Node):
         p.map_field_orientation_min_points = int(declare("map_field_orientation_min_points", p.map_field_orientation_min_points))
         p.map_field_orientation_min_confidence = float(declare("map_field_orientation_min_confidence", p.map_field_orientation_min_confidence))
         p.map_field_orientation_alpha = float(declare("map_field_orientation_alpha", p.map_field_orientation_alpha))
+        p.map_field_orientation_max_local_deviation = float(declare("map_field_orientation_max_local_deviation", p.map_field_orientation_max_local_deviation))
         p.map_row_lateral_bin = float(declare("map_row_lateral_bin", p.map_row_lateral_bin))
         p.map_row_min_band_points = int(declare("map_row_min_band_points", p.map_row_min_band_points))
         p.map_row_min_band_length = float(declare("map_row_min_band_length", p.map_row_min_band_length))
@@ -3891,6 +3897,7 @@ class MaizeNavigator(Node):
             f" | map_row_yaw_conf={self.map_row_detector.last_row_yaw_confidence:.3f}"
             f" | field_row_yaw={self.map_row_detector.last_field_row_yaw_map if self.map_row_detector.last_field_row_yaw_map is not None else 'None'}"
             f" | field_row_yaw_conf={self.map_row_detector.last_field_row_yaw_confidence:.3f}"
+            f" | headland_reference_row_yaw={self.mission.headland_reference_row_yaw_map if self.mission.headland_reference_row_yaw_map is not None else 'None'}"
             f" | entry_row_stable_frames={self.mission.entry_row_stable_frames}"
             f" | expected_target_offset={self.mission.expected_target_offset:.3f}"
             f" | detected_target_offset={self.mission.detected_target_offset:.3f}"
