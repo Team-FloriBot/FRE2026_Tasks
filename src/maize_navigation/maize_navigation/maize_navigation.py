@@ -51,53 +51,41 @@ class PlantSpline:
         candidate_limit: int = 5,
         support_radius: float = 0.16,
         cluster_radius: float = 0.18,
-            clusters_with_idx = self._cluster_nearby_points_with_indices(candidate_points, cluster_radius)
-            if not clusters_with_idx:
+        support_weight: float = 2.8,
+        prediction_weight: float = 2.2,
         smoothness_weight: float = 1.1,
         gap_penalty: float = 0.9,
-            left_ref = float((left_end - pair_center) @ pair_perp)
-            right_ref = float((right_end - pair_center) @ pair_perp)
+        logger: Optional[Node] = None,
+    ) -> None:
+        # Parameters
+        self.window_length = float(window_length)
+        self.window_step = float(window_step)
+        self.beam_width = int(beam_width)
+        self.candidate_limit = int(candidate_limit)
+        self.support_radius = float(support_radius)
+        self.cluster_radius = float(cluster_radius)
+        self.support_weight = float(support_weight)
+        self.prediction_weight = float(prediction_weight)
+        self.smoothness_weight = float(smoothness_weight)
+        self.gap_penalty = float(gap_penalty)
+
+        # State
         self.valid = False
+        self.linear_mode = False
         self.t_min = 0.0
         self.t_max = 0.0
-            # Track assigned indices relative to candidate_points to ensure exclusivity
-            assigned_candidate_indices = set()
-            candidate_idx_map = np.where(candidate_mask)[0]
         self.perp_dir = None
-            for cluster, rel_indices in clusters_with_idx:
-                mapped = [int(candidate_idx_map[i]) for i in rel_indices]
-                if any(mi in assigned_candidate_indices for mi in mapped):
-                    continue
 
-                cluster_rel = cluster - pair_center
-                cluster_along = cluster_rel @ shared_dir
-                cluster_lateral = cluster_rel @ pair_perp
-
-                left_mask = (cluster_along >= 0.0) & (cluster_along <= forward_max_dist) & (np.abs(cluster_lateral - left_ref) <= orthogonal_max_dist)
-                right_mask = (cluster_along >= 0.0) & (cluster_along <= forward_max_dist) & (np.abs(cluster_lateral - right_ref) <= orthogonal_max_dist)
-                if not np.any(left_mask) and not np.any(right_mask):
-                    continue
-
-                both_mask = left_mask & right_mask
-                left_only_mask = left_mask & (~right_mask)
-                right_only_mask = right_mask & (~left_mask)
-                if np.any(both_mask):
-                    choose_left_both = np.abs(cluster_lateral[both_mask] - left_ref) <= np.abs(cluster_lateral[both_mask] - right_ref)
-                    left_only_mask = left_only_mask | (both_mask & choose_left_both)
-                    right_only_mask = right_only_mask | (both_mask & (~choose_left_both))
-
-                left_indices = np.where(left_only_mask)[0]
-                right_indices = np.where(right_only_mask)[0]
-                if len(left_indices) > 0:
-                    step_left_clusters.append(cluster[left_indices])
-                    assigned_candidate_indices.update([mapped[i] for i in left_indices])
-                if len(right_indices) > 0:
-                    step_right_clusters.append(cluster[right_indices])
-                    assigned_candidate_indices.update([mapped[i] for i in right_indices])
+        # Points
+        if points is None:
+            self.points = np.empty((0, 2), dtype=float)
+        else:
+            self.points = np.asarray(points, dtype=float)
 
         if len(self.points) < 4:
             return
 
+        # PCA to find main direction
         self.mean = np.mean(self.points, axis=0)
         centered = self.points - self.mean
         cov = np.cov(centered.T)
