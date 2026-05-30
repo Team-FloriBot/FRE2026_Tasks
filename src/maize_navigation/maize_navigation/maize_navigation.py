@@ -1227,17 +1227,12 @@ class MaizeNavigator(Node):
                 field_dir,
                 half_length=float(self.p.row_rectangle_length) / 2.0,
                 half_width=float(self.p.row_rectangle_width) / 2.0,
-                min_along=0.0,
-                max_along=float(self.p.row_rectangle_length) / 2.0,
             )
             pair_support = remaining_points[support_mask]
-            # Visualize only the real RANSAC input zone: along in [0, L/2] from pair_center.
-            pair_display_length = 0.5 * float(self.p.row_rectangle_length)
-            pair_display_center = pair_center + field_dir * (0.25 * float(self.p.row_rectangle_length))
             debug_pair_rectangles.append((
-                np.array(pair_display_center, copy=True),
+                np.array(pair_center, copy=True),
                 np.array(field_dir, copy=True),
-                pair_display_length,
+                float(self.p.row_rectangle_length),
                 float(self.p.row_rectangle_width),
             ))
             left_points = self._local_rectangle_points(
@@ -1308,8 +1303,6 @@ class MaizeNavigator(Node):
                     field_dir,
                     half_length=float(self.p.row_rectangle_length) / 2.0,
                     half_width=float(self.p.row_rectangle_width) / 2.0,
-                    min_along=0.0,
-                    max_along=float(self.p.row_rectangle_length) / 2.0,
                 )]
             if len(remaining_points) == 0:
                 break
@@ -1405,6 +1398,9 @@ class MaizeNavigator(Node):
 
     def publish_visuals(self):
         markers = MarkerArray()
+        clear_marker = Marker(header=Header(frame_id=self.p.map_frame, stamp=self.get_clock().now().to_msg()))
+        clear_marker.action = Marker.DELETEALL
+        markers.markers.append(clear_marker)
         ordered_ids = self.row_ids_in_order if self.row_ids_in_order else sorted(self.known_rows.keys())
         for row_id in ordered_ids:
             spline = self.known_rows[row_id]
@@ -1465,18 +1461,6 @@ class MaizeNavigator(Node):
                 stamp=stamp,
             ))
 
-        if self._debug_last_pair_rectangles:
-            center, direction, length, width = self._debug_last_pair_rectangles[-1]
-            markers.append(self._direction_arrow_marker(
-                center=center,
-                direction=direction,
-                length=max(length, width),
-                ns=f"debug_pair_direction_{row_id}",
-                marker_id=45000 + row_id,
-                color=(0.2, 0.8, 1.0, 0.95),
-                stamp=stamp,
-            ))
-
         return markers
 
     def _rectangle_marker_bundle(
@@ -1513,24 +1497,7 @@ class MaizeNavigator(Node):
         ]
         for corner in corners:
             outline.points.append(Point(x=float(corner[0]), y=float(corner[1]), z=0.0))
-
-        cross = Marker(header=Header(frame_id=self.p.map_frame, stamp=stamp))
-        cross.ns = f"{ns}_crosshair"
-        cross.id = marker_id + 5000
-        cross.type = Marker.LINE_LIST
-        cross.action = Marker.ADD
-        cross.scale.x = 0.025
-        cross.color.r, cross.color.g, cross.color.b, cross.color.a = color
-        cross_len = max(0.08, 0.25 * float(length))
-        line_a = center - cross_len * direction
-        line_b = center + cross_len * direction
-        line_c = center - 0.5 * float(width) * perp
-        line_d = center + 0.5 * float(width) * perp
-        cross.points.append(Point(x=float(line_a[0]), y=float(line_a[1]), z=0.0))
-        cross.points.append(Point(x=float(line_b[0]), y=float(line_b[1]), z=0.0))
-        cross.points.append(Point(x=float(line_c[0]), y=float(line_c[1]), z=0.0))
-        cross.points.append(Point(x=float(line_d[0]), y=float(line_d[1]), z=0.0))
-        return [outline, cross]
+        return [outline]
 
     def _direction_arrow_marker(
         self,
