@@ -377,11 +377,8 @@ class NavigatorParams:
     # Deshalb ist der Zusatzversatz standardmaessig 0.0; ein positiver Wert
     # waere nur eine bewusst eingestellte Sicherheitsreserve.
     multirow_entry_extra_shift: float = 0.0
-    # Kompensation fuer reale Dynamik/Controller-Latenz im geraden Mittelstueck
-    # von 2L/2R. Im Testlog wurde bei Soll 0.750 m erst bei 0.864 m in
-    # ENTRY_CURVE gewechselt; dadurch lag der Roboter zu weit aussen und traf
-    # die naechste Maisreihe. Der deterministische Sollwert wird deshalb leicht
-    # vorgezogen: 2L/2R fahren nominal eine Reihenbreite minus Trim.
+    # Shorten the deterministic straight leg between the two 90 degree arcs.
+    # This compensates controller/path-following delay at the transition to ENTRY_CURVE.
     multirow_straight_trim: float = 0.15
     # Wenn die per Reihenzaehlung erkannte Zielgasse bei 2R/2L nach innen
     # gegenueber dem Pattern-Sollzentrum verschoben ist, wird sie nicht als
@@ -2758,14 +2755,11 @@ class MissionManager:
 
     def _multirow_deterministic_straight_target(self) -> float:
         # 1L/1R: no straight part between the two 90 degree arcs.
-        # 2L/2R: nominally one row spacing straight, so one gap is skipped.
-        # In practice the robot still travels during planning/controller latency
-        # and while the entry arc starts. The logged successful-but-too-wide run
-        # reached ENTRY_CURVE at 0.864 m with a nominal target of 0.750 m.
-        # Trim the deterministic straight segment so the entry arc starts before
-        # the outer maize row instead of on it.
+        # 2L/2R: one nominal row spacing straight, shortened by a small trim so
+        # the transition delay does not carry the robot into the next crop row.
+        # nL/nR: n-1 spacings straight, with the same transition trim.
         step = max(1, int(self.p.row_shift_count))
-        nominal = max(0.0, float(step - 1) * float(self.p.expected_row_width))
+        nominal = float(step - 1) * float(self.p.expected_row_width)
         if step >= 2:
             nominal -= max(0.0, float(self.p.multirow_straight_trim))
         return max(0.0, nominal)
@@ -3086,24 +3080,31 @@ class MissionManager:
 
         tol = max(0.03, float(self.p.headland_shift_tolerance))
 
-        # Completion of the straight part must be decided in the same signed,
-        # pattern-relative shift basis that is logged as multirow_corrected_shift.
-        # A previous version used only the travelled straight distance
-        # (step-1)*row_width. In both 2R and 2L logs this switched to ENTRY_CURVE
-        # while multirow_corrected_shift was only about 0.4...0.5 m although the
-        # pre-entry target was 1.125 m. The robot then naturally entered the
-        # first neighbouring gap.
-        #
-        # Use the geometric pattern pre-entry shift here, not the noisy absolute
-        # counted lane center. The counted target is still required as a latch,
-        # but the commanded manoeuvre remains exactly n * expected_row_width.
-        target = self._headland_pre_entry_shift_target()
-        if target <= 1e-6:
-            return True
+        # Do not decide 2R/2L completion from the raw global PCA-v coordinate:
+        # its sign can be opposite to the signed row offsets used by the target
+        # counter. Instead compare travelled headland shift and latched target in
+        # the same corrected pattern-relative coordinate system. This is the
+        # failure seen in the log: target=-1.48 m, but measured_shift=+0.80 m.
+        preentry = self._multirow_relative_preentry_shift()
+        if preentry is not None:
+            current = self._multirow_corrected_headland_shift()
+            direction = 1.0 if float(preentry) >= 0.0 else -1.0
+            pattern_reached = direction * float(current) >= direction * float(preentry) - tol
 
-        current = self._multirow_corrected_headland_shift()
-        direction = 1.0 if float(self.headland_required_shift) >= 0.0 else -1.0
-        return direction * float(current) >= float(target) - tol
+            # Backup completion test in the fixed latched map-row basis. This
+            # avoids getting stuck when the corrected pattern-relative shift is
+            # degraded by a changing local PCA row-yaw estimate while the global
+            # pre-entry line itself has already been reached.
+            remaining_global = self._multirow_remaining_to_preentry(pose_map)
+            global_reached = False
+            if remaining_global is not None:
+                global_reached = direction * float(remaining_global) <= tol
+
+            return bool(pattern_reached or global_reached)
+
+        travelled = abs(float(self.headland_measured_shift))
+        target = self._headland_pre_entry_shift_target()
+        return travelled >= target - tol
 
     def _entry_yaw_or_local_row_ok(self, row: RowModel, pose_map: Optional[Pose2D]) -> bool:
         if self._entry_yaw_ok(pose_map):
@@ -3117,17 +3118,47 @@ class MissionManager:
         # übernehmen.
         return self._entry_local_row_takeover_ok(row, pose_map)
 
-    def _multirow_safe_acquire_steering_ok(self, row: RowModel, shift_ok: bool) -> bool:
+    def _multirow_safe_acquire_steering_ok(self, row: RowModel, shift_ok: bool, pose_map: Optional[Pose2D] = None) -> bool:
         if int(self.p.row_shift_count) < 2:
-            return False
-        if not shift_ok:
             return False
         if not row.valid:
             return False
-        return row.confidence >= max(
-            float(self.p.entry_row_min_confidence),
-            float(self.p.multirow_local_takeover_min_confidence),
+        if not self._multirow_counted_target_locked():
+            return False
+
+        # In the 2R log the counted target lane was correctly latched and the
+        # deterministic U-turn was completed, but the local/map lane geometry at
+        # the row entrance was temporarily split into a very narrow false pair
+        # (width about 0.22 m). That made entry_geometry_ok and entry_shift_ok
+        # false, so ACQUIRE_ROW kept driving straight with
+        # ACQUIRE_ROW_WAIT_FULL_LANE and hit the next crop row.
+        #
+        # For multi-row turns, once the vehicle has essentially completed the
+        # 180 deg maneuver, a valid local row model is safer than continuing
+        # open-loop straight. This does NOT mark the pattern completed; it only
+        # allows the row controller to steer while the stricter geometry checks
+        # continue to decide the ENTER_ROW transition.
+        min_conf = min(
+            max(0.05, float(self.p.entry_row_min_confidence)),
+            max(0.05, float(self.p.min_enter_confidence)),
         )
+        if row.confidence < min_conf:
+            return False
+
+        if shift_ok:
+            return True
+
+        # Allow recovery steering after the U-turn is substantially complete.
+        progress = self._headland_total_yaw_progress(pose_map)
+        target = max(0.0, float(self.p.headland_total_yaw_change))
+        # pose_map is not available in this helper; the caller updates the
+        # progress-related diagnostics before calling us. If progress cannot be
+        # evaluated here it is 0, so fall back to row confidence only when the
+        # local model is already strong.
+        if progress >= target - max(0.45, float(self.p.entry_yaw_accept_tolerance)):
+            return True
+
+        return row.confidence >= max(0.45, float(self.p.min_enter_confidence))
 
     def _neighbor_target_offset_ok(self) -> bool:
         if int(self.p.row_shift_count) != 1:
@@ -3242,30 +3273,28 @@ class MissionManager:
         # Vorzeichen der PCA-Row-Basis lokal flippt.
         row_yaw = float(self.headland_reference_row_yaw_map)
 
-        # For multi-row turns the L/R command cannot be mapped directly to
-        # row_yaw +/- 90 deg, because the PCA row axis is axial and may be
-        # flipped by pi relative to the signed counted target offset. The log
-        # failure showed exactly this: 2R was correctly latched at -1.507 m,
-        # but the raw map-v shift after the exit arc was +0.785 m and the
-        # previous code drove row_yaw - 90 deg, reducing this shift back toward
-        # zero. That pulls the robot into 1R.
-        #
-        # Convert the locked target offset into the raw map-v basis and then
-        # drive in the sign of that raw target. Positive raw-v corresponds to
-        # row_yaw + 90 deg, negative raw-v to row_yaw - 90 deg. Do not replace
-        # this heading by the opposite axial direction just because it is closer
-        # to the current yaw; that reverses the lateral crossing direction.
-        direction = float(self.headland_direction)
-        if int(self.p.row_shift_count) >= 2 and self.multirow_counted_target_latched:
-            self._refresh_multirow_shift_sign_correction()
-            corr = float(self.multirow_shift_sign_correction)
-            if abs(corr) < 1e-6:
-                corr = 1.0
-            raw_target = float(self.multirow_latched_target_offset) / corr
-            if abs(raw_target) > 0.05:
-                direction = 1.0 if raw_target >= 0.0 else -1.0
+        # Keep the straight headland leg in the commanded L/R direction. The
+        # previous logic reversed the desired heading when the global remaining
+        # value changed sign. On 2R this can pull the robot back toward the first
+        # right gap instead of committing to the second counted gap. Stopping is
+        # handled separately by _multirow_map_preentry_reached().
+        direction = self.headland_direction
 
         desired = wrap_to_pi(row_yaw + direction * math.pi / 2.0)
+
+        # Die Vorgewende-Achse ist axial: yaw und yaw+pi beschreiben dieselbe
+        # Gerade. Fuer die Fahrtrichtung muss aber die Richtung genommen werden,
+        # die zur aktuellen Roboterorientierung passt. Sonst versucht der
+        # Controller im HEADLAND_SHIFT_MULTIROW_STRAIGHT eine 180-Grad-Korrektur
+        # und dreht waehrend der eigentlich geraden Querfahrt weiter. Genau das
+        # war im v17-Log sichtbar: headland_shift_forward lief zwar bis ca.
+        # 0.72 m, aber headland_total_yaw_progress stieg dabei bis ca. 3.1 rad.
+        # Dadurch war die Gerade kein reines Ueberspringen mehr.
+        if int(self.p.row_shift_count) >= 2 and pose_map is not None:
+            alt = wrap_to_pi(desired + math.pi)
+            if abs(wrap_to_pi(alt - float(pose_map.yaw))) < abs(wrap_to_pi(desired - float(pose_map.yaw))):
+                desired = alt
+
         return desired
 
     def _target_entry_row_yaw_from_map(self, pose_map: Optional[Pose2D], map_detector: Optional[MapRowDetector]) -> Optional[float]:
@@ -3459,32 +3488,21 @@ class MissionManager:
                     self.headland_shift_start_yaw_map = pose_map.yaw
                     self.headland_shift_forward_distance = 0.0
 
-                # Multi-row turns are non-holonomic U-turns:
-                #   90 deg exit arc -> straight segment -> 90 deg entry arc.
-                # The straight segment must be driven in the robot yaw reached
-                # at the end of EXIT_CURVE. Do not re-orient this segment from
-                # the SLAM/PCA row yaw: that yaw is axial and noisy at the
-                # headland; in the failing logs it kept rotating the robot during
-                # HEADLAND_SHIFT (headland_total_yaw_progress grew beyond 2.7 rad)
-                # while the travelled straight distance was only about 0.42 m.
-                # Result: the entry arc started geometrically in the first gap.
+                desired_shift_yaw = self._desired_headland_shift_yaw(pose_map, map_detector)
                 if self.headland_shift_axis_yaw_map is None:
-                    self.headland_shift_axis_yaw_map = self.headland_shift_start_yaw_map
+                    self.headland_shift_axis_yaw_map = desired_shift_yaw if desired_shift_yaw is not None else self.headland_shift_start_yaw_map
 
                 self._update_headland_shift_forward_distance(pose_map)
                 straight_target = self._multirow_deterministic_straight_target()
-                straight_reached = (
-                    abs(float(self.headland_shift_forward_distance))
-                    >= max(0.0, float(straight_target) - max(0.0, float(self.p.headland_shift_tolerance)))
-                )
 
-                # The counted 2L/2R target is still required as a plausibility
-                # latch when map_multirow_require_counted_rows is enabled, but it
-                # must not control the straight-segment stop criterion. The stop
-                # criterion is pure U-turn geometry: for 2L/2R the middle straight
-                # is one row spacing.
-                if straight_reached and self._multirow_counted_target_locked():
-                    self.transition(MissionState.ENTRY_CURVE, "multirow deterministic straight reached")
+                # 2R-Regel:
+                # Nach dem ersten 90°-Bogen wird (step-1)*row_width entlang
+                # der festen Vorgewende-Achse gefahren. Diese Achse ist aus der
+                # SLAM-Reihenrichtung abgeleitet: row_yaw +/- 90°. Damit ist die
+                # Gerade geometrisch quer zu den Reihenenden und nicht nur
+                # "geradeaus in Fahrzeugrichtung".
+                if self.headland_shift_forward_distance >= straight_target - max(0.02, float(self.p.headland_shift_tolerance)):
+                    self.transition(MissionState.ENTRY_CURVE, "deterministic multirow perpendicular distance reached")
                     return planner.plan_constant_curve_base_link(
                         self.headland_direction,
                         self.p.entry_curve_speed,
@@ -3899,7 +3917,7 @@ class MissionManager:
             # lokalen Reihenhypothese nachgeführt, statt stur geradeaus weiter zu
             # fahren.
             if self.p.headland_maneuver_enabled and self.headland_required_shift != 0.0 and not acquire_row_ok:
-                if self._multirow_safe_acquire_steering_ok(row, acquire_shift_ok):
+                if self._multirow_safe_acquire_steering_ok(row, acquire_shift_ok, pose_map):
                     return planner.plan_acquire_row(row)
                 return planner.plan_headland_shift_base_link(
                     speed=min(self.p.enter_speed, self.p.slow_speed),
@@ -3975,7 +3993,7 @@ class MissionManager:
             # dienen, auch wenn die vollständige Gassengeometrie noch nicht
             # bestätigt ist.
             if self.p.headland_maneuver_enabled and self.headland_required_shift != 0.0 and not enter_guards_ok:
-                if self._multirow_safe_acquire_steering_ok(row, shift_ok_for_follow):
+                if self._multirow_safe_acquire_steering_ok(row, shift_ok_for_follow, pose_map):
                     return planner.plan_enter_row(row)
                 return planner.plan_headland_shift_base_link(
                     speed=min(self.p.enter_speed, self.p.slow_speed),
@@ -4060,6 +4078,11 @@ class MaizeNavigator(Node):
         self.timer = self.create_timer(period, self.control_loop)
 
         self.get_logger().info("maize_navigator started")
+        self.get_logger().info(
+            "maprow_update_version=2026-05-30-multirow-acquire-v3, "
+            f"multirow_straight_trim={self.p.multirow_straight_trim:.3f}, "
+            f"multirow_straight_target={max(0.0, (max(1, int(self.p.row_shift_count)) - 1) * float(self.p.expected_row_width) - (max(0.0, float(self.p.multirow_straight_trim)) if int(self.p.row_shift_count) >= 2 else 0.0)):.3f}"
+        )
         self.get_logger().info(
             f"scan_topic={self.p.scan_topic}, cmd_vel_topic={self.p.cmd_vel_topic}, "
             f"map_topic={self.p.map_topic}, map_frame={self.p.map_frame}"
@@ -4171,6 +4194,7 @@ class MaizeNavigator(Node):
         p.entry_relaxed_center_b_tolerance = float(declare("entry_relaxed_center_b_tolerance", p.entry_relaxed_center_b_tolerance))
         p.entry_relaxed_row_yaw_tolerance = float(declare("entry_relaxed_row_yaw_tolerance", p.entry_relaxed_row_yaw_tolerance))
         p.multirow_entry_extra_shift = float(declare("multirow_entry_extra_shift", p.multirow_entry_extra_shift))
+        p.multirow_straight_trim = float(declare("multirow_straight_trim", p.multirow_straight_trim))
         p.multirow_entry_shift_overshoot_rows = float(declare("multirow_entry_shift_overshoot_rows", p.multirow_entry_shift_overshoot_rows))
         p.multirow_local_takeover_min_yaw_progress = float(declare("multirow_local_takeover_min_yaw_progress", p.multirow_local_takeover_min_yaw_progress))
         p.multirow_local_takeover_min_confidence = float(declare("multirow_local_takeover_min_confidence", p.multirow_local_takeover_min_confidence))
