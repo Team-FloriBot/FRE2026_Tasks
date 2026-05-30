@@ -1963,8 +1963,12 @@ class PathFollower:
             heading_scale = 1.0 if abs(yaw_err) < 0.20 else max(0.55, math.cos(min(abs(yaw_err), math.pi / 2.0)))
             v = base_v * heading_scale
 
-            w_limit = min(0.25, float(self.p.turn_max_angular_speed), float(self.p.follow_max_angular_speed))
-            w = clamp(float(self.p.headland_heading_kp) * yaw_err, -w_limit, w_limit)
+            # Nur kleine Winkelfehler ausregeln. Die Richtung wurde bereits
+            # axial passend zur aktuellen Roboterpose gewaehlt; ein grosser
+            # Korrekturbefehl waere hier ein Fehler und wuerde wieder in die
+            # erste Nachbargasse eindrehen.
+            w_limit = min(0.12, float(self.p.turn_max_angular_speed), float(self.p.follow_max_angular_speed))
+            w = clamp(0.75 * float(self.p.headland_heading_kp) * yaw_err, -w_limit, w_limit)
             w = self.rate_limit(w, self.last_w_odom)
             self.last_w_odom = w
 
@@ -3054,6 +3058,20 @@ class MissionManager:
         direction = self.headland_direction
 
         desired = wrap_to_pi(row_yaw + direction * math.pi / 2.0)
+
+        # Die Vorgewende-Achse ist axial: yaw und yaw+pi beschreiben dieselbe
+        # Gerade. Fuer die Fahrtrichtung muss aber die Richtung genommen werden,
+        # die zur aktuellen Roboterorientierung passt. Sonst versucht der
+        # Controller im HEADLAND_SHIFT_MULTIROW_STRAIGHT eine 180-Grad-Korrektur
+        # und dreht waehrend der eigentlich geraden Querfahrt weiter. Genau das
+        # war im v17-Log sichtbar: headland_shift_forward lief zwar bis ca.
+        # 0.72 m, aber headland_total_yaw_progress stieg dabei bis ca. 3.1 rad.
+        # Dadurch war die Gerade kein reines Ueberspringen mehr.
+        if int(self.p.row_shift_count) >= 2 and pose_map is not None:
+            alt = wrap_to_pi(desired + math.pi)
+            if abs(wrap_to_pi(alt - float(pose_map.yaw))) < abs(wrap_to_pi(desired - float(pose_map.yaw))):
+                desired = alt
+
         return desired
 
     def _target_entry_row_yaw_from_map(self, pose_map: Optional[Pose2D], map_detector: Optional[MapRowDetector]) -> Optional[float]:
