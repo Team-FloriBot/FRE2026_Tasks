@@ -233,7 +233,7 @@ private:
                               float r, float g, float b)
         {
             visualization_msgs::msg::Marker m;
-            m.header.frame_id = global_frame_;
+            m.header.frame_id = "odom"";
             m.header.stamp = this->now();
             m.ns = "pp_debug";
             m.id = id;
