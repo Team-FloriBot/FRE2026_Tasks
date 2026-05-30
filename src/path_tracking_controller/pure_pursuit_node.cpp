@@ -1,3 +1,4 @@
+// pure_pursuit_node.cpp
 #include <rclcpp/rclcpp.hpp>
 #include <geometry_msgs/msg/pose_stamped.hpp>
 #include <geometry_msgs/msg/twist.hpp>
@@ -15,7 +16,7 @@ class PurePursuitNode : public rclcpp::Node
 public:
     PurePursuitNode() : Node("pure_pursuit_node")
     {
-        // 1. ZUERST Parameter deklarieren
+        // Parameter deklarieren
         this->declare_parameter<std::string>("global_frame", "odom");
         this->declare_parameter<std::string>("base_link_frame", "base_link");
         this->declare_parameter<std::string>("path_topic", "/plan");
@@ -31,7 +32,7 @@ public:
         this->declare_parameter<int>("search_window", 200);
         this->declare_parameter<double>("control_rate", 20.0);
 
-        // 2. Parameter einlesen (damit sie für Subscriber/Publisher bereitstehen!)
+        // Parameter einlesen
         global_frame_ = this->get_parameter("global_frame").as_string();
         base_link_frame_ = this->get_parameter("base_link_frame").as_string();
         path_topic_ = this->get_parameter("path_topic").as_string();
@@ -47,17 +48,15 @@ public:
         search_window_ = this->get_parameter("search_window").as_int();
         control_rate_ = this->get_parameter("control_rate").as_double();
 
-        // 3. JETZT Interfaces mit den geladenen Variablen erstellen
+        // Interfaces erstellen
         cmd_vel_pub_ = this->create_publisher<geometry_msgs::msg::Twist>("/cmd_vel", 10);
         path_sub_ = this->create_subscription<nav_msgs::msg::Path>(
             path_topic_, 10, std::bind(&PurePursuitNode::path_callback, this, std::placeholders::_1));
         debug_pub_ = this->create_publisher<visualization_msgs::msg::MarkerArray>("/pure_pursuit/debug", 10);
 
-        // TF Buffer & Listener
         tf_buffer_ = std::make_shared<tf2_ros::Buffer>(this->get_clock());
         tf_listener_ = std::make_shared<tf2_ros::TransformListener>(*tf_buffer_);
 
-        // Timer
         std::chrono::duration<double> double_duration(1.0 / control_rate_);
         timer_ = this->create_wall_timer(
             std::chrono::duration_cast<std::chrono::milliseconds>(double_duration),
@@ -76,7 +75,7 @@ private:
     // ---- Parameters ----
     std::string global_frame_;
     std::string base_link_frame_;
-    std::string path_topic_; // <--- HIER hat es gefehlt!
+    std::string path_topic_;
     double lookahead_min_, lookahead_max_, lookahead_gain_;
     double max_speed_, min_speed_;
     double curvature_gain_, max_angular_velocity_;
@@ -90,7 +89,6 @@ private:
     size_t current_path_index_ = 0;
     bool path_received_ = false;
 
-    // ---- Path Callback ----
     void path_callback(const nav_msgs::msg::Path::SharedPtr msg)
     {
         if (msg->poses.empty()) {
@@ -104,7 +102,6 @@ private:
                     current_path_.poses.size(), current_path_.header.frame_id.c_str());
     }
 
-    // ---- Vehicle Pose ----
     bool get_vehicle_pose(const std::string & target_frame, geometry_msgs::msg::PoseStamped & pose)
     {
         try
@@ -125,16 +122,21 @@ private:
         }
     }
 
-    // ---- Vorwärts gerichtete Suche ----
+    // ---- Vorwärts gerichtete Suche (KORRIGIERT FÜR SCHLEIFEN) ----
     size_t find_nearest_point_forward(const geometry_msgs::msg::PoseStamped & pose)
     {
         size_t best_idx = current_path_index_;
         double best_dist = std::numeric_limits<double>::max();
         
         size_t start_idx = current_path_index_;
-        size_t end_idx = (current_path_index_ == 0) ? 
-                        current_path_.poses.size() : 
-                        std::min(current_path_index_ + static_cast<size_t>(search_window_), current_path_.poses.size());
+        size_t end_idx = std::min(current_path_index_ + static_cast<size_t>(search_window_), current_path_.poses.size());
+        
+        // FIX: Wenn wir ganz am Anfang stehen, darf die Suche NICHT das Ende des Pfades prüfen.
+        // Da Start- und Endpunkt identisch sind, würde er sonst sofort ans Ende springen.
+        if (current_path_index_ < 10 && current_path_.poses.size() > 30)
+        {
+            end_idx = std::min(end_idx, current_path_.poses.size() - 20);
+        }
         
         for(size_t i = start_idx; i < end_idx; ++i)
         {
@@ -151,14 +153,12 @@ private:
         return current_path_index_;
     }
 
-    // ---- Lookahead berechnen ----
     double compute_lookahead_distance()
     {
         double ld = lookahead_min_ + lookahead_gain_ * max_speed_;
         return std::clamp(ld, lookahead_min_, lookahead_max_);
     }
 
-    // ---- Lookahead Punkt entlang Pfad ----
     bool find_lookahead_point(size_t nearest_idx, double lookahead_distance, geometry_msgs::msg::Point & lookahead)
     {
         double accumulated = 0.0;
@@ -182,7 +182,7 @@ private:
         return true;
     }
 
-    // ---- Kontrolle ----
+    // ---- Kontrolle (KORRIGIERT FÜR SCHLEIFEN) ----
     bool compute_control(const geometry_msgs::msg::Point & lookahead_global, double & speed, double & omega)
     {
         geometry_msgs::msg::PoseStamped lookahead_pose;
@@ -212,17 +212,23 @@ private:
         double curvature = 2.0 * std::sin(alpha) / ld;
 
         double v_curve = max_speed_ / (1.0 + curvature_gain_ * std::abs(curvature));
-        double goal_dist = std::hypot(
-            current_path_.poses.back().pose.position.x - current_path_.poses[current_path_index_].pose.position.x,
-            current_path_.poses.back().pose.position.y - current_path_.poses[current_path_index_].pose.position.y);
         
-        double v_goal = max_speed_ * std::min(1.0, goal_dist / goal_slowdown_distance_);
-        speed = std::clamp(std::min(v_curve,v_goal), min_speed_, max_speed_);
+        // FIX: Bremsrampe vor dem Ziel nur aktivieren, wenn wir auch wirklich kurz vor dem Ende des Pfad-Arrays stehen!
+        double v_goal = max_speed_;
+        size_t remaining_points = current_path_.poses.size() - 1 - current_path_index_;
+        if (remaining_points < 40)
+        {
+            double goal_dist = std::hypot(
+                current_path_.poses.back().pose.position.x - current_path_.poses[current_path_index_].pose.position.x,
+                current_path_.poses.back().pose.position.y - current_path_.poses[current_path_index_].pose.position.y);
+            v_goal = max_speed_ * std::min(1.0, goal_dist / goal_slowdown_distance_);
+        }
+        
+        speed = std::clamp(std::min(v_curve, v_goal), min_speed_, max_speed_);
         omega = std::clamp(speed * curvature, -max_angular_velocity_, max_angular_velocity_);
         return true;
     }
 
-    // ---- Zielprüfung ----
     bool check_goal_reached(const geometry_msgs::msg::PoseStamped & pose)
     {
         if (current_path_.poses.empty()) return false;
@@ -278,19 +284,13 @@ private:
             return m;
         };
 
-        // 🔴 Vehicle
         arr.markers.push_back(make_sphere(0, vehicle.pose.position.x, vehicle.pose.position.y, 1.0, 0.0, 0.0));
-
-        // 🟢 Lookahead
         arr.markers.push_back(make_sphere(1, lookahead.x, lookahead.y, 0.0, 1.0, 0.0));
-
-        // 🔵 Nearest point
         arr.markers.push_back(make_sphere(2, current_path_.poses[nearest_idx].pose.position.x, current_path_.poses[nearest_idx].pose.position.y, 0.0, 0.0, 1.0));
 
         debug_pub_->publish(arr);
     }
 
-    // ---- Hauptkontrollschleife ----
     void control_loop()
     {
         if(!path_received_ || current_path_.poses.empty()) return;
