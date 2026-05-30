@@ -6,7 +6,8 @@ import math
 
 # ROS 2 Services & Messages
 from std_srvs.srv import Trigger
-from geometry_msgs.msg import PoseStamped, PointStamped
+from geometry_msgs.msg import PoseStamped, PointStamped, Point
+from visualization_msgs.msg import Marker
 from nav_msgs.msg import Path
 
 # TF2 für die Transformationen
@@ -38,6 +39,7 @@ class CoveragePlanner(Node):
 
         # 3. Publisher
         self.path_pub = self.create_publisher(Path, 'plan', 10)
+        self.marker_pub = self.create_publisher(Marker, 'coverage_polygon_marker', 10)
 
         # 4. Service
         self.srv = self.create_service(
@@ -93,6 +95,8 @@ class CoveragePlanner(Node):
 
             point_out = do_transform_point(point_in, transform)
             transformed_coords.append((point_out.point.x, point_out.point.y))
+
+        self.publish_polygon_marker(transformed_coords, target_frame)
 
         robot_x = transform.transform.translation.x
         robot_y = transform.transform.translation.y
@@ -183,6 +187,46 @@ class CoveragePlanner(Node):
 
         self.path_pub.publish(ros_path)
         self.get_logger().info(f"Pfad mit {len(ros_path.poses)} Wegpunkten erfolgreich auf /plan publiziert!")
+
+    def publish_polygon_marker(self, coords, frame_id):
+        marker = Marker()
+        marker.header.frame_id = frame_id
+        marker.header.stamp = self.get_clock().now().to_msg()
+        
+        marker.ns = "coverage_polygon"
+        marker.id = 0
+        
+        # LINE_STRIP verbindet die Punkte mit Linien
+        marker.type = Marker.LINE_STRIP
+        marker.action = Marker.ADD
+
+        # Linienbreite
+        marker.scale.x = 0.05
+
+        # Farbe (z.B. ein gut sichtbares Blau)
+        marker.color.r = 0.0
+        marker.color.g = 0.5
+        marker.color.b = 1.0
+        marker.color.a = 1.0  # Wichtig: Alpha muss > 0 sein, sonst ist der Marker unsichtbar
+
+        # Punkte zum Marker hinzufügen
+        for pt in coords:
+            p = Point()
+            p.x = float(pt[0])
+            p.y = float(pt[1])
+            p.z = 0.0
+            marker.points.append(p)
+
+        # Das Polygon schließen, indem der erste Punkt am Ende nochmal angehängt wird
+        if len(coords) > 0:
+            p = Point()
+            p.x = float(coords[0][0])
+            p.y = float(coords[0][1])
+            p.z = 0.0
+            marker.points.append(p)
+
+        self.marker_pub.publish(marker)
+        self.get_logger().info("Coverage Polygon Marker publiziert!")
 
 def main(args=None):
     rclpy.init(args=args)
