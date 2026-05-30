@@ -3119,46 +3119,14 @@ class MissionManager:
         return self._entry_local_row_takeover_ok(row, pose_map)
 
     def _multirow_safe_acquire_steering_ok(self, row: RowModel, shift_ok: bool, pose_map: Optional[Pose2D] = None) -> bool:
-        if int(self.p.row_shift_count) < 2:
-            return False
-        if not row.valid:
-            return False
-        if not self._multirow_counted_target_locked():
-            return False
-
-        # In the 2R log the counted target lane was correctly latched and the
-        # deterministic U-turn was completed, but the local/map lane geometry at
-        # the row entrance was temporarily split into a very narrow false pair
-        # (width about 0.22 m). That made entry_geometry_ok and entry_shift_ok
-        # false, so ACQUIRE_ROW kept driving straight with
-        # ACQUIRE_ROW_WAIT_FULL_LANE and hit the next crop row.
-        #
-        # For multi-row turns, once the vehicle has essentially completed the
-        # 180 deg maneuver, a valid local row model is safer than continuing
-        # open-loop straight. This does NOT mark the pattern completed; it only
-        # allows the row controller to steer while the stricter geometry checks
-        # continue to decide the ENTER_ROW transition.
-        min_conf = min(
-            max(0.05, float(self.p.entry_row_min_confidence)),
-            max(0.05, float(self.p.min_enter_confidence)),
-        )
-        if row.confidence < min_conf:
-            return False
-
-        if shift_ok:
-            return True
-
-        # Allow recovery steering after the U-turn is substantially complete.
-        progress = self._headland_total_yaw_progress(pose_map)
-        target = max(0.0, float(self.p.headland_total_yaw_change))
-        # pose_map is not available in this helper; the caller updates the
-        # progress-related diagnostics before calling us. If progress cannot be
-        # evaluated here it is 0, so fall back to row confidence only when the
-        # local model is already strong.
-        if progress >= target - max(0.45, float(self.p.entry_yaw_accept_tolerance)):
-            return True
-
-        return row.confidence >= max(0.45, float(self.p.min_enter_confidence))
+        # v4 rollback: Die v3-Freigabe hat in ACQUIRE_ROW/ENTER_ROW lokale
+        # Reihenhypothesen trotz nicht erfuellter Shift-/Geometrie-Gates als
+        # Lenkreferenz zugelassen. In den Logs danach wurde die Zielreihe wieder
+        # verfehlt. Deshalb wird das Verhalten der besser funktionierenden
+        # Trim-Version wiederhergestellt: Solange die Full-Lane-/Shift-Guards
+        # nicht erfuellt sind, bleibt ACQUIRE_ROW im WAIT_FULL_LANE-Pfad und
+        # folgt keiner einzelnen, potenziell falschen Begrenzungsreihe.
+        return False
 
     def _neighbor_target_offset_ok(self) -> bool:
         if int(self.p.row_shift_count) != 1:
@@ -3910,12 +3878,9 @@ class MissionManager:
                     self.acquire_start_time = self.node.get_clock().now()
 
             # Critical safety guard: do not let ACQUIRE_ROW follow a single or
-            # geometrically invalid row too early. Bei 3R war der Sollversatz
-            # jedoch bereits erreicht/überschritten und die lokale Reihe stabil;
-            # weiteres Geradeausfahren ohne Reihenregelung ließ den Roboter aus
-            # der Gasse driften. Für Mehrreihensprünge wird dann langsam mit der
-            # lokalen Reihenhypothese nachgeführt, statt stur geradeaus weiter zu
-            # fahren.
+            # geometrically invalid row too early. For multi-row turns the row
+            # controller is enabled only after shift/yaw/reference/geometry
+            # guards are satisfied.
             if self.p.headland_maneuver_enabled and self.headland_required_shift != 0.0 and not acquire_row_ok:
                 if self._multirow_safe_acquire_steering_ok(row, acquire_shift_ok, pose_map):
                     return planner.plan_acquire_row(row)
@@ -3988,10 +3953,8 @@ class MissionManager:
                 self.transition(MissionState.FOLLOW_ROW, "stable final row following")
                 return planner.plan_follow_row(row)
 
-            # Same guard as ACQUIRE_ROW. Bei Mehrreihensprüngen darf eine stabile
-            # lokale Reihe nach erreichtem Sollversatz weiter als Lenkreferenz
-            # dienen, auch wenn die vollständige Gassengeometrie noch nicht
-            # bestätigt ist.
+            # Same guard as ACQUIRE_ROW: do not follow a partial/invalid lane
+            # after multi-row turns until the full guards are satisfied.
             if self.p.headland_maneuver_enabled and self.headland_required_shift != 0.0 and not enter_guards_ok:
                 if self._multirow_safe_acquire_steering_ok(row, shift_ok_for_follow, pose_map):
                     return planner.plan_enter_row(row)
@@ -4079,7 +4042,7 @@ class MaizeNavigator(Node):
 
         self.get_logger().info("maize_navigator started")
         self.get_logger().info(
-            "maprow_update_version=2026-05-30-multirow-acquire-v3, "
+            "maprow_update_version=2026-05-30-multirow-trim-v4-rollback, "
             f"multirow_straight_trim={self.p.multirow_straight_trim:.3f}, "
             f"multirow_straight_target={max(0.0, (max(1, int(self.p.row_shift_count)) - 1) * float(self.p.expected_row_width) - (max(0.0, float(self.p.multirow_straight_trim)) if int(self.p.row_shift_count) >= 2 else 0.0)):.3f}"
         )
