@@ -90,10 +90,25 @@ class PlantSpline:
         centered = self.points - self.mean
         cov = np.cov(centered.T)
         eigenvalues, eigenvectors = np.linalg.eig(cov)
-        self.main_dir = eigenvectors[:, np.argmax(eigenvalues)]
-        self.perp_dir = np.array([-self.main_dir[1], self.main_dir[0]])
-
+        # ensure real values (cov is symmetric, but eig may return complex dtype)
+        eigenvalues = np.real(eigenvalues)
+        eigenvectors = np.real(eigenvectors)
         heading_vec = np.array([math.cos(heading_yaw), math.sin(heading_yaw)])
+        self.main_dir = eigenvectors[:, np.argmax(eigenvalues)]
+        # Stabilize PCA direction if eigenvalue ratio indicates weak principal axis
+        try:
+            max_eig = float(np.max(eigenvalues))
+            min_eig = float(np.min(eigenvalues))
+            eig_ratio = max_eig / (min_eig if min_eig > 1e-9 else 1e-9)
+            if eig_ratio < 3.0:
+                # blend a bit with the heading to avoid arbitrary flips for near-isotropic clouds
+                try:
+                    self.main_dir = self._normalize_vector(self.main_dir + 0.3 * heading_vec)
+                except Exception:
+                    self.main_dir = self.main_dir
+        except Exception:
+            pass
+        self.perp_dir = np.array([-self.main_dir[1], self.main_dir[0]])
         if np.dot(self.main_dir, heading_vec) < 0:
             self.main_dir = -self.main_dir
             self.perp_dir = -self.perp_dir
@@ -120,7 +135,7 @@ class PlantSpline:
             self._build_linear_fallback(logger)
             return
 
-        if not self._build_window_path(unique_t, unique_lateral, heading_yaw=heading_yaw, logger=logger):
+        if not self._build_knot_path(unique_t, unique_lateral, heading_yaw=heading_yaw, logger=logger):
             self._build_linear_fallback(logger)
 
     def _spawn_extension(self) -> "PlantSpline":
@@ -136,6 +151,14 @@ class PlantSpline:
         clone.segment_splines = list(self.segment_splines)
         clone.segment_bounds = list(self.segment_bounds)
         clone.lateral_spline = self.lateral_spline
+        if hasattr(self, "anchor_world"):
+            clone.anchor_world = np.array(self.anchor_world, copy=True)
+        if hasattr(self, "anchor_t"):
+            clone.anchor_t = np.array(self.anchor_t, copy=True)
+        if hasattr(self, "anchor_lateral"):
+            clone.anchor_lateral = np.array(self.anchor_lateral, copy=True)
+        if hasattr(self, "row_points"):
+            clone.row_points = np.array(self.row_points, copy=True)
         if self.linear_mode:
             clone.line_start = np.array(self.line_start, copy=True)
             clone.line_end = np.array(self.line_end, copy=True)
@@ -201,138 +224,165 @@ class PlantSpline:
         if logger:
             logger.info(f"Using linear fallback (n={len(self.points)})")
 
-    def _build_window_path(self, fit_t: np.ndarray, fit_lateral: np.ndarray, heading_yaw: float = 0.0, logger: Optional[Node] = None) -> bool:
-        forward_max_dist = max(0.5, float(self.window_length))
-        step_distance = max(0.25, float(self.window_step))
-        orthogonal_max_dist = max(0.20, float(self.support_radius))
-        cluster_radius = max(0.10, float(self.cluster_radius))
+    def _build_knot_path(self, fit_t: np.ndarray, fit_lateral: np.ndarray, heading_yaw: float = 0.0, logger: Optional[Node] = None) -> bool:
+        knot_spacing = 0.30
+        half_window = 0.5 * knot_spacing
 
-        if len(self.points) < 2:
+        if len(fit_t) < 2:
             return False
 
-        self._last_rejected = []
-        self._last_accepted = []
+        t_min = float(np.min(fit_t))
+        t_max = float(np.max(fit_t))
+        knot_ts = [t_min]
+        current_t = t_min + knot_spacing
+        while current_t < t_max - 1e-6:
+            knot_ts.append(float(current_t))
+            current_t += knot_spacing
+        if knot_ts[-1] < t_max:
+            knot_ts.append(t_max)
 
-        def normalize(vec: np.ndarray) -> np.ndarray:
-            norm = float(np.linalg.norm(vec))
-            if norm < 1e-9:
-                return np.array([1.0, 0.0], dtype=float)
-            return vec / norm
+        knot_world: List[np.ndarray] = []
+        knot_t: List[float] = []
+        knot_lateral: List[float] = []
+        for knot_t_val in knot_ts:
+            mask = (fit_t >= knot_t_val - half_window) & (fit_t <= knot_t_val + half_window)
+            if np.any(mask):
+                local_t = fit_t[mask]
+                local_l = fit_lateral[mask]
+                # weighted center around the knot; keeps local curvature without over-smoothing
+                weights = np.exp(-((local_t - knot_t_val) / max(0.08, 0.35 * knot_spacing)) ** 2)
+                if float(np.sum(weights)) < 1e-9:
+                    weights = np.ones_like(local_t)
+                t_center = float(np.sum(local_t * weights) / np.sum(weights))
+                l_center = float(np.sum(local_l * weights) / np.sum(weights))
+            else:
+                t_center = float(knot_t_val)
+                l_center = float(np.interp(knot_t_val, fit_t, fit_lateral))
+            knot_t.append(t_center)
+            knot_lateral.append(l_center)
+            knot_world.append(self.mean + t_center * self.main_dir + l_center * self.perp_dir)
 
-        def cluster_points(candidate_points: np.ndarray) -> List[np.ndarray]:
-            if len(candidate_points) == 0:
-                return []
-            visited = np.zeros(len(candidate_points), dtype=bool)
-            clusters: List[np.ndarray] = []
-            for seed_idx in range(len(candidate_points)):
-                if visited[seed_idx]:
-                    continue
-                stack = [seed_idx]
-                visited[seed_idx] = True
-                member_indices = []
-                while stack:
-                    idx = stack.pop()
-                    member_indices.append(idx)
-                    deltas = candidate_points - candidate_points[idx]
-                    neighbor_mask = np.linalg.norm(deltas, axis=1) <= cluster_radius
-                    neighbors = np.where(neighbor_mask & (~visited))[0]
-                    for neighbor_idx in neighbors:
-                        visited[neighbor_idx] = True
-                        stack.append(int(neighbor_idx))
-                cluster = candidate_points[np.array(member_indices, dtype=int)]
-                if len(cluster) >= 2:
-                    clusters.append(cluster)
-            return clusters
-
-        def fit_cluster_direction(cluster: np.ndarray) -> np.ndarray:
-            if len(cluster) < 2:
-                return self.main_dir
-            centered = cluster - np.mean(cluster, axis=0)
-            cov_local = np.cov(centered.T)
-            eigenvalues_local, eigenvectors_local = np.linalg.eig(cov_local)
-            return normalize(eigenvectors_local[:, int(np.argmax(eigenvalues_local))])
-
-        # Start from the row beginning (minimum projection along the chosen heading direction),
-        # not from the global mean. This keeps the displayed line complete from row start.
-        start_idx = int(np.argmin(self.t))
-        start_anchor = np.array(self.points[start_idx], copy=True)
-        current_anchor = np.array(start_anchor, copy=True)
-        current_dir = normalize(np.array(self.main_dir, copy=True))
-        if np.dot(current_dir, np.array([math.cos(heading_yaw), math.sin(heading_yaw)])) < 0:
-            current_dir = -current_dir
-
-        anchors_world = [current_anchor]
-        anchors_t = [0.0]
-        anchors_l = [float((current_anchor - self.mean) @ self.perp_dir)]
-
-        remaining_points = np.array(self.points, copy=True)
-        total_span = max(0.0, float(np.max(self.t) - np.min(self.t)))
-        max_steps = max(1, int(math.ceil(total_span / step_distance)) + 4)
-
-        for _step_idx in range(max_steps):
-            rel = remaining_points - current_anchor
-            along = rel @ current_dir
-            perp = rel @ np.array([-current_dir[1], current_dir[0]])
-            candidate_mask = (along >= 0.0) & (along <= forward_max_dist) & (np.abs(perp) <= orthogonal_max_dist)
-            candidate_points = remaining_points[candidate_mask]
-            if len(candidate_points) == 0:
-                break
-
-            clusters = cluster_points(candidate_points)
-            if not clusters:
-                break
-
-            best_cluster = None
-            best_score = -float("inf")
-            for cluster in clusters:
-                centroid = np.mean(cluster, axis=0)
-                rel_centroid = centroid - current_anchor
-                along_c = float(rel_centroid @ current_dir)
-                perp_c = float(rel_centroid @ np.array([-current_dir[1], current_dir[0]]))
-                score = float(len(cluster))
-                score -= 1.2 * abs(along_c - step_distance)
-                score -= 0.6 * abs(perp_c)
-                if score > best_score:
-                    best_score = score
-                    best_cluster = cluster
-
-            if best_cluster is None or best_score < 1.0:
-                break
-
-            centroid = np.mean(best_cluster, axis=0)
-            step_vec = centroid - current_anchor
-            step_len = float(np.linalg.norm(step_vec))
-            if step_len < 0.12:
-                break
-
-            current_dir = normalize(0.6 * current_dir + 0.4 * (step_vec / step_len))
-            current_anchor = centroid
-            anchors_world.append(np.array(current_anchor, copy=True))
-            anchors_t.append(anchors_t[-1] + step_len)
-            anchors_l.append(float((current_anchor - self.mean) @ self.perp_dir))
-
-            keep_mask = np.ones(len(remaining_points), dtype=bool)
-            for cluster_point in best_cluster:
-                keep_mask &= np.linalg.norm(remaining_points - cluster_point, axis=1) > cluster_radius
-            remaining_points = remaining_points[keep_mask]
-            if len(remaining_points) == 0:
-                break
-
-        if len(anchors_world) < 2:
+        if len(knot_world) < 2:
             return False
 
-        self.anchor_world = np.asarray(anchors_world, dtype=float)
-        self.row_points = self.anchor_world
-        self.anchor_t = np.asarray(anchors_t, dtype=float)
-        self.anchor_lateral = np.asarray(anchors_l, dtype=float)
-
+        self.anchor_t = np.asarray(knot_t, dtype=float)
+        self.anchor_lateral = np.asarray(knot_lateral, dtype=float)
+        self.anchor_world = np.asarray(knot_world, dtype=float)
+        self.row_points = np.asarray(knot_world, dtype=float)
         self.segment_bounds = [(float(self.anchor_t[i]), float(self.anchor_t[i + 1])) for i in range(len(self.anchor_t) - 1)]
         self.segment_splines = []
         self.lateral_spline = None
         self.valid = True
         if logger:
-            logger.info(f"Built clustered row with {len(self.anchor_t)} anchors and {len(self.segment_bounds)} segments")
+            logger.info(f"Built knot row with {len(self.anchor_t)} knots at ~{knot_spacing:.2f} m spacing")
         return True
+
+    def _fit_ransac_line(self, points: np.ndarray, fallback_dir: np.ndarray, iterations: int = 48, inlier_threshold: float = 0.06) -> Tuple[np.ndarray, np.ndarray]:
+        if len(points) < 2:
+            direction = self._normalize_vector(np.asarray(fallback_dir, dtype=float))
+            origin = np.mean(points, axis=0) if len(points) > 0 else np.array([0.0, 0.0], dtype=float)
+            return origin, direction
+
+        best_inliers: np.ndarray = np.zeros(len(points), dtype=bool)
+        best_count = -1
+        best_origin = np.mean(points, axis=0)
+        best_dir = self._normalize_vector(np.asarray(fallback_dir, dtype=float))
+        fallback_dir = self._normalize_vector(np.asarray(fallback_dir, dtype=float))
+
+        for _ in range(iterations):
+            idx_a, idx_b = np.random.choice(len(points), size=2, replace=False)
+            a = points[idx_a]
+            b = points[idx_b]
+            direction = b - a
+            norm = float(np.linalg.norm(direction))
+            if norm < 1e-9:
+                continue
+            direction = direction / norm
+            if np.dot(direction, fallback_dir) < 0:
+                direction = -direction
+            rel = points - a
+            perp = np.array([-direction[1], direction[0]], dtype=float)
+            distances = np.abs(rel @ perp)
+            inliers = distances <= inlier_threshold
+            count = int(np.sum(inliers))
+            if count > best_count:
+                best_count = count
+                best_inliers = inliers
+                best_origin = np.mean(points[inliers], axis=0) if count > 0 else np.mean(points, axis=0)
+                best_dir = direction
+
+        if best_count < 0:
+            return best_origin, best_dir
+
+        inlier_points = points[best_inliers] if np.any(best_inliers) else points
+        centered = inlier_points - np.mean(inlier_points, axis=0)
+        cov = np.cov(centered.T)
+        _, eigenvectors = np.linalg.eig(cov)
+        direction = np.real(eigenvectors[:, int(np.argmax(np.real(np.linalg.eigvals(cov))))]) if len(inlier_points) >= 2 else best_dir
+        direction = self._normalize_vector(direction)
+        if np.dot(direction, fallback_dir) < 0:
+            direction = -direction
+        origin = np.mean(inlier_points, axis=0)
+        return origin, direction
+
+    def build_knot_chain_ransac(self, start_points: np.ndarray, local_points: np.ndarray, heading_yaw: float, knot_spacing: float = 0.30, max_empty_advance: float = 2.0, logger: Optional[Node] = None) -> Tuple[np.ndarray, bool]:
+        start_points = np.asarray(start_points, dtype=float)
+        local_points = np.asarray(local_points, dtype=float)
+        if len(start_points) == 0:
+            return np.empty((0, 2), dtype=float), False
+
+        if len(start_points) >= 2:
+            base_dir = self._normalize_vector(start_points[-1] - start_points[0])
+        else:
+            base_dir = np.array([math.cos(heading_yaw), math.sin(heading_yaw)], dtype=float)
+        if np.linalg.norm(base_dir) < 1e-9:
+            base_dir = np.array([math.cos(heading_yaw), math.sin(heading_yaw)], dtype=float)
+
+        current_point = np.array(start_points[-1], copy=True)
+        current_dir = self._normalize_vector(base_dir)
+        knots: List[np.ndarray] = [np.array(p, copy=True) for p in start_points]
+        empty_progress = 0.0
+        max_steps = int(math.ceil(max_empty_advance / knot_spacing)) + 12
+
+        for _ in range(max_steps):
+            forward = self._normalize_vector(current_dir)
+            perp = np.array([-forward[1], forward[0]], dtype=float)
+            rel = local_points - current_point
+            along = rel @ forward
+            lateral = rel @ perp
+            window_mask = (along >= 0.0) & (along <= knot_spacing) & (np.abs(lateral) <= knot_spacing)
+            window_points = local_points[window_mask]
+
+            if len(window_points) == 0:
+                empty_progress += knot_spacing
+                if logger:
+                    logger.info(f"RANSAC knot step empty: empty_progress={empty_progress:.2f}m")
+                if empty_progress > max_empty_advance:
+                    break
+                current_point = current_point + forward * knot_spacing
+                knots.append(np.array(current_point, copy=True))
+                continue
+
+            empty_progress = 0.0
+            ransac_origin, ransac_dir = self._fit_ransac_line(window_points, forward)
+            if np.dot(ransac_dir, forward) < 0:
+                ransac_dir = -ransac_dir
+
+            mean_point = np.mean(window_points, axis=0)
+            offset = float((mean_point - ransac_origin) @ np.array([-ransac_dir[1], ransac_dir[0]], dtype=float))
+            projected_point = mean_point - offset * np.array([-ransac_dir[1], ransac_dir[0]], dtype=float)
+
+            if logger:
+                logger.info(f"RANSAC knot step: n={len(window_points)}, offset={offset:.3f}, dir_yaw={math.degrees(math.atan2(ransac_dir[1], ransac_dir[0])):.1f}deg")
+
+            current_point = np.array(projected_point, copy=True)
+            knots.append(np.array(current_point, copy=True))
+            current_dir = self._normalize_vector(0.5 * forward + 0.5 * ransac_dir)
+
+        if len(knots) < 2:
+            return np.empty((0, 2), dtype=float), False
+
+        return np.asarray(knots, dtype=float), empty_progress > max_empty_advance
 
     def _interpolate_lateral(self, t: float) -> float:
         if len(self.anchor_t) == 0:
@@ -394,6 +444,60 @@ class PlantSpline:
             return 0.0
         return float(np.dot(direction - self.main_dir, self.perp_dir) / denom)
 
+    def _knot_segment(self, t: float) -> Tuple[int, float, float]:
+        if len(self.anchor_t) < 2:
+            return 0, 0.0, 1.0
+        t_clamped = float(np.clip(t, self.anchor_t[0], self.anchor_t[-1]))
+        idx = int(np.searchsorted(self.anchor_t, t_clamped, side="right") - 1)
+        idx = int(np.clip(idx, 0, len(self.anchor_t) - 2))
+        t0 = float(self.anchor_t[idx])
+        t1 = float(self.anchor_t[idx + 1])
+        dt = max(1e-6, t1 - t0)
+        u = float(np.clip((t_clamped - t0) / dt, 0.0, 1.0))
+        return idx, u, dt
+
+    def _knot_derivative(self, idx: int) -> np.ndarray:
+        if len(self.anchor_world) < 2:
+            return np.array(self.main_dir, copy=True)
+        if idx <= 0:
+            dt = max(1e-6, float(self.anchor_t[1] - self.anchor_t[0]))
+            deriv = (self.anchor_world[1] - self.anchor_world[0]) / dt
+        elif idx >= len(self.anchor_world) - 1:
+            dt = max(1e-6, float(self.anchor_t[-1] - self.anchor_t[-2]))
+            deriv = (self.anchor_world[-1] - self.anchor_world[-2]) / dt
+        else:
+            dt = max(1e-6, float(self.anchor_t[idx + 1] - self.anchor_t[idx - 1]))
+            deriv = (self.anchor_world[idx + 1] - self.anchor_world[idx - 1]) / dt
+        norm = float(np.linalg.norm(deriv))
+        if norm < 1e-9:
+            return np.array(self.main_dir, copy=True)
+        return deriv / norm
+
+    def _evaluate_world_curve(self, t: float) -> np.ndarray:
+        if len(self.anchor_world) < 2:
+            centered = self.mean + t * self.main_dir
+            return np.array(centered, dtype=float)
+
+        idx, u, dt = self._knot_segment(t)
+        p0 = np.asarray(self.anchor_world[idx], dtype=float)
+        p1 = np.asarray(self.anchor_world[idx + 1], dtype=float)
+        m0 = self._knot_derivative(idx) * dt
+        m1 = self._knot_derivative(idx + 1) * dt
+
+        u2 = u * u
+        u3 = u2 * u
+        h00 = 2.0 * u3 - 3.0 * u2 + 1.0
+        h10 = u3 - 2.0 * u2 + u
+        h01 = -2.0 * u3 + 3.0 * u2
+        h11 = u3 - u2
+        return h00 * p0 + h10 * m0 + h01 * p1 + h11 * m1
+
+    def _local_direction(self, t: float) -> np.ndarray:
+        if len(self.anchor_t) < 2:
+            return self.main_dir
+        idx, _, _ = self._knot_segment(t)
+        return self._knot_derivative(idx)
+
     def evaluate(self, t: float) -> Tuple[float, float]:
         if self.linear_mode and hasattr(self, "line_start") and hasattr(self, "line_end"):
             if self.t_max <= self.t_min:
@@ -403,8 +507,7 @@ class PlantSpline:
                 alpha = float(np.clip(alpha, 0.0, 1.0))
                 p = self.line_start + alpha * (self.line_end - self.line_start)
             return float(p[0]), float(p[1])
-        lateral = self._interpolate_lateral(t)
-        p = self.mean + t * self.main_dir + lateral * self.perp_dir
+        p = self._evaluate_world_curve(t)
         return float(p[0]), float(p[1])
 
     def get_direction(self, t: float) -> float:
@@ -519,6 +622,7 @@ class MaizeNavigator(Node):
         self.right_row_spline: Optional[PlantSpline] = None
         self.left_start_chain: Optional[np.ndarray] = None
         self.right_start_chain: Optional[np.ndarray] = None
+        self.field_direction_yaw: Optional[float] = None
         self.current_left_row_id: Optional[int] = None
         self.current_right_row_id: Optional[int] = None
         self.next_row_id: int = 1
@@ -745,6 +849,11 @@ class MaizeNavigator(Node):
             self.right_start_chain = np.array([right_start], dtype=float)
             self.left_row_spline.row_points = np.array(self.left_start_chain, copy=True)
             self.right_row_spline.row_points = np.array(self.right_start_chain, copy=True)
+            self.field_direction_yaw = self.mean_yaw([
+                self.left_row_spline.get_global_direction(),
+                self.right_row_spline.get_global_direction(),
+                self.robot_pose.yaw,
+            ])
             self.current_left_row_id = self.next_row_id
             self.next_row_id += 1
             self.current_right_row_id = self.next_row_id
@@ -770,10 +879,17 @@ class MaizeNavigator(Node):
         if self.right_start_chain is None or len(self.right_start_chain) == 0:
             self.right_start_chain = np.array([np.array(self.right_row_spline.evaluate(self.right_row_spline.t_min), dtype=float)], dtype=float)
 
+        if self.field_direction_yaw is None:
+            self.field_direction_yaw = self.mean_yaw([
+                self.left_row_spline.get_global_direction(),
+                self.right_row_spline.get_global_direction(),
+                self.robot_pose.yaw,
+            ])
+
         new_left_chain, new_right_chain, new_pts_l, new_pts_r, shared_heading_yaw = self._march_pair_startpoints(
             self.left_start_chain,
             self.right_start_chain,
-            self.robot_pose.yaw,
+            self.field_direction_yaw,
         )
 
         self.left_start_chain = new_left_chain
@@ -1119,203 +1235,14 @@ class MaizeNavigator(Node):
             return np.array([1.0, 0.0], dtype=float)
         return vec / norm
 
-    def _cluster_nearby_points(self, points: np.ndarray, cluster_radius: float) -> List[np.ndarray]:
-        if len(points) == 0:
-            return []
-        visited = np.zeros(len(points), dtype=bool)
-        clusters: List[np.ndarray] = []
-        for seed_idx in range(len(points)):
-            if visited[seed_idx]:
-                continue
-            stack = [seed_idx]
-            visited[seed_idx] = True
-            member_indices: List[int] = []
-            while stack:
-                idx = stack.pop()
-                member_indices.append(idx)
-                deltas = points - points[idx]
-                neighbors = np.where((np.linalg.norm(deltas, axis=1) <= cluster_radius) & (~visited))[0]
-                for neighbor_idx in neighbors:
-                    visited[neighbor_idx] = True
-                    stack.append(int(neighbor_idx))
-            cluster = points[np.array(member_indices, dtype=int)]
-            if len(cluster) >= 2:
-                clusters.append(cluster)
-        return clusters
-
-    def _cluster_nearby_points_with_indices(self, points: np.ndarray, cluster_radius: float) -> List[tuple]:
-        """Return clusters together with their member indices into the provided `points` array.
-
-        Each element is a tuple (cluster_points, indices_array).
-        """
-        if len(points) == 0:
-            return []
-        visited = np.zeros(len(points), dtype=bool)
-        clusters: List[tuple] = []
-        for seed_idx in range(len(points)):
-            if visited[seed_idx]:
-                continue
-            stack = [seed_idx]
-            visited[seed_idx] = True
-            member_indices: List[int] = []
-            while stack:
-                idx = stack.pop()
-                member_indices.append(idx)
-                deltas = points - points[idx]
-                neighbors = np.where((np.linalg.norm(deltas, axis=1) <= cluster_radius) & (~visited))[0]
-                for neighbor_idx in neighbors:
-                    visited[neighbor_idx] = True
-                    stack.append(int(neighbor_idx))
-            cluster = points[np.array(member_indices, dtype=int)]
-            if len(cluster) >= 2:
-                clusters.append((cluster, np.array(member_indices, dtype=int)))
-        return clusters
-
-    def _points_in_marching_quad(
-        self,
-        points: np.ndarray,
-        origin: np.ndarray,
-        forward_dir: np.ndarray,
-        lateral_center: float,
-        forward_max_dist: float,
-        lateral_half_width: float,
-    ) -> Tuple[np.ndarray, np.ndarray]:
-        if len(points) == 0:
-            return np.zeros(0, dtype=bool), np.empty((0, 2), dtype=float)
-        perp_dir = np.array([-forward_dir[1], forward_dir[0]], dtype=float)
-        rel = points - origin
-        along = rel @ forward_dir
-        lateral = rel @ perp_dir
-        mask = (along >= 0.0) & (along <= forward_max_dist) & (np.abs(lateral - lateral_center) <= lateral_half_width)
-        return mask, lateral
-
-    def _direction_from_points(self, points: np.ndarray, fallback_dir: np.ndarray) -> np.ndarray:
-        if len(points) < 2:
-            return self._normalize_vector(np.asarray(fallback_dir, dtype=float))
-        centered = points - np.mean(points, axis=0)
-        cov = np.cov(centered.T)
-        eigenvalues, eigenvectors = np.linalg.eig(cov)
-        direction = eigenvectors[:, int(np.argmax(eigenvalues))]
-        direction = self._normalize_vector(direction)
-        fallback_dir = self._normalize_vector(np.asarray(fallback_dir, dtype=float))
-        if np.dot(direction, fallback_dir) < 0:
-            direction = -direction
-        return direction
-
-    def _shared_pair_heading(self, left_spline: PlantSpline, right_spline: PlantSpline, fallback_yaw: float) -> float:
-        vectors = []
-        if left_spline is not None and left_spline.valid:
-            vectors.append(np.array([math.cos(left_spline.get_direction(left_spline.t_max)), math.sin(left_spline.get_direction(left_spline.t_max))]))
-        if right_spline is not None and right_spline.valid:
-            vectors.append(np.array([math.cos(right_spline.get_direction(right_spline.t_max)), math.sin(right_spline.get_direction(right_spline.t_max))]))
-        if not vectors:
-            return float(fallback_yaw)
-        shared_vec = self._normalize_vector(np.sum(vectors, axis=0))
-        return float(math.atan2(shared_vec[1], shared_vec[0]))
-
-    def _march_row_pair_clusters(self, left_spline: PlantSpline, right_spline: PlantSpline) -> Tuple[np.ndarray, np.ndarray, float]:
-        if left_spline is None or right_spline is None or not left_spline.valid or not right_spline.valid:
-            return np.empty((0, 2), dtype=float), np.empty((0, 2), dtype=float), float(self.robot_pose.yaw if self.robot_pose else 0.0)
-
-        step_distance = 0.5
-        forward_max_dist = 2.0
-        orthogonal_max_dist = 0.5
-        cluster_radius = max(0.12, float(self.p.row_cluster_radius))
-
-        left_end = np.array(left_spline.evaluate(left_spline.t_max), dtype=float)
-        right_end = np.array(right_spline.evaluate(right_spline.t_max), dtype=float)
-        pair_center = 0.5 * (left_end + right_end)
-        shared_heading_yaw = self._shared_pair_heading(left_spline, right_spline, self.robot_pose.yaw if self.robot_pose else 0.0)
-        shared_dir = self._normalize_vector(np.array([math.cos(shared_heading_yaw), math.sin(shared_heading_yaw)], dtype=float))
-
-        collected_left: List[np.ndarray] = []
-        collected_right: List[np.ndarray] = []
-        remaining_points = self.get_map_points_in_roi(Pose2D(pair_center[0], pair_center[1], shared_heading_yaw), 4.5)
-        if len(remaining_points) == 0:
-            return np.empty((0, 2), dtype=float), np.empty((0, 2), dtype=float), shared_heading_yaw
-
-        left_points_ref = np.array(self.left_row_points, copy=True) if self.left_row_points is not None else np.empty((0, 2), dtype=float)
-        right_points_ref = np.array(self.right_row_points, copy=True) if self.right_row_points is not None else np.empty((0, 2), dtype=float)
-
-        for _ in range(12):
-            pair_perp = np.array([-shared_dir[1], shared_dir[0]], dtype=float)
-            rel = remaining_points - pair_center
-            along = rel @ shared_dir
-            orth = rel @ pair_perp
-            candidate_mask = (along >= 0.0) & (along <= forward_max_dist) & (np.abs(orth) <= orthogonal_max_dist)
-            candidate_points = remaining_points[candidate_mask]
-            if len(candidate_points) == 0:
-                break
-
-            clusters_with_idx = self._cluster_nearby_points_with_indices(candidate_points, cluster_radius)
-            if not clusters_with_idx:
-                break
-
-            left_ref = float((left_end - pair_center) @ pair_perp)
-            right_ref = float((right_end - pair_center) @ pair_perp)
-            step_left_clusters: List[np.ndarray] = []
-            step_right_clusters: List[np.ndarray] = []
-
-            # Track assigned indices relative to candidate_points to ensure exclusivity
-            assigned_candidate_indices = set()
-            candidate_idx_map = np.where(candidate_mask)[0]
-
-            for cluster, rel_indices in clusters_with_idx:
-                # map cluster-relative indices to indices into remaining_points via candidate_idx_map
-                mapped = [int(candidate_idx_map[i]) for i in rel_indices]
-                # skip if any point already assigned
-                if any(mi in assigned_candidate_indices for mi in mapped):
-                    continue
-
-                centroid = np.mean(cluster, axis=0)
-                centroid_rel = centroid - pair_center
-                centroid_along = float(centroid_rel @ shared_dir)
-                centroid_orth = float(centroid_rel @ pair_perp)
-                if centroid_along < 0.0 or centroid_along > forward_max_dist or abs(centroid_orth) > orthogonal_max_dist:
-                    continue
-                d_left = abs(centroid_orth - left_ref)
-                d_right = abs(centroid_orth - right_ref)
-                if d_left <= d_right:
-                    step_left_clusters.append(cluster)
-                    assigned_candidate_indices.update(mapped)
-                else:
-                    step_right_clusters.append(cluster)
-                    assigned_candidate_indices.update(mapped)
-
-            if not step_left_clusters and not step_right_clusters:
-                break
-
-            if step_left_clusters:
-                left_step_points = np.vstack(step_left_clusters)
-                collected_left.append(left_step_points)
-            else:
-                left_step_points = np.empty((0, 2), dtype=float)
-            if step_right_clusters:
-                right_step_points = np.vstack(step_right_clusters)
-                collected_right.append(right_step_points)
-            else:
-                right_step_points = np.empty((0, 2), dtype=float)
-
-            left_dir = self._direction_from_points(left_step_points, shared_dir) if len(left_step_points) > 0 else shared_dir
-            right_dir = self._direction_from_points(right_step_points, shared_dir) if len(right_step_points) > 0 else shared_dir
-            shared_dir = self._normalize_vector(left_dir + right_dir)
-            shared_heading_yaw = float(math.atan2(shared_dir[1], shared_dir[0]))
-
-            # Remove consumed points from remaining_points using assigned_candidate_indices
-            if len(assigned_candidate_indices) > 0:
-                keep_mask = np.ones(len(remaining_points), dtype=bool)
-                for idx in sorted(assigned_candidate_indices):
-                    keep_mask[idx] = False
-                remaining_points = remaining_points[keep_mask]
-            pair_center = pair_center + shared_dir * step_distance
-            left_end = left_end + shared_dir * step_distance
-            right_end = right_end + shared_dir * step_distance
-            if len(remaining_points) == 0:
-                break
-
-        left_out = np.vstack(collected_left) if collected_left else np.empty((0, 2), dtype=float)
-        right_out = np.vstack(collected_right) if collected_right else np.empty((0, 2), dtype=float)
-        return left_out, right_out, shared_heading_yaw
+    def mean_yaw(self, yaws: List[float]) -> float:
+        if len(yaws) == 0:
+            return 0.0
+        sx = float(sum(math.cos(yaw) for yaw in yaws))
+        sy = float(sum(math.sin(yaw) for yaw in yaws))
+        if abs(sx) < 1e-9 and abs(sy) < 1e-9:
+            return float(yaws[0])
+        return float(math.atan2(sy, sx))
 
     def _march_pair_startpoints(
         self,
@@ -1323,134 +1250,121 @@ class MaizeNavigator(Node):
         right_chain: np.ndarray,
         initial_heading_yaw: float,
     ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, float]:
-        # Exact paired process: from two startpoints build two parallel lines,
-        # assign clusters uniquely, fit new parallel direction, step 0.5m, repeat.
-        step_distance = 0.5
-        forward_max_dist = 2.0
-        orthogonal_max_dist = 0.5
-        cluster_radius = max(0.12, float(self.p.row_cluster_radius))
+        knot_spacing = 0.30
+        row_half_width = max(0.18, float(self.p.row_extension_max_spline_distance))
+        corridor_half_width = max(0.35, float(self.p.expected_row_width * 0.80))
+        max_empty_advance = 2.0
 
         left_chain = np.asarray(left_chain, dtype=float)
         right_chain = np.asarray(right_chain, dtype=float)
         if len(left_chain) == 0 or len(right_chain) == 0:
-            return left_chain, right_chain, np.empty((0, 2), dtype=float), np.empty((0, 2), dtype=float), float(initial_heading_yaw)
+            empty = np.empty((0, 2), dtype=float)
+            return left_chain, right_chain, empty, empty, float(initial_heading_yaw)
 
         left_start = np.array(left_chain[-1], dtype=float)
         right_start = np.array(right_chain[-1], dtype=float)
-        # Start with the robot heading directly; later iterations can refine the direction.
-        heading_vec = self._normalize_vector(np.array([math.cos(initial_heading_yaw), math.sin(initial_heading_yaw)], dtype=float))
-        shared_dir = np.array(heading_vec, copy=True)
-
         pair_center = 0.5 * (left_start + right_start)
+        pair_vector = right_start - left_start
+        pair_perp = self._normalize_vector(np.array([-pair_vector[1], pair_vector[0]], dtype=float))
+
+        field_dir = self._normalize_vector(np.array([math.cos(initial_heading_yaw), math.sin(initial_heading_yaw)], dtype=float))
+        if np.dot(field_dir, pair_vector) < 0:
+            field_dir = -field_dir
+
         remaining_points = self.get_map_points_in_roi(Pose2D(pair_center[0], pair_center[1], initial_heading_yaw), 6.0)
         if len(remaining_points) == 0:
-            return left_chain, right_chain, np.empty((0, 2), dtype=float), np.empty((0, 2), dtype=float), float(initial_heading_yaw)
+            empty = np.empty((0, 2), dtype=float)
+            return left_chain, right_chain, empty, empty, float(initial_heading_yaw)
 
         added_left_points: List[np.ndarray] = []
         added_right_points: List[np.ndarray] = []
+        empty_progress = 0.0
+        steps = 0
+        max_steps = int(math.ceil(max_empty_advance / knot_spacing)) + 12
 
-        for step_idx in range(24):
-            pair_perp = np.array([-shared_dir[1], shared_dir[0]], dtype=float)
-            current_forward_max_dist = step_distance if step_idx == 0 else forward_max_dist
-            clusters_with_idx = self._cluster_nearby_points_with_indices(remaining_points, cluster_radius)
-            if not clusters_with_idx:
-                break
-
-            assigned_left: List[np.ndarray] = []
-            assigned_right: List[np.ndarray] = []
-            consumed_indices: List[int] = []
-
-            # Track indices into remaining_points already assigned this step
-            assigned_indices_set = set()
+        while steps < max_steps:
+            steps += 1
+            pair_perp = self._normalize_vector(np.array([-field_dir[1], field_dir[0]], dtype=float))
             left_ref = float((left_start - pair_center) @ pair_perp)
             right_ref = float((right_start - pair_center) @ pair_perp)
+            pair_center = 0.5 * (left_start + right_start)
 
-            for cluster, rel_indices in clusters_with_idx:
-                # skip if any member was already assigned
-                if any(int(i) in assigned_indices_set for i in rel_indices):
-                    continue
+            rel = remaining_points - pair_center
+            along = rel @ field_dir
+            orth = rel @ pair_perp
 
-                cluster_rel = cluster - pair_center
-                cluster_along = cluster_rel @ shared_dir
-                cluster_lateral = cluster_rel @ pair_perp
+            forward_mask = (along >= 0.0) & (along <= knot_spacing)
+            corridor_mask = (np.abs(orth) <= corridor_half_width)
+            current_mask = forward_mask & corridor_mask
+            current_points = remaining_points[current_mask]
 
-                left_mask = (cluster_along >= 0.0) & (cluster_along <= current_forward_max_dist) & (np.abs(cluster_lateral - left_ref) <= orthogonal_max_dist)
-                right_mask = (cluster_along >= 0.0) & (cluster_along <= current_forward_max_dist) & (np.abs(cluster_lateral - right_ref) <= orthogonal_max_dist)
+            left_mask = current_mask & (np.abs(orth - left_ref) <= row_half_width)
+            right_mask = current_mask & (np.abs(orth - right_ref) <= row_half_width)
+            left_points = remaining_points[left_mask]
+            right_points = remaining_points[right_mask]
 
-                if not np.any(left_mask) and not np.any(right_mask):
-                    continue
+            if len(left_points) == 0 and len(right_points) == 0:
+                empty_progress += knot_spacing
+                if self.get_logger():
+                    self.get_logger().info(f"RANSAC step empty: empty_progress={empty_progress:.2f}m")
+                if empty_progress > max_empty_advance:
+                    break
+                left_start = left_start + field_dir * knot_spacing
+                right_start = right_start + field_dir * knot_spacing
+                left_chain = np.vstack((left_chain, left_start))
+                right_chain = np.vstack((right_chain, right_start))
+                continue
 
-                both_mask = left_mask & right_mask
-                left_only_mask = left_mask & (~right_mask)
-                right_only_mask = right_mask & (~left_mask)
-                if np.any(both_mask):
-                    choose_left_both = np.abs(cluster_lateral[both_mask] - left_ref) <= np.abs(cluster_lateral[both_mask] - right_ref)
-                    left_only_mask = left_only_mask | (both_mask & choose_left_both)
-                    right_only_mask = right_only_mask | (both_mask & (~choose_left_both))
+            empty_progress = 0.0
 
-                left_indices = np.where(left_only_mask)[0]
-                right_indices = np.where(right_only_mask)[0]
-                if len(left_indices) > 0:
-                    assigned_left.append(cluster[left_indices])
-                    mapped_indices = [int(rel_indices[i]) for i in left_indices]
-                    assigned_indices_set.update(mapped_indices)
-                    consumed_indices.extend(mapped_indices)
-                if len(right_indices) > 0:
-                    assigned_right.append(cluster[right_indices])
-                    mapped_indices = [int(rel_indices[i]) for i in right_indices]
-                    assigned_indices_set.update(mapped_indices)
-                    consumed_indices.extend(mapped_indices)
-
-            if not assigned_left and not assigned_right:
-                break
-
-            left_pts = np.vstack(assigned_left) if assigned_left else np.empty((0, 2), dtype=float)
-            right_pts = np.vstack(assigned_right) if assigned_right else np.empty((0, 2), dtype=float)
-
-            if len(left_pts) > 0:
-                added_left_points.append(left_pts)
-            if len(right_pts) > 0:
-                added_right_points.append(right_pts)
-
-            # Keep robot heading for the very first march iteration to avoid 90deg flips;
-            # allow cluster-based refinement afterwards.
-            if step_idx == 0:
-                shared_dir = np.array(heading_vec, copy=True)
+            direction_source = current_points if len(current_points) >= 2 else np.vstack((left_points, right_points))
+            if len(direction_source) >= 2:
+                ransac_origin, ransac_dir = self._fit_ransac_line(direction_source, field_dir, iterations=40, inlier_threshold=max(0.05, knot_spacing * 0.25))
             else:
-                left_dir = self._direction_from_points(left_pts, heading_vec) if len(left_pts) > 0 else heading_vec
-                right_dir = self._direction_from_points(right_pts, heading_vec) if len(right_pts) > 0 else heading_vec
-                # Robustness: require enough assigned points and limited angular deviation
-                total_assigned = int(len(left_pts) + len(right_pts))
-                min_assigned_points = 6
-                max_angle_rad = math.radians(30.0)
-                candidate = self._normalize_vector(left_dir + right_dir)
-                cand_yaw = float(math.atan2(candidate[1], candidate[0]))
-                heading_yaw = float(math.atan2(heading_vec[1], heading_vec[0]))
-                angle_diff = abs(wrap_to_pi(cand_yaw - heading_yaw))
-                if total_assigned >= min_assigned_points and angle_diff <= max_angle_rad:
-                    shared_dir = candidate
-                else:
-                    # keep previous shared_dir (no large, unsupported rotation)
-                    shared_dir = np.array(shared_dir, copy=True)
+                ransac_origin = pair_center
+                ransac_dir = np.array(field_dir, copy=True)
+            if np.dot(ransac_dir, field_dir) < 0:
+                ransac_dir = -ransac_dir
+            pair_perp = self._normalize_vector(np.array([-field_dir[1], field_dir[0]], dtype=float))
 
-            new_left_start = left_start + step_distance * shared_dir
-            new_right_start = right_start + step_distance * shared_dir
-            left_chain = np.vstack((left_chain, new_left_start))
-            right_chain = np.vstack((right_chain, new_right_start))
-            left_start = new_left_start
-            right_start = new_right_start
+            def build_knot(row_points: np.ndarray, row_start: np.ndarray, row_ref: float) -> Tuple[np.ndarray, bool]:
+                if len(row_points) == 0:
+                    return row_start + field_dir * knot_spacing, False
+                row_mean = np.mean(row_points, axis=0)
+                row_offset = float((row_mean - ransac_origin) @ pair_perp)
+                knot = row_mean - row_offset * pair_perp
+                projected = float((knot - ransac_origin) @ field_dir)
+                target_along = max(knot_spacing, projected)
+                knot = ransac_origin + target_along * field_dir + row_ref * pair_perp
+                return knot, True
 
-            if len(consumed_indices) > 0:
-                keep_mask = np.ones(len(remaining_points), dtype=bool)
-                for idx in sorted(set(consumed_indices)):
-                    keep_mask[idx] = False
-                remaining_points = remaining_points[keep_mask]
+            left_knot, left_ok = build_knot(left_points, left_start, left_ref)
+            right_knot, right_ok = build_knot(right_points, right_start, right_ref)
+
+            if self.get_logger():
+                self.get_logger().info(
+                    f"RANSAC knot step: left_n={len(left_points)}, right_n={len(right_points)}, dir_yaw={math.degrees(math.atan2(field_dir[1], field_dir[0])):.1f}deg"
+                )
+
+            left_start = np.array(left_knot, copy=True)
+            right_start = np.array(right_knot, copy=True)
+            left_chain = np.vstack((left_chain, left_start))
+            right_chain = np.vstack((right_chain, right_start))
+
+            if left_ok:
+                added_left_points.append(left_points)
+            if right_ok:
+                added_right_points.append(right_points)
+
+            keep_mask = np.ones(len(remaining_points), dtype=bool)
+            keep_mask[current_mask] = False
+            remaining_points = remaining_points[keep_mask]
             if len(remaining_points) == 0:
                 break
 
         new_pts_l = np.vstack(added_left_points) if added_left_points else np.empty((0, 2), dtype=float)
         new_pts_r = np.vstack(added_right_points) if added_right_points else np.empty((0, 2), dtype=float)
-        heading_yaw = float(math.atan2(shared_dir[1], shared_dir[0]))
+        heading_yaw = float(math.atan2(field_dir[1], field_dir[0]))
         return left_chain, right_chain, new_pts_l, new_pts_r, heading_yaw
 
     def handle_exit_row(self):
