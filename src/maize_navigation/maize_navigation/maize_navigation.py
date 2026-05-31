@@ -118,11 +118,13 @@ class NavigatorParams:
     follow_speed: float = 0.20
     lookahead_distance: float = 1.10
     yaw_kp: float = 0.6
+    pure_pursuit_gain: float = 1.0
     max_angular_speed: float = 0.40
     min_follow_turn_radius: float = 0.37
     angular_rate_limit: float = 1.2
     target_filter_alpha: float = 0.35
     row_exit_extension_distance: float = 0.30
+    row_turn_waypoint_outward_offset: float = 0.50
     path_goal_xy_tolerance: float = 0.20
 
     pattern: str = "1L 2R"
@@ -159,6 +161,8 @@ class MaizeNavigator(Node):
         self.entrance_hist_peaks: List[EntrancePeak] = []
         self.entrance_target: Optional[np.ndarray] = None
         self.entrance_target_direction: Optional[np.ndarray] = None
+        self.entrance_waypoint: Optional[np.ndarray] = None
+        self.entrance_waypoint_reached: bool = False
         self.pending_target_peaks: Optional[Tuple[EntrancePeak, EntrancePeak]] = None
 
         self.tf_buffer = tf2_ros.Buffer()
@@ -209,11 +213,15 @@ class MaizeNavigator(Node):
         p.follow_speed = float(get_param("follow_speed", p.follow_speed))
         p.lookahead_distance = float(get_param("lookahead_distance", p.lookahead_distance))
         p.yaw_kp = float(get_param("yaw_kp", p.yaw_kp))
+        p.pure_pursuit_gain = float(get_param("pure_pursuit_gain", p.pure_pursuit_gain))
         p.max_angular_speed = float(get_param("follow_max_angular_speed", p.max_angular_speed))
         p.min_follow_turn_radius = float(get_param("min_follow_turn_radius", p.min_follow_turn_radius))
         p.angular_rate_limit = float(get_param("angular_rate_limit", p.angular_rate_limit))
         p.target_filter_alpha = float(get_param("target_filter_alpha", p.target_filter_alpha))
         p.row_exit_extension_distance = float(get_param("row_exit_extension_distance", p.row_exit_extension_distance))
+        p.row_turn_waypoint_outward_offset = float(
+            get_param("row_turn_waypoint_outward_offset", p.row_turn_waypoint_outward_offset)
+        )
         p.path_goal_xy_tolerance = float(get_param("path_goal_xy_tolerance", p.path_goal_xy_tolerance))
 
         p.pattern = str(get_param("pattern", p.pattern))
@@ -237,6 +245,8 @@ class MaizeNavigator(Node):
         self.p.angular_rate_limit = max(0.01, self.p.angular_rate_limit)
         self.p.target_filter_alpha = float(np.clip(self.p.target_filter_alpha, 0.01, 1.0))
         self.p.row_exit_extension_distance = max(0.0, self.p.row_exit_extension_distance)
+        self.p.row_turn_waypoint_outward_offset = max(0.0, self.p.row_turn_waypoint_outward_offset)
+        self.p.pure_pursuit_gain = max(0.05, self.p.pure_pursuit_gain)
         self.p.starting_lane_number = max(1, self.p.starting_lane_number)
         self.p.row_numbers_increase_to = self.p.row_numbers_increase_to.lower()
         if self.p.row_numbers_increase_to not in ("left", "right"):
@@ -283,6 +293,8 @@ class MaizeNavigator(Node):
         self.entrance_hist_peaks = []
         self.entrance_target = None
         self.entrance_target_direction = None
+        self.entrance_waypoint = None
+        self.entrance_waypoint_reached = False
         self.pending_target_peaks = None
 
     def parse_pattern(self, pattern: str) -> List[PatternStep]:
@@ -400,6 +412,15 @@ class MaizeNavigator(Node):
                 return
 
         robot_xy = np.array([self.robot_pose.x, self.robot_pose.y], dtype=float)
+        if self.entrance_waypoint is not None and not self.entrance_waypoint_reached:
+            if float(np.linalg.norm(robot_xy - self.entrance_waypoint)) <= self.p.path_goal_xy_tolerance:
+                self.entrance_waypoint_reached = True
+                self.reset_controller_state()
+                self.get_logger().info("Headland waypoint reached. Driving to the new row entrance.")
+            else:
+                self.drive_to_point(self.entrance_waypoint)
+                return
+
         if float(np.linalg.norm(robot_xy - self.entrance_target)) <= self.p.path_goal_xy_tolerance:
             self.initialize_selected_entrance_rows()
             return
@@ -452,7 +473,16 @@ class MaizeNavigator(Node):
         first.selected = True
         second.selected = True
         self.pending_target_peaks = (first, second)
-        self.entrance_target = 0.5 * (first.point + second.point)
+        target_row_end = 0.5 * (first.point + second.point)
+        self.entrance_target = target_row_end + self.p.row_exit_extension_distance * outgoing
+        turn_start = self.row_exit_goal
+        if turn_start is None:
+            turn_start = center + self.p.row_exit_extension_distance * outgoing
+        self.entrance_waypoint = (
+            0.5 * (np.asarray(turn_start, dtype=float) + self.entrance_target)
+            + self.p.row_turn_waypoint_outward_offset * outgoing
+        )
+        self.entrance_waypoint_reached = False
         self.entrance_target_direction = -outgoing
         self.pattern_index += 1
         self.finish_after_current_row = self.pattern_index >= len(self.pattern_steps)
@@ -1015,6 +1045,7 @@ class MaizeNavigator(Node):
 
         dx = float(filtered_target[0] - self.robot_pose.x)
         dy = float(filtered_target[1] - self.robot_pose.y)
+        target_distance = math.hypot(dx, dy)
         target_yaw = math.atan2(dy, dx)
         yaw_error = wrap_to_pi(target_yaw - self.robot_pose.yaw)
 
@@ -1023,7 +1054,11 @@ class MaizeNavigator(Node):
         cmd.linear.x = self.p.follow_speed * speed_factor
         radius_limited_angular = abs(cmd.linear.x) / self.p.min_follow_turn_radius
         max_angular = min(self.p.max_angular_speed, radius_limited_angular)
-        angular_raw = float(np.clip(self.p.yaw_kp * yaw_error, -max_angular, max_angular))
+        # Pure-pursuit curvature is calmer around the midline than a direct
+        # proportional yaw correction and still works for headland waypoints.
+        pursuit_distance = max(0.10, target_distance)
+        pursuit_angular = self.p.pure_pursuit_gain * 2.0 * cmd.linear.x * math.sin(yaw_error) / pursuit_distance
+        angular_raw = float(np.clip(pursuit_angular, -max_angular, max_angular))
 
         dt = 1.0 / max(1e-6, self.p.control_frequency)
         max_delta = self.p.angular_rate_limit * dt
@@ -1111,6 +1146,17 @@ class MaizeNavigator(Node):
             label = "?" if peak.row_number is None else str(peak.row_number)
             markers.markers.append(self.create_text_marker("entrance_histogram_row_numbers", marker_id, peak.point, label, color, stamp))
             marker_id += 1
+        if self.entrance_waypoint is not None:
+            markers.markers.append(
+                self.create_sphere_marker("entrance_waypoint", marker_id, self.entrance_waypoint, (1.0, 0.75, 0.0, 1.0), 0.24, stamp)
+            )
+            marker_id += 1
+            if self.row_exit_goal is not None and self.entrance_target is not None:
+                turn_route = np.vstack((self.row_exit_goal, self.entrance_waypoint, self.entrance_target))
+                markers.markers.append(
+                    self.create_line_marker("entrance_turn_route", marker_id, turn_route, (1.0, 0.75, 0.0, 0.9), 0.045, stamp)
+                )
+                marker_id += 1
         if self.entrance_target is not None:
             markers.markers.append(self.create_sphere_marker("entrance_target", marker_id, self.entrance_target, (0.9, 0.1, 1.0, 1.0), 0.26, stamp))
             marker_id += 1

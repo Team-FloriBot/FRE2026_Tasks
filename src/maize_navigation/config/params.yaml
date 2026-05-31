@@ -66,12 +66,15 @@ maize_navigator:
     enter_speed: 0.22
     turn_speed: 0.24
     yaw_kp: 0.6
+    pure_pursuit_gain: 1.0
     heading_kp: 1.2
     lateral_kp: 1.0
     stanley_min_speed: 0.10
     min_follow_turn_radius: 0.37
     target_filter_alpha: 0.35
     row_exit_extension_distance: 0.30
+    # Zwischenpunkt der Wendekurve liegt zusaetzlich so weit vom Feld entfernt.
+    row_turn_waypoint_outward_offset: 0.50
 
     max_linear_speed: 0.35
     max_angular_speed: 1.40
