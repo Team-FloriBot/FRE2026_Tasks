@@ -6,16 +6,16 @@ pure_pursuit_node:
     global_frame: "odom"
     base_link_frame: "base_link"
 
-    lookahead_min: 0.5
-    lookahead_max: 2.5
-    lookahead_gain: 1.0
+    lookahead_min: 0.25
+    lookahead_max: 0.80
+    lookahead_gain: 0.15
 
-    max_speed: 2.0
-    min_speed: 0.3
+    max_speed: 0.8
+    min_speed: 0.2
 
-    curvature_gain: 1.5
-    max_angular_velocity: 2.0
-    
+    curvature_gain: 3.0
+    max_angular_velocity: 3.0
+
     goal_tolerance: 0.15
 
     control_rate: 20.0

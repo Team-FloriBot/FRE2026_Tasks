@@ -252,15 +252,53 @@ private:
         double ld = lookahead_distance();
         auto lookahead = get_lookahead(idx, ld);
 
-        double dx = lookahead.x - robot.pose.position.x;
-        double dy = lookahead.y - robot.pose.position.y;
+        // Lookahead-Punkt im Pfad-Frame
+        geometry_msgs::msg::PoseStamped lookahead_pose;
+        lookahead_pose.header.frame_id = path_.header.frame_id;
+        lookahead_pose.header.stamp = this->now();
+        lookahead_pose.pose.position = lookahead;
+        lookahead_pose.pose.orientation.w = 1.0;
 
-        double alpha = std::atan2(dy, dx);
-        double dist = std::hypot(dx, dy);
+        // Transformiere Lookahead in base_link
+        geometry_msgs::msg::PoseStamped lookahead_base;
 
-        if (dist < 0.05) return;
+        try
+        {
+            auto tf = tf_buffer_->lookupTransform(
+                "base_link",
+                path_.header.frame_id,
+                tf2::TimePointZero);
 
-        double curvature = 2.0 * std::sin(alpha) / dist;
+            tf2::doTransform(
+                lookahead_pose,
+                lookahead_base,
+                tf);
+        }
+        catch (const tf2::TransformException & ex)
+        {
+            RCLCPP_WARN_THROTTLE(
+                get_logger(),
+                *get_clock(),
+                1000,
+                "Lookahead TF failed: %s",
+                ex.what());
+
+            return;
+        }
+
+        // Pure Pursuit arbeitet im Fahrzeugkoordinatensystem
+        double x = lookahead_base.pose.position.x;
+        double y = lookahead_base.pose.position.y;
+
+        double dist = std::hypot(x, y);
+
+        if (dist < 0.05)
+            return;
+
+        double alpha = std::atan2(y, x);
+
+        double curvature =
+            2.0 * std::sin(alpha) / dist;
 
         double v = max_speed_ / (1.0 + curvature_gain_ * std::abs(curvature));
         v = std::clamp(v, min_speed_, max_speed_);
