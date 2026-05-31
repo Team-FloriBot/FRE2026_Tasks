@@ -69,8 +69,9 @@ maize_navigator:
     heading_kp: 1.2
     lateral_kp: 1.0
     stanley_min_speed: 0.10
-    min_follow_turn_radius: 1.0
+    min_follow_turn_radius: 0.37
     target_filter_alpha: 0.35
+    row_exit_extension_distance: 0.30
 
     max_linear_speed: 0.35
     max_angular_speed: 1.40
@@ -91,6 +92,10 @@ maize_navigator:
     enter_distance: 0.90
 
     pattern: "1L 2R 1L 3R"
+    # Startgasse 1 liegt zwischen Pflanzenreihe 1 und 2.
+    # Die Richtung gilt feldfest relativ zur Blickrichtung beim Missionsstart.
+    starting_lane_number: 1
+    row_numbers_increase_to: "left"
 
     row_shift_count: 1
     row_shift_direction: "L"
