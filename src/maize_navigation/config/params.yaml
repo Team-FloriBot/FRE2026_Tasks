@@ -93,10 +93,10 @@ maize_navigator:
     turn_min_angular_speed: 0.30
 
     path_goal_xy_tolerance: 0.25
-    path_goal_yaw_tolerance: 0.5
+    path_goal_yaw_tolerance: 0.75
     # Fuer Reihenende, Wendepunkt und neue Einfahrt: groessere Pose-Toleranz.
     maneuver_goal_xy_tolerance: 0.25
-    maneuver_goal_yaw_tolerance: 0.5
+    maneuver_goal_yaw_tolerance: 0.75
     # Virtueller Fuehrungspunkt hinter der Zielpose verhindert Drehen auf der Stelle.
     maneuver_heading_lookahead_distance: 0.1
 
