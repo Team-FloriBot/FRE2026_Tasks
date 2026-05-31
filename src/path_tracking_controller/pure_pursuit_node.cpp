@@ -36,6 +36,7 @@ public:
         control_rate_ = get_parameter("control_rate").as_double();
 
         cmd_vel_pub_ = create_publisher<geometry_msgs::msg::Twist>("/cmd_vel", 10);
+        debug_pub_ = create_publisher<visualization_msgs::msg::MarkerArray>("/pure_pursuit/debug", 10);
         path_sub_ = create_subscription<nav_msgs::msg::Path>(
             "/plan", 10,
             std::bind(&PurePursuitNode::path_callback, this, std::placeholders::_1));
@@ -50,6 +51,7 @@ public:
 
 private:
     rclcpp::Publisher<geometry_msgs::msg::Twist>::SharedPtr cmd_vel_pub_;
+    rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr debug_pub_;
     rclcpp::Subscription<nav_msgs::msg::Path>::SharedPtr path_sub_;
     rclcpp::TimerBase::SharedPtr timer_;
 
@@ -176,6 +178,65 @@ private:
         return path_.poses[idx].pose.position;
     }
 
+    void publish_debug(const geometry_msgs::msg::PoseStamped & robot,
+                   const geometry_msgs::msg::Point & lookahead,
+                   size_t idx)
+    {
+        visualization_msgs::msg::MarkerArray arr;
+
+        auto mk = [&](int id, double x, double y,
+                      float r, float g, float b)
+        {
+            visualization_msgs::msg::Marker m;
+            m.header.frame_id = path_.header.frame_id;
+            m.header.stamp = this->now();
+
+            m.ns = "pp_debug";
+            m.id = id;
+            m.type = visualization_msgs::msg::Marker::SPHERE;
+            m.action = visualization_msgs::msg::Marker::ADD;
+
+            m.pose.position.x = x;
+            m.pose.position.y = y;
+            m.pose.position.z = 0.0;
+
+            m.scale.x = 0.25;
+            m.scale.y = 0.25;
+            m.scale.z = 0.25;
+
+            m.color.a = 1.0;
+            m.color.r = r;
+            m.color.g = g;
+            m.color.b = b;
+
+            return m;
+        };
+
+        // Robot (rot)
+        arr.markers.push_back(
+            mk(0,
+              robot.pose.position.x,
+              robot.pose.position.y,
+              1.0, 0.0, 0.0));
+
+        // Lookahead (grün)
+        arr.markers.push_back(
+            mk(1,
+              lookahead.x,
+              lookahead.y,
+              0.0, 1.0, 0.0));
+
+        // Target Index (blau)
+        auto & p = path_.poses[idx].pose.position;
+        arr.markers.push_back(
+            mk(2,
+              p.x,
+              p.y,
+              0.0, 0.0, 1.0));
+
+        debug_pub_->publish(arr);
+    }
+
     // =========================
     // CONTROL
     // =========================
@@ -212,6 +273,7 @@ private:
         cmd.linear.x = v;
         cmd.angular.z = omega;
         cmd_vel_pub_->publish(cmd);
+        publish_debug(robot, lookahead, idx);
     }
 };
 
