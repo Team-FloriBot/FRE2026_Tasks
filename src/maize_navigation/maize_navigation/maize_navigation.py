@@ -131,6 +131,7 @@ class NavigatorParams:
     angular_rate_limit: float = 1.2
     target_filter_alpha: float = 0.35
     row_exit_extension_distance: float = 0.30
+    row_end_goal_outward_distance: float = 0.30
     path_goal_xy_tolerance: float = 0.20
     maneuver_goal_xy_tolerance: float = 0.35
     maneuver_goal_yaw_tolerance: float = 0.45
@@ -237,6 +238,9 @@ class MaizeNavigator(Node):
         p.angular_rate_limit = float(get_param("angular_rate_limit", p.angular_rate_limit))
         p.target_filter_alpha = float(get_param("target_filter_alpha", p.target_filter_alpha))
         p.row_exit_extension_distance = float(get_param("row_exit_extension_distance", p.row_exit_extension_distance))
+        p.row_end_goal_outward_distance = float(
+            get_param("row_end_goal_outward_distance", p.row_end_goal_outward_distance)
+        )
         p.path_goal_xy_tolerance = float(get_param("path_goal_xy_tolerance", p.path_goal_xy_tolerance))
         p.maneuver_goal_xy_tolerance = float(get_param("maneuver_goal_xy_tolerance", p.maneuver_goal_xy_tolerance))
         p.maneuver_goal_yaw_tolerance = float(get_param("maneuver_goal_yaw_tolerance", p.maneuver_goal_yaw_tolerance))
@@ -268,6 +272,7 @@ class MaizeNavigator(Node):
         self.p.angular_rate_limit = max(0.01, self.p.angular_rate_limit)
         self.p.target_filter_alpha = float(np.clip(self.p.target_filter_alpha, 0.01, 1.0))
         self.p.row_exit_extension_distance = max(0.0, self.p.row_exit_extension_distance)
+        self.p.row_end_goal_outward_distance = max(0.0, self.p.row_end_goal_outward_distance)
         self.p.pure_pursuit_gain = max(0.05, self.p.pure_pursuit_gain)
         self.p.slow_speed = float(np.clip(self.p.slow_speed, 0.0, self.p.follow_speed))
         self.p.curve_speed_reduction_gain = max(0.0, self.p.curve_speed_reduction_gain)
@@ -582,19 +587,20 @@ class MaizeNavigator(Node):
         second.selected = True
         self.pending_target_peaks = (first, second)
         target_row_end = 0.5 * (first.point + second.point)
-        self.entrance_target = target_row_end + self.p.row_exit_extension_distance * outgoing
+        self.entrance_target = target_row_end + self.p.row_end_goal_outward_distance * outgoing
         turn_start = self.row_exit_goal
         if turn_start is None:
-            turn_start = center + self.p.row_exit_extension_distance * outgoing
+            turn_start = center + self.p.row_end_goal_outward_distance * outgoing
         turn_start = np.asarray(turn_start, dtype=float)
         transfer_direction = self.normalize(self.entrance_target - turn_start)
+        outward_offset = self.p.row_exit_extension_distance * outgoing
         if step.lane_shift == 1:
-            self.entrance_waypoints = [0.5 * (turn_start + self.entrance_target)]
+            self.entrance_waypoints = [0.5 * (turn_start + self.entrance_target) + outward_offset]
         else:
             waypoint_offset = self.p.row_exit_extension_distance * transfer_direction
             self.entrance_waypoints = [
-                turn_start + waypoint_offset,
-                self.entrance_target - waypoint_offset,
+                turn_start + waypoint_offset + outward_offset,
+                self.entrance_target - waypoint_offset + outward_offset,
             ]
         self.entrance_waypoint_index = 0
         self.entrance_target_direction = -outgoing
@@ -911,7 +917,7 @@ class MaizeNavigator(Node):
                 farther_end = left_end if float(left_end @ self.row_end_direction) >= float(right_end @ self.row_end_direction) else right_end
                 center_anchor = np.asarray(self.midline[-1], dtype=float)
                 self.plant_row_end_point = self.project_point_to_line(farther_end, center_anchor, self.row_end_direction)
-                self.row_exit_goal = self.plant_row_end_point + self.p.row_exit_extension_distance * self.row_end_direction
+                self.row_exit_goal = self.plant_row_end_point + self.p.row_end_goal_outward_distance * self.row_end_direction
                 self.row_exit_heading_goal = (
                     self.row_exit_goal
                     + self.p.maneuver_heading_lookahead_distance * self.row_end_direction

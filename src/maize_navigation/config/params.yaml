@@ -77,6 +77,9 @@ maize_navigator:
     stanley_min_speed: 0.10
     min_follow_turn_radius: 0.37
     target_filter_alpha: 0.45
+    # Ausfahr- und Einfahrziel liegen so weit ausserhalb der Pflanzenenden.
+    row_end_goal_outward_distance: 0.30
+    # Seitlicher und zusaetzlicher aeusserer Versatz der Wende-Zwischenpunkte.
     row_exit_extension_distance: 0.50
 
     max_linear_speed: 0.45
