@@ -71,13 +71,13 @@ maize_navigator:
     turn_speed: 0.22
     yaw_kp: 0.6
     pure_pursuit_gain: 1.4
-    curve_speed_reduction_gain: 2.0
+    curve_speed_reduction_gain: 2.5
     heading_kp: 1.2
     lateral_kp: 1.0
     stanley_min_speed: 0.10
     min_follow_turn_radius: 0.37
     target_filter_alpha: 0.45
-    row_exit_extension_distance: 0.30
+    row_exit_extension_distance: 0.50
     # Zwischenpunkt der Wendekurve liegt zusaetzlich so weit vom Feld entfernt.
     row_turn_waypoint_outward_offset: 0.70
 
@@ -97,7 +97,7 @@ maize_navigator:
     maneuver_goal_xy_tolerance: 0.25
     maneuver_goal_yaw_tolerance: 0.35
     # Virtueller Fuehrungspunkt hinter der Zielpose verhindert Drehen auf der Stelle.
-    maneuver_heading_lookahead_distance: 0.2
+    maneuver_heading_lookahead_distance: 0.1
 
     exit_distance: 0.70
     turn_forward_distance: 2.20
