@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import csv
 import math
+import os
 import re
 from dataclasses import dataclass, field
+from datetime import datetime
 from enum import Enum
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 
@@ -118,9 +121,11 @@ class NavigatorParams:
     row_min_fit_points: int = 3
 
     follow_speed: float = 0.20
+    slow_speed: float = 0.12
     lookahead_distance: float = 1.10
     yaw_kp: float = 0.6
     pure_pursuit_gain: float = 1.0
+    curve_speed_reduction_gain: float = 1.0
     max_angular_speed: float = 0.40
     min_follow_turn_radius: float = 0.37
     angular_rate_limit: float = 1.2
@@ -128,6 +133,7 @@ class NavigatorParams:
     row_exit_extension_distance: float = 0.30
     row_turn_waypoint_outward_offset: float = 0.50
     path_goal_xy_tolerance: float = 0.20
+    row_map_output_directory: str = "~/.ros/maize_navigation"
 
     pattern: str = "1L 2R"
     starting_lane_number: int = 1
@@ -166,6 +172,8 @@ class MaizeNavigator(Node):
         self.entrance_waypoint: Optional[np.ndarray] = None
         self.entrance_waypoint_reached: bool = False
         self.pending_target_peaks: Optional[Tuple[EntrancePeak, EntrancePeak]] = None
+        self.stored_rows: Dict[int, np.ndarray] = {}
+        self.row_map_exported: bool = False
 
         self.tf_buffer = tf2_ros.Buffer()
         self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
@@ -215,9 +223,11 @@ class MaizeNavigator(Node):
         p.row_min_fit_points = int(get_param("row_min_fit_points", p.row_min_fit_points))
 
         p.follow_speed = float(get_param("follow_speed", p.follow_speed))
+        p.slow_speed = float(get_param("slow_speed", p.slow_speed))
         p.lookahead_distance = float(get_param("lookahead_distance", p.lookahead_distance))
         p.yaw_kp = float(get_param("yaw_kp", p.yaw_kp))
         p.pure_pursuit_gain = float(get_param("pure_pursuit_gain", p.pure_pursuit_gain))
+        p.curve_speed_reduction_gain = float(get_param("curve_speed_reduction_gain", p.curve_speed_reduction_gain))
         p.max_angular_speed = float(get_param("follow_max_angular_speed", p.max_angular_speed))
         p.min_follow_turn_radius = float(get_param("min_follow_turn_radius", p.min_follow_turn_radius))
         p.angular_rate_limit = float(get_param("angular_rate_limit", p.angular_rate_limit))
@@ -227,6 +237,7 @@ class MaizeNavigator(Node):
             get_param("row_turn_waypoint_outward_offset", p.row_turn_waypoint_outward_offset)
         )
         p.path_goal_xy_tolerance = float(get_param("path_goal_xy_tolerance", p.path_goal_xy_tolerance))
+        p.row_map_output_directory = str(get_param("row_map_output_directory", p.row_map_output_directory))
 
         p.pattern = str(get_param("pattern", p.pattern))
         p.starting_lane_number = int(get_param("starting_lane_number", p.starting_lane_number))
@@ -253,6 +264,8 @@ class MaizeNavigator(Node):
         self.p.row_exit_extension_distance = max(0.0, self.p.row_exit_extension_distance)
         self.p.row_turn_waypoint_outward_offset = max(0.0, self.p.row_turn_waypoint_outward_offset)
         self.p.pure_pursuit_gain = max(0.05, self.p.pure_pursuit_gain)
+        self.p.slow_speed = float(np.clip(self.p.slow_speed, 0.0, self.p.follow_speed))
+        self.p.curve_speed_reduction_gain = max(0.0, self.p.curve_speed_reduction_gain)
         self.p.starting_lane_number = max(1, self.p.starting_lane_number)
         self.p.row_numbers_increase_to = self.p.row_numbers_increase_to.lower()
         if self.p.row_numbers_increase_to not in ("left", "right"):
@@ -273,6 +286,8 @@ class MaizeNavigator(Node):
         self.row_number_increase_direction = None
         self.pattern_index = 0
         self.finish_after_current_row = len(self.pattern_steps) == 0
+        self.stored_rows = {}
+        self.row_map_exported = False
         self.reset_entrance_state()
         self.reset_controller_state()
         self.state = MissionState.INITIALIZING
@@ -281,12 +296,16 @@ class MaizeNavigator(Node):
         return res
 
     def stop_cb(self, req, res):
+        self.store_current_rows()
+        export_path = self.export_row_map()
         self.state = MissionState.IDLE
         self.reset_entrance_state()
         self.reset_controller_state()
         self.cmd_pub.publish(Twist())
         res.success = True
         res.message = "Navigation stopped"
+        if export_path is not None:
+            res.message += f"; row map saved to {export_path}"
         return res
 
     def reset_controller_state(self) -> None:
@@ -394,10 +413,12 @@ class MaizeNavigator(Node):
         if self.row_exit_goal is not None:
             dist_to_end = float(np.linalg.norm(robot_xy - self.row_exit_goal))
             if dist_to_end <= self.p.path_goal_xy_tolerance:
+                self.store_current_rows()
                 self.reset_controller_state()
                 self.cmd_pub.publish(Twist())
                 if self.finish_after_current_row:
                     self.get_logger().info("Last pattern row completed. Mission finished.")
+                    self.export_row_map()
                     self.state = MissionState.FINISHED
                 else:
                     self.get_logger().info("Row exit reached. Finding the next row entrance.")
@@ -410,6 +431,57 @@ class MaizeNavigator(Node):
         if target is None:
             target = self.midline[-1]
         self.drive_to_point(np.asarray(target, dtype=float))
+
+    def store_current_rows(self) -> None:
+        for model in (self.left_row, self.right_row):
+            if model is None or len(model.result.points) < 2:
+                continue
+            points = self.orient_row_points(model.result.points)
+            existing = self.stored_rows.get(model.row_number)
+            if existing is None or self.polyline_length(points) > self.polyline_length(existing):
+                self.stored_rows[model.row_number] = np.array(points, copy=True)
+
+    def orient_row_points(self, points: np.ndarray) -> np.ndarray:
+        points = np.asarray(points, dtype=float)
+        if len(points) < 2 or self.initial_forward_direction is None:
+            return np.array(points, copy=True)
+        if float((points[-1] - points[0]) @ self.initial_forward_direction) < 0.0:
+            return np.array(points[::-1], copy=True)
+        return np.array(points, copy=True)
+
+    def polyline_length(self, points: np.ndarray) -> float:
+        if len(points) < 2:
+            return 0.0
+        return float(np.sum(np.linalg.norm(np.diff(points, axis=0), axis=1)))
+
+    def export_row_map(self) -> Optional[str]:
+        if self.row_map_exported or len(self.stored_rows) == 0:
+            return None
+        output_directory = os.path.abspath(os.path.expanduser(self.p.row_map_output_directory))
+        filename = f"maize_row_map_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+        output_path = os.path.join(output_directory, filename)
+        try:
+            os.makedirs(output_directory, exist_ok=True)
+            with open(output_path, "w", newline="", encoding="utf-8") as csv_file:
+                writer = csv.writer(csv_file)
+                writer.writerow(("row_number", "point_index", "x", "y", "map_frame"))
+                for row_number in sorted(self.stored_rows):
+                    for point_index, point in enumerate(self.stored_rows[row_number]):
+                        writer.writerow(
+                            (
+                                row_number,
+                                point_index,
+                                f"{float(point[0]):.6f}",
+                                f"{float(point[1]):.6f}",
+                                self.p.map_frame,
+                            )
+                        )
+            self.row_map_exported = True
+            self.get_logger().info(f"Saved maize row map CSV: {output_path}")
+            return output_path
+        except OSError as exc:
+            self.get_logger().error(f"Could not save maize row map CSV to {output_path}: {exc}")
+            return None
 
     def handle_find_next_row_entrance(self) -> None:
         if self.entrance_target is None:
@@ -1056,14 +1128,18 @@ class MaizeNavigator(Node):
         yaw_error = wrap_to_pi(target_yaw - self.robot_pose.yaw)
 
         cmd = Twist()
-        speed_factor = float(np.clip(1.0 - abs(yaw_error) / 0.7, 0.25, 1.0))
-        cmd.linear.x = self.p.follow_speed * speed_factor
+        pursuit_distance = max(0.10, target_distance)
+        curvature = self.p.pure_pursuit_gain * 2.0 * math.sin(yaw_error) / pursuit_distance
+        cmd.linear.x = float(np.clip(
+            self.p.follow_speed / (1.0 + self.p.curve_speed_reduction_gain * abs(curvature)),
+            self.p.slow_speed,
+            self.p.follow_speed,
+        ))
         radius_limited_angular = abs(cmd.linear.x) / self.p.min_follow_turn_radius
         max_angular = min(self.p.max_angular_speed, radius_limited_angular)
         # Pure-pursuit curvature is calmer around the midline than a direct
         # proportional yaw correction and still works for headland waypoints.
-        pursuit_distance = max(0.10, target_distance)
-        pursuit_angular = self.p.pure_pursuit_gain * 2.0 * cmd.linear.x * math.sin(yaw_error) / pursuit_distance
+        pursuit_angular = cmd.linear.x * curvature
         angular_raw = float(np.clip(pursuit_angular, -max_angular, max_angular))
 
         dt = 1.0 / max(1e-6, self.p.control_frequency)
@@ -1113,6 +1189,18 @@ class MaizeNavigator(Node):
         markers.markers.append(clear_marker)
 
         marker_id = 1
+        for row_number in sorted(self.stored_rows):
+            markers.markers.append(
+                self.create_line_marker(
+                    f"stored_row_{row_number}",
+                    marker_id,
+                    self.stored_rows[row_number],
+                    (0.65, 0.75, 0.82, 0.65),
+                    0.025,
+                    stamp,
+                )
+            )
+            marker_id += 1
         if self.left_row is not None:
             marker_id = self.add_row_markers(markers, marker_id, self.left_row, (0.1, 0.95, 0.2, 1.0), stamp)
         if self.right_row is not None:
