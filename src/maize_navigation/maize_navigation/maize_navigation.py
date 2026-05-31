@@ -268,9 +268,72 @@ class MaizeNavigator(Node):
         self.right_row = RowMarchModel("right", right_point3, forward)
 
         self.recompute_rows()
-        #if len(self.midline) < 2:
-        #    self.get_logger().info("Initial peaks found, but rectangle marching produced no usable midline", throttle_duration_sec=2.0)
-        #    return
+        ########################################################################
+        # die initiale reihenberechnung individualisieren:
+        # bisher nehmen wir den startpeak und das ist unser punkt 3 der rechteckmarschierung
+        # da der startpeak also im dritten feld liegt imd die ersten zwei leer sind, haben wir bisher wenig stabilität bei der richtungsbestimmung der reihen
+        # daher wählen wir für das initiale rechteck den startpeak als punkt 1, damit beginnt die rechteckmarschierung direkt im peak und hat damit hoffentlich mehr stabilität
+        # diesen ersten startpeak nehmen wir auch als initialen reihenpunlt und den zweiten reihenpunkt auch einfach als mittelwet des zweiten sektors falls vorhanden und die mittellinie auch ab dem ersten punkt begeinnen und damit passt es denke ich
+        #####################################################################
+            ########################################################################
+            # Die initiale Reihenberechnung individualisieren:
+            # Setze den Startpeak als ersten Reihenpunkt (Punkt 1) und schätze Punkt 2
+            # als Mittelwert der Punkte im zweiten Sektor (falls vorhanden). Dann
+            # baue die Midline ab dem ersten Punkt auf.
+            ########################################################################
+            try:
+                # reuse ROI points gathered above
+                map_points_roi = points
+                spacing = float(self.p.row_segment_point_spacing)
+                forward = self.yaw_to_vector(self.robot_pose.yaw)
+                lateral = np.array([-forward[1], forward[0]], dtype=float)
+                robot_xy = np.array([self.robot_pose.x, self.robot_pose.y], dtype=float)
+
+                def prepend_initial_two(model: RowMarchModel, peak_y: float) -> None:
+                    if model is None:
+                        return
+                    peak_world = robot_xy + float(peak_y) * lateral
+                    point1 = peak_world
+                    candidate_point2 = point1 + spacing * forward
+                    second_band = self.points_in_oriented_rectangle(
+                        map_points_roi,
+                        candidate_point2,
+                        forward,
+                        self.p.row_point_window_length,
+                        self.p.row_rectangle_width,
+                    )
+                    if len(second_band) > 0:
+                        point2 = np.mean(second_band, axis=0)
+                    else:
+                        point2 = candidate_point2
+
+                    old_pts = model.result.points if model.result is not None else np.empty((0, 2), dtype=float)
+                    if old_pts is None or len(old_pts) == 0:
+                        new_pts = np.vstack((np.asarray(point1, dtype=float), np.asarray(point2, dtype=float)))
+                    else:
+                        new_pts = np.vstack((np.asarray(point1, dtype=float), np.asarray(point2, dtype=float), old_pts))
+                    model.result.points = np.asarray(new_pts, dtype=float)
+
+                prepend_initial_two(self.left_row, left_peak)
+                prepend_initial_two(self.right_row, right_peak)
+
+                # Rebuild midline and row end point from the modified row point lists
+                self.midline = self.build_midline(self.left_row.result.points, self.right_row.result.points)
+                if self.left_row.result.ended and self.right_row.result.ended:
+                    left_end = self.left_row.result.end_point
+                    right_end = self.right_row.result.end_point
+                    if left_end is not None and right_end is not None:
+                        self.row_end_point = 0.5 * (left_end + right_end)
+                    elif len(self.midline) > 0:
+                        self.row_end_point = self.midline[-1]
+                else:
+                    self.row_end_point = None
+            except Exception:
+                # keep original results on any failure
+                pass
+        if len(self.midline) < 2:
+            self.get_logger().info("Initial peaks found, but rectangle marching produced no usable midline", throttle_duration_sec=2.0)
+            return
 
         self.state = MissionState.FOLLOW_ROW
         self.get_logger().info(
