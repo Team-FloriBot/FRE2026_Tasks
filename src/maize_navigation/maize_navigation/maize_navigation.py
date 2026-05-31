@@ -131,7 +131,6 @@ class NavigatorParams:
     angular_rate_limit: float = 1.2
     target_filter_alpha: float = 0.35
     row_exit_extension_distance: float = 0.30
-    row_turn_waypoint_outward_offset: float = 0.50
     path_goal_xy_tolerance: float = 0.20
     maneuver_goal_xy_tolerance: float = 0.35
     maneuver_goal_yaw_tolerance: float = 0.45
@@ -173,8 +172,8 @@ class MaizeNavigator(Node):
         self.entrance_hist_peaks: List[EntrancePeak] = []
         self.entrance_target: Optional[np.ndarray] = None
         self.entrance_target_direction: Optional[np.ndarray] = None
-        self.entrance_waypoint: Optional[np.ndarray] = None
-        self.entrance_waypoint_reached: bool = False
+        self.entrance_waypoints: List[np.ndarray] = []
+        self.entrance_waypoint_index: int = 0
         self.entrance_heading_goal: Optional[np.ndarray] = None
         self.pending_target_peaks: Optional[Tuple[EntrancePeak, EntrancePeak]] = None
         self.stored_rows: Dict[int, np.ndarray] = {}
@@ -238,9 +237,6 @@ class MaizeNavigator(Node):
         p.angular_rate_limit = float(get_param("angular_rate_limit", p.angular_rate_limit))
         p.target_filter_alpha = float(get_param("target_filter_alpha", p.target_filter_alpha))
         p.row_exit_extension_distance = float(get_param("row_exit_extension_distance", p.row_exit_extension_distance))
-        p.row_turn_waypoint_outward_offset = float(
-            get_param("row_turn_waypoint_outward_offset", p.row_turn_waypoint_outward_offset)
-        )
         p.path_goal_xy_tolerance = float(get_param("path_goal_xy_tolerance", p.path_goal_xy_tolerance))
         p.maneuver_goal_xy_tolerance = float(get_param("maneuver_goal_xy_tolerance", p.maneuver_goal_xy_tolerance))
         p.maneuver_goal_yaw_tolerance = float(get_param("maneuver_goal_yaw_tolerance", p.maneuver_goal_yaw_tolerance))
@@ -272,7 +268,6 @@ class MaizeNavigator(Node):
         self.p.angular_rate_limit = max(0.01, self.p.angular_rate_limit)
         self.p.target_filter_alpha = float(np.clip(self.p.target_filter_alpha, 0.01, 1.0))
         self.p.row_exit_extension_distance = max(0.0, self.p.row_exit_extension_distance)
-        self.p.row_turn_waypoint_outward_offset = max(0.0, self.p.row_turn_waypoint_outward_offset)
         self.p.pure_pursuit_gain = max(0.05, self.p.pure_pursuit_gain)
         self.p.slow_speed = float(np.clip(self.p.slow_speed, 0.0, self.p.follow_speed))
         self.p.curve_speed_reduction_gain = max(0.0, self.p.curve_speed_reduction_gain)
@@ -332,8 +327,8 @@ class MaizeNavigator(Node):
         self.entrance_hist_peaks = []
         self.entrance_target = None
         self.entrance_target_direction = None
-        self.entrance_waypoint = None
-        self.entrance_waypoint_reached = False
+        self.entrance_waypoints = []
+        self.entrance_waypoint_index = 0
         self.entrance_heading_goal = None
         self.pending_target_peaks = None
 
@@ -502,17 +497,17 @@ class MaizeNavigator(Node):
                 self.cmd_pub.publish(Twist())
                 return
 
-        if (
-            self.entrance_waypoint is not None
-            and not self.entrance_waypoint_reached
-        ):
+        if self.entrance_waypoint_index < len(self.entrance_waypoints):
+            waypoint = self.entrance_waypoints[self.entrance_waypoint_index]
             robot_xy = np.array([self.robot_pose.x, self.robot_pose.y], dtype=float)
-            if float(np.linalg.norm(robot_xy - self.entrance_waypoint)) <= self.p.maneuver_goal_xy_tolerance:
-                self.entrance_waypoint_reached = True
+            if float(np.linalg.norm(robot_xy - waypoint)) <= self.p.maneuver_goal_xy_tolerance:
+                self.entrance_waypoint_index += 1
                 self.reset_controller_state()
-                self.get_logger().info("Headland waypoint reached. Driving to the new row entrance.")
+                self.get_logger().info(
+                    f"Headland waypoint {self.entrance_waypoint_index}/{len(self.entrance_waypoints)} reached"
+                )
             else:
-                self.drive_to_point(self.entrance_waypoint)
+                self.drive_to_point(waypoint)
                 return
 
         if (
@@ -591,11 +586,17 @@ class MaizeNavigator(Node):
         turn_start = self.row_exit_goal
         if turn_start is None:
             turn_start = center + self.p.row_exit_extension_distance * outgoing
-        self.entrance_waypoint = (
-            0.5 * (np.asarray(turn_start, dtype=float) + self.entrance_target)
-            + self.p.row_turn_waypoint_outward_offset * outgoing
-        )
-        self.entrance_waypoint_reached = False
+        turn_start = np.asarray(turn_start, dtype=float)
+        transfer_direction = self.normalize(self.entrance_target - turn_start)
+        if step.lane_shift == 1:
+            self.entrance_waypoints = [0.5 * (turn_start + self.entrance_target)]
+        else:
+            waypoint_offset = self.p.row_exit_extension_distance * transfer_direction
+            self.entrance_waypoints = [
+                turn_start + waypoint_offset,
+                self.entrance_target - waypoint_offset,
+            ]
+        self.entrance_waypoint_index = 0
         self.entrance_target_direction = -outgoing
         self.entrance_heading_goal = (
             self.entrance_target
@@ -1342,17 +1343,18 @@ class MaizeNavigator(Node):
             label = "?" if peak.row_number is None else str(peak.row_number)
             markers.markers.append(self.create_text_marker("entrance_histogram_row_numbers", marker_id, peak.point, label, color, stamp))
             marker_id += 1
-        if self.entrance_waypoint is not None:
+        for idx, waypoint in enumerate(self.entrance_waypoints):
+            color = (1.0, 0.9, 0.1, 1.0) if idx >= self.entrance_waypoint_index else (0.55, 0.55, 0.2, 0.6)
             markers.markers.append(
-                self.create_sphere_marker("entrance_waypoint", marker_id, self.entrance_waypoint, (1.0, 0.75, 0.0, 1.0), 0.24, stamp)
+                self.create_sphere_marker("entrance_waypoints", marker_id, waypoint, color, 0.24, stamp)
             )
             marker_id += 1
-            if self.row_exit_goal is not None and self.entrance_target is not None:
-                turn_route = np.vstack((self.row_exit_goal, self.entrance_waypoint, self.entrance_target))
-                markers.markers.append(
-                    self.create_line_marker("entrance_turn_route", marker_id, turn_route, (1.0, 0.75, 0.0, 0.9), 0.045, stamp)
-                )
-                marker_id += 1
+        if self.row_exit_goal is not None and self.entrance_target is not None and len(self.entrance_waypoints) > 0:
+            turn_route = np.vstack((self.row_exit_goal, *self.entrance_waypoints, self.entrance_target))
+            markers.markers.append(
+                self.create_line_marker("entrance_turn_route", marker_id, turn_route, (1.0, 0.75, 0.0, 0.9), 0.045, stamp)
+            )
+            marker_id += 1
         if self.entrance_target is not None:
             markers.markers.append(self.create_sphere_marker("entrance_target", marker_id, self.entrance_target, (0.9, 0.1, 1.0, 1.0), 0.26, stamp))
             marker_id += 1

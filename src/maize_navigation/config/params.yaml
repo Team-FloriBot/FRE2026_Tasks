@@ -78,8 +78,6 @@ maize_navigator:
     min_follow_turn_radius: 0.37
     target_filter_alpha: 0.45
     row_exit_extension_distance: 0.50
-    # Zwischenpunkt der Wendekurve liegt zusaetzlich so weit vom Feld entfernt.
-    row_turn_waypoint_outward_offset: 0.70
 
     max_linear_speed: 0.45
     max_angular_speed: 1.40
@@ -87,7 +85,7 @@ maize_navigator:
     turn_max_angular_speed: 1.40
     angular_rate_limit: 2.8
 
-    lookahead_distance: 1.3
+    lookahead_distance: 1.4
     turn_lookahead_distance: 0.32
     turn_min_angular_speed: 0.30
 
