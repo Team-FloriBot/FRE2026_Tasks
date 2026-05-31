@@ -15,6 +15,10 @@ maize_navigator:
     max_lane_width: 1.20
 
     hist_roi_size: 5.0
+    # Histogramm-ROI: quer breit fuer mehr Reihen, laengs kompakter.
+    # hist_roi_size bleibt als Fallback fuer alte Konfigurationen erhalten.
+    hist_roi_depth: 5.0
+    hist_roi_width: 8.0
     hist_bin_size: 0.05
     hist_peak_min_points: 3
 
@@ -61,7 +65,7 @@ maize_navigator:
     enter_stable_frames_required: 3
     acquire_timeout_sec: 8.0
 
-    follow_speed: 0.20
+    follow_speed: 0.35
     slow_speed: 0.12
     enter_speed: 0.22
     turn_speed: 0.24
@@ -76,13 +80,13 @@ maize_navigator:
     # Zwischenpunkt der Wendekurve liegt zusaetzlich so weit vom Feld entfernt.
     row_turn_waypoint_outward_offset: 0.50
 
-    max_linear_speed: 0.35
+    max_linear_speed: 0.45
     max_angular_speed: 1.40
-    follow_max_angular_speed: 0.40
+    follow_max_angular_speed: 0.90
     turn_max_angular_speed: 1.40
-    angular_rate_limit: 1.2
+    angular_rate_limit: 2.8
 
-    lookahead_distance: 1.10
+    lookahead_distance: 0.75
     turn_lookahead_distance: 0.32
     turn_min_angular_speed: 0.30
 

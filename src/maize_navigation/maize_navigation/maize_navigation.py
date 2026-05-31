@@ -103,6 +103,8 @@ class NavigatorParams:
     max_lane_width: float = 1.20
 
     hist_roi_size: float = 5.0
+    hist_roi_depth: float = 5.0
+    hist_roi_width: float = 5.0
     hist_bin_size: float = 0.05
     hist_peak_min_points: int = 3
     occ_threshold: int = 50
@@ -196,6 +198,8 @@ class MaizeNavigator(Node):
         p.max_lane_width = float(get_param("max_lane_width", p.max_lane_width))
 
         p.hist_roi_size = float(get_param("hist_roi_size", p.hist_roi_size))
+        p.hist_roi_depth = float(get_param("hist_roi_depth", p.hist_roi_size))
+        p.hist_roi_width = float(get_param("hist_roi_width", p.hist_roi_size))
         p.hist_bin_size = float(get_param("hist_bin_size", p.hist_bin_size))
         p.hist_peak_min_points = int(get_param("hist_peak_min_points", p.hist_peak_min_points))
         p.occ_threshold = int(get_param("map_row_occupancy_threshold", p.occ_threshold))
@@ -238,6 +242,8 @@ class MaizeNavigator(Node):
             self.get_logger().warn("row_segment_point_count must be odd; adding one")
             self.p.row_segment_point_count += 1
         self.p.row_segment_point_spacing = max(0.05, self.p.row_segment_point_spacing)
+        self.p.hist_roi_depth = max(self.p.hist_bin_size, self.p.hist_roi_depth)
+        self.p.hist_roi_width = max(self.p.hist_bin_size, self.p.hist_roi_width)
         self.p.row_rectangle_width = max(0.05, self.p.row_rectangle_width)
         self.p.row_point_window_length = max(0.05, self.p.row_point_window_length)
         self.p.row_max_march_steps = max(1, self.p.row_max_march_steps)
@@ -333,7 +339,7 @@ class MaizeNavigator(Node):
         self.publish_visuals()
 
     def handle_initializing(self) -> None:
-        points = self.get_map_points_in_roi(self.robot_pose, self.p.hist_roi_size)
+        points = self.get_map_points_in_hist_roi(self.robot_pose)
         if len(points) < 5:
             self.get_logger().info(f"Not enough occupied map points for histogram: {len(points)}", throttle_duration_sec=2.0)
             return
@@ -443,8 +449,8 @@ class MaizeNavigator(Node):
             self.get_all_map_points(),
             center,
             outgoing,
-            self.p.hist_roi_size,
-            self.p.hist_roi_size,
+            self.p.hist_roi_depth,
+            self.p.hist_roi_width,
         )
         self.entrance_hist_center = center
         self.entrance_hist_direction = outgoing
@@ -503,7 +509,7 @@ class MaizeNavigator(Node):
             return []
         lateral_direction = np.array([-outgoing_direction[1], outgoing_direction[0]], dtype=float)
         local_y = (points - center) @ lateral_direction
-        half_roi = 0.5 * self.p.hist_roi_size
+        half_roi = 0.5 * self.p.hist_roi_width
         bins = np.arange(-half_roi, half_roi + self.p.hist_bin_size, self.p.hist_bin_size)
         if len(bins) < 3:
             return []
@@ -587,8 +593,8 @@ class MaizeNavigator(Node):
             self.get_all_map_points(),
             self.entrance_hist_center,
             outgoing,
-            self.p.hist_roi_size,
-            self.p.hist_roi_size,
+            self.p.hist_roi_depth,
+            self.p.hist_roi_width,
         )
         first, second = sorted(self.pending_target_peaks, key=lambda peak: peak.lateral)
         # Seen in the new incoming direction, the lower outgoing-lateral peak is the left row.
@@ -618,7 +624,7 @@ class MaizeNavigator(Node):
         rel = points - robot_xy
         local_y = rel @ lateral
 
-        half_roi = 0.5 * self.p.hist_roi_size
+        half_roi = 0.5 * self.p.hist_roi_width
         bins = np.arange(-half_roi, half_roi + self.p.hist_bin_size, self.p.hist_bin_size)
         if len(bins) < 3:
             return None
@@ -1071,15 +1077,19 @@ class MaizeNavigator(Node):
         cmd.angular.z = angular_limited
         self.cmd_pub.publish(cmd)
 
-    def get_map_points_in_roi(self, pose: Pose2D, size: float) -> np.ndarray:
+    def get_map_points_in_hist_roi(self, pose: Pose2D) -> np.ndarray:
         points = self.get_all_map_points()
         if len(points) == 0:
             return points
         center = np.array([pose.x, pose.y], dtype=float)
-        half = 0.5 * float(size)
-        rel = points - center
-        mask = (np.abs(rel[:, 0]) <= half) & (np.abs(rel[:, 1]) <= half)
-        return points[mask]
+        forward = self.yaw_to_vector(pose.yaw)
+        return self.points_in_oriented_rectangle(
+            points,
+            center,
+            forward,
+            self.p.hist_roi_depth,
+            self.p.hist_roi_width,
+        )
 
     def get_all_map_points(self) -> np.ndarray:
         if self.latest_map is None:
@@ -1131,8 +1141,8 @@ class MaizeNavigator(Node):
                     marker_id,
                     self.entrance_hist_center,
                     self.entrance_hist_direction,
-                    self.p.hist_roi_size,
-                    self.p.hist_roi_size,
+                    self.p.hist_roi_depth,
+                    self.p.hist_roi_width,
                     (0.1, 1.0, 0.9, 0.8),
                     stamp,
                 )
