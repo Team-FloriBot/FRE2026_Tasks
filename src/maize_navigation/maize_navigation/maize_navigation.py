@@ -59,7 +59,8 @@ class RowMarchResult:
 @dataclass
 class RowMarchModel:
     side: str
-    initial_point3: np.ndarray
+    initial_point1: np.ndarray
+    initial_point2: np.ndarray
     initial_direction: np.ndarray
     result: RowMarchResult = field(default_factory=RowMarchResult)
 
@@ -262,19 +263,17 @@ class MaizeNavigator(Node):
         left_peak, right_peak = peak_pair
         forward = self.yaw_to_vector(self.robot_pose.yaw)
 
-        left_point3 = self.start_point3_from_peak(points, self.robot_pose, left_peak)
-        right_point3 = self.start_point3_from_peak(points, self.robot_pose, right_peak)
-        self.left_row = RowMarchModel("left", left_point3, forward)
-        self.right_row = RowMarchModel("right", right_point3, forward)
+        left_point1 = self.start_point1_from_peak(points, self.robot_pose, left_peak)
+        right_point1 = self.start_point1_from_peak(points, self.robot_pose, right_peak)
+        left_point2 = self.initial_point2_from_sector(points, self.robot_pose, left_point1, left_peak)
+        right_point2 = self.initial_point2_from_sector(points, self.robot_pose, right_point1, right_peak)
+
+        left_direction = self.initial_direction_from_points(left_point1, left_point2, forward)
+        right_direction = self.initial_direction_from_points(right_point1, right_point2, forward)
+        self.left_row = RowMarchModel("left", left_point1, left_point2, left_direction)
+        self.right_row = RowMarchModel("right", right_point1, right_point2, right_direction)
 
         self.recompute_rows()
-        ########################################################################
-        # die initiale reihenberechnung individualisieren:
-        # bisher nehmen wir den startpeak und das ist unser punkt 3 der rechteckmarschierung
-        # da der startpeak also im dritten feld liegt imd die ersten zwei leer sind, haben wir bisher wenig stabilität bei der richtungsbestimmung der reihen
-        # daher wählen wir für das initiale rechteck den startpeak als punkt 1, damit beginnt die rechteckmarschierung direkt im peak und hat damit hoffentlich mehr stabilität
-        # diesen ersten startpeak nehmen wir auch als initialen reihenpunlt und den zweiten reihenpunkt auch einfach als mittelwet des zweiten sektors falls vorhanden und die mittellinie auch ab dem ersten punkt begeinnen und damit passt es denke ich
-        #####################################################################
         if len(self.midline) < 2:
             self.get_logger().info("Initial peaks found, but rectangle marching produced no usable midline", throttle_duration_sec=2.0)
             return
@@ -351,7 +350,7 @@ class MaizeNavigator(Node):
         )
         return best_pair
 
-    def start_point3_from_peak(self, points: np.ndarray, pose: Pose2D, peak_y: float) -> np.ndarray:
+    def start_point1_from_peak(self, points: np.ndarray, pose: Pose2D, peak_y: float) -> np.ndarray:
         forward = self.yaw_to_vector(pose.yaw)
         lateral = np.array([-forward[1], forward[0]], dtype=float)
         robot_xy = np.array([pose.x, pose.y], dtype=float)
@@ -383,12 +382,46 @@ class MaizeNavigator(Node):
         if len(start_points) == 0:
             return fallback
 
-        point3 = np.mean(start_points, axis=0)
+        point1 = np.mean(start_points, axis=0)
         self.get_logger().info(
-            f"Initial point 3 for peak {peak_y:.3f}: first_x={first_x:.2f}, n={len(start_points)}",
+            f"Initial point 1 for peak {peak_y:.3f}: first_x={first_x:.2f}, n={len(start_points)}",
             throttle_duration_sec=2.0,
         )
-        return np.asarray(point3, dtype=float)
+        return np.asarray(point1, dtype=float)
+
+    def initial_point2_from_sector(self, points: np.ndarray, pose: Pose2D, point1: np.ndarray, peak_y: float) -> np.ndarray:
+        forward = self.yaw_to_vector(pose.yaw)
+        expected_point2 = np.asarray(point1, dtype=float) + self.p.row_segment_point_spacing * forward
+        sector_points = self.points_in_oriented_rectangle(
+            points,
+            expected_point2,
+            forward,
+            self.p.row_point_window_length,
+            self.p.row_rectangle_width,
+        )
+        if len(sector_points) == 0:
+            self.get_logger().info(
+                f"No occupied second-sector points for peak {peak_y:.3f}; using expected point 2",
+                throttle_duration_sec=2.0,
+            )
+            return expected_point2
+
+        point2 = np.mean(sector_points, axis=0)
+        self.get_logger().info(
+            f"Initial point 2 for peak {peak_y:.3f}: n={len(sector_points)}",
+            throttle_duration_sec=2.0,
+        )
+        return np.asarray(point2, dtype=float)
+
+    def initial_direction_from_points(self, point1: np.ndarray, point2: np.ndarray, fallback_direction: np.ndarray) -> np.ndarray:
+        direction = np.asarray(point2, dtype=float) - np.asarray(point1, dtype=float)
+        if float(np.linalg.norm(direction)) < 1e-6:
+            return self.normalize(fallback_direction)
+        fallback_direction = self.normalize(fallback_direction)
+        direction = self.normalize(direction)
+        if np.dot(direction, fallback_direction) < 0.0:
+            direction = -direction
+        return direction
 
     def recompute_rows(self) -> None:
         if self.left_row is None or self.right_row is None:
@@ -416,9 +449,12 @@ class MaizeNavigator(Node):
     def march_row(self, model: RowMarchModel, map_points: np.ndarray) -> RowMarchResult:
         result = RowMarchResult()
         direction = self.normalize(model.initial_direction)
-        line_points = self.build_initial_line_from_point3(model.initial_point3, direction)
-        exact_points: List[np.ndarray] = []
-        previous_valid_point: Optional[np.ndarray] = None
+        line_points = self.build_initial_line_from_point1_and_point2(model.initial_point1, model.initial_point2, direction)
+        exact_points: List[np.ndarray] = [
+            np.asarray(model.initial_point1, dtype=float),
+            np.asarray(model.initial_point2, dtype=float),
+        ]
+        previous_valid_point: Optional[np.ndarray] = np.asarray(model.initial_point2, dtype=float)
 
         for _ in range(self.p.row_max_march_steps):
             search_point3 = line_points[2]
@@ -489,6 +525,16 @@ class MaizeNavigator(Node):
         spacing = self.p.row_segment_point_spacing
         direction = self.normalize(direction)
         return np.array([point3 + (idx - 2) * spacing * direction for idx in range(self.p.row_segment_point_count)], dtype=float)
+
+    def build_initial_line_from_point1_and_point2(self, point1: np.ndarray, point2: np.ndarray, direction: np.ndarray) -> np.ndarray:
+        spacing = self.p.row_segment_point_spacing
+        direction = self.initial_direction_from_points(point1, point2, direction)
+        point1 = np.asarray(point1, dtype=float)
+        point2 = np.asarray(point2, dtype=float)
+        points = [point1, point2]
+        while len(points) < self.p.row_segment_point_count:
+            points.append(points[-1] + spacing * direction)
+        return np.asarray(points, dtype=float)
 
     def build_next_line_from_old_point3(self, old_point3: np.ndarray, direction: np.ndarray) -> np.ndarray:
         spacing = self.p.row_segment_point_spacing
