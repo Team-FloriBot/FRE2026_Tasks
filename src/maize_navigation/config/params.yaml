@@ -87,7 +87,7 @@ maize_navigator:
     turn_max_angular_speed: 1.40
     angular_rate_limit: 2.8
 
-    lookahead_distance: 1.3
+    lookahead_distance: 1.2
     turn_lookahead_distance: 0.32
     turn_min_angular_speed: 0.30
 

@@ -444,8 +444,7 @@ class MaizeNavigator(Node):
                     self.state = MissionState.FIND_NEXT_ROW_ENTRANCE
                 return
 
-        closest_idx = int(np.argmin(np.linalg.norm(self.midline - robot_xy, axis=1)))
-        target = self.point_at_polyline_distance(self.midline, closest_idx, self.p.lookahead_distance)
+        target = self.lookahead_point_from_polyline_projection(self.midline, robot_xy, self.p.lookahead_distance)
         if target is None:
             target = self.midline[-1]
         self.drive_to_point(np.asarray(target, dtype=float))
@@ -1170,6 +1169,51 @@ class MaizeNavigator(Node):
                 return polyline[idx] + ratio * segment
             travelled += seg_len
         return polyline[-1]
+
+    def lookahead_point_from_polyline_projection(
+        self,
+        polyline: np.ndarray,
+        point: np.ndarray,
+        distance_ahead: float,
+    ) -> Optional[np.ndarray]:
+        if len(polyline) == 0:
+            return None
+        if len(polyline) == 1:
+            return np.asarray(polyline[0], dtype=float)
+
+        point = np.asarray(point, dtype=float)
+        best_projection: Optional[np.ndarray] = None
+        best_segment_idx = 0
+        best_distance = float("inf")
+        for idx in range(len(polyline) - 1):
+            segment = polyline[idx + 1] - polyline[idx]
+            seg_len_sq = float(segment @ segment)
+            if seg_len_sq < 1e-12:
+                continue
+            ratio = float(np.clip(((point - polyline[idx]) @ segment) / seg_len_sq, 0.0, 1.0))
+            projection = polyline[idx] + ratio * segment
+            distance = float(np.linalg.norm(point - projection))
+            if distance < best_distance:
+                best_distance = distance
+                best_projection = projection
+                best_segment_idx = idx
+
+        if best_projection is None:
+            return np.asarray(polyline[-1], dtype=float)
+
+        travelled = 0.0
+        segment_start = best_projection
+        for idx in range(best_segment_idx, len(polyline) - 1):
+            segment_end = polyline[idx + 1]
+            segment = segment_end - segment_start
+            seg_len = float(np.linalg.norm(segment))
+            if seg_len >= 1e-9:
+                if travelled + seg_len >= distance_ahead:
+                    ratio = (distance_ahead - travelled) / seg_len
+                    return segment_start + ratio * segment
+                travelled += seg_len
+            segment_start = segment_end
+        return np.asarray(polyline[-1], dtype=float)
 
     def drive_to_point(self, target: np.ndarray) -> None:
         target = np.asarray(target, dtype=float)
