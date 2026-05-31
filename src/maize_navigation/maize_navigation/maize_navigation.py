@@ -174,8 +174,6 @@ class MaizeNavigator(Node):
         self.entrance_target: Optional[np.ndarray] = None
         self.entrance_target_direction: Optional[np.ndarray] = None
         self.entrance_waypoint: Optional[np.ndarray] = None
-        self.entrance_waypoint_direction: Optional[np.ndarray] = None
-        self.entrance_waypoint_heading_goal: Optional[np.ndarray] = None
         self.entrance_waypoint_reached: bool = False
         self.entrance_heading_goal: Optional[np.ndarray] = None
         self.pending_target_peaks: Optional[Tuple[EntrancePeak, EntrancePeak]] = None
@@ -335,8 +333,6 @@ class MaizeNavigator(Node):
         self.entrance_target = None
         self.entrance_target_direction = None
         self.entrance_waypoint = None
-        self.entrance_waypoint_direction = None
-        self.entrance_waypoint_heading_goal = None
         self.entrance_waypoint_reached = False
         self.entrance_heading_goal = None
         self.pending_target_peaks = None
@@ -508,16 +504,15 @@ class MaizeNavigator(Node):
 
         if (
             self.entrance_waypoint is not None
-            and self.entrance_waypoint_direction is not None
-            and self.entrance_waypoint_heading_goal is not None
             and not self.entrance_waypoint_reached
         ):
-            if self.pose_goal_reached(self.entrance_waypoint, self.entrance_waypoint_direction):
+            robot_xy = np.array([self.robot_pose.x, self.robot_pose.y], dtype=float)
+            if float(np.linalg.norm(robot_xy - self.entrance_waypoint)) <= self.p.maneuver_goal_xy_tolerance:
                 self.entrance_waypoint_reached = True
                 self.reset_controller_state()
                 self.get_logger().info("Headland waypoint reached. Driving to the new row entrance.")
             else:
-                self.drive_to_point(self.entrance_waypoint_heading_goal)
+                self.drive_to_point(self.entrance_waypoint)
                 return
 
         if (
@@ -599,11 +594,6 @@ class MaizeNavigator(Node):
         self.entrance_waypoint = (
             0.5 * (np.asarray(turn_start, dtype=float) + self.entrance_target)
             + self.p.row_turn_waypoint_outward_offset * outgoing
-        )
-        self.entrance_waypoint_direction = self.normalize(self.entrance_target - np.asarray(turn_start, dtype=float))
-        self.entrance_waypoint_heading_goal = (
-            self.entrance_waypoint
-            + self.p.maneuver_heading_lookahead_distance * self.entrance_waypoint_direction
         )
         self.entrance_waypoint_reached = False
         self.entrance_target_direction = -outgoing
@@ -1357,18 +1347,6 @@ class MaizeNavigator(Node):
                 self.create_sphere_marker("entrance_waypoint", marker_id, self.entrance_waypoint, (1.0, 0.75, 0.0, 1.0), 0.24, stamp)
             )
             marker_id += 1
-            if self.entrance_waypoint_heading_goal is not None:
-                markers.markers.append(
-                    self.create_sphere_marker(
-                        "entrance_waypoint_heading_goal",
-                        marker_id,
-                        self.entrance_waypoint_heading_goal,
-                        (1.0, 0.75, 0.0, 0.55),
-                        0.13,
-                        stamp,
-                    )
-                )
-                marker_id += 1
             if self.row_exit_goal is not None and self.entrance_target is not None:
                 turn_route = np.vstack((self.row_exit_goal, self.entrance_waypoint, self.entrance_target))
                 markers.markers.append(
