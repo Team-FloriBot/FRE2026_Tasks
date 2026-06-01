@@ -21,3 +21,7 @@ pure_pursuit_node:
     control_rate: 20.0
 
     search_window: 200
+
+    # --- RESAMPLING ---
+    resample_enabled: true
+    resample_spacing: 0.10

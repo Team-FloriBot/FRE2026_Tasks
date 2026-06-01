@@ -7,11 +7,10 @@
 #include <tf2_ros/buffer.h>
 #include <tf2_geometry_msgs/tf2_geometry_msgs.hpp>
 #include <tf2/utils.h>
-#include <visualization_msgs/msg/marker_array.hpp>
-
 #include <cmath>
 #include <limits>
 #include <algorithm>
+#include <visualization_msgs/msg/marker_array.hpp>
 
 class PurePursuitNode : public rclcpp::Node
 {
@@ -27,9 +26,6 @@ public:
         this->declare_parameter<double>("max_angular_velocity", 2.0);
         this->declare_parameter<double>("control_rate", 20.0);
 
-        this->declare_parameter<double>("resample_spacing", 0.10);
-        this->declare_parameter<bool>("resample_enabled", true);
-
         lookahead_min_ = get_parameter("lookahead_min").as_double();
         lookahead_max_ = get_parameter("lookahead_max").as_double();
         lookahead_gain_ = get_parameter("lookahead_gain").as_double();
@@ -39,12 +35,8 @@ public:
         max_angular_velocity_ = get_parameter("max_angular_velocity").as_double();
         control_rate_ = get_parameter("control_rate").as_double();
 
-        resample_spacing_ = get_parameter("resample_spacing").as_double();
-        resample_enabled_ = get_parameter("resample_enabled").as_bool();
-
         cmd_vel_pub_ = create_publisher<geometry_msgs::msg::Twist>("/cmd_vel", 10);
         debug_pub_ = create_publisher<visualization_msgs::msg::MarkerArray>("/pure_pursuit/debug", 10);
-
         path_sub_ = create_subscription<nav_msgs::msg::Path>(
             "/plan", 10,
             std::bind(&PurePursuitNode::path_callback, this, std::placeholders::_1));
@@ -76,97 +68,41 @@ private:
     double curvature_gain_, max_angular_velocity_;
     double control_rate_;
 
-    double resample_spacing_;
-    bool resample_enabled_;
-
     // =========================
-    // RESAMPLING
-    // =========================
-    nav_msgs::msg::Path resample_path(const nav_msgs::msg::Path & input)
-    {
-        nav_msgs::msg::Path out = input;
-        out.poses.clear();
-
-        if (input.poses.size() < 2)
-            return input;
-
-        for (size_t i = 0; i < input.poses.size() - 1; i++)
-        {
-            const auto & p0 = input.poses[i].pose.position;
-            const auto & p1 = input.poses[i + 1].pose.position;
-
-            double dx = p1.x - p0.x;
-            double dy = p1.y - p0.y;
-
-            double seg_len = std::hypot(dx, dy);
-            if (seg_len < 1e-6)
-                continue;
-
-            int steps = std::max(1, (int)(seg_len / resample_spacing_));
-
-            for (int s = 0; s < steps; s++)
-            {
-                double t = (double)s / steps;
-
-                geometry_msgs::msg::PoseStamped ps;
-                ps.header = input.header;
-
-                ps.pose.position.x = p0.x + t * dx;
-                ps.pose.position.y = p0.y + t * dy;
-                ps.pose.position.z = 0.0;
-                ps.pose.orientation.w = 1.0;
-
-                out.poses.push_back(ps);
-            }
-        }
-
-        // last point
-        out.poses.push_back(input.poses.back());
-
-        return out;
-    }
-
+    // PATH CALLBACK
     // =========================
     void path_callback(const nav_msgs::msg::Path::SharedPtr msg)
     {
-        if (msg->poses.size() < 2)
-            return;
+        if (msg->poses.empty()) return;
 
-        if (resample_enabled_)
-            path_ = resample_path(*msg);
-        else
-            path_ = *msg;
-
+        path_ = *msg;
         path_received_ = true;
         target_idx_ = 0;
 
-        RCLCPP_INFO(get_logger(),
-            "Path received: %zu -> %zu poses",
-            msg->poses.size(),
-            path_.poses.size());
+        RCLCPP_INFO(get_logger(), "Path received: %zu poses", path_.poses.size());
     }
 
+    // =========================
+    // POSE
     // =========================
     bool get_robot_pose(geometry_msgs::msg::PoseStamped & pose)
     {
         try
         {
             auto tf = tf_buffer_->lookupTransform(
-                path_.header.frame_id,
-                "base_link",
-                tf2::TimePointZero);
+                path_.header.frame_id, "base_link", tf2::TimePointZero);
 
             pose.pose.position.x = tf.transform.translation.x;
             pose.pose.position.y = tf.transform.translation.y;
             pose.pose.orientation = tf.transform.rotation;
             return true;
         }
-        catch (...)
-        {
-            return false;
-        }
+        catch (...) { return false; }
     }
 
+    // =========================
+    // LOOKAHEAD DIST
+    // =========================
     double lookahead_distance()
     {
         return std::clamp(
@@ -176,24 +112,25 @@ private:
     }
 
     // =========================
+    // ROUTE FOLLOWING (KEY FIX)
+    // =========================
     size_t update_target_index(const geometry_msgs::msg::PoseStamped & robot)
     {
         size_t N = path_.poses.size();
-
         size_t best = target_idx_;
-        double best_d = std::numeric_limits<double>::max();
+        double best_d = 1e9;
 
-        size_t window = std::min<size_t>(200, N);
+        size_t window = 50;
 
         for (size_t k = 0; k < window; k++)
         {
-            size_t i = std::min(target_idx_ + k, N - 1);
+            size_t i = (target_idx_ + k) % N;
 
-            const auto & p = path_.poses[i].pose.position;
+            auto & p = path_.poses[i].pose.position;
 
             double dx = p.x - robot.pose.position.x;
             double dy = p.y - robot.pose.position.y;
-            double d = dx * dx + dy * dy;
+            double d = dx*dx + dy*dy;
 
             if (d < best_d)
             {
@@ -207,44 +144,43 @@ private:
     }
 
     // =========================
+    // LOOKAHEAD ON ROUTE
+    // =========================
     geometry_msgs::msg::Point get_lookahead(size_t idx, double ld)
     {
+        size_t N = path_.poses.size();
+        double acc = 0.0;
+
         geometry_msgs::msg::Point out;
 
-        double acc = 0.0;
-        size_t N = path_.poses.size();
-
-        for (size_t i = idx; i < N - 1; i++)
+        for (size_t k = 0; k < N; k++)
         {
-            const auto & p0 = path_.poses[i].pose.position;
-            const auto & p1 = path_.poses[i + 1].pose.position;
+            size_t i = (idx + k) % N;
+            size_t j = (i + 1) % N;
 
-            double dx = p1.x - p0.x;
-            double dy = p1.y - p0.y;
+            auto & p0 = path_.poses[i].pose.position;
+            auto & p1 = path_.poses[j].pose.position;
 
-            double seg = std::hypot(dx, dy);
-            if (seg < 1e-6)
-                continue;
+            double seg = std::hypot(p1.x - p0.x, p1.y - p0.y);
+            if (seg < 1e-6) continue;
 
             if (acc + seg >= ld)
             {
                 double r = (ld - acc) / seg;
-
-                out.x = p0.x + r * dx;
-                out.y = p0.y + r * dy;
+                out.x = p0.x + r * (p1.x - p0.x);
+                out.y = p0.y + r * (p1.y - p0.y);
                 return out;
             }
 
             acc += seg;
         }
 
-        return path_.poses.back().pose.position;
+        return path_.poses[idx].pose.position;
     }
 
-    // =========================
     void publish_debug(const geometry_msgs::msg::PoseStamped & robot,
-                       const geometry_msgs::msg::Point & lookahead,
-                       size_t idx)
+                   const geometry_msgs::msg::Point & lookahead,
+                   size_t idx)
     {
         visualization_msgs::msg::MarkerArray arr;
 
@@ -262,6 +198,7 @@ private:
 
             m.pose.position.x = x;
             m.pose.position.y = y;
+            m.pose.position.z = 0.0;
 
             m.scale.x = 0.25;
             m.scale.y = 0.25;
@@ -275,15 +212,33 @@ private:
             return m;
         };
 
-        arr.markers.push_back(mk(0, robot.pose.position.x, robot.pose.position.y, 1, 0, 0));
-        arr.markers.push_back(mk(1, lookahead.x, lookahead.y, 0, 1, 0));
-        arr.markers.push_back(mk(2, path_.poses[idx].pose.position.x,
-                                   path_.poses[idx].pose.position.y,
-                                   0, 0, 1));
+        // Robot (rot)
+        arr.markers.push_back(
+            mk(0,
+              robot.pose.position.x,
+              robot.pose.position.y,
+              1.0, 0.0, 0.0));
+
+        // Lookahead (grün)
+        arr.markers.push_back(
+            mk(1,
+              lookahead.x,
+              lookahead.y,
+              0.0, 1.0, 0.0));
+
+        // Target Index (blau)
+        auto & p = path_.poses[idx].pose.position;
+        arr.markers.push_back(
+            mk(2,
+              p.x,
+              p.y,
+              0.0, 0.0, 1.0));
 
         debug_pub_->publish(arr);
     }
 
+    // =========================
+    // CONTROL
     // =========================
     void control_loop()
     {
@@ -297,11 +252,14 @@ private:
         double ld = lookahead_distance();
         auto lookahead = get_lookahead(idx, ld);
 
+        // Lookahead-Punkt im Pfad-Frame
         geometry_msgs::msg::PoseStamped lookahead_pose;
-        lookahead_pose.header = path_.header;
+        lookahead_pose.header.frame_id = path_.header.frame_id;
+        lookahead_pose.header.stamp = this->now();
         lookahead_pose.pose.position = lookahead;
         lookahead_pose.pose.orientation.w = 1.0;
 
+        // Transformiere Lookahead in base_link
         geometry_msgs::msg::PoseStamped lookahead_base;
 
         try
@@ -311,22 +269,36 @@ private:
                 path_.header.frame_id,
                 tf2::TimePointZero);
 
-            tf2::doTransform(lookahead_pose, lookahead_base, tf);
+            tf2::doTransform(
+                lookahead_pose,
+                lookahead_base,
+                tf);
         }
-        catch (...)
+        catch (const tf2::TransformException & ex)
         {
+            RCLCPP_WARN_THROTTLE(
+                get_logger(),
+                *get_clock(),
+                1000,
+                "Lookahead TF failed: %s",
+                ex.what());
+
             return;
         }
 
+        // Pure Pursuit arbeitet im Fahrzeugkoordinatensystem
         double x = lookahead_base.pose.position.x;
         double y = lookahead_base.pose.position.y;
 
         double dist = std::hypot(x, y);
-        if (dist < 0.05) return;
+
+        if (dist < 0.05)
+            return;
 
         double alpha = std::atan2(y, x);
 
-        double curvature = 2.0 * std::sin(alpha) / dist;
+        double curvature =
+            2.0 * std::sin(alpha) / dist;
 
         double v = max_speed_ / (1.0 + curvature_gain_ * std::abs(curvature));
         v = std::clamp(v, min_speed_, max_speed_);
@@ -338,9 +310,7 @@ private:
         geometry_msgs::msg::Twist cmd;
         cmd.linear.x = v;
         cmd.angular.z = omega;
-
         cmd_vel_pub_->publish(cmd);
-
         publish_debug(robot, lookahead, idx);
     }
 };

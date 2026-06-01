@@ -11,6 +11,6 @@ coverage_planner:
     # Roboter & Feldkonfiguration
     operating_width: 1.0
     robot_width: 0.42
-    turn_radius: 1.0
-    headland_width: 1.5
+    turn_radius: 0.37
+    headland_width: 0.5
     swath_angle_deg: 0.0
