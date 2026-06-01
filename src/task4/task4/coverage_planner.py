@@ -3,12 +3,14 @@
 import rclpy
 from rclpy.node import Node
 import math
+from numbers import Real
 
 # ROS 2 Services & Messages
 from std_srvs.srv import Trigger
 from geometry_msgs.msg import PoseStamped, PointStamped, Point
 from visualization_msgs.msg import Marker
 from nav_msgs.msg import Path
+from rcl_interfaces.msg import SetParametersResult
 
 # TF2 für die Transformationen
 import tf2_ros
@@ -33,6 +35,9 @@ class CoveragePlanner(Node):
         self.declare_parameter('input_frame', 'base_link')
         self.declare_parameter('target_frame', 'odom')
 
+        # Flag, ob polygon_coords per Service gesetzt wurden
+        self.service_coords_set = False
+
         # 2. TF2 Setup
         self.tf_buffer = tf2_ros.Buffer()
         self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
@@ -41,7 +46,9 @@ class CoveragePlanner(Node):
         self.path_pub = self.create_publisher(Path, 'plan', 10)
         self.marker_pub = self.create_publisher(Marker, 'coverage_polygon_marker', 10)
 
-        # 4. Service
+        # 4. Services
+        self.set_params_handler = self.add_on_set_parameters_callback(self.on_parameter_change)
+
         self.srv = self.create_service(
             Trigger, 
             'trigger_coverage_planning', 
@@ -49,9 +56,30 @@ class CoveragePlanner(Node):
         )
         self.get_logger().info("Coverage Planner Service '/trigger_coverage_planning' ist bereit!")
 
+    def on_parameter_change(self, params):
+        polygon_coords_were_set = False
+
+        for p in params:
+            if p.name == 'polygon_coords':
+                success, reason = self.validate_polygon_coords(p.value)
+                if not success:
+                    return SetParametersResult(successful=False, reason=reason)
+                polygon_coords_were_set = True
+
+        if polygon_coords_were_set:
+            self.service_coords_set = True
+            self.get_logger().info("Polygon-Koordinaten erfolgreich per Service gesetzt.")
+
+        return SetParametersResult(successful=True)
+
     def planning_service_callback(self, request, response):
         input_frame = self.get_parameter('input_frame').get_parameter_value().string_value
         target_frame = self.get_parameter('target_frame').get_parameter_value().string_value
+
+        if not self.service_coords_set:
+            self.get_logger().warn(
+                "Keine Polygon-Koordinaten per Service gesetzt. Verwende Default aus der Parameterdatei."
+            )
 
         try:
             transform = self.tf_buffer.lookup_transform(
@@ -71,18 +99,79 @@ class CoveragePlanner(Node):
         
         return response
 
+    def validate_polygon_coords(self, coords):
+        if (
+            isinstance(coords, (str, bytes))
+            or not hasattr(coords, '__iter__')
+            or not hasattr(coords, '__len__')
+        ):
+            return False, "polygon_coords muss eine Liste aus Zahlen sein."
+
+        coords = list(coords)
+
+        if len(coords) % 2 != 0:
+            return False, "polygon_coords muss eine gerade Anzahl an Elementen besitzen."
+
+        if len(coords) < 6:
+            return False, "polygon_coords muss mindestens drei Punkte enthalten."
+
+        for value in coords:
+            if isinstance(value, bool) or not isinstance(value, Real):
+                return False, "polygon_coords darf nur numerische Werte enthalten."
+            if not math.isfinite(float(value)):
+                return False, "polygon_coords darf keine NaN- oder Infinity-Werte enthalten."
+
+        points = self.coords_to_points(coords)
+        if len(points) > 1 and self.same_point(points[0], points[-1]):
+            points = points[:-1]
+
+        if len(points) < 3:
+            return False, "polygon_coords muss mindestens drei unterschiedliche Polygonpunkte enthalten."
+
+        if len(set(points)) < 3:
+            return False, "polygon_coords muss mindestens drei unterschiedliche Polygonpunkte enthalten."
+
+        if math.isclose(self.signed_area_twice(points), 0.0, abs_tol=1e-9):
+            return False, "polygon_coords darf kein degeneriertes Polygon bilden."
+
+        return True, ""
+
+    def get_polygon_coords(self):
+        coords = list(self.get_parameter('polygon_coords').value)
+        success, reason = self.validate_polygon_coords(coords)
+        if not success:
+            raise ValueError(reason)
+
+        points = self.coords_to_points(coords)
+        if len(points) > 1 and self.same_point(points[0], points[-1]):
+            points = points[:-1]
+
+        return [coord for point in points for coord in point]
+
+    def coords_to_points(self, coords):
+        return [(float(coords[i]), float(coords[i + 1])) for i in range(0, len(coords), 2)]
+
+    def same_point(self, first, second):
+        return (
+            math.isclose(first[0], second[0], abs_tol=1e-9)
+            and math.isclose(first[1], second[1], abs_tol=1e-9)
+        )
+
+    def signed_area_twice(self, points):
+        area = 0.0
+        for index, point in enumerate(points):
+            next_point = points[(index + 1) % len(points)]
+            area += point[0] * next_point[1] - next_point[0] * point[1]
+        return area
+
     def generate_coverage_path(self, transform):
-        coords = self.get_parameter('polygon_coords').get_parameter_value().double_array_value
+        coords = self.get_polygon_coords()
         op_width = self.get_parameter('operating_width').get_parameter_value().double_value
         rob_width = self.get_parameter('robot_width').get_parameter_value().double_value
         hl_width = self.get_parameter('headland_width').get_parameter_value().double_value
         turn_rad = self.get_parameter('turn_radius').get_parameter_value().double_value
         swath_angle = math.radians(self.get_parameter('swath_angle_deg').get_parameter_value().double_value)
         target_frame = self.get_parameter('target_frame').get_parameter_value().string_value
-
-        if len(coords) % 2 != 0 or len(coords) < 6:
-            self.get_logger().error("polygon_coords muss eine gerade Anzahl an Elementen besitzen!")
-            return
 
         # 1. Transformation nach odom/map
         transformed_coords = []
