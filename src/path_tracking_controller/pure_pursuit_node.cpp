@@ -3,15 +3,18 @@
 #include <geometry_msgs/msg/pose_stamped.hpp>
 #include <geometry_msgs/msg/twist.hpp>
 #include <nav_msgs/msg/path.hpp>
+#include <std_srvs/srv/set_bool.hpp>
 #include <tf2_ros/transform_listener.h>
 #include <tf2_ros/buffer.h>
 #include <tf2_geometry_msgs/tf2_geometry_msgs.hpp>
 #include <tf2/utils.h>
 #include <visualization_msgs/msg/marker_array.hpp>
 
+#include <chrono>
 #include <cmath>
 #include <limits>
 #include <algorithm>
+#include <string>
 
 class PurePursuitNode : public rclcpp::Node
 {
@@ -25,7 +28,15 @@ public:
         this->declare_parameter<double>("min_speed", 0.3);
         this->declare_parameter<double>("curvature_gain", 1.5);
         this->declare_parameter<double>("max_angular_velocity", 2.0);
+        this->declare_parameter<double>("angular_acceleration_limit", 3.0);
         this->declare_parameter<double>("control_rate", 20.0);
+        this->declare_parameter<double>("goal_tolerance", 0.15);
+        this->declare_parameter<double>("slowdown_distance", 0.75);
+        this->declare_parameter<double>("acceleration_limit", 0.5);
+        this->declare_parameter<double>("deceleration_limit", 0.5);
+        this->declare_parameter<std::string>("path_topic", "/plan");
+        this->declare_parameter<std::string>("cmd_vel_topic", "/cmd_vel");
+        this->declare_parameter<std::string>("base_link_frame", "base_link");
 
         this->declare_parameter<double>("resample_spacing", 0.10);
         this->declare_parameter<bool>("resample_enabled", true);
@@ -37,17 +48,33 @@ public:
         min_speed_ = get_parameter("min_speed").as_double();
         curvature_gain_ = get_parameter("curvature_gain").as_double();
         max_angular_velocity_ = get_parameter("max_angular_velocity").as_double();
+        angular_acceleration_limit_ = get_parameter("angular_acceleration_limit").as_double();
         control_rate_ = get_parameter("control_rate").as_double();
+        goal_tolerance_ = get_parameter("goal_tolerance").as_double();
+        slowdown_distance_ = get_parameter("slowdown_distance").as_double();
+        acceleration_limit_ = get_parameter("acceleration_limit").as_double();
+        deceleration_limit_ = get_parameter("deceleration_limit").as_double();
+        path_topic_ = get_parameter("path_topic").as_string();
+        cmd_vel_topic_ = get_parameter("cmd_vel_topic").as_string();
+        base_link_frame_ = get_parameter("base_link_frame").as_string();
 
         resample_spacing_ = get_parameter("resample_spacing").as_double();
         resample_enabled_ = get_parameter("resample_enabled").as_bool();
 
-        cmd_vel_pub_ = create_publisher<geometry_msgs::msg::Twist>("/cmd_vel", 10);
+        cmd_vel_pub_ = create_publisher<geometry_msgs::msg::Twist>(cmd_vel_topic_, 10);
         debug_pub_ = create_publisher<visualization_msgs::msg::MarkerArray>("/pure_pursuit/debug", 10);
 
         path_sub_ = create_subscription<nav_msgs::msg::Path>(
-            "/plan", 10,
+            path_topic_, 10,
             std::bind(&PurePursuitNode::path_callback, this, std::placeholders::_1));
+
+        set_active_srv_ = create_service<std_srvs::srv::SetBool>(
+            "~/set_active",
+            std::bind(
+                &PurePursuitNode::set_active_callback,
+                this,
+                std::placeholders::_1,
+                std::placeholders::_2));
 
         tf_buffer_ = std::make_shared<tf2_ros::Buffer>(get_clock());
         tf_listener_ = std::make_shared<tf2_ros::TransformListener>(*tf_buffer_);
@@ -55,12 +82,20 @@ public:
         timer_ = create_wall_timer(
             std::chrono::milliseconds((int)(1000.0 / control_rate_)),
             std::bind(&PurePursuitNode::control_loop, this));
+
+        RCLCPP_INFO(
+            get_logger(),
+            "Pure Pursuit Controller bereit. Pfad: %s, cmd_vel: %s, Start/Stop-Service: %s",
+            path_topic_.c_str(),
+            cmd_vel_topic_.c_str(),
+            (std::string(get_fully_qualified_name()) + "/set_active").c_str());
     }
 
 private:
     rclcpp::Publisher<geometry_msgs::msg::Twist>::SharedPtr cmd_vel_pub_;
     rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr debug_pub_;
     rclcpp::Subscription<nav_msgs::msg::Path>::SharedPtr path_sub_;
+    rclcpp::Service<std_srvs::srv::SetBool>::SharedPtr set_active_srv_;
     rclcpp::TimerBase::SharedPtr timer_;
 
     std::shared_ptr<tf2_ros::Buffer> tf_buffer_;
@@ -68,13 +103,28 @@ private:
 
     nav_msgs::msg::Path path_;
     bool path_received_ = false;
+    bool tracking_enabled_ = false;
+    bool path_completed_ = false;
 
     size_t target_idx_ = 0;
 
     double lookahead_min_, lookahead_max_, lookahead_gain_;
     double max_speed_, min_speed_;
     double curvature_gain_, max_angular_velocity_;
+    double angular_acceleration_limit_;
     double control_rate_;
+    double goal_tolerance_;
+    double slowdown_distance_;
+    double acceleration_limit_;
+    double deceleration_limit_;
+    double commanded_linear_speed_ = 0.0;
+    double commanded_angular_velocity_ = 0.0;
+    bool last_control_time_valid_ = false;
+    rclcpp::Time last_control_time_;
+
+    std::string path_topic_;
+    std::string cmd_vel_topic_;
+    std::string base_link_frame_;
 
     double resample_spacing_;
     bool resample_enabled_;
@@ -130,7 +180,13 @@ private:
     void path_callback(const nav_msgs::msg::Path::SharedPtr msg)
     {
         if (msg->poses.size() < 2)
+        {
+            path_received_ = false;
+            tracking_enabled_ = false;
+            path_completed_ = true;
+            RCLCPP_WARN(get_logger(), "Empfangener Pfad hat weniger als zwei Posen. Stoppe Path Tracking.");
             return;
+        }
 
         if (resample_enabled_)
             path_ = resample_path(*msg);
@@ -138,12 +194,41 @@ private:
             path_ = *msg;
 
         path_received_ = true;
+        tracking_enabled_ = true;
+        path_completed_ = false;
         target_idx_ = 0;
 
         RCLCPP_INFO(get_logger(),
-            "Path received: %zu -> %zu poses",
+            "Path received: %zu -> %zu poses. Path Tracking gestartet/restarted.",
             msg->poses.size(),
             path_.poses.size());
+    }
+
+    void set_active_callback(
+        const std_srvs::srv::SetBool::Request::SharedPtr request,
+        std_srvs::srv::SetBool::Response::SharedPtr response)
+    {
+        if (request->data)
+        {
+            if (!path_received_)
+            {
+                response->success = false;
+                response->message = "Kein Pfad vorhanden. Erst /trigger_coverage_planning aufrufen.";
+                return;
+            }
+
+            tracking_enabled_ = true;
+            path_completed_ = false;
+            response->success = true;
+            response->message = "Path Tracking gestartet.";
+            RCLCPP_INFO(get_logger(), "%s", response->message.c_str());
+            return;
+        }
+
+        tracking_enabled_ = false;
+        response->success = true;
+        response->message = "Path Tracking wird sanft gestoppt.";
+        RCLCPP_INFO(get_logger(), "%s", response->message.c_str());
     }
 
     // =========================
@@ -153,7 +238,7 @@ private:
         {
             auto tf = tf_buffer_->lookupTransform(
                 path_.header.frame_id,
-                "base_link",
+                base_link_frame_,
                 tf2::TimePointZero);
 
             pose.pose.position.x = tf.transform.translation.x;
@@ -241,6 +326,88 @@ private:
         return path_.poses.back().pose.position;
     }
 
+    double remaining_path_distance(size_t idx, const geometry_msgs::msg::PoseStamped & robot)
+    {
+        if (path_.poses.empty())
+            return 0.0;
+
+        size_t N = path_.poses.size();
+        idx = std::min(idx, N - 1);
+
+        const auto & start = path_.poses[idx].pose.position;
+        double remaining = std::hypot(
+            start.x - robot.pose.position.x,
+            start.y - robot.pose.position.y);
+
+        for (size_t i = idx; i < N - 1; i++)
+        {
+            const auto & p0 = path_.poses[i].pose.position;
+            const auto & p1 = path_.poses[i + 1].pose.position;
+            remaining += std::hypot(p1.x - p0.x, p1.y - p0.y);
+        }
+
+        return remaining;
+    }
+
+    double ramp_value(double current, double target, double increase_limit, double decrease_limit, double dt)
+    {
+        double delta = target - current;
+        double limit = (delta >= 0.0 ? increase_limit : decrease_limit) * dt;
+
+        if (std::abs(delta) <= limit)
+            return target;
+
+        return current + std::copysign(limit, delta);
+    }
+
+    double control_dt()
+    {
+        rclcpp::Time now = get_clock()->now();
+        double dt = 1.0 / std::max(control_rate_, 1.0);
+
+        if (last_control_time_valid_)
+        {
+            dt = (now - last_control_time_).seconds();
+            dt = std::clamp(dt, 0.001, 0.25);
+        }
+
+        last_control_time_ = now;
+        last_control_time_valid_ = true;
+        return dt;
+    }
+
+    void publish_ramped_command(double target_linear, double target_angular, double dt)
+    {
+        commanded_linear_speed_ = ramp_value(
+            commanded_linear_speed_,
+            target_linear,
+            acceleration_limit_,
+            deceleration_limit_,
+            dt);
+
+        commanded_angular_velocity_ = ramp_value(
+            commanded_angular_velocity_,
+            target_angular,
+            angular_acceleration_limit_,
+            angular_acceleration_limit_,
+            dt);
+
+        if (std::abs(commanded_linear_speed_) < 1e-3)
+            commanded_linear_speed_ = 0.0;
+        if (std::abs(commanded_angular_velocity_) < 1e-3)
+            commanded_angular_velocity_ = 0.0;
+
+        geometry_msgs::msg::Twist cmd;
+        cmd.linear.x = commanded_linear_speed_;
+        cmd.angular.z = commanded_angular_velocity_;
+        cmd_vel_pub_->publish(cmd);
+    }
+
+    void publish_ramped_stop(double dt)
+    {
+        publish_ramped_command(0.0, 0.0, dt);
+    }
+
     // =========================
     void publish_debug(const geometry_msgs::msg::PoseStamped & robot,
                        const geometry_msgs::msg::Point & lookahead,
@@ -287,12 +454,28 @@ private:
     // =========================
     void control_loop()
     {
-        if (!path_received_) return;
+        double dt = control_dt();
+
+        if (!path_received_ || !tracking_enabled_ || path_completed_)
+        {
+            publish_ramped_stop(dt);
+            return;
+        }
 
         geometry_msgs::msg::PoseStamped robot;
-        if (!get_robot_pose(robot)) return;
+        if (!get_robot_pose(robot))
+        {
+            RCLCPP_WARN_THROTTLE(
+                get_logger(),
+                *get_clock(),
+                1000,
+                "Keine TF-Pose verfuegbar. Bremse mit Rampe auf 0.");
+            publish_ramped_stop(dt);
+            return;
+        }
 
         size_t idx = update_target_index(robot);
+        double remaining = remaining_path_distance(idx, robot);
 
         double ld = lookahead_distance();
         auto lookahead = get_lookahead(idx, ld);
@@ -307,7 +490,7 @@ private:
         try
         {
             auto tf = tf_buffer_->lookupTransform(
-                "base_link",
+                base_link_frame_,
                 path_.header.frame_id,
                 tf2::TimePointZero);
 
@@ -315,6 +498,12 @@ private:
         }
         catch (...)
         {
+            RCLCPP_WARN_THROTTLE(
+                get_logger(),
+                *get_clock(),
+                1000,
+                "Lookahead konnte nicht transformiert werden. Bremse mit Rampe auf 0.");
+            publish_ramped_stop(dt);
             return;
         }
 
@@ -322,7 +511,23 @@ private:
         double y = lookahead_base.pose.position.y;
 
         double dist = std::hypot(x, y);
-        if (dist < 0.05) return;
+        bool final_point_reached = idx >= path_.poses.size() - 1 &&
+            (remaining <= goal_tolerance_ || x <= 0.0);
+
+        if (final_point_reached)
+        {
+            path_completed_ = true;
+            tracking_enabled_ = false;
+            RCLCPP_INFO(get_logger(), "Pfadende erreicht. Bremse mit Geschwindigkeitsrampe auf 0.");
+            publish_ramped_stop(dt);
+            return;
+        }
+
+        if (dist < 0.05)
+        {
+            publish_ramped_stop(dt);
+            return;
+        }
 
         double alpha = std::atan2(y, x);
 
@@ -331,15 +536,17 @@ private:
         double v = max_speed_ / (1.0 + curvature_gain_ * std::abs(curvature));
         v = std::clamp(v, min_speed_, max_speed_);
 
+        if (slowdown_distance_ > 1e-6 && remaining < slowdown_distance_)
+        {
+            double slowdown_ratio = std::clamp(remaining / slowdown_distance_, 0.0, 1.0);
+            v = std::min(v, max_speed_ * slowdown_ratio);
+        }
+
         double omega = std::clamp(v * curvature,
                                   -max_angular_velocity_,
                                   max_angular_velocity_);
 
-        geometry_msgs::msg::Twist cmd;
-        cmd.linear.x = v;
-        cmd.angular.z = omega;
-
-        cmd_vel_pub_->publish(cmd);
+        publish_ramped_command(v, omega, dt);
 
         publish_debug(robot, lookahead, idx);
     }

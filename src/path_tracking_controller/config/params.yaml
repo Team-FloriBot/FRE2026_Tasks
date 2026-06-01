@@ -15,8 +15,12 @@ pure_pursuit_node:
 
     curvature_gain: 3.0
     max_angular_velocity: 3.0
+    angular_acceleration_limit: 3.0
 
     goal_tolerance: 0.15
+    slowdown_distance: 0.75
+    acceleration_limit: 0.5
+    deceleration_limit: 0.5
 
     control_rate: 20.0
 

@@ -8,6 +8,8 @@ Dieses Package implementiert einen minimalistischen Pure-Pursuit-Controller für
 - Adaptive Lookahead-Distanz basierend auf Geschwindigkeit
 - Krümmungsabhängige Geschwindigkeitsregelung für Kurven
 - Zielerkennung mit Stop-Funktion
+- Sanftes Abbremsen am Pfadende und beim manuellen Stop
+- Start/Stop-Service für das Path Tracking
 - RViz-Debug-Marker für nearest und lookahead point
 - Minimale Abhängigkeiten (kein Nav2-Stack)
 
@@ -35,6 +37,10 @@ path_tracking_controller/
 - `/cmd_vel` (geometry_msgs/msg/Twist): Geschwindigkeitskommandos
 - `~/debug_marker` (visualization_msgs/msg/Marker): RViz-Debug-Marker
 
+### Services
+
+- `~/set_active` (`std_srvs/srv/SetBool`): `true` startet das Tracking des aktuellen Pfads, `false` stoppt mit Geschwindigkeitsrampe
+
 ### TF-Frames
 
 - `map` → `odom` → `base_link`
@@ -55,6 +61,10 @@ path_tracking_controller/
 | `min_speed` | double | `0.3` | Minimale Geschwindigkeit [m/s] |
 | `curvature_speed_gain` | double | `2.0` | Gain für krümmungsabhängige Geschwindigkeitsreduktion |
 | `goal_tolerance` | double | `0.15` | Toleranz für Zielerkennung [m] |
+| `slowdown_distance` | double | `0.75` | Distanz vor dem Ziel, ab der abgebremst wird [m] |
+| `acceleration_limit` | double | `0.5` | Maximale Beschleunigung der linearen Geschwindigkeit [m/s²] |
+| `deceleration_limit` | double | `0.5` | Maximale Verzögerung der linearen Geschwindigkeit [m/s²] |
+| `angular_acceleration_limit` | double | `3.0` | Maximale Änderung der Winkelgeschwindigkeit [rad/s²] |
 | `control_rate` | double | `30` | Regelrate [Hz] |
 
 ## Algorithmus
@@ -105,6 +115,18 @@ ros2 launch path_tracking_controller path_tracking_controller.launch.py
 1. Pfad über `/path` Topic publizieren (nav_msgs/Path im map-frame)
 2. Odometrie über `/odom` Topic publizieren
 3. Geschwindigkeitskommandos empfangen auf `/cmd_vel`
+
+Tracking stoppen:
+
+```bash
+ros2 service call /pure_pursuit_node/set_active std_srvs/srv/SetBool "{data: false}"
+```
+
+Tracking des aktuellen Pfads wieder starten:
+
+```bash
+ros2 service call /pure_pursuit_node/set_active std_srvs/srv/SetBool "{data: true}"
+```
 
 ## Hinweise
 
