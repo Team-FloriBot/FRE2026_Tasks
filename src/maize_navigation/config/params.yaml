@@ -76,7 +76,9 @@ maize_navigator:
     # Rausbogen -> pattern-relativer Versatz -> Reinbogen.
     # Die normale Reihenfahrt bleibt unveraendert.
     headland_maneuver_enabled: true
-    headland_exit_straight_distance: 0.45
+    # Direkt nach erkannter Reihenende-Bedingung in den Ausfahrbogen wechseln.
+    # Vorher: 0.45 m Geradeaus-Ausfahrt vor dem Bogen.
+    headland_exit_straight_distance: 0.0
     headland_exit_straight_speed: 0.18
     exit_curve_speed: 0.18
     exit_curve_angular_speed: 0.48
