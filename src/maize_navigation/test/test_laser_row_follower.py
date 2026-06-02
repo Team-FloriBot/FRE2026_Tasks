@@ -45,6 +45,7 @@ def install_ros_import_stubs():
 install_ros_import_stubs()
 
 from maize_navigation.maize_navigation import (  # noqa: E402
+    EntrancePeak,
     LaserRowFollower,
     MaizeNavigator,
     MissionState,
@@ -230,6 +231,7 @@ def bare_navigator():
     navigator.initial_forward_direction = np.array([1.0, 0.0])
     navigator.row_end_directions_by_side = {"forward": [], "backward": []}
     navigator.entrance_route = np.empty((0, 2))
+    navigator.entrance_route_support = np.empty((0, 2))
     navigator.entrance_route_progress_index = 0
     navigator.entrance_route_projection = None
     navigator.entrance_route_target = None
@@ -415,6 +417,59 @@ def test_turn_waypoints_follow_outermost_peak_on_traversed_route():
 
     assert np.allclose(navigator.entrance_waypoints[0], np.array([1.2, 0.0]))
     assert np.allclose(navigator.entrance_waypoints[1], np.array([1.2, 1.5]))
+
+
+def test_support_route_keeps_first_waypoint_visible_when_active_route_skips_it():
+    navigator = bare_navigator()
+    navigator.robot_pose = Pose2D(0.26, 0.0, 0.0)
+    navigator.plant_row_end_point = np.array([0.0, 0.0])
+    navigator.row_end_direction = np.array([1.0, 0.0])
+    navigator.entrance_active_step = PatternStep(1, "L")
+
+    navigator.rebuild_entrance_route(None)
+
+    assert len(navigator.entrance_waypoints) == 2
+    assert np.allclose(navigator.entrance_waypoints[0], np.array([0.3, 0.0]))
+    assert np.allclose(navigator.entrance_route_support[1], np.array([0.3, 0.0]))
+    assert not np.any(np.all(np.isclose(navigator.entrance_route, np.array([0.3, 0.0])), axis=1))
+
+
+def test_locked_turn_route_is_not_resampled_for_small_peak_jitter():
+    navigator = bare_navigator()
+    navigator.get_logger = lambda: type("Logger", (), {"info": lambda *args, **kwargs: None})()
+    navigator.robot_pose = Pose2D(0.0, 0.0, 0.0)
+    navigator.plant_row_end_point = np.array([0.0, 0.0])
+    navigator.row_end_direction = np.array([1.0, 0.0])
+    navigator.entrance_active_step = PatternStep(2, "L")
+    navigator.pattern_index = 0
+    navigator.pattern_steps = [PatternStep(2, "L")]
+    navigator.entrance_route_provisional = True
+    navigator.left_row = RowMarchModel("left", np.array([0.0, 0.75]), np.array([0.3, 0.75]), np.array([1.0, 0.0]), 2)
+    navigator.right_row = RowMarchModel("right", np.array([0.0, 0.0]), np.array([0.3, 0.0]), np.array([1.0, 0.0]), 1)
+    navigator.row_number_increase_direction = np.array([0.0, 1.0])
+    navigator.get_all_map_points = lambda: np.empty((0, 2))
+    navigator.associate_known_rows_with_entrance_peaks = lambda center, outgoing: (0, 1)
+    navigator.build_entrance_follow_path = lambda: np.array([[0.8, 1.5], [1.6, 1.5]])
+    navigator.find_entrance_histogram_peaks = lambda points, center, outgoing: [
+        EntrancePeak(0.0, np.array([0.0, 0.0]), 1),
+        EntrancePeak(0.75, np.array([0.0, 0.75]), 2),
+        EntrancePeak(1.5, np.array([0.0, 1.5]), 3),
+        EntrancePeak(2.25, np.array([0.0, 2.25]), 4),
+    ]
+
+    assert navigator.lock_next_row_entrance()
+    locked_route = np.array(navigator.entrance_route, copy=True)
+    navigator.robot_pose = Pose2D(0.4, 0.1, 0.0)
+    navigator.find_entrance_histogram_peaks = lambda points, center, outgoing: [
+        EntrancePeak(0.0, np.array([0.0, 0.0]), 1),
+        EntrancePeak(0.75, np.array([0.0, 0.75]), 2),
+        EntrancePeak(1.5, np.array([0.02, 1.5]), 3),
+        EntrancePeak(2.25, np.array([0.0, 2.25]), 4),
+    ]
+
+    assert navigator.lock_next_row_entrance()
+
+    assert np.allclose(navigator.entrance_route, locked_route)
 
 
 def test_missed_entry_line_replans_forward_onto_follow_path():
