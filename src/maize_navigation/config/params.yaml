@@ -43,10 +43,10 @@ maize_navigator:
     # Rechteck-Marching-Reihenerkennung:
     # Die initiale linke/rechte Reihe kommt einmalig aus Histogrammpeaks.
     # Danach werden beide Reihen bei jedem Kartenupdate von dieser Initialgeraden neu berechnet.
-    row_segment_point_count: 5
+    row_segment_point_count: 7
     row_segment_point_spacing: 0.30
-    row_rectangle_width: 0.50
-    row_point_window_length: 0.40
+    row_rectangle_width: 0.55
+    row_point_window_length: 0.30
     row_end_min_points_fields_3_to_5: 2
     row_max_march_steps: 120
     row_min_fit_points: 3
