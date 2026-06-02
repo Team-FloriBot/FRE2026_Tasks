@@ -141,7 +141,7 @@ maize_navigator:
     min_turn_radius: 0.38
     enter_distance: 0.90
 
-    pattern: "1L 6R 5R 4R 3R 2R 1R"
+    pattern: "3L 6R 5R 4R 3R 2R 1R"
     # Startgasse 1 liegt zwischen Pflanzenreihe 1 und 2.
     # Die Richtung gilt feldfest relativ zur Blickrichtung beim Missionsstart.
     starting_lane_number: 1

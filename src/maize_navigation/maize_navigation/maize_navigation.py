@@ -17,6 +17,7 @@ import rclpy
 from rclpy.node import Node
 
 from geometry_msgs.msg import Point, Twist
+from maize_navigation_interfaces.srv import StartNavigation
 from nav_msgs.msg import OccupancyGrid
 from sensor_msgs.msg import LaserScan
 from std_msgs.msg import Header
@@ -438,7 +439,7 @@ class MaizeNavigator(Node):
         self.cmd_pub = self.create_publisher(Twist, self.p.cmd_vel_topic, 10)
         self.marker_pub = self.create_publisher(MarkerArray, "navigation_markers", 10)
 
-        self.start_srv = self.create_service(Trigger, "start_navigation", self.start_cb)
+        self.start_srv = self.create_service(StartNavigation, "start_navigation", self.start_cb)
         self.stop_srv = self.create_service(Trigger, "stop_navigation", self.stop_cb)
         self.timer = self.create_timer(1.0 / self.p.control_frequency, self.control_loop)
 
@@ -616,6 +617,15 @@ class MaizeNavigator(Node):
         self.latest_scan_received_ns = self.get_clock().now().nanoseconds
 
     def start_cb(self, req, res):
+        pattern = req.pattern.strip()
+        invalid_tokens = [token for token in pattern.split() if re.fullmatch(r"([1-9][0-9]*)([LlRr])", token) is None]
+        if not pattern or invalid_tokens:
+            res.success = False
+            res.message = "Invalid pattern. Use space-separated steps such as '1L 2R'."
+            return res
+
+        self.p.pattern = pattern
+        self.pattern_steps = self.parse_pattern(pattern)
         self.left_row = None
         self.right_row = None
         self.midline = np.empty((0, 2), dtype=float)
@@ -637,7 +647,7 @@ class MaizeNavigator(Node):
         self.fused_target_point = None
         self.state = MissionState.INITIALIZING
         res.success = True
-        res.message = "Navigation started"
+        res.message = f"Navigation started with pattern: {pattern}"
         return res
 
     def stop_cb(self, req, res):

@@ -18,6 +18,7 @@ def install_ros_import_stubs():
 
     for package, names in (
         ("geometry_msgs", ("Point", "Twist")),
+        ("maize_navigation_interfaces", ("StartNavigation",)),
         ("nav_msgs", ("OccupancyGrid",)),
         ("sensor_msgs", ("LaserScan",)),
         ("std_msgs", ("Header",)),
@@ -25,10 +26,11 @@ def install_ros_import_stubs():
         ("visualization_msgs", ("Marker", "MarkerArray")),
     ):
         package_module = module(package)
-        message_module = module(f"{package}.msg" if package != "std_srvs" else f"{package}.srv")
+        module_type = "srv" if package in ("maize_navigation_interfaces", "std_srvs") else "msg"
+        message_module = module(f"{package}.{module_type}")
         for name in names:
             setattr(message_module, name, type(name, (), {}))
-        if package == "std_srvs":
+        if package in ("maize_navigation_interfaces", "std_srvs"):
             package_module.srv = message_module
         else:
             package_module.msg = message_module
@@ -45,6 +47,7 @@ install_ros_import_stubs()
 from maize_navigation.maize_navigation import (  # noqa: E402
     LaserRowFollower,
     MaizeNavigator,
+    MissionState,
     NavigatorParams,
     PatternStep,
     Pose2D,
@@ -83,6 +86,36 @@ def process_repeatedly(follower, scan, count=12, map_slope=0.0, map_target=(1.4,
     for _ in range(count):
         result = follower.process_scan(scan, map_slope, np.asarray(map_target, dtype=float))
     return result
+
+
+def make_navigator_for_start_callback():
+    navigator = MaizeNavigator.__new__(MaizeNavigator)
+    navigator.p = NavigatorParams()
+    navigator.pattern_steps = [PatternStep(1, "L")]
+    navigator.laser_follower = types.SimpleNamespace(reset=lambda: None)
+    return navigator
+
+
+def test_start_callback_sets_requested_pattern():
+    navigator = make_navigator_for_start_callback()
+
+    response = navigator.start_cb(types.SimpleNamespace(pattern="3L  2r"), types.SimpleNamespace())
+
+    assert response.success
+    assert response.message == "Navigation started with pattern: 3L  2r"
+    assert navigator.p.pattern == "3L  2r"
+    assert navigator.pattern_steps == [PatternStep(3, "L"), PatternStep(2, "R")]
+    assert navigator.state == MissionState.INITIALIZING
+
+
+def test_start_callback_rejects_invalid_pattern_without_changing_mission():
+    navigator = make_navigator_for_start_callback()
+
+    response = navigator.start_cb(types.SimpleNamespace(pattern="3L invalid"), types.SimpleNamespace())
+
+    assert not response.success
+    assert navigator.p.pattern == "1L 2R"
+    assert navigator.pattern_steps == [PatternStep(1, "L")]
 
 
 def test_both_rows_produce_centered_high_weight_target():
