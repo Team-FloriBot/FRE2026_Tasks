@@ -46,7 +46,7 @@ maize_navigator:
     row_segment_point_count: 5
     row_segment_point_spacing: 0.30
     row_rectangle_width: 0.50
-    row_point_window_length: 0.30
+    row_point_window_length: 0.40
     row_end_min_points_fields_3_to_5: 2
     row_max_march_steps: 120
     row_min_fit_points: 3
@@ -62,8 +62,8 @@ maize_navigator:
     laser_roi_x_min: 0.25
     laser_roi_x_max: 1.80
     laser_roi_length: 1.55
-    laser_roi_width: 0.32
-    laser_roi_center_offset_limit: 0.25
+    laser_roi_width: 0.5
+    laser_roi_center_offset_limit: 0.2
     laser_ransac_iterations: 80
     laser_ransac_distance: 0.08
     laser_min_inliers: 5
