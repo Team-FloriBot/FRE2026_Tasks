@@ -5,6 +5,7 @@ maize_navigator:
     odom_frame: "odom"
     map_topic: "/map"
     map_frame: "map"
+    scan_topic: "/sensors/merged_scan"
     use_slam_map: true
     require_map_for_turns: true
 
@@ -17,8 +18,8 @@ maize_navigator:
     hist_roi_size: 5.0
     # Histogramm-ROI: quer breit fuer mehr Reihen, laengs kompakter.
     # hist_roi_size bleibt als Fallback fuer alte Konfigurationen erhalten.
-    hist_roi_depth: 5.0
-    hist_roi_width: 8.0
+    hist_roi_depth: 4.0
+    hist_roi_width: 12.0
     hist_bin_size: 0.05
     hist_peak_min_points: 3
 
@@ -49,6 +50,27 @@ maize_navigator:
     row_end_min_points_fields_3_to_5: 2
     row_max_march_steps: 120
     row_min_fit_points: 3
+
+    # Lokale LaserScan-Feinfuehrung innerhalb der Reihe.
+    # Karte bleibt Prior und Fallback; Reihenende und Vorgewende bleiben kartenbasiert.
+    laser_follow_enabled: true
+    laser_scan_timeout: 0.50
+    laser_roi_x_min: 0.25
+    laser_roi_x_max: 2.0
+    laser_roi_y_abs_min: 0.18
+    laser_roi_y_abs_max: 0.90
+    laser_ransac_iterations: 80
+    laser_ransac_distance: 0.08
+    laser_min_inliers: 5
+    laser_min_visible_length: 0.35
+    laser_max_abs_line_slope: 0.90
+    laser_max_angle_to_map: 0.45
+    laser_max_center_offset: 0.40
+    laser_min_confidence: 0.25
+    laser_full_confidence: 0.85
+    laser_max_weight_both_sides: 0.80
+    laser_max_weight_one_side: 0.40
+    laser_tracker_alpha: 0.25
 
     tracker_alpha: 0.18
     confidence_decay: 0.95
@@ -105,7 +127,7 @@ maize_navigator:
     min_turn_radius: 0.38
     enter_distance: 0.90
 
-    pattern: "1L 2R 1L 3R"
+    pattern: "1L 6R 5R 4R 3R 2R 1R"
     # Startgasse 1 liegt zwischen Pflanzenreihe 1 und 2.
     # Die Richtung gilt feldfest relativ zur Blickrichtung beim Missionsstart.
     starting_lane_number: 1

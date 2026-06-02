@@ -18,6 +18,7 @@ from rclpy.node import Node
 
 from geometry_msgs.msg import Point, Twist
 from nav_msgs.msg import OccupancyGrid
+from sensor_msgs.msg import LaserScan
 from std_msgs.msg import Header
 from std_srvs.srv import Trigger
 from visualization_msgs.msg import Marker, MarkerArray
@@ -85,6 +86,28 @@ class EntrancePeak:
     selected: bool = False
 
 
+@dataclass
+class LaserLineFit:
+    valid: bool = False
+    slope: float = 0.0
+    intercept: float = 0.0
+    inliers: int = 0
+    visible_length: float = 0.0
+
+
+@dataclass
+class LaserFollowResult:
+    valid: bool = False
+    left_line: LaserLineFit = field(default_factory=LaserLineFit)
+    right_line: LaserLineFit = field(default_factory=LaserLineFit)
+    center_slope: float = 0.0
+    center_intercept: float = 0.0
+    confidence: float = 0.0
+    weight: float = 0.0
+    target_base: Optional[np.ndarray] = None
+    reason: str = ""
+
+
 class MissionState(Enum):
     IDLE = 0
     INITIALIZING = 1
@@ -99,6 +122,7 @@ class NavigatorParams:
     base_frame: str = "base_link"
     map_frame: str = "map"
     map_topic: str = "/map"
+    scan_topic: str = "/sensors/merged_scan"
 
     control_frequency: float = 30.0
     expected_row_width: float = 0.75
@@ -119,6 +143,25 @@ class NavigatorParams:
     row_end_min_points_fields_3_to_5: int = 2
     row_max_march_steps: int = 120
     row_min_fit_points: int = 3
+
+    laser_follow_enabled: bool = True
+    laser_scan_timeout: float = 0.50
+    laser_roi_x_min: float = 0.25
+    laser_roi_x_max: float = 2.0
+    laser_roi_y_abs_min: float = 0.18
+    laser_roi_y_abs_max: float = 0.90
+    laser_ransac_iterations: int = 80
+    laser_ransac_distance: float = 0.08
+    laser_min_inliers: int = 5
+    laser_min_visible_length: float = 0.35
+    laser_max_abs_line_slope: float = 0.9
+    laser_max_angle_to_map: float = 0.45
+    laser_max_center_offset: float = 0.40
+    laser_min_confidence: float = 0.25
+    laser_full_confidence: float = 0.85
+    laser_max_weight_both_sides: float = 0.80
+    laser_max_weight_one_side: float = 0.40
+    laser_tracker_alpha: float = 0.25
 
     follow_speed: float = 0.20
     slow_speed: float = 0.12
@@ -144,6 +187,125 @@ class NavigatorParams:
     publish_debug: bool = True
 
 
+class LaserRowFollower:
+    def __init__(self, params: NavigatorParams) -> None:
+        self.p = params
+        self.filtered_confidence = 0.0
+
+    def reset(self) -> None:
+        self.filtered_confidence = 0.0
+
+    def reject(self, result: LaserFollowResult, reason: str) -> LaserFollowResult:
+        self.filtered_confidence *= 1.0 - self.p.laser_tracker_alpha
+        result.confidence = self.filtered_confidence
+        result.reason = reason
+        return result
+
+    def process_scan(
+        self,
+        scan: Optional[LaserScan],
+        map_slope: float,
+        map_target_base: np.ndarray,
+    ) -> LaserFollowResult:
+        if scan is None:
+            return self.reject(LaserFollowResult(), "no scan")
+
+        points = self.scan_to_points(scan)
+        left_line = self.fit_line_ransac(self.points_in_side_roi(points, "left"))
+        right_line = self.fit_line_ransac(self.points_in_side_roi(points, "right"))
+        result = LaserFollowResult(left_line=left_line, right_line=right_line)
+        target_x = float(np.clip(map_target_base[0], self.p.laser_roi_x_min, self.p.laser_roi_x_max))
+
+        if left_line.valid and right_line.valid:
+            left_y = left_line.slope * target_x + left_line.intercept
+            right_y = right_line.slope * target_x + right_line.intercept
+            width = left_y - right_y
+            if not self.p.min_lane_width <= width <= self.p.max_lane_width:
+                return self.reject(result, "invalid lane width")
+            if abs(left_line.slope - right_line.slope) > 0.35:
+                return self.reject(result, "side lines not parallel")
+            result.center_slope = 0.5 * (left_line.slope + right_line.slope)
+            result.center_intercept = 0.5 * (left_line.intercept + right_line.intercept)
+            raw_confidence = 1.0
+            max_weight = self.p.laser_max_weight_both_sides
+        elif left_line.valid:
+            result.center_slope = left_line.slope
+            result.center_intercept = left_line.intercept - 0.5 * self.p.expected_row_width
+            raw_confidence = 0.60
+            max_weight = self.p.laser_max_weight_one_side
+        elif right_line.valid:
+            result.center_slope = right_line.slope
+            result.center_intercept = right_line.intercept + 0.5 * self.p.expected_row_width
+            raw_confidence = 0.60
+            max_weight = self.p.laser_max_weight_one_side
+        else:
+            return self.reject(result, "no valid side line")
+
+        laser_target_y = result.center_slope * target_x + result.center_intercept
+        angle_error = abs(wrap_to_pi(math.atan(result.center_slope) - math.atan(map_slope)))
+        if angle_error > self.p.laser_max_angle_to_map:
+            return self.reject(result, "angle differs from map")
+        if abs(laser_target_y - float(map_target_base[1])) > self.p.laser_max_center_offset:
+            return self.reject(result, "center differs from map")
+
+        alpha = self.p.laser_tracker_alpha
+        self.filtered_confidence = (1.0 - alpha) * self.filtered_confidence + alpha * raw_confidence
+        confidence_range = max(1e-6, self.p.laser_full_confidence - self.p.laser_min_confidence)
+        scale = (self.filtered_confidence - self.p.laser_min_confidence) / confidence_range
+        result.valid = True
+        result.confidence = self.filtered_confidence
+        result.weight = float(np.clip(scale, 0.0, 1.0)) * max_weight
+        result.target_base = np.array([target_x, laser_target_y], dtype=float)
+        result.reason = "ok"
+        return result
+
+    def scan_to_points(self, scan: LaserScan) -> np.ndarray:
+        ranges = np.asarray(scan.ranges, dtype=float)
+        angles = scan.angle_min + np.arange(len(ranges), dtype=float) * scan.angle_increment
+        mask = np.isfinite(ranges) & (ranges > scan.range_min) & (ranges < scan.range_max)
+        return np.column_stack((ranges[mask] * np.cos(angles[mask]), ranges[mask] * np.sin(angles[mask])))
+
+    def points_in_side_roi(self, points: np.ndarray, side: str) -> np.ndarray:
+        if len(points) == 0:
+            return np.empty((0, 2), dtype=float)
+        y_min = self.p.laser_roi_y_abs_min
+        y_max = self.p.laser_roi_y_abs_max
+        if side == "left":
+            side_mask = (points[:, 1] >= y_min) & (points[:, 1] <= y_max)
+        else:
+            side_mask = (points[:, 1] <= -y_min) & (points[:, 1] >= -y_max)
+        mask = side_mask & (points[:, 0] >= self.p.laser_roi_x_min) & (points[:, 0] <= self.p.laser_roi_x_max)
+        return points[mask]
+
+    def fit_line_ransac(self, points: np.ndarray) -> LaserLineFit:
+        if len(points) < self.p.laser_min_inliers:
+            return LaserLineFit()
+
+        best_inliers = np.zeros(len(points), dtype=bool)
+        rng = np.random.default_rng(42)
+        for _ in range(self.p.laser_ransac_iterations):
+            first, second = points[rng.choice(len(points), size=2, replace=False)]
+            dx = float(second[0] - first[0])
+            if abs(dx) < 1e-6:
+                continue
+            slope = float((second[1] - first[1]) / dx)
+            if abs(slope) > self.p.laser_max_abs_line_slope:
+                continue
+            intercept = float(first[1] - slope * first[0])
+            distances = np.abs(slope * points[:, 0] - points[:, 1] + intercept) / math.sqrt(slope * slope + 1.0)
+            inliers = distances <= self.p.laser_ransac_distance
+            if int(np.sum(inliers)) > int(np.sum(best_inliers)):
+                best_inliers = inliers
+
+        if int(np.sum(best_inliers)) < self.p.laser_min_inliers:
+            return LaserLineFit()
+        inlier_points = points[best_inliers]
+        slope, intercept = np.polyfit(inlier_points[:, 0], inlier_points[:, 1], 1)
+        visible_length = float(np.max(inlier_points[:, 0]) - np.min(inlier_points[:, 0]))
+        valid = visible_length >= self.p.laser_min_visible_length and abs(slope) <= self.p.laser_max_abs_line_slope
+        return LaserLineFit(valid, float(slope), float(intercept), int(np.sum(best_inliers)), visible_length)
+
+
 class MaizeNavigator(Node):
     def __init__(self) -> None:
         super().__init__("maize_navigator")
@@ -152,7 +314,12 @@ class MaizeNavigator(Node):
 
         self.state = MissionState.IDLE
         self.latest_map: Optional[OccupancyGrid] = None
+        self.latest_scan: Optional[LaserScan] = None
+        self.latest_scan_received_ns: Optional[int] = None
         self.robot_pose: Optional[Pose2D] = None
+        self.laser_follower = LaserRowFollower(self.p)
+        self.laser_follow_result = LaserFollowResult(reason="not initialized")
+        self.fused_target_point: Optional[np.ndarray] = None
 
         self.left_row: Optional[RowMarchModel] = None
         self.right_row: Optional[RowMarchModel] = None
@@ -184,6 +351,7 @@ class MaizeNavigator(Node):
         self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
 
         self.map_sub = self.create_subscription(OccupancyGrid, self.p.map_topic, self.map_callback, 10)
+        self.scan_sub = self.create_subscription(LaserScan, self.p.scan_topic, self.scan_callback, 10)
         self.cmd_pub = self.create_publisher(Twist, self.p.cmd_vel_topic, 10)
         self.marker_pub = self.create_publisher(MarkerArray, "navigation_markers", 10)
 
@@ -204,6 +372,7 @@ class MaizeNavigator(Node):
         p.base_frame = str(get_param("base_frame", p.base_frame))
         p.map_frame = str(get_param("map_frame", p.map_frame))
         p.map_topic = str(get_param("map_topic", p.map_topic))
+        p.scan_topic = str(get_param("scan_topic", p.scan_topic))
         p.control_frequency = float(get_param("control_frequency", p.control_frequency))
 
         p.expected_row_width = float(get_param("expected_row_width", p.expected_row_width))
@@ -226,6 +395,29 @@ class MaizeNavigator(Node):
         )
         p.row_max_march_steps = int(get_param("row_max_march_steps", p.row_max_march_steps))
         p.row_min_fit_points = int(get_param("row_min_fit_points", p.row_min_fit_points))
+
+        p.laser_follow_enabled = bool(get_param("laser_follow_enabled", p.laser_follow_enabled))
+        p.laser_scan_timeout = float(get_param("laser_scan_timeout", p.laser_scan_timeout))
+        p.laser_roi_x_min = float(get_param("laser_roi_x_min", p.laser_roi_x_min))
+        p.laser_roi_x_max = float(get_param("laser_roi_x_max", p.laser_roi_x_max))
+        p.laser_roi_y_abs_min = float(get_param("laser_roi_y_abs_min", p.laser_roi_y_abs_min))
+        p.laser_roi_y_abs_max = float(get_param("laser_roi_y_abs_max", p.laser_roi_y_abs_max))
+        p.laser_ransac_iterations = int(get_param("laser_ransac_iterations", p.laser_ransac_iterations))
+        p.laser_ransac_distance = float(get_param("laser_ransac_distance", p.laser_ransac_distance))
+        p.laser_min_inliers = int(get_param("laser_min_inliers", p.laser_min_inliers))
+        p.laser_min_visible_length = float(get_param("laser_min_visible_length", p.laser_min_visible_length))
+        p.laser_max_abs_line_slope = float(get_param("laser_max_abs_line_slope", p.laser_max_abs_line_slope))
+        p.laser_max_angle_to_map = float(get_param("laser_max_angle_to_map", p.laser_max_angle_to_map))
+        p.laser_max_center_offset = float(get_param("laser_max_center_offset", p.laser_max_center_offset))
+        p.laser_min_confidence = float(get_param("laser_min_confidence", p.laser_min_confidence))
+        p.laser_full_confidence = float(get_param("laser_full_confidence", p.laser_full_confidence))
+        p.laser_max_weight_both_sides = float(
+            get_param("laser_max_weight_both_sides", p.laser_max_weight_both_sides)
+        )
+        p.laser_max_weight_one_side = float(
+            get_param("laser_max_weight_one_side", p.laser_max_weight_one_side)
+        )
+        p.laser_tracker_alpha = float(get_param("laser_tracker_alpha", p.laser_tracker_alpha))
 
         p.follow_speed = float(get_param("follow_speed", p.follow_speed))
         p.slow_speed = float(get_param("slow_speed", p.slow_speed))
@@ -268,6 +460,21 @@ class MaizeNavigator(Node):
         self.p.row_rectangle_width = max(0.05, self.p.row_rectangle_width)
         self.p.row_point_window_length = max(0.05, self.p.row_point_window_length)
         self.p.row_max_march_steps = max(1, self.p.row_max_march_steps)
+        self.p.laser_scan_timeout = max(0.05, self.p.laser_scan_timeout)
+        self.p.laser_roi_x_max = max(self.p.laser_roi_x_min + 0.05, self.p.laser_roi_x_max)
+        self.p.laser_roi_y_abs_max = max(self.p.laser_roi_y_abs_min + 0.05, self.p.laser_roi_y_abs_max)
+        self.p.laser_ransac_iterations = max(1, self.p.laser_ransac_iterations)
+        self.p.laser_ransac_distance = max(0.01, self.p.laser_ransac_distance)
+        self.p.laser_min_inliers = max(2, self.p.laser_min_inliers)
+        self.p.laser_min_visible_length = max(0.05, self.p.laser_min_visible_length)
+        self.p.laser_max_abs_line_slope = max(0.05, self.p.laser_max_abs_line_slope)
+        self.p.laser_max_angle_to_map = max(0.05, self.p.laser_max_angle_to_map)
+        self.p.laser_max_center_offset = max(0.05, self.p.laser_max_center_offset)
+        self.p.laser_min_confidence = float(np.clip(self.p.laser_min_confidence, 0.0, 0.99))
+        self.p.laser_full_confidence = float(np.clip(self.p.laser_full_confidence, self.p.laser_min_confidence + 0.01, 1.0))
+        self.p.laser_max_weight_both_sides = float(np.clip(self.p.laser_max_weight_both_sides, 0.0, 1.0))
+        self.p.laser_max_weight_one_side = float(np.clip(self.p.laser_max_weight_one_side, 0.0, 1.0))
+        self.p.laser_tracker_alpha = float(np.clip(self.p.laser_tracker_alpha, 0.01, 1.0))
         self.p.min_follow_turn_radius = max(0.1, self.p.min_follow_turn_radius)
         self.p.angular_rate_limit = max(0.01, self.p.angular_rate_limit)
         self.p.target_filter_alpha = float(np.clip(self.p.target_filter_alpha, 0.01, 1.0))
@@ -288,6 +495,10 @@ class MaizeNavigator(Node):
     def map_callback(self, msg: OccupancyGrid) -> None:
         self.latest_map = msg
 
+    def scan_callback(self, msg: LaserScan) -> None:
+        self.latest_scan = msg
+        self.latest_scan_received_ns = self.get_clock().now().nanoseconds
+
     def start_cb(self, req, res):
         self.left_row = None
         self.right_row = None
@@ -304,6 +515,9 @@ class MaizeNavigator(Node):
         self.row_map_exported = False
         self.reset_entrance_state()
         self.reset_controller_state()
+        self.laser_follower.reset()
+        self.laser_follow_result = LaserFollowResult(reason="navigation started")
+        self.fused_target_point = None
         self.state = MissionState.INITIALIZING
         res.success = True
         res.message = "Navigation started"
@@ -325,6 +539,7 @@ class MaizeNavigator(Node):
     def reset_controller_state(self) -> None:
         self.last_cmd_angular_z = 0.0
         self.last_target_point = None
+        self.fused_target_point = None
 
     def reset_entrance_state(self) -> None:
         self.entrance_hist_center = None
@@ -443,7 +658,85 @@ class MaizeNavigator(Node):
         target = self.lookahead_point_from_polyline_projection(self.midline, robot_xy, self.p.lookahead_distance)
         if target is None:
             target = self.midline[-1]
-        self.drive_to_point(np.asarray(target, dtype=float))
+        target = np.asarray(target, dtype=float)
+        self.fused_target_point = self.fuse_follow_target_with_laser(target)
+        self.drive_to_point(self.fused_target_point)
+
+    def fuse_follow_target_with_laser(self, map_target: np.ndarray) -> np.ndarray:
+        self.laser_follow_result = LaserFollowResult(reason="laser following disabled")
+        if not self.p.laser_follow_enabled:
+            return np.asarray(map_target, dtype=float)
+
+        scan = self.latest_scan
+        if self.latest_scan_received_ns is None:
+            scan = None
+        else:
+            age = (self.get_clock().now().nanoseconds - self.latest_scan_received_ns) * 1e-9
+            if age > self.p.laser_scan_timeout:
+                scan = None
+
+        map_target_base = self.map_point_to_base(map_target)
+        tangent_map = self.polyline_tangent_at_point(self.midline, np.array([self.robot_pose.x, self.robot_pose.y]))
+        tangent_base = self.map_direction_to_base(tangent_map)
+        if abs(float(tangent_base[0])) < 1e-6:
+            map_slope = math.copysign(self.p.laser_max_abs_line_slope, float(tangent_base[1]))
+        else:
+            map_slope = float(tangent_base[1] / tangent_base[0])
+
+        self.laser_follow_result = self.laser_follower.process_scan(scan, map_slope, map_target_base)
+        result = self.laser_follow_result
+        if not result.valid or result.target_base is None or result.weight <= 0.0:
+            return np.asarray(map_target, dtype=float)
+        fused_base = (1.0 - result.weight) * map_target_base + result.weight * result.target_base
+        return self.base_point_to_map(fused_base)
+
+    def map_point_to_base(self, point: np.ndarray) -> np.ndarray:
+        rel = np.asarray(point, dtype=float) - np.array([self.robot_pose.x, self.robot_pose.y], dtype=float)
+        cosine = math.cos(self.robot_pose.yaw)
+        sine = math.sin(self.robot_pose.yaw)
+        return np.array([cosine * rel[0] + sine * rel[1], -sine * rel[0] + cosine * rel[1]], dtype=float)
+
+    def base_point_to_map(self, point: np.ndarray) -> np.ndarray:
+        point = np.asarray(point, dtype=float)
+        cosine = math.cos(self.robot_pose.yaw)
+        sine = math.sin(self.robot_pose.yaw)
+        return np.array(
+            [
+                self.robot_pose.x + cosine * point[0] - sine * point[1],
+                self.robot_pose.y + sine * point[0] + cosine * point[1],
+            ],
+            dtype=float,
+        )
+
+    def map_direction_to_base(self, direction: np.ndarray) -> np.ndarray:
+        direction = self.normalize(direction)
+        cosine = math.cos(self.robot_pose.yaw)
+        sine = math.sin(self.robot_pose.yaw)
+        return np.array([cosine * direction[0] + sine * direction[1], -sine * direction[0] + cosine * direction[1]])
+
+    def base_direction_to_map(self, direction: np.ndarray) -> np.ndarray:
+        direction = self.normalize(direction)
+        cosine = math.cos(self.robot_pose.yaw)
+        sine = math.sin(self.robot_pose.yaw)
+        return np.array([cosine * direction[0] - sine * direction[1], sine * direction[0] + cosine * direction[1]])
+
+    def polyline_tangent_at_point(self, polyline: np.ndarray, point: np.ndarray) -> np.ndarray:
+        if len(polyline) < 2:
+            return self.yaw_to_vector(self.robot_pose.yaw)
+        point = np.asarray(point, dtype=float)
+        best_direction = np.asarray(polyline[1] - polyline[0], dtype=float)
+        best_distance = float("inf")
+        for start, end in zip(polyline[:-1], polyline[1:]):
+            segment = end - start
+            length_sq = float(segment @ segment)
+            if length_sq < 1e-12:
+                continue
+            ratio = float(np.clip(((point - start) @ segment) / length_sq, 0.0, 1.0))
+            distance = float(np.linalg.norm(point - (start + ratio * segment)))
+            if distance < best_distance:
+                best_distance = distance
+                best_direction = segment
+        return self.normalize(best_direction)
 
     def store_current_rows(self) -> None:
         for model in (self.left_row, self.right_row):
@@ -730,6 +1023,7 @@ class MaizeNavigator(Node):
         self.row_exit_heading_goal = None
         self.row_end_direction = None
         self.reset_controller_state()
+        self.laser_follower.reset()
         self.reset_entrance_state()
         self.state = MissionState.FOLLOW_ROW
         self.get_logger().info(
@@ -1308,6 +1602,11 @@ class MaizeNavigator(Node):
         if len(self.midline) > 0:
             markers.markers.append(self.create_line_marker("march_midline", marker_id, self.midline, (0.15, 0.45, 1.0, 1.0), 0.055, stamp))
             marker_id += 1
+        if self.robot_pose is not None and self.p.laser_follow_enabled:
+            marker_id = self.add_laser_follow_markers(markers, marker_id, stamp)
+        if self.fused_target_point is not None:
+            markers.markers.append(self.create_sphere_marker("fused_target_point", marker_id, self.fused_target_point, (0.95, 0.25, 0.95, 1.0), 0.14, stamp))
+            marker_id += 1
         if self.last_target_point is not None:
             markers.markers.append(self.create_sphere_marker("filtered_target_point", marker_id, self.last_target_point, (1.0, 0.05, 1.0, 1.0), 0.18, stamp))
             marker_id += 1
@@ -1382,6 +1681,71 @@ class MaizeNavigator(Node):
                 )
 
         self.marker_pub.publish(markers)
+
+    def add_laser_follow_markers(self, markers: MarkerArray, marker_id: int, stamp) -> int:
+        x_min = self.p.laser_roi_x_min
+        x_max = self.p.laser_roi_x_max
+        y_min = self.p.laser_roi_y_abs_min
+        y_max = self.p.laser_roi_y_abs_max
+        length = x_max - x_min
+        width = y_max - y_min
+        for side_sign, namespace in ((1.0, "laser_left_roi"), (-1.0, "laser_right_roi")):
+            center_base = np.array([0.5 * (x_min + x_max), side_sign * 0.5 * (y_min + y_max)], dtype=float)
+            markers.markers.append(
+                self.create_rectangle_marker(
+                    namespace,
+                    marker_id,
+                    self.base_point_to_map(center_base),
+                    self.base_direction_to_map(np.array([1.0, 0.0], dtype=float)),
+                    length,
+                    width,
+                    (0.2, 0.95, 0.95, 0.65),
+                    stamp,
+                )
+            )
+            marker_id += 1
+
+        result = self.laser_follow_result
+        for line, namespace, color in (
+            (result.left_line, "laser_left_line", (0.0, 1.0, 0.25, 1.0)),
+            (result.right_line, "laser_right_line", (1.0, 0.55, 0.0, 1.0)),
+        ):
+            if not line.valid:
+                continue
+            line_base = np.array(
+                [[x_min, line.slope * x_min + line.intercept], [x_max, line.slope * x_max + line.intercept]],
+                dtype=float,
+            )
+            markers.markers.append(self.create_line_marker(namespace, marker_id, self.base_points_to_map(line_base), color, 0.045, stamp))
+            marker_id += 1
+
+        if result.valid:
+            centerline_base = np.array(
+                [
+                    [x_min, result.center_slope * x_min + result.center_intercept],
+                    [x_max, result.center_slope * x_max + result.center_intercept],
+                ],
+                dtype=float,
+            )
+            markers.markers.append(
+                self.create_line_marker(
+                    "laser_centerline",
+                    marker_id,
+                    self.base_points_to_map(centerline_base),
+                    (0.95, 0.15, 0.95, 1.0),
+                    0.055,
+                    stamp,
+                )
+            )
+            marker_id += 1
+
+        status_point = self.base_point_to_map(np.array([0.35, 0.0], dtype=float))
+        status = f"laser conf={result.confidence:.2f} weight={result.weight:.2f} {result.reason}"
+        markers.markers.append(self.create_text_marker("laser_follow_status", marker_id, status_point, status, (1.0, 1.0, 1.0, 1.0), stamp))
+        return marker_id + 1
+
+    def base_points_to_map(self, points: np.ndarray) -> np.ndarray:
+        return np.asarray([self.base_point_to_map(point) for point in points], dtype=float)
 
     def add_row_markers(
         self,
