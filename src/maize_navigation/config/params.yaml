@@ -50,10 +50,9 @@ maize_navigator:
     row_end_min_points_fields_3_to_5: 2
     row_max_march_steps: 120
     row_min_fit_points: 3
-    # Bereits sicher passierte Kartenpunkte bleiben stabil; die beiden Seiten
-    # werden gemeinsam auf parallelen und plausiblen Verlauf geprueft.
+    # Bereits sicher passierte Kartenpunkte bleiben stabil.
+    # Linke und rechte Kartenreihe werden weiterhin unabhaengig erkannt.
     row_freeze_behind_distance: 1.0
-    row_pair_max_direction_difference: 0.30
 
     # Lokale LaserScan-Feinfuehrung innerhalb der Reihe.
     # Karte bleibt Prior und Fallback; Reihenende und Vorgewende bleiben kartenbasiert.

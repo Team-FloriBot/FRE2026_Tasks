@@ -148,7 +148,6 @@ class NavigatorParams:
     row_max_march_steps: int = 120
     row_min_fit_points: int = 3
     row_freeze_behind_distance: float = 1.50
-    row_pair_max_direction_difference: float = 0.30
 
     laser_follow_enabled: bool = True
     laser_scan_timeout: float = 0.50
@@ -475,9 +474,6 @@ class MaizeNavigator(Node):
         p.row_max_march_steps = int(get_param("row_max_march_steps", p.row_max_march_steps))
         p.row_min_fit_points = int(get_param("row_min_fit_points", p.row_min_fit_points))
         p.row_freeze_behind_distance = float(get_param("row_freeze_behind_distance", p.row_freeze_behind_distance))
-        p.row_pair_max_direction_difference = float(
-            get_param("row_pair_max_direction_difference", p.row_pair_max_direction_difference)
-        )
 
         p.laser_follow_enabled = bool(get_param("laser_follow_enabled", p.laser_follow_enabled))
         p.laser_scan_timeout = float(get_param("laser_scan_timeout", p.laser_scan_timeout))
@@ -564,7 +560,6 @@ class MaizeNavigator(Node):
         self.p.row_point_window_length = max(0.05, self.p.row_point_window_length)
         self.p.row_max_march_steps = max(1, self.p.row_max_march_steps)
         self.p.row_freeze_behind_distance = max(0.0, self.p.row_freeze_behind_distance)
-        self.p.row_pair_max_direction_difference = max(0.01, self.p.row_pair_max_direction_difference)
         self.p.laser_scan_timeout = max(0.05, self.p.laser_scan_timeout)
         self.p.laser_roi_length = max(0.05, self.p.laser_roi_length)
         self.p.laser_roi_x_max = self.p.laser_roi_x_min + self.p.laser_roi_length
@@ -1502,7 +1497,6 @@ class MaizeNavigator(Node):
 
         self.left_row.result = self.march_row(self.left_row, map_points)
         self.right_row.result = self.march_row(self.right_row, map_points)
-        self.couple_row_results(self.left_row.result, self.right_row.result)
         self.update_frozen_prefix(self.left_row)
         self.update_frozen_prefix(self.right_row)
         self.midline = self.build_midline(self.left_row.result.points, self.right_row.result.points)
@@ -1548,61 +1542,6 @@ class MaizeNavigator(Node):
         if freeze_count > len(model.frozen_points):
             model.frozen_points = np.array(model.result.points[:freeze_count], copy=True)
         model.result.frozen_count = len(model.frozen_points)
-
-    def couple_row_results(self, left: RowMarchResult, right: RowMarchResult) -> None:
-        count = min(len(left.points), len(right.points))
-        if count < 2:
-            return
-        corrected_left = np.array(left.points, copy=True)
-        corrected_right = np.array(right.points, copy=True)
-        start_idx = max(1, left.frozen_count, right.frozen_count)
-        previous_idx = min(max(0, start_idx - 2), count - 2)
-        previous_direction = self.mean_direction(
-            corrected_left[previous_idx + 1] - corrected_left[previous_idx],
-            corrected_right[previous_idx + 1] - corrected_right[previous_idx],
-        )
-
-        for idx in range(start_idx, count):
-            left_direction = corrected_left[idx] - corrected_left[idx - 1]
-            right_direction = corrected_right[idx] - corrected_right[idx - 1]
-            angle_difference = abs(wrap_to_pi(
-                math.atan2(float(left_direction[1]), float(left_direction[0]))
-                - math.atan2(float(right_direction[1]), float(right_direction[0]))
-            ))
-            shared_direction = previous_direction
-            if angle_difference <= self.p.row_pair_max_direction_difference:
-                shared_direction = self.mean_direction(left_direction, right_direction)
-            lateral = np.array([-shared_direction[1], shared_direction[0]], dtype=float)
-            width = float((corrected_left[idx] - corrected_right[idx]) @ lateral)
-            if (
-                angle_difference > self.p.row_pair_max_direction_difference
-                or not self.p.min_lane_width <= width <= self.p.max_lane_width
-            ):
-                predicted_left = corrected_left[idx - 1] + self.p.row_segment_point_spacing * shared_direction
-                predicted_right = corrected_right[idx - 1] + self.p.row_segment_point_spacing * shared_direction
-                left_error = float(np.linalg.norm(corrected_left[idx] - predicted_left))
-                right_error = float(np.linalg.norm(corrected_right[idx] - predicted_right))
-                if left_error <= right_error:
-                    corrected_right[idx] = corrected_left[idx] - self.p.expected_row_width * lateral
-                else:
-                    corrected_left[idx] = corrected_right[idx] + self.p.expected_row_width * lateral
-            previous_direction = shared_direction
-
-        left.points = corrected_left
-        right.points = corrected_right
-        left.frozen_count = min(left.frozen_count, len(left.points))
-        right.frozen_count = min(right.frozen_count, len(right.points))
-        if count >= 2:
-            end_direction = self.mean_direction(
-                corrected_left[count - 1] - corrected_left[count - 2],
-                corrected_right[count - 1] - corrected_right[count - 2],
-            )
-            left.end_direction = end_direction
-            right.end_direction = end_direction
-        if left.ended:
-            left.end_point = np.asarray(corrected_left[-1], dtype=float)
-        if right.ended:
-            right.end_point = np.asarray(corrected_right[-1], dtype=float)
 
     def march_row(self, model: RowMarchModel, map_points: np.ndarray) -> RowMarchResult:
         result = RowMarchResult()

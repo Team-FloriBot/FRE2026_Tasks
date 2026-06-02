@@ -213,16 +213,26 @@ def test_freeze_prefix_keeps_passed_points_static():
     assert np.allclose(model.frozen_points, np.array([[0.0, 0.4], [0.3, 0.4], [1.0, 0.4]]))
 
 
-def test_pair_coupling_repairs_drifting_side_without_changing_frozen_prefix():
+def test_midline_does_not_modify_independent_row_results():
     navigator = bare_navigator()
     left = RowMarchResult(points=np.array([[0.0, 0.4], [0.3, 0.4], [0.6, 1.5]]), frozen_count=2)
     right = RowMarchResult(points=np.array([[0.0, -0.35], [0.3, -0.35], [0.6, -0.35]]), frozen_count=2)
+    left_before = np.array(left.points, copy=True)
+    right_before = np.array(right.points, copy=True)
 
-    navigator.couple_row_results(left, right)
+    midline = navigator.build_midline(left.points, right.points)
 
-    assert np.allclose(left.points[:2], np.array([[0.0, 0.4], [0.3, 0.4]]))
-    assert abs(left.points[2, 1] - 0.40) < 1e-6
-    assert abs(right.points[2, 1] + 0.35) < 1e-6
+    assert np.allclose(left.points, left_before)
+    assert np.allclose(right.points, right_before)
+    assert np.allclose(midline[-1], np.array([0.6, 0.575]))
+
+
+def test_end_direction_can_still_average_independent_rows():
+    navigator = bare_navigator()
+
+    direction = navigator.mean_direction(np.array([1.0, 0.1]), np.array([1.0, -0.1]))
+
+    assert np.allclose(direction, np.array([1.0, 0.0]))
 
 
 def test_histogram_peak_uses_actual_shifted_row_end():
