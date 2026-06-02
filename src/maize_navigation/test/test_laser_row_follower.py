@@ -46,6 +46,7 @@ from maize_navigation.maize_navigation import (  # noqa: E402
     LaserRowFollower,
     MaizeNavigator,
     NavigatorParams,
+    PatternStep,
     Pose2D,
     RowMarchModel,
     RowMarchResult,
@@ -200,17 +201,36 @@ def bare_navigator():
     navigator.entrance_route_projection = None
     navigator.entrance_route_target = None
     navigator.entrance_route_remaining_distance = 0.0
+    navigator.entrance_route_provisional = False
+    navigator.entrance_active_step = None
+    navigator.entrance_target = None
+    navigator.entrance_hist_peaks = []
     return navigator
 
 
 def test_freeze_prefix_keeps_passed_points_static():
     navigator = bare_navigator()
     model = RowMarchModel("left", np.array([0.0, 0.4]), np.array([0.3, 0.4]), np.array([1.0, 0.0]), 1)
-    model.result = RowMarchResult(points=np.array([[0.0, 0.4], [0.3, 0.4], [1.0, 0.4], [2.0, 0.4], [3.0, 0.4]]))
+    model.result = RowMarchResult(
+        points=np.array([[0.0, 0.4], [0.3, 0.4], [1.0, 0.4], [2.0, 0.4], [3.0, 0.4], [3.3, 0.4]]),
+        point_directions=np.tile(np.array([1.0, 0.0]), (6, 1)),
+    )
 
     navigator.update_frozen_prefix(model)
 
-    assert np.allclose(model.frozen_points, np.array([[0.0, 0.4], [0.3, 0.4], [1.0, 0.4]]))
+    assert np.allclose(model.frozen_points, np.array([[0.0, 0.4], [0.3, 0.4], [1.0, 0.4], [2.0, 0.4], [3.0, 0.4]]))
+    assert np.allclose(model.frozen_directions, np.tile(np.array([1.0, 0.0]), (5, 1)))
+
+
+def test_frozen_prefix_continues_with_saved_ransac_direction():
+    navigator = bare_navigator()
+    model = RowMarchModel("left", np.array([0.0, 0.4]), np.array([0.3, 0.4]), np.array([1.0, 0.0]), 1)
+    model.frozen_points = np.array([[0.0, 0.4], [0.3, 0.7]])
+    model.frozen_directions = np.array([[1.0, 0.0], [1.0, 0.0]])
+
+    result = navigator.march_row(model, np.empty((0, 2)))
+
+    assert np.allclose(result.current_line_points[2], np.array([0.6, 0.7]))
 
 
 def test_midline_does_not_modify_independent_row_results():
@@ -312,3 +332,39 @@ def test_route_target_stops_when_deviation_is_too_large():
     target = navigator.update_entrance_route_target()
 
     assert target is None
+
+
+def test_provisional_turn_route_exits_then_moves_to_expected_pattern_offset():
+    navigator = bare_navigator()
+    navigator.get_logger = lambda: type("Logger", (), {"info": lambda *args, **kwargs: None})()
+    navigator.robot_pose = Pose2D(0.0, 0.0, 0.0)
+    navigator.plant_row_end_point = np.array([0.0, 0.0])
+    navigator.row_end_direction = np.array([1.0, 0.0])
+    navigator.row_exit_goal = np.array([0.3, 0.0])
+    navigator.pattern_steps = [PatternStep(2, "L")]
+    navigator.pattern_index = 0
+
+    assert navigator.ensure_provisional_entrance_route()
+    assert navigator.entrance_target is None
+    assert navigator.entrance_route_provisional
+    assert np.allclose(navigator.entrance_waypoints[0], np.array([0.3, 0.0]))
+    assert np.allclose(navigator.entrance_route[-1], np.array([0.3, 1.5]))
+
+
+def test_turn_waypoints_follow_outermost_peak_on_traversed_route():
+    navigator = bare_navigator()
+    navigator.robot_pose = Pose2D(0.0, 0.0, 0.0)
+    navigator.plant_row_end_point = np.array([0.0, 0.0])
+    navigator.row_end_direction = np.array([1.0, 0.0])
+    navigator.entrance_active_step = PatternStep(2, "L")
+    navigator.entrance_hist_peaks = [
+        type("Peak", (), {"lateral": 0.0, "point": np.array([0.4, 0.0])})(),
+        type("Peak", (), {"lateral": 0.75, "point": np.array([0.9, 0.75])})(),
+        type("Peak", (), {"lateral": 1.5, "point": np.array([0.6, 1.5])})(),
+        type("Peak", (), {"lateral": -2.0, "point": np.array([2.0, -2.0])})(),
+    ]
+
+    navigator.rebuild_entrance_route(None)
+
+    assert np.allclose(navigator.entrance_waypoints[0], np.array([1.2, 0.0]))
+    assert np.allclose(navigator.entrance_waypoints[1], np.array([1.2, 1.5]))

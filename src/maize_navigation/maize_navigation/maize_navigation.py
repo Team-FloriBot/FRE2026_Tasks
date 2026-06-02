@@ -55,6 +55,7 @@ class SegmentDebug:
 @dataclass
 class RowMarchResult:
     points: np.ndarray = field(default_factory=lambda: np.empty((0, 2), dtype=float))
+    point_directions: np.ndarray = field(default_factory=lambda: np.empty((0, 2), dtype=float))
     frozen_count: int = 0
     debug_segments: List[SegmentDebug] = field(default_factory=list)
     current_line_points: np.ndarray = field(default_factory=lambda: np.empty((0, 2), dtype=float))
@@ -72,6 +73,7 @@ class RowMarchModel:
     row_number: int
     result: RowMarchResult = field(default_factory=RowMarchResult)
     frozen_points: np.ndarray = field(default_factory=lambda: np.empty((0, 2), dtype=float))
+    frozen_directions: np.ndarray = field(default_factory=lambda: np.empty((0, 2), dtype=float))
 
 
 @dataclass
@@ -147,7 +149,7 @@ class NavigatorParams:
     row_end_min_points_fields_3_to_5: int = 2
     row_max_march_steps: int = 120
     row_min_fit_points: int = 3
-    row_freeze_behind_distance: float = 1.50
+    row_freeze_behind_distance: float = 0.0
 
     laser_follow_enabled: bool = True
     laser_scan_timeout: float = 0.50
@@ -420,6 +422,8 @@ class MaizeNavigator(Node):
         self.entrance_route_projection: Optional[np.ndarray] = None
         self.entrance_route_target: Optional[np.ndarray] = None
         self.entrance_route_remaining_distance: float = 0.0
+        self.entrance_route_provisional: bool = False
+        self.entrance_active_step: Optional[PatternStep] = None
         self.pending_target_peaks: Optional[Tuple[EntrancePeak, EntrancePeak]] = None
         self.stored_rows: Dict[int, np.ndarray] = {}
         self.row_end_directions_by_side: Dict[str, List[np.ndarray]] = {"forward": [], "backward": []}
@@ -666,6 +670,8 @@ class MaizeNavigator(Node):
         self.entrance_route_projection = None
         self.entrance_route_target = None
         self.entrance_route_remaining_distance = 0.0
+        self.entrance_route_provisional = False
+        self.entrance_active_step = None
         self.pending_target_peaks = None
 
     def parse_pattern(self, pattern: str) -> List[PatternStep]:
@@ -994,10 +1000,11 @@ class MaizeNavigator(Node):
             return None
 
     def handle_find_next_row_entrance(self) -> None:
-        if self.entrance_target is None:
-            if not self.lock_next_row_entrance():
-                self.cmd_pub.publish(Twist())
-                return
+        if not self.ensure_provisional_entrance_route():
+            self.cmd_pub.publish(Twist())
+            return
+        if not self.lock_next_row_entrance() and self.entrance_target is None:
+            self.rebuild_entrance_route(None)
 
         if (
             self.entrance_target_direction is not None
@@ -1008,6 +1015,12 @@ class MaizeNavigator(Node):
 
         target = self.update_entrance_route_target()
         if target is None:
+            self.cmd_pub.publish(Twist())
+            return
+        if (
+            self.entrance_route_provisional
+            and self.entrance_route_remaining_distance <= self.p.maneuver_goal_xy_tolerance
+        ):
             self.cmd_pub.publish(Twist())
             return
         self.drive_to_point(target, self.p.maneuver_speed, self.p.maneuver_slow_speed)
@@ -1084,7 +1097,7 @@ class MaizeNavigator(Node):
             or self.row_end_direction is None
             or self.left_row is None
             or self.right_row is None
-            or self.pattern_index >= len(self.pattern_steps)
+            or self.entrance_active_step is None
         ):
             self.get_logger().warn("Cannot find next entrance without completed row end data and a pending pattern step")
             return False
@@ -1110,7 +1123,7 @@ class MaizeNavigator(Node):
             self.get_logger().info("Could not associate known plant rows with headland peaks", throttle_duration_sec=2.0)
             return False
 
-        step = self.pattern_steps[self.pattern_index]
+        step = self.entrance_active_step
         shift = step.lane_shift if step.direction == "L" else -step.lane_shift
         target_indices = (current_indices[0] + shift, current_indices[1] + shift)
         if min(target_indices) < 0 or max(target_indices) >= len(self.entrance_hist_peaks):
@@ -1127,41 +1140,88 @@ class MaizeNavigator(Node):
         self.pending_target_peaks = (first, second)
         target_row_end = 0.5 * (first.point + second.point)
         self.entrance_target = target_row_end + self.p.row_end_goal_outward_distance * outgoing
-        turn_start = self.row_exit_goal
-        if turn_start is None:
-            turn_start = center + self.p.row_end_goal_outward_distance * outgoing
-        turn_start = np.asarray(turn_start, dtype=float)
-        transfer_direction = self.normalize(self.entrance_target - turn_start)
-        outward_offset = self.p.row_exit_extension_distance * outgoing
-        if step.lane_shift == 1:
-            self.entrance_waypoints = [0.5 * (turn_start + self.entrance_target) + outward_offset]
-        else:
-            waypoint_offset = self.p.row_exit_extension_distance * transfer_direction
-            self.entrance_waypoints = [
-                turn_start + waypoint_offset + outward_offset,
-                self.entrance_target - waypoint_offset + outward_offset,
-            ]
         self.entrance_target_direction = -outgoing
         self.entrance_heading_goal = (
             self.entrance_target
             + self.p.maneuver_entry_extension_distance * self.entrance_target_direction
         )
-        route_support_points = np.vstack(
-            (turn_start, *self.entrance_waypoints, self.entrance_target, self.entrance_heading_goal)
+        first_lock = self.entrance_route_provisional
+        self.rebuild_entrance_route(self.entrance_target)
+        if first_lock:
+            self.pattern_index += 1
+            self.finish_after_current_row = self.pattern_index >= len(self.pattern_steps)
+            self.reset_controller_state()
+            self.get_logger().info(
+                f"Locked next entrance for pattern step {step.lane_shift}{step.direction}: "
+                f"rows {first.row_number}/{second.row_number}"
+            )
+        return True
+
+    def ensure_provisional_entrance_route(self) -> bool:
+        if self.entrance_active_step is not None and len(self.entrance_route) >= 2:
+            return True
+        if (
+            self.plant_row_end_point is None
+            or self.row_end_direction is None
+            or self.pattern_index >= len(self.pattern_steps)
+        ):
+            return False
+
+        self.entrance_active_step = self.pattern_steps[self.pattern_index]
+        self.rebuild_entrance_route(None)
+        self.reset_controller_state()
+        self.get_logger().info(
+            f"Headland peaks not ready; following provisional route for pattern step "
+            f"{self.entrance_active_step.lane_shift}{self.entrance_active_step.direction}",
+            throttle_duration_sec=2.0,
         )
-        self.entrance_route = self.build_rounded_route(route_support_points)
+        return True
+
+    def rebuild_entrance_route(self, target: Optional[np.ndarray]) -> None:
+        if self.plant_row_end_point is None or self.row_end_direction is None or self.entrance_active_step is None:
+            return
+        center = np.asarray(self.plant_row_end_point, dtype=float)
+        outgoing = self.average_row_end_direction_for_side(self.row_end_direction)
+        lateral_direction = np.array([-outgoing[1], outgoing[0]], dtype=float)
+        step = self.entrance_active_step
+        signed_shift = step.lane_shift if step.direction == "L" else -step.lane_shift
+        expected_lateral = signed_shift * self.p.expected_row_width
+        target_lateral = expected_lateral if target is None else float((np.asarray(target) - center) @ lateral_direction)
+        lower_lateral, upper_lateral = sorted((0.0, target_lateral))
+        lateral_margin = self.p.expected_row_width
+        route_peaks = [
+            peak
+            for peak in self.entrance_hist_peaks
+            if lower_lateral - lateral_margin <= peak.lateral <= upper_lateral + lateral_margin
+        ]
+        outermost = max(
+            [0.0] + [float((np.asarray(peak.point) - center) @ outgoing) for peak in route_peaks]
+        )
+        traverse_outward = outermost + self.p.row_exit_extension_distance
+
+        robot_xy = np.array([self.robot_pose.x, self.robot_pose.y], dtype=float)
+        robot_lateral = float((robot_xy - center) @ lateral_direction)
+        first_waypoint = center + traverse_outward * outgoing + robot_lateral * lateral_direction
+        second_waypoint = center + traverse_outward * outgoing + target_lateral * lateral_direction
+        support_points = [robot_xy]
+        self.entrance_waypoints = []
+        if float((robot_xy - center) @ outgoing) < traverse_outward - self.p.maneuver_route_spacing:
+            support_points.append(first_waypoint)
+            self.entrance_waypoints.append(first_waypoint)
+        if float(np.linalg.norm(support_points[-1] - second_waypoint)) > self.p.maneuver_route_spacing:
+            support_points.append(second_waypoint)
+            self.entrance_waypoints.append(second_waypoint)
+        if target is not None and self.entrance_heading_goal is not None:
+            support_points.extend((np.asarray(target, dtype=float), self.entrance_heading_goal))
+        if len(support_points) < 2:
+            support_points.append(second_waypoint)
+
+        self.entrance_route = self.build_rounded_route(np.asarray(support_points, dtype=float))
         self.entrance_route_progress_index = 0
         self.entrance_route_projection = None
         self.entrance_route_target = None
         self.entrance_route_remaining_distance = self.polyline_length(self.entrance_route)
-        self.pattern_index += 1
-        self.finish_after_current_row = self.pattern_index >= len(self.pattern_steps)
-        self.reset_controller_state()
-        self.get_logger().info(
-            f"Locked next entrance for pattern step {step.lane_shift}{step.direction}: "
-            f"rows {first.row_number}/{second.row_number}"
-        )
-        return True
+        self.entrance_route_provisional = target is None
 
     def find_entrance_histogram_peaks(
         self,
@@ -1541,6 +1601,8 @@ class MaizeNavigator(Node):
         freeze_count = int(eligible[-1]) + 1
         if freeze_count > len(model.frozen_points):
             model.frozen_points = np.array(model.result.points[:freeze_count], copy=True)
+            if len(model.result.point_directions) >= freeze_count:
+                model.frozen_directions = np.array(model.result.point_directions[:freeze_count], copy=True)
         model.result.frozen_count = len(model.frozen_points)
 
     def march_row(self, model: RowMarchModel, map_points: np.ndarray) -> RowMarchResult:
@@ -1549,14 +1611,21 @@ class MaizeNavigator(Node):
             exact_points = [np.asarray(point, dtype=float) for point in model.frozen_points]
             point1 = exact_points[-2]
             point2 = exact_points[-1]
-            direction = self.initial_direction_from_points(point1, point2, model.initial_direction)
+            if len(model.frozen_directions) == len(model.frozen_points):
+                exact_directions = [np.asarray(direction, dtype=float) for direction in model.frozen_directions]
+                direction = self.normalize(exact_directions[-1])
+            else:
+                direction = self.initial_direction_from_points(point1, point2, model.initial_direction)
+                exact_directions = [np.asarray(direction, dtype=float) for _ in exact_points]
+            line_points = self.build_next_line_from_old_point3(point2, direction)
         else:
             point1 = np.asarray(model.initial_point1, dtype=float)
             point2 = np.asarray(model.initial_point2, dtype=float)
             direction = self.normalize(model.initial_direction)
             exact_points = [point1, point2]
+            exact_directions = [np.asarray(direction, dtype=float), np.asarray(direction, dtype=float)]
+            line_points = self.build_initial_line_from_point1_and_point2(point1, point2, direction)
         result.frozen_count = len(model.frozen_points)
-        line_points = self.build_initial_line_from_point1_and_point2(point1, point2, direction)
         previous_valid_point: Optional[np.ndarray] = np.asarray(point2, dtype=float)
         last_valid_direction = np.asarray(direction, dtype=float)
 
@@ -1602,6 +1671,7 @@ class MaizeNavigator(Node):
                 row_point = np.array(corrected_point3, copy=True)
 
             exact_points.append(row_point)
+            exact_directions.append(np.asarray(corrected_direction, dtype=float))
             last_valid_direction = np.asarray(corrected_direction, dtype=float)
             result.debug_segments.append(
                 SegmentDebug(
@@ -1622,6 +1692,9 @@ class MaizeNavigator(Node):
             line_points = self.build_next_line_from_old_point3(corrected_point3, direction)
 
         result.points = np.asarray(exact_points, dtype=float) if exact_points else np.empty((0, 2), dtype=float)
+        result.point_directions = (
+            np.asarray(exact_directions, dtype=float) if exact_directions else np.empty((0, 2), dtype=float)
+        )
         result.current_line_points = np.asarray(line_points, dtype=float)
         if result.ended and result.end_point is None and len(result.points) > 0:
             result.end_point = result.points[-1]
