@@ -191,7 +191,7 @@ class NavigatorParams:
     maneuver_slow_speed: float = 0.10
     maneuver_lookahead_distance: float = 0.40
     maneuver_route_spacing: float = 0.08
-    maneuver_corner_radius: float = 0.45
+    maneuver_corner_radius: float = 0.75
     maneuver_entry_extension_distance: float = 0.80
     maneuver_max_route_deviation: float = 0.70
     maneuver_entry_lateral_tolerance: float = 0.25
@@ -417,6 +417,7 @@ class MaizeNavigator(Node):
         self.entrance_target_direction: Optional[np.ndarray] = None
         self.entrance_waypoints: List[np.ndarray] = []
         self.entrance_heading_goal: Optional[np.ndarray] = None
+        self.entrance_follow_path: np.ndarray = np.empty((0, 2), dtype=float)
         self.entrance_route: np.ndarray = np.empty((0, 2), dtype=float)
         self.entrance_route_progress_index: int = 0
         self.entrance_route_projection: Optional[np.ndarray] = None
@@ -665,6 +666,7 @@ class MaizeNavigator(Node):
         self.entrance_target_direction = None
         self.entrance_waypoints = []
         self.entrance_heading_goal = None
+        self.entrance_follow_path = np.empty((0, 2), dtype=float)
         self.entrance_route = np.empty((0, 2), dtype=float)
         self.entrance_route_progress_index = 0
         self.entrance_route_projection = None
@@ -900,7 +902,6 @@ class MaizeNavigator(Node):
                 continue
             radius = min(
                 self.p.maneuver_corner_radius,
-                self.p.min_follow_turn_radius,
                 0.45 * incoming_length,
                 0.45 * outgoing_length,
             )
@@ -1145,6 +1146,7 @@ class MaizeNavigator(Node):
             self.entrance_target
             + self.p.maneuver_entry_extension_distance * self.entrance_target_direction
         )
+        self.entrance_follow_path = self.build_entrance_follow_path()
         first_lock = self.entrance_route_provisional
         self.rebuild_entrance_route(self.entrance_target)
         if first_lock:
@@ -1200,6 +1202,19 @@ class MaizeNavigator(Node):
         traverse_outward = outermost + self.p.row_exit_extension_distance
 
         robot_xy = np.array([self.robot_pose.x, self.robot_pose.y], dtype=float)
+        incoming = -outgoing
+        if target is not None and float((robot_xy - np.asarray(target, dtype=float)) @ incoming) >= 0.0:
+            forward_path = [
+                point
+                for point in self.entrance_follow_path
+                if float((np.asarray(point, dtype=float) - robot_xy) @ incoming) > self.p.maneuver_route_spacing
+            ]
+            if not forward_path:
+                forward_path = [robot_xy + self.p.maneuver_entry_extension_distance * incoming]
+            self.entrance_waypoints = []
+            self.set_entrance_route(np.vstack((robot_xy, *forward_path)), False)
+            return
+
         robot_lateral = float((robot_xy - center) @ lateral_direction)
         first_waypoint = center + traverse_outward * outgoing + robot_lateral * lateral_direction
         second_waypoint = center + traverse_outward * outgoing + target_lateral * lateral_direction
@@ -1211,17 +1226,39 @@ class MaizeNavigator(Node):
         if float(np.linalg.norm(support_points[-1] - second_waypoint)) > self.p.maneuver_route_spacing:
             support_points.append(second_waypoint)
             self.entrance_waypoints.append(second_waypoint)
-        if target is not None and self.entrance_heading_goal is not None:
-            support_points.extend((np.asarray(target, dtype=float), self.entrance_heading_goal))
+        if target is not None:
+            support_points.append(np.asarray(target, dtype=float))
+            support_points.extend(self.entrance_follow_path)
         if len(support_points) < 2:
             support_points.append(second_waypoint)
 
-        self.entrance_route = self.build_rounded_route(np.asarray(support_points, dtype=float))
+        self.set_entrance_route(np.asarray(support_points, dtype=float), target is None)
+
+    def set_entrance_route(self, support_points: np.ndarray, provisional: bool) -> None:
+        self.entrance_route = self.build_rounded_route(support_points)
         self.entrance_route_progress_index = 0
         self.entrance_route_projection = None
         self.entrance_route_target = None
         self.entrance_route_remaining_distance = self.polyline_length(self.entrance_route)
-        self.entrance_route_provisional = target is None
+        self.entrance_route_provisional = provisional
+
+    def build_entrance_follow_path(self) -> np.ndarray:
+        models = self.build_selected_entrance_models()
+        if models is None or self.entrance_target is None or self.entrance_target_direction is None:
+            return np.empty((0, 2), dtype=float)
+        incoming = self.normalize(self.entrance_target_direction)
+        fallback = self.entrance_target + self.p.maneuver_entry_extension_distance * incoming
+        left_model, right_model = models
+        map_points = self.get_all_map_points()
+        left_result = self.march_row(left_model, map_points)
+        right_result = self.march_row(right_model, map_points)
+        midline = self.build_midline(left_result.points, right_result.points)
+        path = [np.asarray(fallback, dtype=float)]
+        minimum_along = self.p.maneuver_entry_extension_distance + self.p.maneuver_route_spacing
+        for point in midline:
+            if float((np.asarray(point, dtype=float) - self.entrance_target) @ incoming) > minimum_along:
+                path.append(np.asarray(point, dtype=float))
+        return np.asarray(path, dtype=float)
 
     def find_entrance_histogram_peaks(
         self,
@@ -1348,13 +1385,33 @@ class MaizeNavigator(Node):
         return tuple(sorted((left_idx, right_idx)))
 
     def initialize_selected_entrance_rows(self) -> None:
+        models = self.build_selected_entrance_models()
+        if models is None:
+            self.cmd_pub.publish(Twist())
+            return
+
+        first, second = sorted(self.pending_target_peaks, key=lambda peak: peak.lateral)
+        self.left_row, self.right_row = models
+        self.midline = np.empty((0, 2), dtype=float)
+        self.plant_row_end_point = None
+        self.row_exit_goal = None
+        self.row_exit_heading_goal = None
+        self.row_end_direction = None
+        self.reset_controller_state()
+        self.laser_follower.reset()
+        self.reset_entrance_state()
+        self.state = MissionState.FOLLOW_ROW
+        self.get_logger().info(
+            f"Entered new lane between plant rows {first.row_number} and {second.row_number}; following row"
+        )
+
+    def build_selected_entrance_models(self) -> Optional[Tuple[RowMarchModel, RowMarchModel]]:
         if (
             self.pending_target_peaks is None
             or self.entrance_hist_center is None
             or self.entrance_hist_direction is None
         ):
-            self.cmd_pub.publish(Twist())
-            return
+            return None
 
         outgoing = self.normalize(self.entrance_hist_direction)
         incoming = -outgoing
@@ -1373,19 +1430,9 @@ class MaizeNavigator(Node):
         right_point2 = self.point2_from_sector(roi_points, right_point1, incoming, f"row {second.row_number}")
         left_direction = self.initial_direction_from_points(left_point1, left_point2, incoming)
         right_direction = self.initial_direction_from_points(right_point1, right_point2, incoming)
-        self.left_row = RowMarchModel("left", left_point1, left_point2, left_direction, int(first.row_number))
-        self.right_row = RowMarchModel("right", right_point1, right_point2, right_direction, int(second.row_number))
-        self.midline = np.empty((0, 2), dtype=float)
-        self.plant_row_end_point = None
-        self.row_exit_goal = None
-        self.row_exit_heading_goal = None
-        self.row_end_direction = None
-        self.reset_controller_state()
-        self.laser_follower.reset()
-        self.reset_entrance_state()
-        self.state = MissionState.FOLLOW_ROW
-        self.get_logger().info(
-            f"Entered new lane between plant rows {first.row_number} and {second.row_number}; following row"
+        return (
+            RowMarchModel("left", left_point1, left_point2, left_direction, int(first.row_number)),
+            RowMarchModel("right", right_point1, right_point2, right_direction, int(second.row_number)),
         )
 
     def find_start_peak_pair(self, points: np.ndarray, pose: Pose2D) -> Optional[Tuple[float, float]]:
@@ -2062,6 +2109,11 @@ class MaizeNavigator(Node):
         for waypoint in self.entrance_waypoints:
             markers.markers.append(
                 self.create_sphere_marker("entrance_waypoints", marker_id, waypoint, (1.0, 0.9, 0.1, 1.0), 0.24, stamp)
+            )
+            marker_id += 1
+        if len(self.entrance_follow_path) > 0:
+            markers.markers.append(
+                self.create_line_marker("entrance_follow_path", marker_id, self.entrance_follow_path, (0.1, 1.0, 0.35, 0.9), 0.06, stamp)
             )
             marker_id += 1
         if len(self.entrance_route) > 0:

@@ -204,6 +204,8 @@ def bare_navigator():
     navigator.entrance_route_provisional = False
     navigator.entrance_active_step = None
     navigator.entrance_target = None
+    navigator.entrance_target_direction = None
+    navigator.entrance_follow_path = np.empty((0, 2))
     navigator.entrance_hist_peaks = []
     return navigator
 
@@ -299,6 +301,18 @@ def test_rounded_route_replaces_sharp_corner_with_curve():
     assert np.allclose(route[-1], support[-1])
 
 
+def test_rounded_route_is_not_capped_by_minimum_follow_radius():
+    navigator = bare_navigator()
+    navigator.p.maneuver_corner_radius = 0.75
+    navigator.p.min_follow_turn_radius = 0.10
+    support = np.array([[0.0, 0.0], [2.0, 0.0], [2.0, 2.0]])
+
+    route = navigator.build_rounded_route(support)
+    first_curve_point = route[np.where(route[:, 1] > 0.0)[0][0]]
+
+    assert first_curve_point[0] < 1.5
+
+
 def test_entry_line_requires_crossing_with_alignment():
     navigator = bare_navigator()
     navigator.entrance_target = np.array([1.0, 0.0])
@@ -368,3 +382,19 @@ def test_turn_waypoints_follow_outermost_peak_on_traversed_route():
 
     assert np.allclose(navigator.entrance_waypoints[0], np.array([1.2, 0.0]))
     assert np.allclose(navigator.entrance_waypoints[1], np.array([1.2, 1.5]))
+
+
+def test_missed_entry_line_replans_forward_onto_follow_path():
+    navigator = bare_navigator()
+    navigator.robot_pose = Pose2D(0.2, 0.35, 0.0)
+    navigator.plant_row_end_point = np.array([0.0, 0.0])
+    navigator.row_end_direction = np.array([-1.0, 0.0])
+    navigator.entrance_active_step = PatternStep(1, "L")
+    navigator.entrance_target_direction = np.array([1.0, 0.0])
+    navigator.entrance_follow_path = np.array([[0.8, 0.0], [1.6, 0.0], [2.4, 0.0]])
+
+    navigator.rebuild_entrance_route(np.array([0.0, 0.0]))
+
+    assert np.allclose(navigator.entrance_route[0], np.array([0.2, 0.35]))
+    assert np.all(np.diff(navigator.entrance_route[:, 0]) >= -1e-9)
+    assert np.allclose(navigator.entrance_route[-1], np.array([2.4, 0.0]))
