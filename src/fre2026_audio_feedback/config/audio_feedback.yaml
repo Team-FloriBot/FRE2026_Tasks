@@ -1,0 +1,12 @@
+audio_feedback_node:
+  ros__parameters:
+    classification_topic: /classification_result
+    spoken_topic: /audio_feedback/last_phrase
+    enabled: true
+    min_repeat_interval_sec: 1.5
+    speech_rate_wpm: 150
+    speech_volume: 180
+    language: en
+    # Leave empty for automatic selection: espeak-ng, espeak, spd-say.
+    tts_command: ""
+    queue_size: 10
