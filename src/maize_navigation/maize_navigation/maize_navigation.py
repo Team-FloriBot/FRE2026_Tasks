@@ -55,6 +55,7 @@ class SegmentDebug:
 @dataclass
 class RowMarchResult:
     points: np.ndarray = field(default_factory=lambda: np.empty((0, 2), dtype=float))
+    frozen_count: int = 0
     debug_segments: List[SegmentDebug] = field(default_factory=list)
     current_line_points: np.ndarray = field(default_factory=lambda: np.empty((0, 2), dtype=float))
     ended: bool = False
@@ -70,6 +71,7 @@ class RowMarchModel:
     initial_direction: np.ndarray
     row_number: int
     result: RowMarchResult = field(default_factory=RowMarchResult)
+    frozen_points: np.ndarray = field(default_factory=lambda: np.empty((0, 2), dtype=float))
 
 
 @dataclass
@@ -106,6 +108,8 @@ class LaserFollowResult:
     weight: float = 0.0
     target_base: Optional[np.ndarray] = None
     reason: str = ""
+    roi_centers: List[np.ndarray] = field(default_factory=list)
+    roi_direction: np.ndarray = field(default_factory=lambda: np.array([1.0, 0.0], dtype=float))
 
 
 class MissionState(Enum):
@@ -143,13 +147,16 @@ class NavigatorParams:
     row_end_min_points_fields_3_to_5: int = 2
     row_max_march_steps: int = 120
     row_min_fit_points: int = 3
+    row_freeze_behind_distance: float = 1.50
+    row_pair_max_direction_difference: float = 0.30
 
     laser_follow_enabled: bool = True
     laser_scan_timeout: float = 0.50
     laser_roi_x_min: float = 0.25
-    laser_roi_x_max: float = 2.0
-    laser_roi_y_abs_min: float = 0.18
-    laser_roi_y_abs_max: float = 0.90
+    laser_roi_x_max: float = 1.80
+    laser_roi_length: float = 1.55
+    laser_roi_width: float = 0.32
+    laser_roi_center_offset_limit: float = 0.25
     laser_ransac_iterations: int = 80
     laser_ransac_distance: float = 0.08
     laser_min_inliers: int = 5
@@ -179,6 +186,15 @@ class NavigatorParams:
     maneuver_goal_xy_tolerance: float = 0.35
     maneuver_goal_yaw_tolerance: float = 0.45
     maneuver_heading_lookahead_distance: float = 0.70
+    maneuver_speed: float = 0.16
+    maneuver_slow_speed: float = 0.10
+    maneuver_lookahead_distance: float = 0.40
+    maneuver_route_spacing: float = 0.08
+    maneuver_corner_radius: float = 0.45
+    maneuver_entry_extension_distance: float = 0.80
+    maneuver_max_route_deviation: float = 0.70
+    maneuver_entry_lateral_tolerance: float = 0.25
+    maneuver_entry_yaw_tolerance: float = 0.45
     row_map_output_directory: str = "~/.ros/maize_navigation"
 
     pattern: str = "1L 2R"
@@ -204,16 +220,22 @@ class LaserRowFollower:
     def process_scan(
         self,
         scan: Optional[LaserScan],
-        map_slope: float,
+        map_slope: Optional[float],
         map_target_base: np.ndarray,
     ) -> LaserFollowResult:
         if scan is None:
             return self.reject(LaserFollowResult(), "no scan")
 
         points = self.scan_to_points(scan)
-        left_line = self.fit_line_ransac(self.points_in_side_roi(points, "left"))
-        right_line = self.fit_line_ransac(self.points_in_side_roi(points, "right"))
-        result = LaserFollowResult(left_line=left_line, right_line=right_line)
+        roi_centers, roi_direction = self.build_rois(map_slope, map_target_base)
+        left_line = self.fit_line_in_roi(points, roi_centers[0], roi_direction)
+        right_line = self.fit_line_in_roi(points, roi_centers[1], roi_direction)
+        result = LaserFollowResult(
+            left_line=left_line,
+            right_line=right_line,
+            roi_centers=roi_centers,
+            roi_direction=roi_direction,
+        )
         target_x = float(np.clip(map_target_base[0], self.p.laser_roi_x_min, self.p.laser_roi_x_max))
 
         if left_line.valid and right_line.valid:
@@ -242,8 +264,8 @@ class LaserRowFollower:
             return self.reject(result, "no valid side line")
 
         laser_target_y = result.center_slope * target_x + result.center_intercept
-        angle_error = abs(wrap_to_pi(math.atan(result.center_slope) - math.atan(map_slope)))
-        if angle_error > self.p.laser_max_angle_to_map:
+        angle_error = 0.0 if map_slope is None else abs(wrap_to_pi(math.atan(result.center_slope) - math.atan(map_slope)))
+        if map_slope is not None and angle_error > self.p.laser_max_angle_to_map:
             return self.reject(result, "angle differs from map")
         if abs(laser_target_y - float(map_target_base[1])) > self.p.laser_max_center_offset:
             return self.reject(result, "center differs from map")
@@ -265,17 +287,69 @@ class LaserRowFollower:
         mask = np.isfinite(ranges) & (ranges > scan.range_min) & (ranges < scan.range_max)
         return np.column_stack((ranges[mask] * np.cos(angles[mask]), ranges[mask] * np.sin(angles[mask])))
 
-    def points_in_side_roi(self, points: np.ndarray, side: str) -> np.ndarray:
+    def build_rois(
+        self,
+        map_slope: Optional[float],
+        map_target_base: np.ndarray,
+    ) -> Tuple[List[np.ndarray], np.ndarray]:
+        slope = 0.0 if map_slope is None else float(map_slope)
+        angle = math.atan(slope)
+        direction = np.array([math.cos(angle), math.sin(angle)], dtype=float)
+        perp = np.array([-direction[1], direction[0]], dtype=float)
+        map_center_intercept = float(map_target_base[1] - slope * map_target_base[0])
+        center_offset = float(np.clip(
+            map_center_intercept,
+            -self.p.laser_roi_center_offset_limit,
+            self.p.laser_roi_center_offset_limit,
+        ))
+        along_center = self.p.laser_roi_x_min + 0.5 * self.p.laser_roi_length
+        lane_center = np.array([0.0, center_offset], dtype=float) + along_center * direction
+        half_lane = 0.5 * self.p.expected_row_width
+        return [lane_center + half_lane * perp, lane_center - half_lane * perp], direction
+
+    def points_in_oriented_roi(
+        self,
+        points: np.ndarray,
+        center: np.ndarray,
+        direction: np.ndarray,
+    ) -> np.ndarray:
         if len(points) == 0:
             return np.empty((0, 2), dtype=float)
-        y_min = self.p.laser_roi_y_abs_min
-        y_max = self.p.laser_roi_y_abs_max
-        if side == "left":
-            side_mask = (points[:, 1] >= y_min) & (points[:, 1] <= y_max)
-        else:
-            side_mask = (points[:, 1] <= -y_min) & (points[:, 1] >= -y_max)
-        mask = side_mask & (points[:, 0] >= self.p.laser_roi_x_min) & (points[:, 0] <= self.p.laser_roi_x_max)
+        perp = np.array([-direction[1], direction[0]], dtype=float)
+        rel = points - np.asarray(center, dtype=float)
+        mask = (
+            (np.abs(rel @ direction) <= 0.5 * self.p.laser_roi_length)
+            & (np.abs(rel @ perp) <= 0.5 * self.p.laser_roi_width)
+        )
         return points[mask]
+
+    def fit_line_in_roi(
+        self,
+        points: np.ndarray,
+        center: np.ndarray,
+        direction: np.ndarray,
+    ) -> LaserLineFit:
+        roi_points = self.points_in_oriented_roi(points, center, direction)
+        perp = np.array([-direction[1], direction[0]], dtype=float)
+        rel = roi_points - np.asarray(center, dtype=float)
+        local_points = np.column_stack((rel @ direction, rel @ perp))
+        local_fit = self.fit_line_ransac(local_points)
+        if not local_fit.valid:
+            return local_fit
+        local_endpoints = np.array(
+            [
+                [-0.5 * self.p.laser_roi_length, local_fit.intercept - 0.5 * self.p.laser_roi_length * local_fit.slope],
+                [0.5 * self.p.laser_roi_length, local_fit.intercept + 0.5 * self.p.laser_roi_length * local_fit.slope],
+            ],
+            dtype=float,
+        )
+        base_endpoints = center + np.outer(local_endpoints[:, 0], direction) + np.outer(local_endpoints[:, 1], perp)
+        dx = float(base_endpoints[1, 0] - base_endpoints[0, 0])
+        if abs(dx) < 1e-6:
+            return LaserLineFit()
+        slope = float((base_endpoints[1, 1] - base_endpoints[0, 1]) / dx)
+        intercept = float(base_endpoints[0, 1] - slope * base_endpoints[0, 0])
+        return LaserLineFit(True, slope, intercept, local_fit.inliers, local_fit.visible_length)
 
     def fit_line_ransac(self, points: np.ndarray) -> LaserLineFit:
         if len(points) < self.p.laser_min_inliers:
@@ -341,10 +415,15 @@ class MaizeNavigator(Node):
         self.entrance_target: Optional[np.ndarray] = None
         self.entrance_target_direction: Optional[np.ndarray] = None
         self.entrance_waypoints: List[np.ndarray] = []
-        self.entrance_waypoint_index: int = 0
         self.entrance_heading_goal: Optional[np.ndarray] = None
+        self.entrance_route: np.ndarray = np.empty((0, 2), dtype=float)
+        self.entrance_route_progress_index: int = 0
+        self.entrance_route_projection: Optional[np.ndarray] = None
+        self.entrance_route_target: Optional[np.ndarray] = None
+        self.entrance_route_remaining_distance: float = 0.0
         self.pending_target_peaks: Optional[Tuple[EntrancePeak, EntrancePeak]] = None
         self.stored_rows: Dict[int, np.ndarray] = {}
+        self.row_end_directions_by_side: Dict[str, List[np.ndarray]] = {"forward": [], "backward": []}
         self.row_map_exported: bool = False
 
         self.tf_buffer = tf2_ros.Buffer()
@@ -395,13 +474,20 @@ class MaizeNavigator(Node):
         )
         p.row_max_march_steps = int(get_param("row_max_march_steps", p.row_max_march_steps))
         p.row_min_fit_points = int(get_param("row_min_fit_points", p.row_min_fit_points))
+        p.row_freeze_behind_distance = float(get_param("row_freeze_behind_distance", p.row_freeze_behind_distance))
+        p.row_pair_max_direction_difference = float(
+            get_param("row_pair_max_direction_difference", p.row_pair_max_direction_difference)
+        )
 
         p.laser_follow_enabled = bool(get_param("laser_follow_enabled", p.laser_follow_enabled))
         p.laser_scan_timeout = float(get_param("laser_scan_timeout", p.laser_scan_timeout))
         p.laser_roi_x_min = float(get_param("laser_roi_x_min", p.laser_roi_x_min))
         p.laser_roi_x_max = float(get_param("laser_roi_x_max", p.laser_roi_x_max))
-        p.laser_roi_y_abs_min = float(get_param("laser_roi_y_abs_min", p.laser_roi_y_abs_min))
-        p.laser_roi_y_abs_max = float(get_param("laser_roi_y_abs_max", p.laser_roi_y_abs_max))
+        p.laser_roi_length = float(get_param("laser_roi_length", p.laser_roi_length))
+        p.laser_roi_width = float(get_param("laser_roi_width", p.laser_roi_width))
+        p.laser_roi_center_offset_limit = float(
+            get_param("laser_roi_center_offset_limit", p.laser_roi_center_offset_limit)
+        )
         p.laser_ransac_iterations = int(get_param("laser_ransac_iterations", p.laser_ransac_iterations))
         p.laser_ransac_distance = float(get_param("laser_ransac_distance", p.laser_ransac_distance))
         p.laser_min_inliers = int(get_param("laser_min_inliers", p.laser_min_inliers))
@@ -439,6 +525,23 @@ class MaizeNavigator(Node):
         p.maneuver_heading_lookahead_distance = float(
             get_param("maneuver_heading_lookahead_distance", p.maneuver_heading_lookahead_distance)
         )
+        p.maneuver_speed = float(get_param("maneuver_speed", p.maneuver_speed))
+        p.maneuver_slow_speed = float(get_param("maneuver_slow_speed", p.maneuver_slow_speed))
+        p.maneuver_lookahead_distance = float(get_param("maneuver_lookahead_distance", p.maneuver_lookahead_distance))
+        p.maneuver_route_spacing = float(get_param("maneuver_route_spacing", p.maneuver_route_spacing))
+        p.maneuver_corner_radius = float(get_param("maneuver_corner_radius", p.maneuver_corner_radius))
+        p.maneuver_entry_extension_distance = float(
+            get_param("maneuver_entry_extension_distance", p.maneuver_entry_extension_distance)
+        )
+        p.maneuver_max_route_deviation = float(
+            get_param("maneuver_max_route_deviation", p.maneuver_max_route_deviation)
+        )
+        p.maneuver_entry_lateral_tolerance = float(
+            get_param("maneuver_entry_lateral_tolerance", p.maneuver_entry_lateral_tolerance)
+        )
+        p.maneuver_entry_yaw_tolerance = float(
+            get_param("maneuver_entry_yaw_tolerance", p.maneuver_entry_yaw_tolerance)
+        )
         p.row_map_output_directory = str(get_param("row_map_output_directory", p.row_map_output_directory))
 
         p.pattern = str(get_param("pattern", p.pattern))
@@ -460,9 +563,13 @@ class MaizeNavigator(Node):
         self.p.row_rectangle_width = max(0.05, self.p.row_rectangle_width)
         self.p.row_point_window_length = max(0.05, self.p.row_point_window_length)
         self.p.row_max_march_steps = max(1, self.p.row_max_march_steps)
+        self.p.row_freeze_behind_distance = max(0.0, self.p.row_freeze_behind_distance)
+        self.p.row_pair_max_direction_difference = max(0.01, self.p.row_pair_max_direction_difference)
         self.p.laser_scan_timeout = max(0.05, self.p.laser_scan_timeout)
-        self.p.laser_roi_x_max = max(self.p.laser_roi_x_min + 0.05, self.p.laser_roi_x_max)
-        self.p.laser_roi_y_abs_max = max(self.p.laser_roi_y_abs_min + 0.05, self.p.laser_roi_y_abs_max)
+        self.p.laser_roi_length = max(0.05, self.p.laser_roi_length)
+        self.p.laser_roi_x_max = self.p.laser_roi_x_min + self.p.laser_roi_length
+        self.p.laser_roi_width = max(0.05, self.p.laser_roi_width)
+        self.p.laser_roi_center_offset_limit = max(0.0, self.p.laser_roi_center_offset_limit)
         self.p.laser_ransac_iterations = max(1, self.p.laser_ransac_iterations)
         self.p.laser_ransac_distance = max(0.01, self.p.laser_ransac_distance)
         self.p.laser_min_inliers = max(2, self.p.laser_min_inliers)
@@ -486,6 +593,15 @@ class MaizeNavigator(Node):
         self.p.maneuver_goal_xy_tolerance = max(0.05, self.p.maneuver_goal_xy_tolerance)
         self.p.maneuver_goal_yaw_tolerance = max(0.05, self.p.maneuver_goal_yaw_tolerance)
         self.p.maneuver_heading_lookahead_distance = max(0.05, self.p.maneuver_heading_lookahead_distance)
+        self.p.maneuver_speed = max(0.01, self.p.maneuver_speed)
+        self.p.maneuver_slow_speed = float(np.clip(self.p.maneuver_slow_speed, 0.01, self.p.maneuver_speed))
+        self.p.maneuver_lookahead_distance = max(0.05, self.p.maneuver_lookahead_distance)
+        self.p.maneuver_route_spacing = max(0.02, self.p.maneuver_route_spacing)
+        self.p.maneuver_corner_radius = max(0.0, self.p.maneuver_corner_radius)
+        self.p.maneuver_entry_extension_distance = max(0.10, self.p.maneuver_entry_extension_distance)
+        self.p.maneuver_max_route_deviation = max(0.10, self.p.maneuver_max_route_deviation)
+        self.p.maneuver_entry_lateral_tolerance = max(0.05, self.p.maneuver_entry_lateral_tolerance)
+        self.p.maneuver_entry_yaw_tolerance = max(0.05, self.p.maneuver_entry_yaw_tolerance)
         self.p.starting_lane_number = max(1, self.p.starting_lane_number)
         self.p.row_numbers_increase_to = self.p.row_numbers_increase_to.lower()
         if self.p.row_numbers_increase_to not in ("left", "right"):
@@ -512,6 +628,7 @@ class MaizeNavigator(Node):
         self.pattern_index = 0
         self.finish_after_current_row = len(self.pattern_steps) == 0
         self.stored_rows = {}
+        self.row_end_directions_by_side = {"forward": [], "backward": []}
         self.row_map_exported = False
         self.reset_entrance_state()
         self.reset_controller_state()
@@ -548,8 +665,12 @@ class MaizeNavigator(Node):
         self.entrance_target = None
         self.entrance_target_direction = None
         self.entrance_waypoints = []
-        self.entrance_waypoint_index = 0
         self.entrance_heading_goal = None
+        self.entrance_route = np.empty((0, 2), dtype=float)
+        self.entrance_route_progress_index = 0
+        self.entrance_route_projection = None
+        self.entrance_route_target = None
+        self.entrance_route_remaining_distance = 0.0
         self.pending_target_peaks = None
 
     def parse_pattern(self, pattern: str) -> List[PatternStep]:
@@ -643,6 +764,7 @@ class MaizeNavigator(Node):
         if self.row_exit_goal is not None and self.row_end_direction is not None:
             if self.pose_goal_reached(self.row_exit_goal, self.row_end_direction):
                 self.store_current_rows()
+                self.record_current_row_end_direction()
                 self.reset_controller_state()
                 self.cmd_pub.publish(Twist())
                 if self.finish_after_current_row:
@@ -760,6 +882,93 @@ class MaizeNavigator(Node):
             return 0.0
         return float(np.sum(np.linalg.norm(np.diff(points, axis=0), axis=1)))
 
+    def build_rounded_route(self, support_points: np.ndarray) -> np.ndarray:
+        points = [np.asarray(point, dtype=float) for point in support_points]
+        if len(points) < 2:
+            return np.asarray(points, dtype=float)
+        route: List[np.ndarray] = [points[0]]
+        for idx in range(1, len(points) - 1):
+            previous = points[idx - 1]
+            corner = points[idx]
+            following = points[idx + 1]
+            incoming = corner - previous
+            outgoing = following - corner
+            incoming_length = float(np.linalg.norm(incoming))
+            outgoing_length = float(np.linalg.norm(outgoing))
+            if incoming_length < 1e-6 or outgoing_length < 1e-6:
+                continue
+            radius = min(
+                self.p.maneuver_corner_radius,
+                self.p.min_follow_turn_radius,
+                0.45 * incoming_length,
+                0.45 * outgoing_length,
+            )
+            before = corner - radius * incoming / incoming_length
+            after = corner + radius * outgoing / outgoing_length
+            self.append_sampled_line(route, route[-1], before)
+            sample_count = max(3, int(math.ceil((2.0 * radius) / self.p.maneuver_route_spacing)))
+            for ratio in np.linspace(0.0, 1.0, sample_count)[1:]:
+                one_minus = 1.0 - float(ratio)
+                route.append(one_minus * one_minus * before + 2.0 * one_minus * ratio * corner + ratio * ratio * after)
+        self.append_sampled_line(route, route[-1], points[-1])
+        return np.asarray(route, dtype=float)
+
+    def append_sampled_line(self, route: List[np.ndarray], start: np.ndarray, end: np.ndarray) -> None:
+        distance = float(np.linalg.norm(np.asarray(end, dtype=float) - np.asarray(start, dtype=float)))
+        sample_count = max(1, int(math.ceil(distance / self.p.maneuver_route_spacing)))
+        for ratio in np.linspace(0.0, 1.0, sample_count + 1)[1:]:
+            route.append((1.0 - ratio) * np.asarray(start, dtype=float) + ratio * np.asarray(end, dtype=float))
+
+    def project_onto_route_forward(
+        self,
+        route: np.ndarray,
+        point: np.ndarray,
+        start_idx: int,
+    ) -> Tuple[np.ndarray, int, float]:
+        point = np.asarray(point, dtype=float)
+        best_projection = np.asarray(route[-1], dtype=float)
+        best_idx = min(max(0, start_idx), max(0, len(route) - 2))
+        best_distance = float("inf")
+        for idx in range(best_idx, len(route) - 1):
+            segment = route[idx + 1] - route[idx]
+            length_sq = float(segment @ segment)
+            if length_sq < 1e-12:
+                continue
+            ratio = float(np.clip(((point - route[idx]) @ segment) / length_sq, 0.0, 1.0))
+            projection = route[idx] + ratio * segment
+            distance = float(np.linalg.norm(point - projection))
+            if distance < best_distance:
+                best_projection = projection
+                best_idx = idx
+                best_distance = distance
+        return np.asarray(best_projection, dtype=float), best_idx, best_distance
+
+    def polyline_distance_from_projection(self, route: np.ndarray, projection: np.ndarray, start_idx: int) -> float:
+        if len(route) < 2:
+            return 0.0
+        start_idx = int(np.clip(start_idx, 0, len(route) - 2))
+        return float(np.linalg.norm(route[start_idx + 1] - projection)) + self.polyline_length(route[start_idx + 1:])
+
+    def point_at_route_distance(
+        self,
+        route: np.ndarray,
+        projection: np.ndarray,
+        start_idx: int,
+        distance_ahead: float,
+    ) -> np.ndarray:
+        start_idx = int(np.clip(start_idx, 0, len(route) - 2))
+        travelled = 0.0
+        segment_start = np.asarray(projection, dtype=float)
+        for idx in range(start_idx, len(route) - 1):
+            segment_end = np.asarray(route[idx + 1], dtype=float)
+            segment = segment_end - segment_start
+            length = float(np.linalg.norm(segment))
+            if travelled + length >= distance_ahead and length > 1e-9:
+                return segment_start + ((distance_ahead - travelled) / length) * segment
+            travelled += length
+            segment_start = segment_end
+        return np.asarray(route[-1], dtype=float)
+
     def export_row_map(self) -> Optional[str]:
         if self.row_map_exported or len(self.stored_rows) == 0:
             return None
@@ -795,27 +1004,69 @@ class MaizeNavigator(Node):
                 self.cmd_pub.publish(Twist())
                 return
 
-        if self.entrance_waypoint_index < len(self.entrance_waypoints):
-            waypoint = self.entrance_waypoints[self.entrance_waypoint_index]
-            robot_xy = np.array([self.robot_pose.x, self.robot_pose.y], dtype=float)
-            if float(np.linalg.norm(robot_xy - waypoint)) <= self.p.maneuver_goal_xy_tolerance:
-                self.entrance_waypoint_index += 1
-                self.reset_controller_state()
-                self.get_logger().info(
-                    f"Headland waypoint {self.entrance_waypoint_index}/{len(self.entrance_waypoints)} reached"
-                )
-            else:
-                self.drive_to_point(waypoint)
-                return
-
         if (
             self.entrance_target_direction is not None
-            and self.pose_goal_reached(self.entrance_target, self.entrance_target_direction)
+            and self.entry_line_reached(self.entrance_target, self.entrance_target_direction)
         ):
             self.initialize_selected_entrance_rows()
             return
-        target = self.entrance_heading_goal if self.entrance_heading_goal is not None else self.entrance_target
-        self.drive_to_point(target)
+
+        target = self.update_entrance_route_target()
+        if target is None:
+            self.cmd_pub.publish(Twist())
+            return
+        self.drive_to_point(target, self.p.maneuver_speed, self.p.maneuver_slow_speed)
+
+    def entry_line_reached(self, goal: np.ndarray, direction: np.ndarray) -> bool:
+        direction = self.normalize(direction)
+        lateral_direction = np.array([-direction[1], direction[0]], dtype=float)
+        robot_xy = np.array([self.robot_pose.x, self.robot_pose.y], dtype=float)
+        rel = robot_xy - np.asarray(goal, dtype=float)
+        along = float(rel @ direction)
+        lateral = abs(float(rel @ lateral_direction))
+        desired_yaw = math.atan2(float(direction[1]), float(direction[0]))
+        yaw_error = abs(wrap_to_pi(desired_yaw - self.robot_pose.yaw))
+        return (
+            along >= 0.0
+            and lateral <= self.p.maneuver_entry_lateral_tolerance
+            and yaw_error <= self.p.maneuver_entry_yaw_tolerance
+        )
+
+    def update_entrance_route_target(self) -> Optional[np.ndarray]:
+        if len(self.entrance_route) < 2:
+            self.get_logger().warn("Cannot follow headland maneuver without an entrance route")
+            return None
+        robot_xy = np.array([self.robot_pose.x, self.robot_pose.y], dtype=float)
+        projection, segment_idx, deviation = self.project_onto_route_forward(
+            self.entrance_route,
+            robot_xy,
+            self.entrance_route_progress_index,
+        )
+        self.entrance_route_projection = projection
+        self.entrance_route_progress_index = max(self.entrance_route_progress_index, segment_idx)
+        if deviation > self.p.maneuver_max_route_deviation:
+            self.get_logger().warn(
+                f"Headland route deviation too large: {deviation:.3f} m",
+                throttle_duration_sec=1.0,
+            )
+            self.entrance_route_target = None
+            return None
+        self.entrance_route_remaining_distance = self.polyline_distance_from_projection(
+            self.entrance_route,
+            projection,
+            self.entrance_route_progress_index,
+        )
+        lookahead = min(
+            self.p.maneuver_lookahead_distance,
+            max(0.10, 0.60 * self.entrance_route_remaining_distance),
+        )
+        self.entrance_route_target = self.point_at_route_distance(
+            self.entrance_route,
+            projection,
+            self.entrance_route_progress_index,
+            lookahead,
+        )
+        return self.entrance_route_target
 
     def pose_goal_reached(self, goal: np.ndarray, direction: np.ndarray) -> bool:
         direction = self.normalize(direction)
@@ -844,7 +1095,7 @@ class MaizeNavigator(Node):
             return False
 
         center = np.asarray(self.plant_row_end_point, dtype=float)
-        outgoing = self.normalize(self.row_end_direction)
+        outgoing = self.average_row_end_direction_for_side(self.row_end_direction)
         roi_points = self.points_in_oriented_rectangle(
             self.get_all_map_points(),
             center,
@@ -895,12 +1146,19 @@ class MaizeNavigator(Node):
                 turn_start + waypoint_offset + outward_offset,
                 self.entrance_target - waypoint_offset + outward_offset,
             ]
-        self.entrance_waypoint_index = 0
         self.entrance_target_direction = -outgoing
         self.entrance_heading_goal = (
             self.entrance_target
-            + self.p.maneuver_heading_lookahead_distance * self.entrance_target_direction
+            + self.p.maneuver_entry_extension_distance * self.entrance_target_direction
         )
+        route_support_points = np.vstack(
+            (turn_start, *self.entrance_waypoints, self.entrance_target, self.entrance_heading_goal)
+        )
+        self.entrance_route = self.build_rounded_route(route_support_points)
+        self.entrance_route_progress_index = 0
+        self.entrance_route_projection = None
+        self.entrance_route_target = None
+        self.entrance_route_remaining_distance = self.polyline_length(self.entrance_route)
         self.pattern_index += 1
         self.finish_after_current_row = self.pattern_index >= len(self.pattern_steps)
         self.reset_controller_state()
@@ -929,7 +1187,8 @@ class MaizeNavigator(Node):
         for idx in range(1, len(hist) - 1):
             if hist[idx] >= self.p.hist_peak_min_points and hist[idx] >= hist[idx - 1] and hist[idx] >= hist[idx + 1]:
                 lateral = float(0.5 * (bin_edges[idx] + bin_edges[idx + 1]))
-                candidates.append((int(hist[idx]), EntrancePeak(lateral, center + lateral * lateral_direction)))
+                point = self.actual_row_end_from_peak(points, center, outgoing_direction, lateral)
+                candidates.append((int(hist[idx]), EntrancePeak(lateral, point)))
 
         # Broad occupied bands often form several adjacent local maxima. Count them
         # as one plant row before applying pattern-relative peak offsets.
@@ -944,6 +1203,50 @@ class MaizeNavigator(Node):
             throttle_duration_sec=2.0,
         )
         return peaks
+
+    def actual_row_end_from_peak(
+        self,
+        points: np.ndarray,
+        center: np.ndarray,
+        outgoing_direction: np.ndarray,
+        peak_lateral: float,
+    ) -> np.ndarray:
+        lateral_direction = np.array([-outgoing_direction[1], outgoing_direction[0]], dtype=float)
+        rel = points - np.asarray(center, dtype=float)
+        local_x = rel @ outgoing_direction
+        local_y = rel @ lateral_direction
+        half_width = max(self.p.hist_bin_size, 0.5 * self.p.row_rectangle_width)
+        band_mask = np.abs(local_y - peak_lateral) <= half_width
+        if not np.any(band_mask):
+            return np.asarray(center, dtype=float) + peak_lateral * lateral_direction
+        band_points = points[band_mask]
+        band_x = local_x[band_mask]
+        outermost_x = float(np.max(band_x))
+        end_points = band_points[band_x >= outermost_x - self.p.row_point_window_length]
+        return np.asarray(np.mean(end_points, axis=0), dtype=float)
+
+    def row_end_side(self, direction: np.ndarray) -> str:
+        if self.initial_forward_direction is None:
+            return "forward"
+        return "forward" if float(self.normalize(direction) @ self.initial_forward_direction) >= 0.0 else "backward"
+
+    def record_current_row_end_direction(self) -> None:
+        if self.row_end_direction is None:
+            return
+        direction = self.normalize(self.row_end_direction)
+        side = self.row_end_side(direction)
+        directions = self.row_end_directions_by_side[side]
+        if directions and float(direction @ directions[-1]) < 0.0:
+            direction = -direction
+        directions.append(direction)
+
+    def average_row_end_direction_for_side(self, current_direction: np.ndarray) -> np.ndarray:
+        current_direction = self.normalize(current_direction)
+        directions = self.row_end_directions_by_side[self.row_end_side(current_direction)]
+        if not directions:
+            return current_direction
+        aligned = [direction if float(direction @ current_direction) >= 0.0 else -direction for direction in directions]
+        return self.normalize(np.sum(aligned, axis=0))
 
     def associate_known_rows_with_entrance_peaks(
         self,
@@ -1199,6 +1502,9 @@ class MaizeNavigator(Node):
 
         self.left_row.result = self.march_row(self.left_row, map_points)
         self.right_row.result = self.march_row(self.right_row, map_points)
+        self.couple_row_results(self.left_row.result, self.right_row.result)
+        self.update_frozen_prefix(self.left_row)
+        self.update_frozen_prefix(self.right_row)
         self.midline = self.build_midline(self.left_row.result.points, self.right_row.result.points)
 
         if self.left_row.result.ended and self.right_row.result.ended:
@@ -1229,15 +1535,90 @@ class MaizeNavigator(Node):
             self.row_exit_heading_goal = None
             self.row_end_direction = None
 
+    def update_frozen_prefix(self, model: RowMarchModel) -> None:
+        if self.robot_pose is None or len(model.result.points) < 2:
+            return
+        robot_xy = np.array([self.robot_pose.x, self.robot_pose.y], dtype=float)
+        direction = self.normalize(model.initial_direction)
+        along = (model.result.points - robot_xy) @ direction
+        eligible = np.where(along <= -self.p.row_freeze_behind_distance)[0]
+        if len(eligible) == 0:
+            return
+        freeze_count = int(eligible[-1]) + 1
+        if freeze_count > len(model.frozen_points):
+            model.frozen_points = np.array(model.result.points[:freeze_count], copy=True)
+        model.result.frozen_count = len(model.frozen_points)
+
+    def couple_row_results(self, left: RowMarchResult, right: RowMarchResult) -> None:
+        count = min(len(left.points), len(right.points))
+        if count < 2:
+            return
+        corrected_left = np.array(left.points, copy=True)
+        corrected_right = np.array(right.points, copy=True)
+        start_idx = max(1, left.frozen_count, right.frozen_count)
+        previous_idx = min(max(0, start_idx - 2), count - 2)
+        previous_direction = self.mean_direction(
+            corrected_left[previous_idx + 1] - corrected_left[previous_idx],
+            corrected_right[previous_idx + 1] - corrected_right[previous_idx],
+        )
+
+        for idx in range(start_idx, count):
+            left_direction = corrected_left[idx] - corrected_left[idx - 1]
+            right_direction = corrected_right[idx] - corrected_right[idx - 1]
+            angle_difference = abs(wrap_to_pi(
+                math.atan2(float(left_direction[1]), float(left_direction[0]))
+                - math.atan2(float(right_direction[1]), float(right_direction[0]))
+            ))
+            shared_direction = previous_direction
+            if angle_difference <= self.p.row_pair_max_direction_difference:
+                shared_direction = self.mean_direction(left_direction, right_direction)
+            lateral = np.array([-shared_direction[1], shared_direction[0]], dtype=float)
+            width = float((corrected_left[idx] - corrected_right[idx]) @ lateral)
+            if (
+                angle_difference > self.p.row_pair_max_direction_difference
+                or not self.p.min_lane_width <= width <= self.p.max_lane_width
+            ):
+                predicted_left = corrected_left[idx - 1] + self.p.row_segment_point_spacing * shared_direction
+                predicted_right = corrected_right[idx - 1] + self.p.row_segment_point_spacing * shared_direction
+                left_error = float(np.linalg.norm(corrected_left[idx] - predicted_left))
+                right_error = float(np.linalg.norm(corrected_right[idx] - predicted_right))
+                if left_error <= right_error:
+                    corrected_right[idx] = corrected_left[idx] - self.p.expected_row_width * lateral
+                else:
+                    corrected_left[idx] = corrected_right[idx] + self.p.expected_row_width * lateral
+            previous_direction = shared_direction
+
+        left.points = corrected_left
+        right.points = corrected_right
+        left.frozen_count = min(left.frozen_count, len(left.points))
+        right.frozen_count = min(right.frozen_count, len(right.points))
+        if count >= 2:
+            end_direction = self.mean_direction(
+                corrected_left[count - 1] - corrected_left[count - 2],
+                corrected_right[count - 1] - corrected_right[count - 2],
+            )
+            left.end_direction = end_direction
+            right.end_direction = end_direction
+        if left.ended:
+            left.end_point = np.asarray(corrected_left[-1], dtype=float)
+        if right.ended:
+            right.end_point = np.asarray(corrected_right[-1], dtype=float)
+
     def march_row(self, model: RowMarchModel, map_points: np.ndarray) -> RowMarchResult:
         result = RowMarchResult()
-        direction = self.normalize(model.initial_direction)
-        line_points = self.build_initial_line_from_point1_and_point2(model.initial_point1, model.initial_point2, direction)
-        exact_points: List[np.ndarray] = [
-            np.asarray(model.initial_point1, dtype=float),
-            np.asarray(model.initial_point2, dtype=float),
-        ]
-        previous_valid_point: Optional[np.ndarray] = np.asarray(model.initial_point2, dtype=float)
+        if len(model.frozen_points) >= 2:
+            exact_points = [np.asarray(point, dtype=float) for point in model.frozen_points]
+            point1 = exact_points[-2]
+            point2 = exact_points[-1]
+            direction = self.initial_direction_from_points(point1, point2, model.initial_direction)
+        else:
+            point1 = np.asarray(model.initial_point1, dtype=float)
+            point2 = np.asarray(model.initial_point2, dtype=float)
+            direction = self.normalize(model.initial_direction)
+            exact_points = [point1, point2]
+        result.frozen_count = len(model.frozen_points)
+        line_points = self.build_initial_line_from_point1_and_point2(point1, point2, direction)
+        previous_valid_point: Optional[np.ndarray] = np.asarray(point2, dtype=float)
         last_valid_direction = np.asarray(direction, dtype=float)
 
         for _ in range(self.p.row_max_march_steps):
@@ -1506,7 +1887,12 @@ class MaizeNavigator(Node):
             segment_start = segment_end
         return np.asarray(polyline[-1], dtype=float)
 
-    def drive_to_point(self, target: np.ndarray) -> None:
+    def drive_to_point(
+        self,
+        target: np.ndarray,
+        max_speed: Optional[float] = None,
+        min_speed: Optional[float] = None,
+    ) -> None:
         target = np.asarray(target, dtype=float)
         if self.last_target_point is None:
             filtered_target = target
@@ -1522,12 +1908,14 @@ class MaizeNavigator(Node):
         yaw_error = wrap_to_pi(target_yaw - self.robot_pose.yaw)
 
         cmd = Twist()
+        max_speed = self.p.follow_speed if max_speed is None else max_speed
+        min_speed = self.p.slow_speed if min_speed is None else min_speed
         pursuit_distance = max(0.10, target_distance)
         curvature = self.p.pure_pursuit_gain * 2.0 * math.sin(yaw_error) / pursuit_distance
         cmd.linear.x = float(np.clip(
-            self.p.follow_speed / (1.0 + self.p.curve_speed_reduction_gain * abs(curvature)),
-            self.p.slow_speed,
-            self.p.follow_speed,
+            max_speed / (1.0 + self.p.curve_speed_reduction_gain * abs(curvature)),
+            min_speed,
+            max_speed,
         ))
         radius_limited_angular = abs(cmd.linear.x) / self.p.min_follow_turn_radius
         max_angular = min(self.p.max_angular_speed, radius_limited_angular)
@@ -1640,6 +2028,17 @@ class MaizeNavigator(Node):
                 )
             )
             marker_id += 1
+            markers.markers.append(
+                self.create_arrow_marker(
+                    "entrance_histogram_direction",
+                    marker_id,
+                    self.entrance_hist_center,
+                    self.entrance_hist_direction,
+                    (0.1, 1.0, 0.9, 1.0),
+                    stamp,
+                )
+            )
+            marker_id += 1
         for peak in self.entrance_hist_peaks:
             color = (0.0, 1.0, 0.25, 1.0) if peak.selected else (0.0, 0.85, 1.0, 0.9)
             scale = 0.24 if peak.selected else 0.16
@@ -1648,16 +2047,35 @@ class MaizeNavigator(Node):
             label = "?" if peak.row_number is None else str(peak.row_number)
             markers.markers.append(self.create_text_marker("entrance_histogram_row_numbers", marker_id, peak.point, label, color, stamp))
             marker_id += 1
-        for idx, waypoint in enumerate(self.entrance_waypoints):
-            color = (1.0, 0.9, 0.1, 1.0) if idx >= self.entrance_waypoint_index else (0.55, 0.55, 0.2, 0.6)
+        for waypoint in self.entrance_waypoints:
             markers.markers.append(
-                self.create_sphere_marker("entrance_waypoints", marker_id, waypoint, color, 0.24, stamp)
+                self.create_sphere_marker("entrance_waypoints", marker_id, waypoint, (1.0, 0.9, 0.1, 1.0), 0.24, stamp)
             )
             marker_id += 1
-        if self.row_exit_goal is not None and self.entrance_target is not None and len(self.entrance_waypoints) > 0:
-            turn_route = np.vstack((self.row_exit_goal, *self.entrance_waypoints, self.entrance_target))
+        if len(self.entrance_route) > 0:
             markers.markers.append(
-                self.create_line_marker("entrance_turn_route", marker_id, turn_route, (1.0, 0.75, 0.0, 0.9), 0.045, stamp)
+                self.create_line_marker("entrance_turn_route", marker_id, self.entrance_route, (1.0, 0.75, 0.0, 0.9), 0.055, stamp)
+            )
+            marker_id += 1
+        if self.entrance_route_projection is not None:
+            markers.markers.append(
+                self.create_sphere_marker("entrance_route_projection", marker_id, self.entrance_route_projection, (0.1, 1.0, 0.9, 1.0), 0.15, stamp)
+            )
+            marker_id += 1
+        if self.entrance_route_target is not None:
+            markers.markers.append(
+                self.create_sphere_marker("entrance_route_lookahead", marker_id, self.entrance_route_target, (1.0, 0.2, 0.8, 1.0), 0.17, stamp)
+            )
+            marker_id += 1
+            markers.markers.append(
+                self.create_text_marker(
+                    "entrance_route_status",
+                    marker_id,
+                    self.entrance_route_target,
+                    f"idx={self.entrance_route_progress_index} remaining={self.entrance_route_remaining_distance:.2f}",
+                    (1.0, 1.0, 1.0, 1.0),
+                    stamp,
+                )
             )
             marker_id += 1
         if self.entrance_target is not None:
@@ -1685,27 +2103,26 @@ class MaizeNavigator(Node):
     def add_laser_follow_markers(self, markers: MarkerArray, marker_id: int, stamp) -> int:
         x_min = self.p.laser_roi_x_min
         x_max = self.p.laser_roi_x_max
-        y_min = self.p.laser_roi_y_abs_min
-        y_max = self.p.laser_roi_y_abs_max
-        length = x_max - x_min
-        width = y_max - y_min
-        for side_sign, namespace in ((1.0, "laser_left_roi"), (-1.0, "laser_right_roi")):
-            center_base = np.array([0.5 * (x_min + x_max), side_sign * 0.5 * (y_min + y_max)], dtype=float)
+        result = self.laser_follow_result
+        roi_centers = result.roi_centers
+        roi_direction = result.roi_direction
+        if len(roi_centers) != 2:
+            roi_centers, roi_direction = self.laser_follower.build_rois(None, np.array([x_max, 0.0], dtype=float))
+        for center_base, namespace in zip(roi_centers, ("laser_left_roi", "laser_right_roi")):
             markers.markers.append(
                 self.create_rectangle_marker(
                     namespace,
                     marker_id,
                     self.base_point_to_map(center_base),
-                    self.base_direction_to_map(np.array([1.0, 0.0], dtype=float)),
-                    length,
-                    width,
+                    self.base_direction_to_map(roi_direction),
+                    self.p.laser_roi_length,
+                    self.p.laser_roi_width,
                     (0.2, 0.95, 0.95, 0.65),
                     stamp,
                 )
             )
             marker_id += 1
 
-        result = self.laser_follow_result
         for line, namespace, color in (
             (result.left_line, "laser_left_line", (0.0, 1.0, 0.25, 1.0)),
             (result.right_line, "laser_right_line", (1.0, 0.55, 0.0, 1.0)),
@@ -1758,6 +2175,18 @@ class MaizeNavigator(Node):
         marker_id = start_id
         result = model.result
         if len(result.points) > 0:
+            if result.frozen_count > 0:
+                markers.markers.append(
+                    self.create_line_marker(
+                        f"{model.side}_row_frozen",
+                        marker_id,
+                        result.points[: result.frozen_count],
+                        (0.72, 0.72, 0.82, 0.95),
+                        0.065,
+                        stamp,
+                    )
+                )
+                marker_id += 1
             markers.markers.append(self.create_line_marker(f"{model.side}_row_curve", marker_id, result.points, color, 0.045, stamp))
             marker_id += 1
             markers.markers.append(self.create_points_marker(f"{model.side}_row_points", marker_id, result.points, color, 0.11, stamp))

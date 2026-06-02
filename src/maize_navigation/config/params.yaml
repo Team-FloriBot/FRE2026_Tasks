@@ -50,15 +50,20 @@ maize_navigator:
     row_end_min_points_fields_3_to_5: 2
     row_max_march_steps: 120
     row_min_fit_points: 3
+    # Bereits sicher passierte Kartenpunkte bleiben stabil; die beiden Seiten
+    # werden gemeinsam auf parallelen und plausiblen Verlauf geprueft.
+    row_freeze_behind_distance: 1.50
+    row_pair_max_direction_difference: 0.30
 
     # Lokale LaserScan-Feinfuehrung innerhalb der Reihe.
     # Karte bleibt Prior und Fallback; Reihenende und Vorgewende bleiben kartenbasiert.
     laser_follow_enabled: true
     laser_scan_timeout: 0.50
     laser_roi_x_min: 0.25
-    laser_roi_x_max: 2.0
-    laser_roi_y_abs_min: 0.18
-    laser_roi_y_abs_max: 0.90
+    laser_roi_x_max: 1.80
+    laser_roi_length: 1.55
+    laser_roi_width: 0.32
+    laser_roi_center_offset_limit: 0.25
     laser_ransac_iterations: 80
     laser_ransac_distance: 0.08
     laser_min_inliers: 5
@@ -121,6 +126,16 @@ maize_navigator:
     maneuver_goal_yaw_tolerance: 0.75
     # Virtueller Fuehrungspunkt hinter der Zielpose verhindert Drehen auf der Stelle.
     maneuver_heading_lookahead_distance: 0.1
+    # Verrundete, monoton verfolgte Route fuer das Vorgewende.
+    maneuver_speed: 0.16
+    maneuver_slow_speed: 0.10
+    maneuver_lookahead_distance: 0.40
+    maneuver_route_spacing: 0.08
+    maneuver_corner_radius: 0.45
+    maneuver_entry_extension_distance: 0.80
+    maneuver_max_route_deviation: 0.70
+    maneuver_entry_lateral_tolerance: 0.25
+    maneuver_entry_yaw_tolerance: 0.45
 
     exit_distance: 0.70
     turn_forward_distance: 2.20
