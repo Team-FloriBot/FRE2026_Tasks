@@ -1,0 +1,15 @@
+coverage_planner:
+  ros__parameters:
+    # Feld startet beim Roboter (0,0) und geht 10 Meter nach vorne (X) 
+    # und spannt sich 5 Meter nach links und rechts auf (Y)
+    polygon_coords: [0.0, 0.0, 5.0, 0.0, 5.0, 5.0, 0.0, 5.0]
+    
+    # Frames für die Transformation
+    input_frame: "base_link"
+    target_frame: "map"
+    
+    # Roboter & Feldkonfiguration
+    operating_width: 1.0
+    robot_width: 0.42
+    turn_radius: 0.37
+    headland_width: 0.5

@@ -1,0 +1,35 @@
+pure_pursuit_node:
+  ros__parameters:
+
+    path_topic: "/plan"
+    cmd_vel_topic: "/cmd_vel"
+
+    base_link_frame: "base_link"
+
+    # Wenn der Roboter auf Geraden pendelt oder nervös lenkt:lookahead_min leicht erhöhen
+    # Wenn er Kurven schneidet oder in engen Turns zu spät einlenkt: lookahead_min senken oder lookahead_max kleiner halten.
+    # Wenn er bei Kreuzungen zu weit voraus “in den falschen Ast” schaut: lookahead_max reduzieren
+    lookahead_min: 0.25 # minimale Vorschauweite
+    lookahead_max: 0.60 # maximale Vorschauweite
+    lookahead_gain: 0.15 # Skaliert die Vorschauweite mit der Geschwindigkeit
+
+    max_speed: 0.3
+    min_speed: 0.2
+
+    curvature_gain: 3.0 # reduziert Geschwindigkeit bei hoher Krümmung. Höher = langsamer in Kurven.
+    pure_pursuit_gain: 1.0 # multipliziert die Krümmung, höher lenkt stärker, niedriger ruhiger
+    max_angular_velocity: 3.0
+    min_follow_turn_radius: 0.37 # minimal erlaubter Fahrradius
+    angular_acceleration_limit: 3.0
+
+    goal_tolerance: 0.15
+    slowdown_distance: 0.75
+    acceleration_limit: 0.5
+    deceleration_limit: 0.5
+
+    control_rate: 20.0
+
+    projection_search_distance: 1.5 # lokales Suchfenster nach vorne entlang des Pfads
+    projection_backtrack_distance: 0.20 # kleiner Rückblick gegen Messrauschen
+    heading_filter_enabled: true # aktiviert Richtungsprüfung
+    heading_tolerance: 1.75 # erlaubte Abweichung zwischen Roboter-Yaw und Segmentrichtung in rad; kleiner genauer, aber Risiko für enge Turns

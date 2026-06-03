@@ -44,7 +44,27 @@ ros2 launch maize_navigation maize_navigation.launch.py
 ``` 
 Die Konfiguration erfolgt über die config/params.yaml. Hier können das Fahrmuster sowie wietere Paramter angepasst werden.
 
-Zum Starten des Roboters folgenden Service in der Kommandozeile aufrufen:
+Zum Starten der Maisnavigation folgenden Service in der Kommandozeile aufrufen:
 ```
 ros2 service call /start_navigation std_srvs/srv/Trigger {}
 ``` 
+
+Zum Starten der Task4 an den Startpunk am Feldrand fahren und folgenden Service in der Kommandozeile aufrufen:
+```
+ros2 service call /trigger_coverage_planning std_srvs/srv/Trigger "{}"
+``` 
+
+Eckkoordinaten setzen gemessen vom Startpunkt des Roboters:
+```
+ros2 param set /coverage_planner polygon_coords '[0.0, 0.0, 5.0, 0.0, 5.0, 5.0, 0.0, 5.0]'
+```
+
+Unterbrechung (Stop)
+```
+ros2 service call /pure_pursuit_node/set_active std_srvs/srv/SetBool "{data: false}"
+```
+
+Starten (nach Stop)
+```
+ros2 service call /pure_pursuit_node/set_active std_srvs/srv/SetBool "{data: true}"
+```
