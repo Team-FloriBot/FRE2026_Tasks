@@ -84,6 +84,26 @@ class PatternStep:
 
 
 @dataclass
+class DrivingProfile:
+    follow_speed: float
+    slow_speed: float
+    lookahead_distance: float
+    pure_pursuit_gain: float
+    heading_kp: float
+    lateral_kp: float
+    curve_speed_reduction_gain: float
+    lateral_speed_reduction_gain: float
+    max_angular_speed: float
+    min_follow_turn_radius: float
+    angular_rate_limit: float
+    target_filter_alpha: float
+    maneuver_speed: float
+    maneuver_slow_speed: float
+    maneuver_lookahead_distance: float
+    maneuver_corner_radius: float
+
+
+@dataclass
 class EntrancePeak:
     lateral: float
     point: np.ndarray
@@ -404,6 +424,8 @@ class MaizeNavigator(Node):
         self.laser_follower = LaserRowFollower(self.p)
         self.laser_follow_result = LaserFollowResult(reason="not initialized")
         self.fused_target_point: Optional[np.ndarray] = None
+        self.driving_profiles = self.build_driving_profiles()
+        self.current_carefulness = "high"
 
         self.left_row: Optional[RowMarchModel] = None
         self.right_row: Optional[RowMarchModel] = None
@@ -494,7 +516,6 @@ class MaizeNavigator(Node):
         p.laser_follow_enabled = bool(get_param("laser_follow_enabled", p.laser_follow_enabled))
         p.laser_scan_timeout = float(get_param("laser_scan_timeout", p.laser_scan_timeout))
         p.laser_roi_x_min = float(get_param("laser_roi_x_min", p.laser_roi_x_min))
-        p.laser_roi_x_max = float(get_param("laser_roi_x_max", p.laser_roi_x_max))
         p.laser_roi_length = float(get_param("laser_roi_length", p.laser_roi_length))
         p.laser_roi_width = float(get_param("laser_roi_width", p.laser_roi_width))
         p.laser_roi_center_offset_limit = float(
@@ -643,8 +664,14 @@ class MaizeNavigator(Node):
             res.success = False
             res.message = "Invalid pattern. Use space-separated steps such as '1L 2R'."
             return res
+        carefulness = req.carefulness.strip().lower() or "high"
+        if carefulness not in self.driving_profiles:
+            res.success = False
+            res.message = "Invalid carefulness. Use one of: low, medium, high."
+            return res
 
         self.p.pattern = pattern
+        self.apply_driving_profile(carefulness)
         self.pattern_steps = self.parse_pattern(pattern)
         self.left_row = None
         self.right_row = None
@@ -667,8 +694,73 @@ class MaizeNavigator(Node):
         self.fused_target_point = None
         self.state = MissionState.INITIALIZING
         res.success = True
-        res.message = f"Navigation started with pattern: {pattern}"
+        res.message = f"Navigation started with pattern: {pattern}; carefulness: {carefulness}"
         return res
+
+    def build_driving_profiles(self) -> Dict[str, DrivingProfile]:
+        high = DrivingProfile(
+            follow_speed=self.p.follow_speed,
+            slow_speed=self.p.slow_speed,
+            lookahead_distance=self.p.lookahead_distance,
+            pure_pursuit_gain=self.p.pure_pursuit_gain,
+            heading_kp=self.p.heading_kp,
+            lateral_kp=self.p.lateral_kp,
+            curve_speed_reduction_gain=self.p.curve_speed_reduction_gain,
+            lateral_speed_reduction_gain=self.p.lateral_speed_reduction_gain,
+            max_angular_speed=self.p.max_angular_speed,
+            min_follow_turn_radius=self.p.min_follow_turn_radius,
+            angular_rate_limit=self.p.angular_rate_limit,
+            target_filter_alpha=self.p.target_filter_alpha,
+            maneuver_speed=self.p.maneuver_speed,
+            maneuver_slow_speed=self.p.maneuver_slow_speed,
+            maneuver_lookahead_distance=self.p.maneuver_lookahead_distance,
+            maneuver_corner_radius=self.p.maneuver_corner_radius,
+        )
+        return {
+            "high": high,
+            "medium": DrivingProfile(
+                follow_speed=high.follow_speed * 1.30,
+                slow_speed=high.slow_speed * 1.65,
+                lookahead_distance=high.lookahead_distance * 1.12,
+                pure_pursuit_gain=high.pure_pursuit_gain * 0.82,
+                heading_kp=high.heading_kp * 0.75,
+                lateral_kp=high.lateral_kp * 0.75,
+                curve_speed_reduction_gain=high.curve_speed_reduction_gain * 0.55,
+                lateral_speed_reduction_gain=high.lateral_speed_reduction_gain * 0.50,
+                max_angular_speed=high.max_angular_speed * 1.10,
+                min_follow_turn_radius=high.min_follow_turn_radius * 1.22,
+                angular_rate_limit=high.angular_rate_limit * 1.15,
+                target_filter_alpha=min(1.0, high.target_filter_alpha * 1.20),
+                maneuver_speed=high.maneuver_speed * 1.20,
+                maneuver_slow_speed=high.maneuver_slow_speed * 1.80,
+                maneuver_lookahead_distance=high.maneuver_lookahead_distance * 1.20,
+                maneuver_corner_radius=high.maneuver_corner_radius * 1.25,
+            ),
+            "low": DrivingProfile(
+                follow_speed=high.follow_speed * 1.60,
+                slow_speed=high.slow_speed * 2.50,
+                lookahead_distance=high.lookahead_distance * 1.30,
+                pure_pursuit_gain=high.pure_pursuit_gain * 0.68,
+                heading_kp=high.heading_kp * 0.50,
+                lateral_kp=high.lateral_kp * 0.50,
+                curve_speed_reduction_gain=high.curve_speed_reduction_gain * 0.30,
+                lateral_speed_reduction_gain=high.lateral_speed_reduction_gain * 0.25,
+                max_angular_speed=high.max_angular_speed * 1.20,
+                min_follow_turn_radius=high.min_follow_turn_radius * 1.50,
+                angular_rate_limit=high.angular_rate_limit * 1.30,
+                target_filter_alpha=min(1.0, high.target_filter_alpha * 1.40),
+                maneuver_speed=high.maneuver_speed * 1.40,
+                maneuver_slow_speed=high.maneuver_slow_speed * 2.50,
+                maneuver_lookahead_distance=high.maneuver_lookahead_distance * 1.38,
+                maneuver_corner_radius=high.maneuver_corner_radius * 1.50,
+            ),
+        }
+
+    def apply_driving_profile(self, carefulness: str) -> None:
+        profile = self.driving_profiles[carefulness]
+        for name, value in profile.__dict__.items():
+            setattr(self.p, name, value)
+        self.current_carefulness = carefulness
 
     def stop_cb(self, req, res):
         self.store_current_rows()

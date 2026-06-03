@@ -94,29 +94,59 @@ def make_navigator_for_start_callback():
     navigator.p = NavigatorParams()
     navigator.pattern_steps = [PatternStep(1, "L")]
     navigator.laser_follower = types.SimpleNamespace(reset=lambda: None)
+    navigator.driving_profiles = navigator.build_driving_profiles()
+    navigator.current_carefulness = "high"
     return navigator
 
 
 def test_start_callback_sets_requested_pattern():
     navigator = make_navigator_for_start_callback()
 
-    response = navigator.start_cb(types.SimpleNamespace(pattern="3L  2r"), types.SimpleNamespace())
+    request = types.SimpleNamespace(pattern="3L  2r", carefulness="high")
+    response = navigator.start_cb(request, types.SimpleNamespace())
 
     assert response.success
-    assert response.message == "Navigation started with pattern: 3L  2r"
+    assert response.message == "Navigation started with pattern: 3L  2r; carefulness: high"
     assert navigator.p.pattern == "3L  2r"
     assert navigator.pattern_steps == [PatternStep(3, "L"), PatternStep(2, "R")]
     assert navigator.state == MissionState.INITIALIZING
+    assert navigator.current_carefulness == "high"
+
+
+def test_start_callback_applies_requested_carefulness_profile():
+    navigator = make_navigator_for_start_callback()
+    high_speed = navigator.p.follow_speed
+
+    request = types.SimpleNamespace(pattern="3L", carefulness="medium")
+    response = navigator.start_cb(request, types.SimpleNamespace())
+
+    assert response.success
+    assert navigator.current_carefulness == "medium"
+    assert navigator.p.follow_speed > high_speed
+    assert navigator.p.slow_speed > NavigatorParams().slow_speed
 
 
 def test_start_callback_rejects_invalid_pattern_without_changing_mission():
     navigator = make_navigator_for_start_callback()
 
-    response = navigator.start_cb(types.SimpleNamespace(pattern="3L invalid"), types.SimpleNamespace())
+    request = types.SimpleNamespace(pattern="3L invalid", carefulness="high")
+    response = navigator.start_cb(request, types.SimpleNamespace())
 
     assert not response.success
     assert navigator.p.pattern == "1L 2R"
     assert navigator.pattern_steps == [PatternStep(1, "L")]
+
+
+def test_start_callback_rejects_invalid_carefulness_without_changing_mission():
+    navigator = make_navigator_for_start_callback()
+
+    request = types.SimpleNamespace(pattern="3L", carefulness="turbo")
+    response = navigator.start_cb(request, types.SimpleNamespace())
+
+    assert not response.success
+    assert navigator.p.pattern == "1L 2R"
+    assert navigator.pattern_steps == [PatternStep(1, "L")]
+    assert navigator.current_carefulness == "high"
 
 
 def test_both_rows_produce_centered_high_weight_target():

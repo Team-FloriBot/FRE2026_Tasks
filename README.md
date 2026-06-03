@@ -46,5 +46,6 @@ Die Konfiguration erfolgt über die config/params.yaml. Hier können das Fahrmus
 
 Zum Starten des Roboters folgenden Service in der Kommandozeile aufrufen:
 ```
-ros2 service call /start_navigation maize_navigation_interfaces/srv/StartNavigation "{pattern: '3L 6R 5R'}"
+ros2 service call /start_navigation maize_navigation_interfaces/srv/StartNavigation "{pattern: '3L 6R 5R', carefulness: 'high'}"
 ``` 
+`carefulness` kann `high`, `medium` oder `low` sein. `high` ist vorsichtig, `low` ist am schnellsten.
