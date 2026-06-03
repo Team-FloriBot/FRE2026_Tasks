@@ -92,8 +92,12 @@ class DrivingProfile:
     heading_kp: float
     lateral_kp: float
     lateral_kd: float
+    lateral_rate_limit: float
     curve_speed_reduction_gain: float
     lateral_speed_reduction_gain: float
+    lateral_rate_speed_reduction_gain: float
+    linear_accel_limit: float
+    angular_control_speed: float
     max_angular_speed: float
     min_follow_turn_radius: float
     angular_rate_limit: float
@@ -202,8 +206,12 @@ class NavigatorParams:
     lateral_kp: float = 0.0
     lateral_kd: float = 0.0
     lateral_error_limit: float = 0.35
+    lateral_rate_limit: float = 0.60
     curve_speed_reduction_gain: float = 1.0
     lateral_speed_reduction_gain: float = 0.0
+    lateral_rate_speed_reduction_gain: float = 0.0
+    linear_accel_limit: float = 0.0
+    angular_control_speed: float = 0.30
     max_angular_speed: float = 0.40
     min_follow_turn_radius: float = 0.37
     angular_rate_limit: float = 1.2
@@ -437,6 +445,7 @@ class MaizeNavigator(Node):
         self.row_exit_heading_goal: Optional[np.ndarray] = None
         self.row_end_direction: Optional[np.ndarray] = None
         self.last_cmd_angular_z: float = 0.0
+        self.last_cmd_linear_x: float = 0.0
         self.last_target_point: Optional[np.ndarray] = None
         self.last_lateral_error: Optional[float] = None
         self.initial_forward_direction: Optional[np.ndarray] = None
@@ -550,10 +559,16 @@ class MaizeNavigator(Node):
         p.lateral_kp = float(get_param("lateral_kp", p.lateral_kp))
         p.lateral_kd = float(get_param("lateral_kd", p.lateral_kd))
         p.lateral_error_limit = float(get_param("lateral_error_limit", p.lateral_error_limit))
+        p.lateral_rate_limit = float(get_param("lateral_rate_limit", p.lateral_rate_limit))
         p.curve_speed_reduction_gain = float(get_param("curve_speed_reduction_gain", p.curve_speed_reduction_gain))
         p.lateral_speed_reduction_gain = float(
             get_param("lateral_speed_reduction_gain", p.lateral_speed_reduction_gain)
         )
+        p.lateral_rate_speed_reduction_gain = float(
+            get_param("lateral_rate_speed_reduction_gain", p.lateral_rate_speed_reduction_gain)
+        )
+        p.linear_accel_limit = float(get_param("linear_accel_limit", p.linear_accel_limit))
+        p.angular_control_speed = float(get_param("angular_control_speed", p.angular_control_speed))
         p.max_angular_speed = float(get_param("follow_max_angular_speed", p.max_angular_speed))
         p.min_follow_turn_radius = float(get_param("min_follow_turn_radius", p.min_follow_turn_radius))
         p.angular_rate_limit = float(get_param("angular_rate_limit", p.angular_rate_limit))
@@ -634,9 +649,13 @@ class MaizeNavigator(Node):
         self.p.lateral_kp = max(0.0, self.p.lateral_kp)
         self.p.lateral_kd = max(0.0, self.p.lateral_kd)
         self.p.lateral_error_limit = max(0.05, self.p.lateral_error_limit)
+        self.p.lateral_rate_limit = max(0.05, self.p.lateral_rate_limit)
         self.p.slow_speed = float(np.clip(self.p.slow_speed, 0.0, self.p.follow_speed))
         self.p.curve_speed_reduction_gain = max(0.0, self.p.curve_speed_reduction_gain)
         self.p.lateral_speed_reduction_gain = max(0.0, self.p.lateral_speed_reduction_gain)
+        self.p.lateral_rate_speed_reduction_gain = max(0.0, self.p.lateral_rate_speed_reduction_gain)
+        self.p.linear_accel_limit = max(0.0, self.p.linear_accel_limit)
+        self.p.angular_control_speed = max(0.0, self.p.angular_control_speed)
         self.p.maneuver_goal_xy_tolerance = max(0.05, self.p.maneuver_goal_xy_tolerance)
         self.p.maneuver_goal_yaw_tolerance = max(0.05, self.p.maneuver_goal_yaw_tolerance)
         self.p.maneuver_heading_lookahead_distance = max(0.05, self.p.maneuver_heading_lookahead_distance)
@@ -711,8 +730,12 @@ class MaizeNavigator(Node):
             heading_kp=self.p.heading_kp,
             lateral_kp=self.p.lateral_kp,
             lateral_kd=self.p.lateral_kd,
+            lateral_rate_limit=self.p.lateral_rate_limit,
             curve_speed_reduction_gain=self.p.curve_speed_reduction_gain,
             lateral_speed_reduction_gain=self.p.lateral_speed_reduction_gain,
+            lateral_rate_speed_reduction_gain=self.p.lateral_rate_speed_reduction_gain,
+            linear_accel_limit=self.p.linear_accel_limit,
+            angular_control_speed=self.p.angular_control_speed,
             max_angular_speed=self.p.max_angular_speed,
             min_follow_turn_radius=self.p.min_follow_turn_radius,
             angular_rate_limit=self.p.angular_rate_limit,
@@ -732,8 +755,12 @@ class MaizeNavigator(Node):
                 heading_kp=high.heading_kp * 0.75,
                 lateral_kp=high.lateral_kp * 0.75,
                 lateral_kd=high.lateral_kd * 0.75,
+                lateral_rate_limit=high.lateral_rate_limit * 1.15,
                 curve_speed_reduction_gain=high.curve_speed_reduction_gain * 0.55,
                 lateral_speed_reduction_gain=high.lateral_speed_reduction_gain * 0.50,
+                lateral_rate_speed_reduction_gain=high.lateral_rate_speed_reduction_gain * 0.50,
+                linear_accel_limit=high.linear_accel_limit * 1.30,
+                angular_control_speed=high.angular_control_speed * 1.10,
                 max_angular_speed=high.max_angular_speed * 1.10,
                 min_follow_turn_radius=high.min_follow_turn_radius * 1.22,
                 angular_rate_limit=high.angular_rate_limit * 1.15,
@@ -751,8 +778,12 @@ class MaizeNavigator(Node):
                 heading_kp=high.heading_kp * 0.50,
                 lateral_kp=high.lateral_kp * 0.50,
                 lateral_kd=high.lateral_kd * 0.50,
+                lateral_rate_limit=high.lateral_rate_limit * 1.30,
                 curve_speed_reduction_gain=high.curve_speed_reduction_gain * 0.30,
                 lateral_speed_reduction_gain=high.lateral_speed_reduction_gain * 0.25,
+                lateral_rate_speed_reduction_gain=high.lateral_rate_speed_reduction_gain * 0.25,
+                linear_accel_limit=high.linear_accel_limit * 1.60,
+                angular_control_speed=high.angular_control_speed * 1.20,
                 max_angular_speed=high.max_angular_speed * 1.20,
                 min_follow_turn_radius=high.min_follow_turn_radius * 1.50,
                 angular_rate_limit=high.angular_rate_limit * 1.30,
@@ -785,6 +816,7 @@ class MaizeNavigator(Node):
 
     def reset_controller_state(self) -> None:
         self.last_cmd_angular_z = 0.0
+        self.last_cmd_linear_x = 0.0
         self.last_target_point = None
         self.fused_target_point = None
         self.last_lateral_error = None
@@ -2300,15 +2332,16 @@ class MaizeNavigator(Node):
         pursuit_distance = max(0.10, target_distance)
         curvature = self.p.pure_pursuit_gain * 2.0 * math.sin(yaw_error) / pursuit_distance
         lateral_error = 0.0
+        lateral_rate = 0.0
         dt = 1.0 / max(1e-6, self.p.control_frequency)
         if reference_polyline is not None and (self.p.lateral_kp > 0.0 or self.p.lateral_kd > 0.0):
             robot_xy = np.array([self.robot_pose.x, self.robot_pose.y], dtype=float)
-            lateral_error = self.signed_lateral_error_to_polyline(reference_polyline, robot_xy)
-            lateral_error = float(np.clip(lateral_error, -self.p.lateral_error_limit, self.p.lateral_error_limit))
-            lateral_rate = 0.0
+            raw_lateral_error = self.signed_lateral_error_to_polyline(reference_polyline, robot_xy)
+            lateral_error = float(np.clip(raw_lateral_error, -self.p.lateral_error_limit, self.p.lateral_error_limit))
             if self.last_lateral_error is not None:
-                lateral_rate = (lateral_error - self.last_lateral_error) / dt
-            self.last_lateral_error = lateral_error
+                lateral_rate = (raw_lateral_error - self.last_lateral_error) / dt
+                lateral_rate = float(np.clip(lateral_rate, -self.p.lateral_rate_limit, self.p.lateral_rate_limit))
+            self.last_lateral_error = raw_lateral_error
             curvature -= self.p.lateral_kp * lateral_error
             curvature -= self.p.lateral_kd * lateral_rate
         else:
@@ -2319,20 +2352,29 @@ class MaizeNavigator(Node):
             path_yaw = math.atan2(float(tangent[1]), float(tangent[0]))
             heading_error = wrap_to_pi(path_yaw - self.robot_pose.yaw)
             curvature += self.p.heading_kp * math.sin(heading_error)
-        cmd.linear.x = float(np.clip(
+        linear_raw = float(np.clip(
             max_speed / (
                 1.0
                 + self.p.curve_speed_reduction_gain * abs(curvature)
                 + self.p.lateral_speed_reduction_gain * abs(lateral_error)
+                + self.p.lateral_rate_speed_reduction_gain * abs(lateral_rate)
             ),
             min_speed,
             max_speed,
         ))
-        radius_limited_angular = abs(cmd.linear.x) / self.p.min_follow_turn_radius
+        if self.p.linear_accel_limit > 0.0 and linear_raw > self.last_cmd_linear_x:
+            max_linear_delta = self.p.linear_accel_limit * dt
+            previous_linear = max(self.last_cmd_linear_x, min_speed)
+            cmd.linear.x = min(linear_raw, previous_linear + max_linear_delta)
+        else:
+            cmd.linear.x = linear_raw
+        self.last_cmd_linear_x = cmd.linear.x
+        angular_reference_speed = min(max_speed, max(cmd.linear.x, self.p.angular_control_speed))
+        radius_limited_angular = angular_reference_speed / self.p.min_follow_turn_radius
         max_angular = min(self.p.max_angular_speed, radius_limited_angular)
         # Pure-pursuit curvature is calmer around the midline than a direct
         # proportional yaw correction and still works for headland waypoints.
-        pursuit_angular = cmd.linear.x * curvature
+        pursuit_angular = angular_reference_speed * curvature
         angular_raw = float(np.clip(pursuit_angular, -max_angular, max_angular))
 
         max_delta = self.p.angular_rate_limit * dt
