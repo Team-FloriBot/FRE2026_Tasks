@@ -1,33 +1,59 @@
 # laser_scan_merger_node:
 #   ros__parameters:
-    # Declare laser scan topics to be subscribed here.
-    # Max 9 laser scan topics
+
+    # Input LaserScan topics.
+    # Maximal 9 LaserScan topics are supported by the merger.
     scan_topics: ["/sensors/scan_front", "/sensors/scan_rear"]
 
-    # reliability policy ros2 topic: 0=reliable, 1=best effort
+    # QoS policy per scan topic:
+    # 0 = reliable
+    # 1 = best effort
     scan_policies: [0, 0]
 
-    # Declare the frame id for output scan, most likely base_link is appropriate.
-    merged_frame_id: "base_link" # später wieder auf base_footprint ändern
+    # Output frame of the merged scan.
+    # Keep this consistent with slam_toolbox base_frame.
+    # For now: base_link.
+    # Only change to base_footprint if the TF chain and slam_toolbox are also configured for base_footprint.
+    merged_frame_id: "base_link"
 
-    tolerance: 0.01
-    min_height: -0.05 # default to std::numeric_limits<double>::min() if not given
-    max_height: 20.0 # default to std::numeric_limits<double>::max() if not given
-    angle_min: -3.14159
-    angle_max: 3.14159
-    angle_increment: 0.01745
-    scan_time: 0.0333
-    range_min: 0.3
-    range_max: 100.0 # default to std::numeric_limits<double>::max() if not given
-    inf_epsilon: 1.0
+    # Output topic consumed by slam_toolbox.
+    output_topic: "/sensors/merged_scan"
 
-    use_inf: true
-    # Queue size for approximate filter
-    queue_size: 20
-
-    debug: true
+    # The scanners are mounted on moving robot segments due to the articulation joint.
+    # Therefore the merger must transform each scan using the time-dependent TF.
     moving_frames: true
 
+    # ApproximateTime synchronizer queue size.
+    queue_size: 20
 
-    # self added
-    output_topic: "/sensors/merged_scan"
+    # TF lookup tolerance in seconds.
+    # 0.01 s is tight for moving frames; 0.05 s is more robust with stamped joint TFs.
+    tolerance: 0.05
+
+    # Height filter after transforming scan points into merged_frame_id.
+    # Keep wide enough for both scanner planes during articulation, but not unnecessarily huge.
+    min_height: -0.20
+    max_height: 0.50
+
+    # Full 360° merged scan.
+    angle_min: -3.14159265359
+    angle_max: 3.14159265359
+
+    # 1° angular resolution.
+    angle_increment: 0.01745329252
+
+    # Measured SICK scan rate is approx. 15 Hz.
+    # scan_time = 1 / 15 Hz = 0.0667 s
+    scan_time: 0.0667
+
+    # Range limits.
+    # range_max is limited to the useful SLAM range to suppress far reflections/outliers.
+    range_min: 0.30
+    range_max: 20.0
+
+    # Empty rays are published as +inf when use_inf is true.
+    inf_epsilon: 1.0
+    use_inf: true
+
+    # Disable debug output during mapping/driving.
+    debug: false
