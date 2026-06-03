@@ -201,13 +201,15 @@ namespace util
         std::for_each(indexes_.begin(), indexes_.end(),
           [&, this](auto &index)
           {
+            const rclcpp::Time scan_stamp = msgs[index]->header.stamp;
+
             if (buffer_->canTransform(
                   merged_frame_id_, msgs[index]->header.frame_id,
-                  rclcpp::Time(0), rclcpp::Duration::from_nanoseconds(tolerance_)))
+                  scan_stamp, rclcpp::Duration::from_nanoseconds(tolerance_)))
             {
               transforms_.emplace_back(buffer_->lookupTransform(
                     merged_frame_id_, msgs[index]->header.frame_id,
-                    rclcpp::Time(0), rclcpp::Duration::from_nanoseconds(tolerance_)));
+                    scan_stamp, rclcpp::Duration::from_nanoseconds(tolerance_)));
             }
         });
       }
@@ -292,7 +294,7 @@ namespace util
     }
 
     // Iterate through pointcloud
-    std::for_each(std::execution::par_unseq, merged_cloud_->points.begin(), merged_cloud_->points.end(),
+    std::for_each(merged_cloud_->points.begin(), merged_cloud_->points.end(),
         [this, &scan_msg](const auto &point) {
           if (std::isnan(point.x) || std::isnan(point.y) || std::isnan(point.z)) {
             RCLCPP_DEBUG(
