@@ -424,6 +424,7 @@ def test_angular_limit_uses_control_speed_when_linear_speed_is_reduced():
     navigator.p.follow_speed = 0.50
     navigator.p.slow_speed = 0.12
     navigator.p.pure_pursuit_gain = 1.0
+    navigator.p.lateral_kp = 10.0
     navigator.p.curve_speed_reduction_gain = 100.0
     navigator.p.lateral_speed_reduction_gain = 0.0
     navigator.p.lateral_rate_speed_reduction_gain = 0.0
@@ -433,11 +434,40 @@ def test_angular_limit_uses_control_speed_when_linear_speed_is_reduced():
     navigator.p.min_follow_turn_radius = 0.37
     navigator.p.angular_rate_limit = 100.0
 
-    navigator.drive_to_point(np.array([0.0, 0.20]))
+    navigator.drive_to_point(np.array([0.05, 0.05]))
 
     assert len(published) == 1
     assert math.isclose(published[0].linear.x, navigator.p.slow_speed)
     assert math.isclose(published[0].angular.z, 0.35 / 0.37)
+
+
+def test_lookahead_pose_controller_turns_toward_midline_side():
+    navigator = bare_navigator()
+    published = []
+    navigator.cmd_pub = types.SimpleNamespace(publish=published.append)
+    navigator.robot_pose = Pose2D(0.0, -0.20, 0.0)
+    navigator.last_target_point = None
+    navigator.last_lateral_error = None
+    navigator.last_cmd_linear_x = 0.0
+    navigator.last_cmd_angular_z = 0.0
+    navigator.p.follow_speed = 0.40
+    navigator.p.slow_speed = 0.10
+    navigator.p.pure_pursuit_gain = 1.0
+    navigator.p.heading_kp = 0.0
+    navigator.p.lateral_kp = 1.0
+    navigator.p.lateral_kd = 0.0
+    navigator.p.curve_speed_reduction_gain = 0.0
+    navigator.p.lateral_speed_reduction_gain = 0.0
+    navigator.p.lateral_rate_speed_reduction_gain = 0.0
+    navigator.p.linear_accel_limit = 0.0
+    navigator.p.angular_control_speed = 0.0
+    navigator.p.max_angular_speed = 1.00
+    navigator.p.min_follow_turn_radius = 0.10
+    navigator.p.angular_rate_limit = 100.0
+
+    navigator.drive_to_point(np.array([0.8, 0.0]), reference_polyline=np.array([[0.0, 0.0], [1.0, 0.0]]))
+
+    assert published[-1].angular.z > 0.0
 
 
 def test_entry_line_requires_crossing_with_alignment():

@@ -70,6 +70,9 @@ maize_navigator:
     lateral_rate_speed_reduction_gain: 2.0
     linear_accel_limit: 0.25
     angular_control_speed: 0.35
+    ackermann_wheelbase: 1.00
+    max_steering_angle: 1.40
+    stanley_min_speed: 0.10
     follow_max_angular_speed: 1.00
     min_follow_turn_radius: 0.37
     angular_rate_limit: 2.8
