@@ -364,14 +364,14 @@ private:
         }
 
         path_received_ = true;
-        tracking_enabled_ = true;
+        tracking_enabled_ = false;
         path_completed_ = false;
         progress_s_ = 0.0;
         progress_initialized_ = false;
         current_segment_idx_ = 0;
 
         RCLCPP_INFO(get_logger(),
-            "Path received: %zu poses, Laenge %.2f m. Path Tracking gestartet/restarted.",
+            "Path received: %zu poses, Laenge %.2f m. Path Tracking bereit. Start mit /pure_pursuit_node/set_active.",
             msg->poses.size(),
             path_length_);
     }
