@@ -38,7 +38,7 @@ maize_navigator:
     laser_scan_timeout: 0.50
     laser_roi_x_min: 0.0
     laser_roi_length: 1.55
-    laser_roi_width: 0.6
+    laser_roi_width: 0.65
     laser_roi_center_offset_limit: 0.1
     laser_ransac_iterations: 50
     laser_ransac_distance: 0.08

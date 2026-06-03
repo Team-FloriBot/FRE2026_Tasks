@@ -994,8 +994,10 @@ class MaizeNavigator(Node):
             roi_prior_map = map_target
         roi_prior_map = np.asarray(roi_prior_map, dtype=float)
         roi_prior_base = self.map_point_to_base(roi_prior_map)
-        tangent_map = self.polyline_tangent_at_point(self.midline, roi_prior_map)
-        tangent_base = self.map_direction_to_base(tangent_map)
+        map_row_direction = self.local_map_row_direction_at(roi_prior_map)
+        if map_row_direction is None:
+            map_row_direction = self.polyline_tangent_at_point(self.midline, roi_prior_map)
+        tangent_base = self.map_direction_to_base(map_row_direction)
         if abs(float(tangent_base[0])) < 1e-6:
             map_slope = math.copysign(self.p.laser_max_abs_line_slope, float(tangent_base[1]))
         else:
@@ -1037,6 +1039,24 @@ class MaizeNavigator(Node):
         cosine = math.cos(self.robot_pose.yaw)
         sine = math.sin(self.robot_pose.yaw)
         return np.array([cosine * direction[0] - sine * direction[1], sine * direction[0] + cosine * direction[1]])
+
+    def local_map_row_direction_at(self, point: np.ndarray) -> Optional[np.ndarray]:
+        directions: List[np.ndarray] = []
+        for model in (self.left_row, self.right_row):
+            if model is None:
+                continue
+            result = model.result
+            if len(result.points) == 0 or len(result.point_directions) != len(result.points):
+                continue
+            distances = np.linalg.norm(result.points - np.asarray(point, dtype=float), axis=1)
+            idx = int(np.argmin(distances))
+            directions.append(self.normalize(result.point_directions[idx]))
+        if not directions:
+            return None
+        direction = directions[0]
+        for other in directions[1:]:
+            direction = self.mean_direction(direction, other)
+        return self.normalize(direction)
 
     def polyline_tangent_at_point(self, polyline: np.ndarray, point: np.ndarray) -> np.ndarray:
         if len(polyline) < 2:
@@ -1217,7 +1237,13 @@ class MaizeNavigator(Node):
         ):
             self.cmd_pub.publish(Twist())
             return
-        self.drive_to_point(target, self.p.maneuver_speed, self.p.maneuver_slow_speed)
+        route_reference = self.entrance_route if len(self.entrance_route) >= 2 else None
+        self.drive_to_point(
+            target,
+            self.p.maneuver_speed,
+            self.p.maneuver_slow_speed,
+            reference_polyline=route_reference,
+        )
 
     def entry_line_reached(self, goal: np.ndarray, direction: np.ndarray) -> bool:
         direction = self.normalize(direction)

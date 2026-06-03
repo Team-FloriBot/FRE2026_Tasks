@@ -323,6 +323,26 @@ def test_midline_does_not_modify_independent_row_results():
     assert np.allclose(midline[-1], np.array([0.6, 0.575]))
 
 
+def test_laser_roi_direction_uses_local_map_row_marching_direction():
+    navigator = bare_navigator()
+    navigator.left_row = RowMarchModel("left", np.array([0.0, 0.4]), np.array([0.3, 0.4]), np.array([1.0, 0.0]), 2)
+    navigator.right_row = RowMarchModel("right", np.array([0.0, -0.4]), np.array([0.3, -0.4]), np.array([1.0, 0.0]), 1)
+    row_direction = np.array([1.0, 0.2])
+    row_direction = row_direction / np.linalg.norm(row_direction)
+    navigator.left_row.result = RowMarchResult(
+        points=np.array([[0.0, 0.4], [1.0, 0.4]]),
+        point_directions=np.tile(row_direction, (2, 1)),
+    )
+    navigator.right_row.result = RowMarchResult(
+        points=np.array([[0.0, -0.4], [1.0, -0.4]]),
+        point_directions=np.tile(row_direction, (2, 1)),
+    )
+
+    direction = navigator.local_map_row_direction_at(np.array([0.8, 0.0]))
+
+    assert np.allclose(direction, row_direction)
+
+
 def test_end_direction_can_still_average_independent_rows():
     navigator = bare_navigator()
 
@@ -492,6 +512,27 @@ def test_route_target_uses_extension_after_missed_entry_point():
 
     assert target is not None
     assert target[0] > 1.10
+
+
+def test_headland_route_following_passes_route_reference_to_controller():
+    navigator = bare_navigator()
+    calls = []
+    navigator.ensure_provisional_entrance_route = lambda: True
+    navigator.lock_next_row_entrance = lambda: True
+    navigator.entry_line_reached = lambda goal, direction: False
+    navigator.update_entrance_route_target = lambda: np.array([1.0, 0.0])
+    navigator.drive_to_point = lambda target, max_speed=None, min_speed=None, reference_polyline=None: calls.append(
+        (target, max_speed, min_speed, reference_polyline)
+    )
+    navigator.entrance_target = np.array([2.0, 0.0])
+    navigator.entrance_target_direction = np.array([1.0, 0.0])
+    navigator.entrance_route = np.array([[0.0, 0.0], [1.0, 0.0], [2.0, 0.0]])
+    navigator.entrance_route_provisional = False
+
+    navigator.handle_find_next_row_entrance()
+
+    assert len(calls) == 1
+    assert calls[0][3] is navigator.entrance_route
 
 
 def test_route_target_stops_when_deviation_is_too_large():
