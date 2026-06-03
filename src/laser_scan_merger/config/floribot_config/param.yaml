@@ -3,7 +3,7 @@
 
     # Input LaserScan topics.
     # Maximal 9 LaserScan topics are supported by the merger.
-    scan_topics: ["/sensors/scan_front", "/sensors/scan_rear"]
+    scan_topics: ["/laser_scan_mux/front_scan", "/sensors/scan_rear"]
 
     # QoS policy per scan topic:
     # 0 = reliable

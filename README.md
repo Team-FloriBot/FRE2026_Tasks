@@ -68,3 +68,13 @@ Starten (nach Stop)
 ```
 ros2 service call /pure_pursuit_node/set_active std_srvs/srv/SetBool "{data: true}"
 ```
+
+Laserscan Merger umschalten
+```
+ros2 service call /front_scan_mux/set_profile fre2026_task_interfaces/srv/SetScanProfile "{profile: 'rs_crop_scan'}"
+
+ros2 service call /front_scan_mux/set_profile fre2026_task_interfaces/srv/SetScanProfile "{profile: 'rs_nonground_scan'}"
+
+ros2 service call /front_scan_mux/set_profile fre2026_task_interfaces/srv/SetScanProfile "{profile: 'sick_front'}"
+```
+Profile: rs_crop_scan (Robosense Scan nur Pflanzen), rs_nonground_scan (Robosense Scan alles außer Boden), sick_front (2D Laser oder Simulation)

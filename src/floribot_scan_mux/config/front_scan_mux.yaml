@@ -1,0 +1,17 @@
+front_scan_mux:
+  ros__parameters:
+    active_profile: "sick_front"
+    output_topic: "/laser_scan_mux/front_scan"
+
+    # Input subscribers can be best_effort for common LaserScan drivers.
+    # The output is reliable so it matches the current laser_scan_merger scan_policies config.
+    input_qos_reliability: "best_effort"
+    output_qos_reliability: "reliable"
+
+    profiles:
+      rs_crop_scan:
+        topic: "/crop2d_topic"
+      rs_nonground_scan:
+        topic: "/nonground2d_topic"
+      sick_front:
+        topic: "/sensors/scan_front"

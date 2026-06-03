@@ -1,0 +1,5 @@
+string profile
+---
+bool success
+string message
+string active_profile
