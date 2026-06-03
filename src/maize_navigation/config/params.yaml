@@ -5,7 +5,7 @@ maize_navigator:
     odom_frame: "odom"
     map_topic: "/map"
     map_frame: "map"
-    scan_topic: "/sensors/scan_front"
+    scan_topic: "/sensors/merged_scan"
     use_slam_map: true
     require_map_for_turns: true
 

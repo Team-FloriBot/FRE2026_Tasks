@@ -95,6 +95,7 @@ namespace util
 
   private:
     std::vector<std::shared_ptr<message_filters::Subscriber<laserScanMsgT>>> scan_subs_;
+    rclcpp::Subscription<laserScanMsgT>::SharedPtr single_scan_sub_;
     std::variant<
       std::monostate,
       std::unique_ptr<message_filters::Synchronizer<syncPolicyT2>>,

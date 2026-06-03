@@ -2,10 +2,10 @@
 #   ros__parameters:
     # Declare laser scan topics to be subscribed here.
     # Max 9 laser scan topics
-    scan_topics: ["/sensors/scan_front", "/sensors/scan_rear"]
+    scan_topics: ["/sensors/scan_front"]
 
     # reliability policy ros2 topic: 0=reliable, 1=best effort
-    scan_policies: [0, 0]
+    scan_policies: [0]
 
     # Declare the frame id for output scan, most likely base_link is appropriate.
     merged_frame_id: "base_link" # später wieder auf base_footprint ändern
