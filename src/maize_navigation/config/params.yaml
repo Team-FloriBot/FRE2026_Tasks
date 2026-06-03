@@ -59,7 +59,7 @@ maize_navigator:
     laser_follow_enabled: true
     laser_scan_timeout: 0.50
     laser_roi_x_min: 0.0
-    laser_roi_x_max: 1.7
+    laser_roi_x_max: 2.0
     laser_roi_length: 1.55
     laser_roi_width: 0.6
     laser_roi_center_offset_limit: 0.1
@@ -116,7 +116,7 @@ maize_navigator:
     turn_max_angular_speed: 1.40
     angular_rate_limit: 2.8
 
-    lookahead_distance: 1.2
+    lookahead_distance: 1.4
     turn_lookahead_distance: 0.32
     turn_min_angular_speed: 0.30
 
