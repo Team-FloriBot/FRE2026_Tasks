@@ -49,34 +49,35 @@ maize_navigator:
     laser_max_center_offset: 0.40
     laser_min_confidence: 0.25
     laser_full_confidence: 0.85
-    laser_max_weight_both_sides: 0.70
-    laser_max_weight_one_side: 0.35
+    laser_max_weight_both_sides: 0.1
+    laser_max_weight_one_side: 0.1
     laser_tracker_alpha: 0.25
+    laser_roi_map_correction_weight: 0.20
 
     # High-carefulness row-following profile.
     # StartNavigation.carefulness=medium/low derives faster runtime profiles from these values.
-    follow_speed: 0.50
+    follow_speed: 0.5
     slow_speed: 0.12
-    lookahead_distance: 0.8
+    lookahead_distance: 0.90
     yaw_kp: 0.6
     pure_pursuit_gain: 1.4
-    heading_kp: 0.3
-    lateral_kp: 0.6
-    lateral_kd: 0.40
+    heading_kp: 0.25
+    lateral_kp: 0.45
+    lateral_kd: 0.22
     lateral_error_limit: 0.35
-    lateral_rate_limit: 0.60
-    curve_speed_reduction_gain: 4.0
-    lateral_speed_reduction_gain: 4.0
-    lateral_rate_speed_reduction_gain: 2.0
-    linear_accel_limit: 0.25
+    lateral_rate_limit: 0.45
+    curve_speed_reduction_gain: 3.0
+    lateral_speed_reduction_gain: 3.0
+    lateral_rate_speed_reduction_gain: 2.5
+    linear_accel_limit: 0.35
     angular_control_speed: 0.35
     ackermann_wheelbase: 1.00
-    max_steering_angle: 1.40
-    stanley_min_speed: 0.10
-    follow_max_angular_speed: 1.00
+    max_steering_angle: 0.95
+    stanley_min_speed: 0.28
+    follow_max_angular_speed: 0.80
     min_follow_turn_radius: 0.37
-    angular_rate_limit: 2.8
-    target_filter_alpha: 0.35
+    angular_rate_limit: 1.8
+    target_filter_alpha: 0.30
 
     # Row exit and headland maneuver
     row_end_goal_outward_distance: 0.30
@@ -85,9 +86,9 @@ maize_navigator:
     maneuver_goal_xy_tolerance: 0.25
     maneuver_goal_yaw_tolerance: 0.75
     maneuver_heading_lookahead_distance: 0.10
-    maneuver_speed: 0.50
+    maneuver_speed: 0.5
     maneuver_slow_speed: 0.10
-    maneuver_lookahead_distance: 0.80
+    maneuver_lookahead_distance: 0.70
     maneuver_route_spacing: 0.08
     maneuver_corner_radius: 0.40
     maneuver_entry_extension_distance: 0.80

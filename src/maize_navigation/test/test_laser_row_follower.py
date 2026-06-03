@@ -267,10 +267,11 @@ def test_laser_rois_track_previous_valid_ransac_direction_until_reset():
 
     first = process_repeatedly(follower, scan, map_slope=0.25, map_target=(1.4, 0.35))
     second = follower.process_scan(scan, 0.0, np.array([1.4, 0.35]))
+    second_roi_slope = second.roi_direction[1] / second.roi_direction[0]
 
     assert first.valid
     assert second.valid
-    assert second.roi_direction[1] / second.roi_direction[0] > 0.15
+    assert 0.15 < second_roi_slope < first.center_slope
 
     follower.reset()
     after_reset = follower.process_scan(scan, 0.0, np.array([1.4, 0.35]))

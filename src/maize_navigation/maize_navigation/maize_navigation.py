@@ -199,6 +199,7 @@ class NavigatorParams:
     laser_max_weight_both_sides: float = 0.80
     laser_max_weight_one_side: float = 0.40
     laser_tracker_alpha: float = 0.25
+    laser_roi_map_correction_weight: float = 0.20
 
     follow_speed: float = 0.20
     slow_speed: float = 0.12
@@ -274,7 +275,7 @@ class LaserRowFollower:
         if roi_prior_base is None:
             roi_prior_base = map_target_base
         points = self.scan_to_points(scan)
-        roi_slope = self.tracked_roi_slope if self.tracked_roi_slope is not None else map_slope
+        roi_slope = self.roi_tracking_slope(map_slope)
         roi_centers, roi_direction = self.build_rois(roi_slope, roi_prior_base)
         left_line = self.fit_line_in_roi(points, roi_centers[0], roi_direction)
         right_line = self.fit_line_in_roi(points, roi_centers[1], roi_direction)
@@ -330,6 +331,25 @@ class LaserRowFollower:
         result.reason = "ok"
         self.tracked_roi_slope = float(result.center_slope)
         return result
+
+    def roi_tracking_slope(self, map_slope: Optional[float]) -> Optional[float]:
+        if self.tracked_roi_slope is None:
+            return map_slope
+        if map_slope is None:
+            return self.tracked_roi_slope
+
+        laser_angle = math.atan(float(self.tracked_roi_slope))
+        map_angle = math.atan(float(map_slope))
+        laser_direction = np.array([math.cos(laser_angle), math.sin(laser_angle)], dtype=float)
+        map_direction = np.array([math.cos(map_angle), math.sin(map_angle)], dtype=float)
+        if float(laser_direction @ map_direction) < 0.0:
+            map_direction = -map_direction
+        map_weight = float(np.clip(self.p.laser_roi_map_correction_weight, 0.0, 1.0))
+        direction = (1.0 - map_weight) * laser_direction + map_weight * map_direction
+        direction = direction / max(1e-9, float(np.linalg.norm(direction)))
+        if abs(float(direction[0])) < 1e-9:
+            return self.tracked_roi_slope
+        return float(direction[1] / direction[0])
 
     def scan_to_points(self, scan: LaserScan) -> np.ndarray:
         ranges = np.asarray(scan.ranges, dtype=float)
@@ -559,6 +579,9 @@ class MaizeNavigator(Node):
             get_param("laser_max_weight_one_side", p.laser_max_weight_one_side)
         )
         p.laser_tracker_alpha = float(get_param("laser_tracker_alpha", p.laser_tracker_alpha))
+        p.laser_roi_map_correction_weight = float(
+            get_param("laser_roi_map_correction_weight", p.laser_roi_map_correction_weight)
+        )
 
         p.follow_speed = float(get_param("follow_speed", p.follow_speed))
         p.slow_speed = float(get_param("slow_speed", p.slow_speed))
@@ -652,6 +675,7 @@ class MaizeNavigator(Node):
         self.p.laser_max_weight_both_sides = float(np.clip(self.p.laser_max_weight_both_sides, 0.0, 1.0))
         self.p.laser_max_weight_one_side = float(np.clip(self.p.laser_max_weight_one_side, 0.0, 1.0))
         self.p.laser_tracker_alpha = float(np.clip(self.p.laser_tracker_alpha, 0.01, 1.0))
+        self.p.laser_roi_map_correction_weight = float(np.clip(self.p.laser_roi_map_correction_weight, 0.0, 1.0))
         self.p.min_follow_turn_radius = max(0.1, self.p.min_follow_turn_radius)
         self.p.angular_rate_limit = max(0.01, self.p.angular_rate_limit)
         self.p.target_filter_alpha = float(np.clip(self.p.target_filter_alpha, 0.01, 1.0))
