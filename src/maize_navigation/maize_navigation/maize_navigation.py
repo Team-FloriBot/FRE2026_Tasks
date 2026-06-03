@@ -192,7 +192,7 @@ class NavigatorParams:
     maneuver_slow_speed: float = 0.10
     maneuver_lookahead_distance: float = 0.80
     maneuver_route_spacing: float = 0.08
-    maneuver_corner_radius: float = 0.75
+    maneuver_corner_radius: float = 0.50
     maneuver_entry_extension_distance: float = 0.80
     maneuver_max_route_deviation: float = 0.70
     maneuver_entry_lateral_tolerance: float = 0.25
@@ -427,6 +427,7 @@ class MaizeNavigator(Node):
         self.entrance_route_remaining_distance: float = 0.0
         self.entrance_route_provisional: bool = False
         self.entrance_active_step: Optional[PatternStep] = None
+        self.entrance_traverse_outward: Optional[float] = None
         self.pending_target_peaks: Optional[Tuple[EntrancePeak, EntrancePeak]] = None
         self.stored_rows: Dict[int, np.ndarray] = {}
         self.row_end_directions_by_side: Dict[str, List[np.ndarray]] = {"forward": [], "backward": []}
@@ -686,6 +687,7 @@ class MaizeNavigator(Node):
         self.entrance_route_remaining_distance = 0.0
         self.entrance_route_provisional = False
         self.entrance_active_step = None
+        self.entrance_traverse_outward = None
         self.pending_target_peaks = None
 
     def parse_pattern(self, pattern: str) -> List[PatternStep]:
@@ -1158,8 +1160,20 @@ class MaizeNavigator(Node):
             if self.entrance_target is None
             else float(np.linalg.norm(new_target - self.entrance_target))
         )
+        new_target_lateral = float((new_target - center) @ np.array([-outgoing[1], outgoing[0]], dtype=float))
+        new_traverse_outward = self.compute_headland_traverse_outward(center, outgoing, new_target_lateral)
+        traverse_shift = (
+            float("inf")
+            if self.entrance_traverse_outward is None
+            else abs(new_traverse_outward - self.entrance_traverse_outward)
+        )
         replan_threshold = max(0.15, 0.25 * self.p.expected_row_width)
-        should_replan = first_lock or len(self.entrance_route) < 2 or target_shift >= replan_threshold
+        should_replan = (
+            first_lock
+            or len(self.entrance_route) < 2
+            or target_shift >= replan_threshold
+            or traverse_shift >= replan_threshold
+        )
         if should_replan:
             self.pending_target_peaks = (first, second)
             self.entrance_target = new_target
@@ -1210,21 +1224,21 @@ class MaizeNavigator(Node):
         signed_shift = step.lane_shift if step.direction == "L" else -step.lane_shift
         expected_lateral = signed_shift * self.p.expected_row_width
         target_lateral = expected_lateral if target is None else float((np.asarray(target) - center) @ lateral_direction)
-        lower_lateral, upper_lateral = sorted((0.0, target_lateral))
-        lateral_margin = self.p.expected_row_width
-        route_peaks = [
-            peak
-            for peak in self.entrance_hist_peaks
-            if lower_lateral - lateral_margin <= peak.lateral <= upper_lateral + lateral_margin
-        ]
-        outermost = max(
-            [0.0] + [float((np.asarray(peak.point) - center) @ outgoing) for peak in route_peaks]
-        )
-        traverse_outward = outermost + self.p.row_exit_extension_distance
+        traverse_outward = self.compute_headland_traverse_outward(center, outgoing, target_lateral)
 
         robot_xy = np.array([self.robot_pose.x, self.robot_pose.y], dtype=float)
         incoming = -outgoing
-        if target is not None and float((robot_xy - np.asarray(target, dtype=float)) @ incoming) >= 0.0:
+        target_lateral_error = (
+            float("inf")
+            if target is None
+            else abs(float((robot_xy - np.asarray(target, dtype=float)) @ lateral_direction))
+        )
+        entry_capture_lateral = max(self.p.maneuver_entry_lateral_tolerance, 0.5 * self.p.expected_row_width)
+        if (
+            target is not None
+            and float((robot_xy - np.asarray(target, dtype=float)) @ incoming) >= 0.0
+            and target_lateral_error <= entry_capture_lateral
+        ):
             forward_path = [
                 point
                 for point in self.entrance_follow_path
@@ -1236,29 +1250,140 @@ class MaizeNavigator(Node):
             self.set_entrance_route(np.vstack((robot_xy, *forward_path)), False)
             return
 
-        robot_lateral = float((robot_xy - center) @ lateral_direction)
-        first_waypoint = center + traverse_outward * outgoing + robot_lateral * lateral_direction
-        second_waypoint = center + traverse_outward * outgoing + target_lateral * lateral_direction
-        support_points = [robot_xy]
-        planned_support_points = [robot_xy, first_waypoint, second_waypoint]
-        self.entrance_waypoints = [first_waypoint, second_waypoint]
-        if float((robot_xy - center) @ outgoing) < traverse_outward - self.p.maneuver_route_spacing:
-            support_points.append(first_waypoint)
-        if float(np.linalg.norm(support_points[-1] - second_waypoint)) > self.p.maneuver_route_spacing:
-            support_points.append(second_waypoint)
-        if target is not None:
-            support_points.append(np.asarray(target, dtype=float))
-            support_points.extend(self.entrance_follow_path)
-            planned_support_points.append(np.asarray(target, dtype=float))
-            planned_support_points.extend(self.entrance_follow_path)
-        if len(support_points) < 2:
-            support_points.append(second_waypoint)
-
-        self.set_entrance_route(
-            np.asarray(support_points, dtype=float),
-            target is None,
-            np.asarray(planned_support_points, dtype=float),
+        route, support_points, waypoints = self.build_headland_route(
+            robot_xy,
+            center,
+            outgoing,
+            lateral_direction,
+            target_lateral,
+            traverse_outward,
+            target,
         )
+        self.entrance_waypoints = waypoints
+        self.entrance_route_support = support_points
+        self.entrance_route = route
+        self.entrance_route_progress_index = 0
+        self.entrance_route_projection = None
+        self.entrance_route_target = None
+        self.entrance_route_remaining_distance = self.polyline_length(self.entrance_route)
+        self.entrance_route_provisional = target is None
+        self.entrance_traverse_outward = traverse_outward
+
+    def compute_headland_traverse_outward(
+        self,
+        center: np.ndarray,
+        outgoing: np.ndarray,
+        target_lateral: float,
+    ) -> float:
+        lower_lateral, upper_lateral = sorted((0.0, target_lateral))
+        lateral_margin = self.p.expected_row_width
+        route_peaks = [
+            peak
+            for peak in self.entrance_hist_peaks
+            if lower_lateral - lateral_margin <= peak.lateral <= upper_lateral + lateral_margin
+        ]
+        outermost = max(
+            [0.0] + [float((np.asarray(peak.point) - center) @ outgoing) for peak in route_peaks]
+        )
+        return outermost + self.p.row_exit_extension_distance
+
+    def build_headland_route(
+        self,
+        start: np.ndarray,
+        center: np.ndarray,
+        outgoing: np.ndarray,
+        lateral_direction: np.ndarray,
+        target_lateral: float,
+        traverse_outward: float,
+        target: Optional[np.ndarray],
+    ) -> Tuple[np.ndarray, np.ndarray, List[np.ndarray]]:
+        start = np.asarray(start, dtype=float)
+        center = np.asarray(center, dtype=float)
+        outgoing = self.normalize(outgoing)
+        lateral_direction = self.normalize(lateral_direction)
+        start_lateral = float((start - center) @ lateral_direction)
+        start_outward = float((start - center) @ outgoing)
+        target_outward = start_outward if target is None else float((np.asarray(target) - center) @ outgoing)
+        delta_lateral = target_lateral - start_lateral
+        turn_sign = 1.0 if delta_lateral >= 0.0 else -1.0
+        abs_delta_lateral = abs(delta_lateral)
+        desired_radius = self.p.maneuver_corner_radius
+        if abs_delta_lateral < 1e-6:
+            desired_radius = 0.0
+        radius = min(desired_radius, 0.5 * abs_delta_lateral) if desired_radius > 0.0 else 0.0
+        traverse_outward = max(traverse_outward, start_outward + radius, target_outward + radius)
+
+        route: List[np.ndarray] = [start]
+        support: List[np.ndarray] = [start]
+        waypoints: List[np.ndarray] = []
+
+        if radius <= 1e-6:
+            straight_point = center + traverse_outward * outgoing + target_lateral * lateral_direction
+            self.append_sampled_line(route, start, straight_point)
+            support.append(straight_point)
+            waypoints.append(straight_point)
+        else:
+            first_arc_start = center + (traverse_outward - radius) * outgoing + start_lateral * lateral_direction
+            first_straight_start = (
+                center
+                + traverse_outward * outgoing
+                + (start_lateral + turn_sign * radius) * lateral_direction
+            )
+            second_straight_end = (
+                center
+                + traverse_outward * outgoing
+                + (target_lateral - turn_sign * radius) * lateral_direction
+            )
+            second_arc_end = center + (traverse_outward - radius) * outgoing + target_lateral * lateral_direction
+
+            self.append_sampled_line(route, route[-1], first_arc_start)
+            self.append_headland_arc(route, first_arc_start, outgoing, lateral_direction, turn_sign, radius, first=True)
+            if target is None:
+                provisional_end = center + traverse_outward * outgoing + target_lateral * lateral_direction
+                self.append_sampled_line(route, route[-1], provisional_end)
+                support.extend((first_arc_start, first_straight_start, provisional_end))
+                waypoints.extend((first_straight_start, provisional_end))
+            else:
+                self.append_sampled_line(route, route[-1], second_straight_end)
+                self.append_headland_arc(route, second_straight_end, outgoing, lateral_direction, turn_sign, radius, first=False)
+                support.extend((first_arc_start, first_straight_start, second_straight_end, second_arc_end))
+                waypoints.extend((first_straight_start, second_straight_end))
+
+        if target is not None:
+            target = np.asarray(target, dtype=float)
+            self.append_sampled_line(route, route[-1], target)
+            support.append(target)
+            for point in self.entrance_follow_path:
+                self.append_sampled_line(route, route[-1], np.asarray(point, dtype=float))
+                support.append(np.asarray(point, dtype=float))
+
+        return np.asarray(route, dtype=float), np.asarray(support, dtype=float), waypoints
+
+    def append_headland_arc(
+        self,
+        route: List[np.ndarray],
+        arc_start: np.ndarray,
+        outgoing: np.ndarray,
+        lateral_direction: np.ndarray,
+        turn_sign: float,
+        radius: float,
+        first: bool,
+    ) -> None:
+        sample_count = max(3, int(math.ceil((0.5 * math.pi * radius) / self.p.maneuver_route_spacing)))
+        for theta in np.linspace(0.0, 0.5 * math.pi, sample_count + 1)[1:]:
+            if first:
+                point = (
+                    arc_start
+                    + radius * math.sin(float(theta)) * outgoing
+                    + turn_sign * radius * (1.0 - math.cos(float(theta))) * lateral_direction
+                )
+            else:
+                point = (
+                    arc_start
+                    + turn_sign * radius * math.sin(float(theta)) * lateral_direction
+                    - radius * (1.0 - math.cos(float(theta))) * outgoing
+                )
+            route.append(np.asarray(point, dtype=float))
 
     def set_entrance_route(
         self,

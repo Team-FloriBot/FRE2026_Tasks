@@ -238,6 +238,7 @@ def bare_navigator():
     navigator.entrance_route_remaining_distance = 0.0
     navigator.entrance_route_provisional = False
     navigator.entrance_active_step = None
+    navigator.entrance_traverse_outward = None
     navigator.entrance_target = None
     navigator.entrance_target_direction = None
     navigator.entrance_follow_path = np.empty((0, 2))
@@ -396,8 +397,8 @@ def test_provisional_turn_route_exits_then_moves_to_expected_pattern_offset():
     assert navigator.ensure_provisional_entrance_route()
     assert navigator.entrance_target is None
     assert navigator.entrance_route_provisional
-    assert np.allclose(navigator.entrance_waypoints[0], np.array([0.3, 0.0]))
-    assert np.allclose(navigator.entrance_route[-1], np.array([0.3, 1.5]))
+    assert np.allclose(navigator.entrance_waypoints[0], np.array([0.5, 0.5]))
+    assert np.allclose(navigator.entrance_route[-1], np.array([0.5, 1.5]))
 
 
 def test_turn_waypoints_follow_outermost_peak_on_traversed_route():
@@ -415,7 +416,7 @@ def test_turn_waypoints_follow_outermost_peak_on_traversed_route():
 
     navigator.rebuild_entrance_route(None)
 
-    assert np.allclose(navigator.entrance_waypoints[0], np.array([1.2, 0.0]))
+    assert np.allclose(navigator.entrance_waypoints[0], np.array([1.2, 0.5]))
     assert np.allclose(navigator.entrance_waypoints[1], np.array([1.2, 1.5]))
 
 
@@ -429,9 +430,9 @@ def test_support_route_keeps_first_waypoint_visible_when_active_route_skips_it()
     navigator.rebuild_entrance_route(None)
 
     assert len(navigator.entrance_waypoints) == 2
-    assert np.allclose(navigator.entrance_waypoints[0], np.array([0.3, 0.0]))
-    assert np.allclose(navigator.entrance_route_support[1], np.array([0.3, 0.0]))
-    assert not np.any(np.all(np.isclose(navigator.entrance_route, np.array([0.3, 0.0])), axis=1))
+    assert np.allclose(navigator.entrance_route_support[1], np.array([0.26, 0.0]))
+    assert np.allclose(navigator.entrance_route_support[2], np.array([0.635, 0.375]))
+    assert np.any(np.all(np.isclose(navigator.entrance_route, np.array([0.635, 0.375])), axis=1))
 
 
 def test_locked_turn_route_is_not_resampled_for_small_peak_jitter():
