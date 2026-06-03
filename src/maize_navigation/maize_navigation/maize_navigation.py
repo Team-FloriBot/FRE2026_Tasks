@@ -224,12 +224,15 @@ class LaserRowFollower:
         scan: Optional[LaserScan],
         map_slope: Optional[float],
         map_target_base: np.ndarray,
+        roi_prior_base: Optional[np.ndarray] = None,
     ) -> LaserFollowResult:
         if scan is None:
             return self.reject(LaserFollowResult(), "no scan")
 
+        if roi_prior_base is None:
+            roi_prior_base = map_target_base
         points = self.scan_to_points(scan)
-        roi_centers, roi_direction = self.build_rois(map_slope, map_target_base)
+        roi_centers, roi_direction = self.build_rois(map_slope, roi_prior_base)
         left_line = self.fit_line_in_roi(points, roi_centers[0], roi_direction)
         right_line = self.fit_line_in_roi(points, roi_centers[1], roi_direction)
         result = LaserFollowResult(
@@ -269,7 +272,8 @@ class LaserRowFollower:
         angle_error = 0.0 if map_slope is None else abs(wrap_to_pi(math.atan(result.center_slope) - math.atan(map_slope)))
         if map_slope is not None and angle_error > self.p.laser_max_angle_to_map:
             return self.reject(result, "angle differs from map")
-        if abs(laser_target_y - float(map_target_base[1])) > self.p.laser_max_center_offset:
+        map_prior_y_at_target = float(roi_prior_base[1] + map_slope * (target_x - roi_prior_base[0])) if map_slope is not None else float(roi_prior_base[1])
+        if abs(laser_target_y - map_prior_y_at_target) > self.p.laser_max_center_offset:
             return self.reject(result, "center differs from map")
 
         alpha = self.p.laser_tracker_alpha
@@ -815,14 +819,21 @@ class MaizeNavigator(Node):
                 scan = None
 
         map_target_base = self.map_point_to_base(map_target)
-        tangent_map = self.polyline_tangent_at_point(self.midline, np.array([self.robot_pose.x, self.robot_pose.y]))
+        robot_xy = np.array([self.robot_pose.x, self.robot_pose.y], dtype=float)
+        roi_prior_distance = self.p.laser_roi_x_min + 0.5 * self.p.laser_roi_length
+        roi_prior_map = self.lookahead_point_from_polyline_projection(self.midline, robot_xy, roi_prior_distance)
+        if roi_prior_map is None:
+            roi_prior_map = map_target
+        roi_prior_map = np.asarray(roi_prior_map, dtype=float)
+        roi_prior_base = self.map_point_to_base(roi_prior_map)
+        tangent_map = self.polyline_tangent_at_point(self.midline, roi_prior_map)
         tangent_base = self.map_direction_to_base(tangent_map)
         if abs(float(tangent_base[0])) < 1e-6:
             map_slope = math.copysign(self.p.laser_max_abs_line_slope, float(tangent_base[1]))
         else:
             map_slope = float(tangent_base[1] / tangent_base[0])
 
-        self.laser_follow_result = self.laser_follower.process_scan(scan, map_slope, map_target_base)
+        self.laser_follow_result = self.laser_follower.process_scan(scan, map_slope, map_target_base, roi_prior_base)
         result = self.laser_follow_result
         if not result.valid or result.target_base is None or result.weight <= 0.0:
             return np.asarray(map_target, dtype=float)
