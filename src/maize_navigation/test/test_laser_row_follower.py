@@ -304,6 +304,31 @@ def test_histogram_peak_uses_actual_shifted_row_end():
     assert abs(end[1] + 0.4) < 1e-6
 
 
+def test_entrance_histogram_detects_peak_split_across_neighbor_bins():
+    navigator = bare_navigator()
+    navigator.get_logger = lambda: type("Logger", (), {"info": lambda *args, **kwargs: None})()
+    center = np.array([0.0, 0.0])
+    outgoing = np.array([1.0, 0.0])
+    points = np.array(
+        [
+            [0.0, -0.76],
+            [0.0, -0.75],
+            [0.0, -0.74],
+            [0.0, 0.00],
+            [0.0, 0.01],
+            [0.0, 0.02],
+            [0.0, 0.74],
+            [0.0, 0.75],
+            [0.0, 0.76],
+        ]
+    )
+
+    peaks = navigator.find_entrance_histogram_peaks(points, center, outgoing)
+
+    assert len(peaks) == 3
+    assert any(abs(peak.lateral - 0.75) < 0.05 for peak in peaks)
+
+
 def test_row_end_direction_average_is_kept_per_field_side():
     navigator = bare_navigator()
     navigator.row_end_directions_by_side["forward"] = [np.array([1.0, 0.0]), np.array([0.98, 0.20])]
@@ -448,21 +473,6 @@ def test_headland_route_stays_anchored_at_row_exit_goal():
 
     assert np.allclose(navigator.entrance_route[0], navigator.row_exit_goal)
     assert np.allclose(navigator.entrance_route_support[0], navigator.row_exit_goal)
-
-
-def test_entrance_peaks_are_regularized_to_expected_spacing():
-    navigator = bare_navigator()
-    peaks = [
-        EntrancePeak(0.00, np.array([0.0, 0.0])),
-        EntrancePeak(0.74, np.array([0.0, 0.74])),
-        EntrancePeak(1.10, np.array([0.0, 1.10])),
-        EntrancePeak(1.50, np.array([0.0, 1.50])),
-        EntrancePeak(2.25, np.array([0.0, 2.25])),
-    ]
-
-    regularized = navigator.regularize_entrance_peak_spacing(peaks)
-
-    assert [round(peak.lateral, 2) for peak in regularized] == [0.0, 0.74, 1.5, 2.25]
 
 
 def test_locked_turn_route_is_not_resampled_for_small_peak_jitter():
