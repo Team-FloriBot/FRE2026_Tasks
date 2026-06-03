@@ -2,7 +2,7 @@ pure_pursuit_node:
   ros__parameters:
 
     path_topic: "/plan"
-    cmd_vel_topic: "/cmd_vel"
+    cmd_vel_topic: "/cmd_vel/task4"
 
     base_link_frame: "base_link"
 
