@@ -91,13 +91,14 @@ maize_navigator:
     enter_stable_frames_required: 3
     acquire_timeout_sec: 8.0
 
-    follow_speed: 0.5
+    follow_speed: 0.6
     slow_speed: 0.12
     enter_speed: 0.22
     turn_speed: 0.22
     yaw_kp: 0.6
     pure_pursuit_gain: 1.2
-    curve_speed_reduction_gain: 3.5
+    curve_speed_reduction_gain: 4.0
+    lateral_speed_reduction_gain: 2.5
     heading_kp: 1.2
     lateral_kp: 0.8
     stanley_min_speed: 0.10

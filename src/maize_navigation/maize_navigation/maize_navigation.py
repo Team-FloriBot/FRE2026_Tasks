@@ -179,6 +179,7 @@ class NavigatorParams:
     pure_pursuit_gain: float = 1.0
     lateral_kp: float = 0.0
     curve_speed_reduction_gain: float = 1.0
+    lateral_speed_reduction_gain: float = 0.0
     max_angular_speed: float = 0.40
     min_follow_turn_radius: float = 0.37
     angular_rate_limit: float = 1.2
@@ -521,6 +522,9 @@ class MaizeNavigator(Node):
         p.pure_pursuit_gain = float(get_param("pure_pursuit_gain", p.pure_pursuit_gain))
         p.lateral_kp = float(get_param("lateral_kp", p.lateral_kp))
         p.curve_speed_reduction_gain = float(get_param("curve_speed_reduction_gain", p.curve_speed_reduction_gain))
+        p.lateral_speed_reduction_gain = float(
+            get_param("lateral_speed_reduction_gain", p.lateral_speed_reduction_gain)
+        )
         p.max_angular_speed = float(get_param("follow_max_angular_speed", p.max_angular_speed))
         p.min_follow_turn_radius = float(get_param("min_follow_turn_radius", p.min_follow_turn_radius))
         p.angular_rate_limit = float(get_param("angular_rate_limit", p.angular_rate_limit))
@@ -600,6 +604,7 @@ class MaizeNavigator(Node):
         self.p.lateral_kp = max(0.0, self.p.lateral_kp)
         self.p.slow_speed = float(np.clip(self.p.slow_speed, 0.0, self.p.follow_speed))
         self.p.curve_speed_reduction_gain = max(0.0, self.p.curve_speed_reduction_gain)
+        self.p.lateral_speed_reduction_gain = max(0.0, self.p.lateral_speed_reduction_gain)
         self.p.maneuver_goal_xy_tolerance = max(0.05, self.p.maneuver_goal_xy_tolerance)
         self.p.maneuver_goal_yaw_tolerance = max(0.05, self.p.maneuver_goal_yaw_tolerance)
         self.p.maneuver_heading_lookahead_distance = max(0.05, self.p.maneuver_heading_lookahead_distance)
@@ -2187,12 +2192,17 @@ class MaizeNavigator(Node):
         min_speed = self.p.slow_speed if min_speed is None else min_speed
         pursuit_distance = max(0.10, target_distance)
         curvature = self.p.pure_pursuit_gain * 2.0 * math.sin(yaw_error) / pursuit_distance
+        lateral_error = 0.0
         if reference_polyline is not None and self.p.lateral_kp > 0.0:
             robot_xy = np.array([self.robot_pose.x, self.robot_pose.y], dtype=float)
             lateral_error = self.signed_lateral_error_to_polyline(reference_polyline, robot_xy)
             curvature -= self.p.lateral_kp * lateral_error
         cmd.linear.x = float(np.clip(
-            max_speed / (1.0 + self.p.curve_speed_reduction_gain * abs(curvature)),
+            max_speed / (
+                1.0
+                + self.p.curve_speed_reduction_gain * abs(curvature)
+                + self.p.lateral_speed_reduction_gain * abs(lateral_error)
+            ),
             min_speed,
             max_speed,
         ))
