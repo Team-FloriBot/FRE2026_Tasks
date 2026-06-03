@@ -18,13 +18,11 @@ setup(
     zip_safe=True,
     maintainer="FRE2026 Team",
     maintainer_email="[EMAIL]",
-    description="Task 4: Marker detection, global marker mapping, coverage planner, and Nav2 configuration for autonomous agrar-robot.",
+    description="Task 4: Coverage Path Planning for Autonomous Lawn Mower",
     license="MIT",
     tests_require=["pytest"],
     entry_points={
         "console_scripts": [
-            "marker_detector = task4.marker_detector:main",
-            "global_marker_map = task4.global_marker_map:main",
             "coverage_planner = task4.coverage_planner:main",
         ],
     },

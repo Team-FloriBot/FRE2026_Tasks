@@ -17,8 +17,6 @@ def generate_launch_description():
         name='coverage_planner',
         output='screen',
         parameters=[config_dir],
-        # Optional: Remap des standardisierten Outputs, falls ihr Nav2 nutzt
-        # remappings=[('/plan', '/global_plan')]
     )
 
     return LaunchDescription([
