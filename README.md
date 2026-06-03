@@ -53,3 +53,18 @@ Zum Starten der Task4 an den Startpunk am Feldrand fahren und folgenden Service 
 ```
 ros2 service call /trigger_coverage_planning std_srvs/srv/Trigger "{}"
 ``` 
+
+Eckkoordinaten setzen gemessen vom Startpunkt des Roboters:
+```
+ros2 param set /coverage_planner polygon_coords '[0.0, 0.0, 5.0, 0.0, 5.0, 5.0, 0.0, 5.0]'
+```
+
+Unterbrechung (Stop)
+```
+ros2 service call /pure_pursuit_node/set_active std_srvs/srv/SetBool "{data: false}"
+```
+
+Starten (nach Stop)
+```
+ros2 service call /pure_pursuit_node/set_active std_srvs/srv/SetBool "{data: true}"
+```

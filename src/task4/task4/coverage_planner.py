@@ -30,7 +30,6 @@ class CoveragePlanner(Node):
         self.declare_parameter('robot_width', 0.6)
         self.declare_parameter('headland_width', 1.5)
         self.declare_parameter('turn_radius', 1.0)
-        self.declare_parameter('swath_angle_deg', 0.0)
         
         self.declare_parameter('input_frame', 'base_link')
         self.declare_parameter('target_frame', 'odom')
@@ -170,7 +169,6 @@ class CoveragePlanner(Node):
         rob_width = self.get_parameter('robot_width').get_parameter_value().double_value
         hl_width = self.get_parameter('headland_width').get_parameter_value().double_value
         turn_rad = self.get_parameter('turn_radius').get_parameter_value().double_value
-        swath_angle = math.radians(self.get_parameter('swath_angle_deg').get_parameter_value().double_value)
         target_frame = self.get_parameter('target_frame').get_parameter_value().string_value
 
         # 1. Transformation nach odom/map
@@ -204,13 +202,16 @@ class CoveragePlanner(Node):
             cells = f2c.Cells(cell)
 
             robot = f2c.Robot(rob_width, op_width)
-            robot.max_curv = 1.0 / turn_rad
+            robot.setMinTurningRadius(turn_rad)
 
             hl_gen = f2c.HG_Const_gen()
+            route_hl_width = hl_width / 2.0
+            mid_hl = hl_gen.generateHeadlands(cells, route_hl_width)
             no_hl = hl_gen.generateHeadlands(cells, hl_width)
 
             sg = f2c.SG_BruteForce()
-            swaths = sg.generateSwaths(swath_angle, op_width, no_hl.getCell(0))
+            swath_objective = f2c.OBJ_NSwath()
+            swaths = sg.generateBestSwaths(swath_objective, robot.getCovWidth(), no_hl.getGeometry(0))
 
             # --- NEU: Globale Graphen-Routenplanung (TSP) ---
             route_planner = f2c.RP_RoutePlannerBase()
@@ -226,7 +227,7 @@ class CoveragePlanner(Node):
                 swaths_by_cells.push_back(swaths)
 
             # Optimierte Route berechnen (Reihenfolge & Richtungen im Graphen optimiert)
-            route = route_planner.genRoute(no_hl, swaths_by_cells)
+            route = route_planner.genRoute(mid_hl, swaths_by_cells)
 
             # --- Kinematische Pfadplanung ---
             pp = f2c.PP_PathPlanning()

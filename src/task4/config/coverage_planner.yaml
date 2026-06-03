@@ -13,4 +13,3 @@ coverage_planner:
     robot_width: 0.42
     turn_radius: 0.37
     headland_width: 0.5
-    swath_angle_deg: 0.0
