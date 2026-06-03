@@ -249,9 +249,11 @@ class LaserRowFollower:
     def __init__(self, params: NavigatorParams) -> None:
         self.p = params
         self.filtered_confidence = 0.0
+        self.tracked_roi_slope: Optional[float] = None
 
     def reset(self) -> None:
         self.filtered_confidence = 0.0
+        self.tracked_roi_slope = None
 
     def reject(self, result: LaserFollowResult, reason: str) -> LaserFollowResult:
         self.filtered_confidence *= 1.0 - self.p.laser_tracker_alpha
@@ -272,7 +274,8 @@ class LaserRowFollower:
         if roi_prior_base is None:
             roi_prior_base = map_target_base
         points = self.scan_to_points(scan)
-        roi_centers, roi_direction = self.build_rois(map_slope, roi_prior_base)
+        roi_slope = self.tracked_roi_slope if self.tracked_roi_slope is not None else map_slope
+        roi_centers, roi_direction = self.build_rois(roi_slope, roi_prior_base)
         left_line = self.fit_line_in_roi(points, roi_centers[0], roi_direction)
         right_line = self.fit_line_in_roi(points, roi_centers[1], roi_direction)
         result = LaserFollowResult(
@@ -325,6 +328,7 @@ class LaserRowFollower:
         result.weight = float(np.clip(scale, 0.0, 1.0)) * max_weight
         result.target_base = np.array([target_x, laser_target_y], dtype=float)
         result.reason = "ok"
+        self.tracked_roi_slope = float(result.center_slope)
         return result
 
     def scan_to_points(self, scan: LaserScan) -> np.ndarray:
@@ -1981,8 +1985,11 @@ class MaizeNavigator(Node):
             self.row_end_direction = None
             return
 
-        self.left_row.result = self.march_row(self.left_row, map_points)
-        self.right_row.result = self.march_row(self.right_row, map_points)
+        left_seed = self.march_row(self.left_row, map_points)
+        right_seed = self.march_row(self.right_row, map_points)
+        left_guides, right_guides = self.build_paired_row_rectangle_guides(left_seed, right_seed)
+        self.left_row.result = self.march_row(self.left_row, map_points, left_guides)
+        self.right_row.result = self.march_row(self.right_row, map_points, right_guides)
         self.update_frozen_prefix(self.left_row)
         self.update_frozen_prefix(self.right_row)
         self.midline = self.build_midline(self.left_row.result.points, self.right_row.result.points)
@@ -2031,7 +2038,77 @@ class MaizeNavigator(Node):
                 model.frozen_directions = np.array(model.result.point_directions[:freeze_count], copy=True)
         model.result.frozen_count = len(model.frozen_points)
 
-    def march_row(self, model: RowMarchModel, map_points: np.ndarray) -> RowMarchResult:
+    def build_paired_row_rectangle_guides(
+        self,
+        left_result: RowMarchResult,
+        right_result: RowMarchResult,
+    ) -> Tuple[List[Tuple[np.ndarray, np.ndarray]], List[Tuple[np.ndarray, np.ndarray]]]:
+        max_count = max(len(left_result.debug_segments), len(right_result.debug_segments))
+        if max_count == 0:
+            return [], []
+
+        left_guides: List[Tuple[np.ndarray, np.ndarray]] = []
+        right_guides: List[Tuple[np.ndarray, np.ndarray]] = []
+        previous_perp: Optional[np.ndarray] = None
+        half_lane = 0.5 * self.p.expected_row_width
+
+        for idx in range(max_count):
+            left_segment = left_result.debug_segments[idx] if idx < len(left_result.debug_segments) else None
+            right_segment = right_result.debug_segments[idx] if idx < len(right_result.debug_segments) else None
+            segments = [segment for segment in (left_segment, right_segment) if segment is not None]
+            if not segments:
+                continue
+
+            direction = self.weighted_rectangle_direction(left_segment, right_segment)
+            perp = np.array([-direction[1], direction[0]], dtype=float)
+            if left_segment is not None and right_segment is not None:
+                separation = left_segment.big_rect_center - right_segment.big_rect_center
+                if float(separation @ perp) < 0.0:
+                    perp = -perp
+            elif previous_perp is not None and float(previous_perp @ perp) < 0.0:
+                perp = -perp
+            previous_perp = np.asarray(perp, dtype=float)
+
+            if left_segment is not None and right_segment is not None:
+                left_weight = self.rectangle_segment_weight(left_segment)
+                right_weight = self.rectangle_segment_weight(right_segment)
+                left_lane_center = left_segment.big_rect_center - half_lane * perp
+                right_lane_center = right_segment.big_rect_center + half_lane * perp
+                lane_center = (left_weight * left_lane_center + right_weight * right_lane_center) / (left_weight + right_weight)
+            elif left_segment is not None:
+                lane_center = left_segment.big_rect_center - half_lane * perp
+            else:
+                lane_center = right_segment.big_rect_center + half_lane * perp
+
+            left_guides.append((np.asarray(lane_center + half_lane * perp, dtype=float), direction))
+            right_guides.append((np.asarray(lane_center - half_lane * perp, dtype=float), direction))
+
+        return left_guides, right_guides
+
+    def rectangle_segment_weight(self, segment: SegmentDebug) -> float:
+        return 1.0 + float(segment.support_count) + 2.0 * float(segment.end_field_count)
+
+    def weighted_rectangle_direction(
+        self,
+        left_segment: Optional[SegmentDebug],
+        right_segment: Optional[SegmentDebug],
+    ) -> np.ndarray:
+        segments = [segment for segment in (left_segment, right_segment) if segment is not None]
+        base_direction = self.normalize(segments[0].direction)
+        accumulated = np.zeros(2, dtype=float)
+        for segment in segments:
+            direction = self.normalize(segment.direction)
+            if float(direction @ base_direction) < 0.0:
+                direction = -direction
+            accumulated += self.rectangle_segment_weight(segment) * direction
+        return self.normalize(accumulated)
+
+    def march_row(
+        self,
+        model: RowMarchModel,
+        map_points: np.ndarray,
+        rectangle_guides: Optional[List[Tuple[np.ndarray, np.ndarray]]] = None,
+    ) -> RowMarchResult:
         result = RowMarchResult()
         if len(model.frozen_points) >= 2:
             exact_points = [np.asarray(point, dtype=float) for point in model.frozen_points]
@@ -2055,23 +2132,28 @@ class MaizeNavigator(Node):
         previous_valid_point: Optional[np.ndarray] = np.asarray(point2, dtype=float)
         last_valid_direction = np.asarray(direction, dtype=float)
 
-        for _ in range(self.p.row_max_march_steps):
+        for step_idx in range(self.p.row_max_march_steps):
             search_point3 = line_points[2]
+            rectangle_center = np.asarray(search_point3, dtype=float)
+            rectangle_direction = np.asarray(direction, dtype=float)
+            if rectangle_guides is not None and step_idx < len(rectangle_guides):
+                rectangle_center = np.asarray(rectangle_guides[step_idx][0], dtype=float)
+                rectangle_direction = self.normalize(rectangle_guides[step_idx][1])
             big_rect_length = self.big_rectangle_length()
             fit_points = self.points_in_oriented_rectangle(
                 map_points,
-                search_point3,
-                direction,
+                rectangle_center,
+                rectangle_direction,
                 big_rect_length,
                 self.p.row_rectangle_width,
             )
 
-            corrected_direction = direction
-            corrected_point3 = np.array(search_point3, copy=True)
+            corrected_direction = rectangle_direction
+            corrected_point3 = np.array(rectangle_center, copy=True)
             if len(fit_points) >= self.p.row_min_fit_points:
-                fit_origin, fitted_direction = self.fit_line(fit_points, direction)
+                fit_origin, fitted_direction = self.fit_line(fit_points, rectangle_direction)
                 corrected_direction = fitted_direction
-                corrected_point3 = self.project_point_to_line(search_point3, fit_origin, fitted_direction)
+                corrected_point3 = self.project_point_to_line(rectangle_center, fit_origin, fitted_direction)
 
             corrected_line_points = self.build_initial_line_from_point3(corrected_point3, corrected_direction)
             field_count = self.count_points_in_fields_3_to_5(map_points, corrected_line_points, corrected_direction)
@@ -2103,7 +2185,7 @@ class MaizeNavigator(Node):
                 SegmentDebug(
                     line_points=np.array(corrected_line_points, copy=True),
                     direction=np.array(corrected_direction, copy=True),
-                    big_rect_center=np.array(search_point3, copy=True),
+                    big_rect_center=np.array(rectangle_center, copy=True),
                     big_rect_length=big_rect_length,
                     big_rect_width=self.p.row_rectangle_width,
                     point3_rect_center=np.array(corrected_point3, copy=True),
