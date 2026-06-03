@@ -177,6 +177,7 @@ class NavigatorParams:
     lookahead_distance: float = 1.10
     yaw_kp: float = 0.6
     pure_pursuit_gain: float = 1.0
+    heading_kp: float = 0.0
     lateral_kp: float = 0.0
     lateral_error_limit: float = 0.35
     curve_speed_reduction_gain: float = 1.0
@@ -521,6 +522,7 @@ class MaizeNavigator(Node):
         p.lookahead_distance = float(get_param("lookahead_distance", p.lookahead_distance))
         p.yaw_kp = float(get_param("yaw_kp", p.yaw_kp))
         p.pure_pursuit_gain = float(get_param("pure_pursuit_gain", p.pure_pursuit_gain))
+        p.heading_kp = float(get_param("heading_kp", p.heading_kp))
         p.lateral_kp = float(get_param("lateral_kp", p.lateral_kp))
         p.lateral_error_limit = float(get_param("lateral_error_limit", p.lateral_error_limit))
         p.curve_speed_reduction_gain = float(get_param("curve_speed_reduction_gain", p.curve_speed_reduction_gain))
@@ -603,6 +605,7 @@ class MaizeNavigator(Node):
         self.p.row_exit_extension_distance = max(0.0, self.p.row_exit_extension_distance)
         self.p.row_end_goal_outward_distance = max(0.0, self.p.row_end_goal_outward_distance)
         self.p.pure_pursuit_gain = max(0.05, self.p.pure_pursuit_gain)
+        self.p.heading_kp = max(0.0, self.p.heading_kp)
         self.p.lateral_kp = max(0.0, self.p.lateral_kp)
         self.p.lateral_error_limit = max(0.05, self.p.lateral_error_limit)
         self.p.slow_speed = float(np.clip(self.p.slow_speed, 0.0, self.p.follow_speed))
@@ -2201,6 +2204,12 @@ class MaizeNavigator(Node):
             lateral_error = self.signed_lateral_error_to_polyline(reference_polyline, robot_xy)
             lateral_error = float(np.clip(lateral_error, -self.p.lateral_error_limit, self.p.lateral_error_limit))
             curvature -= self.p.lateral_kp * lateral_error
+        if reference_polyline is not None and self.p.heading_kp > 0.0:
+            robot_xy = np.array([self.robot_pose.x, self.robot_pose.y], dtype=float)
+            tangent = self.polyline_tangent_at_point(reference_polyline, robot_xy)
+            path_yaw = math.atan2(float(tangent[1]), float(tangent[0]))
+            heading_error = wrap_to_pi(path_yaw - self.robot_pose.yaw)
+            curvature += self.p.heading_kp * math.sin(heading_error)
         cmd.linear.x = float(np.clip(
             max_speed / (
                 1.0

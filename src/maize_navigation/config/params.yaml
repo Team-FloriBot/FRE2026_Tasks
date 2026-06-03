@@ -96,11 +96,11 @@ maize_navigator:
     enter_speed: 0.22
     turn_speed: 0.22
     yaw_kp: 0.6
-    pure_pursuit_gain: 1.2
-    curve_speed_reduction_gain: 6.0
+    pure_pursuit_gain: 1.0
+    curve_speed_reduction_gain: 5.0
     lateral_speed_reduction_gain: 5.0
-    heading_kp: 1.2
-    lateral_kp: 1.0
+    heading_kp: 0.4
+    lateral_kp: 0.9
     lateral_error_limit: 0.35
     stanley_min_speed: 0.10
     min_follow_turn_radius: 0.37
@@ -112,7 +112,7 @@ maize_navigator:
 
     max_linear_speed: 0.50
     max_angular_speed: 1.40
-    follow_max_angular_speed: 1.40
+    follow_max_angular_speed: 1.00
     turn_max_angular_speed: 1.40
     angular_rate_limit: 2.8
 
