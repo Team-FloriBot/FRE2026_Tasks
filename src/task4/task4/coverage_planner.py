@@ -2,11 +2,14 @@
 
 import rclpy
 from rclpy.node import Node
+from rclpy.callback_groups import ReentrantCallbackGroup
+from rclpy.executors import MultiThreadedExecutor
 import math
 from numbers import Real
+from threading import Event
 
 # ROS 2 Services & Messages
-from std_srvs.srv import Trigger
+from std_srvs.srv import SetBool, Trigger
 from geometry_msgs.msg import PoseStamped, PointStamped, Point
 from visualization_msgs.msg import Marker
 from nav_msgs.msg import Path
@@ -37,6 +40,8 @@ class CoveragePlanner(Node):
         # Flag, ob polygon_coords per Service gesetzt wurden
         self.service_coords_set = False
 
+        self.task4_service_group = ReentrantCallbackGroup()
+
         # 2. TF2 Setup
         self.tf_buffer = tf2_ros.Buffer()
         self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
@@ -55,6 +60,25 @@ class CoveragePlanner(Node):
         )
         self.get_logger().info("Coverage Planner Service '/trigger_coverage_planning' ist bereit!")
 
+        self.path_tracking_active_client = self.create_client(
+            SetBool,
+            '/pure_pursuit_node/set_active',
+            callback_group=self.task4_service_group
+        )
+        self.start_navigation_srv = self.create_service(
+            Trigger,
+            '/task4/start_navigation',
+            self.start_navigation_callback,
+            callback_group=self.task4_service_group
+        )
+        self.stop_navigation_srv = self.create_service(
+            Trigger,
+            '/task4/stop_navigation',
+            self.stop_navigation_callback,
+            callback_group=self.task4_service_group
+        )
+        self.get_logger().info("Task-4 Services '/task4/start_navigation' und '/task4/stop_navigation' sind bereit!")
+
     def on_parameter_change(self, params):
         polygon_coords_were_set = False
 
@@ -70,6 +94,41 @@ class CoveragePlanner(Node):
             self.get_logger().info("Polygon-Koordinaten erfolgreich per Service gesetzt.")
 
         return SetParametersResult(successful=True)
+
+    def set_path_tracking_active(self, active):
+        if not self.path_tracking_active_client.service_is_ready():
+            self.path_tracking_active_client.wait_for_service(timeout_sec=0.5)
+
+        if not self.path_tracking_active_client.service_is_ready():
+            return False, "Service '/pure_pursuit_node/set_active' ist nicht erreichbar."
+
+        request = SetBool.Request()
+        request.data = bool(active)
+        future = self.path_tracking_active_client.call_async(request)
+        completed = Event()
+        future.add_done_callback(lambda _: completed.set())
+
+        if not completed.wait(timeout=2.0):
+            return False, "Timeout beim Aufruf von '/pure_pursuit_node/set_active'."
+
+        try:
+            service_response = future.result()
+        except Exception as exc:
+            return False, f"Serviceaufruf fehlgeschlagen: {exc}"
+
+        return bool(service_response.success), service_response.message
+
+    def start_navigation_callback(self, request, response):
+        success, message = self.set_path_tracking_active(True)
+        response.success = success
+        response.message = message or ("Task-4-Navigation gestartet." if success else "Task-4-Navigation konnte nicht gestartet werden.")
+        return response
+
+    def stop_navigation_callback(self, request, response):
+        success, message = self.set_path_tracking_active(False)
+        response.success = success
+        response.message = message or ("Task-4-Navigation gestoppt." if success else "Task-4-Navigation konnte nicht gestoppt werden.")
+        return response
 
     def planning_service_callback(self, request, response):
         input_frame = self.get_parameter('input_frame').get_parameter_value().string_value
@@ -321,11 +380,14 @@ class CoveragePlanner(Node):
 def main(args=None):
     rclpy.init(args=args)
     node = CoveragePlanner()
+    executor = MultiThreadedExecutor(num_threads=2)
+    executor.add_node(node)
     try:
-        rclpy.spin(node)
+        executor.spin()
     except KeyboardInterrupt:
         pass
     finally:
+        executor.shutdown()
         node.destroy_node()
         rclpy.shutdown()
 
