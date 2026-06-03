@@ -230,6 +230,7 @@ def bare_navigator():
     navigator.robot_pose = Pose2D(3.0, 0.0, 0.0)
     navigator.initial_forward_direction = np.array([1.0, 0.0])
     navigator.row_end_directions_by_side = {"forward": [], "backward": []}
+    navigator.row_exit_goal = None
     navigator.entrance_route = np.empty((0, 2))
     navigator.entrance_route_support = np.empty((0, 2))
     navigator.entrance_route_progress_index = 0
@@ -397,8 +398,8 @@ def test_provisional_turn_route_exits_then_moves_to_expected_pattern_offset():
     assert navigator.ensure_provisional_entrance_route()
     assert navigator.entrance_target is None
     assert navigator.entrance_route_provisional
-    assert np.allclose(navigator.entrance_waypoints[0], np.array([0.5, 0.5]))
-    assert np.allclose(navigator.entrance_route[-1], np.array([0.5, 1.5]))
+    assert np.allclose(navigator.entrance_waypoints[0], np.array([0.8, 0.5]))
+    assert np.allclose(navigator.entrance_route[-1], np.array([0.8, 1.5]))
 
 
 def test_turn_waypoints_follow_outermost_peak_on_traversed_route():
@@ -430,9 +431,38 @@ def test_support_route_keeps_first_waypoint_visible_when_active_route_skips_it()
     navigator.rebuild_entrance_route(None)
 
     assert len(navigator.entrance_waypoints) == 2
-    assert np.allclose(navigator.entrance_route_support[1], np.array([0.26, 0.0]))
-    assert np.allclose(navigator.entrance_route_support[2], np.array([0.635, 0.375]))
-    assert np.any(np.all(np.isclose(navigator.entrance_route, np.array([0.635, 0.375])), axis=1))
+    assert np.allclose(navigator.entrance_route_support[0], np.array([0.3, 0.0]))
+    assert np.allclose(navigator.entrance_route_support[2], np.array([0.675, 0.375]))
+    assert np.any(np.all(np.isclose(navigator.entrance_route, np.array([0.675, 0.375])), axis=1))
+
+
+def test_headland_route_stays_anchored_at_row_exit_goal():
+    navigator = bare_navigator()
+    navigator.robot_pose = Pose2D(0.9, 0.2, 0.0)
+    navigator.plant_row_end_point = np.array([0.0, 0.0])
+    navigator.row_exit_goal = np.array([0.3, 0.0])
+    navigator.row_end_direction = np.array([1.0, 0.0])
+    navigator.entrance_active_step = PatternStep(2, "L")
+
+    navigator.rebuild_entrance_route(None)
+
+    assert np.allclose(navigator.entrance_route[0], navigator.row_exit_goal)
+    assert np.allclose(navigator.entrance_route_support[0], navigator.row_exit_goal)
+
+
+def test_entrance_peaks_are_regularized_to_expected_spacing():
+    navigator = bare_navigator()
+    peaks = [
+        EntrancePeak(0.00, np.array([0.0, 0.0])),
+        EntrancePeak(0.74, np.array([0.0, 0.74])),
+        EntrancePeak(1.10, np.array([0.0, 1.10])),
+        EntrancePeak(1.50, np.array([0.0, 1.50])),
+        EntrancePeak(2.25, np.array([0.0, 2.25])),
+    ]
+
+    regularized = navigator.regularize_entrance_peak_spacing(peaks)
+
+    assert [round(peak.lateral, 2) for peak in regularized] == [0.0, 0.74, 1.5, 2.25]
 
 
 def test_locked_turn_route_is_not_resampled_for_small_peak_jitter():

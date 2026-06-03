@@ -1250,8 +1250,9 @@ class MaizeNavigator(Node):
             self.set_entrance_route(np.vstack((robot_xy, *forward_path)), False)
             return
 
+        route_start = self.headland_route_anchor(center, outgoing)
         route, support_points, waypoints = self.build_headland_route(
-            robot_xy,
+            route_start,
             center,
             outgoing,
             lateral_direction,
@@ -1269,6 +1270,11 @@ class MaizeNavigator(Node):
         self.entrance_route_provisional = target is None
         self.entrance_traverse_outward = traverse_outward
 
+    def headland_route_anchor(self, center: np.ndarray, outgoing: np.ndarray) -> np.ndarray:
+        if self.row_exit_goal is not None:
+            return np.asarray(self.row_exit_goal, dtype=float)
+        return np.asarray(center, dtype=float) + self.p.row_end_goal_outward_distance * self.normalize(outgoing)
+
     def compute_headland_traverse_outward(
         self,
         center: np.ndarray,
@@ -1285,7 +1291,8 @@ class MaizeNavigator(Node):
         outermost = max(
             [0.0] + [float((np.asarray(peak.point) - center) @ outgoing) for peak in route_peaks]
         )
-        return outermost + self.p.row_exit_extension_distance
+        clearance = max(self.p.row_exit_extension_distance, self.p.row_end_goal_outward_distance)
+        return outermost + clearance
 
     def build_headland_route(
         self,
@@ -1449,11 +1456,52 @@ class MaizeNavigator(Node):
             if all(abs(candidate.lateral - peak.lateral) >= min_peak_spacing for peak in peaks):
                 peaks.append(candidate)
         peaks.sort(key=lambda peak: peak.lateral)
+        peaks = self.regularize_entrance_peak_spacing(peaks)
         self.get_logger().info(
             f"Headland histogram peaks: {[round(peak.lateral, 3) for peak in peaks]}",
             throttle_duration_sec=2.0,
         )
         return peaks
+
+    def regularize_entrance_peak_spacing(self, peaks: List[EntrancePeak]) -> List[EntrancePeak]:
+        if len(peaks) < 3:
+            return peaks
+        expected = self.p.expected_row_width
+        tolerance = max(0.20, 0.35 * expected)
+        best: List[EntrancePeak] = peaks
+        best_score = -float("inf")
+        laterals = [peak.lateral for peak in peaks]
+        min_lateral = min(laterals)
+        max_lateral = max(laterals)
+
+        for anchor in peaks:
+            for anchor_slot in range(-len(peaks), len(peaks) + 1):
+                origin = anchor.lateral - anchor_slot * expected
+                selected: List[Tuple[float, EntrancePeak]] = []
+                used: set[int] = set()
+                slot_min = math.floor((min_lateral - origin) / expected) - 1
+                slot_max = math.ceil((max_lateral - origin) / expected) + 1
+                for slot in range(slot_min, slot_max + 1):
+                    expected_lateral = origin + slot * expected
+                    candidates = [
+                        (abs(peak.lateral - expected_lateral), idx, peak)
+                        for idx, peak in enumerate(peaks)
+                        if idx not in used and abs(peak.lateral - expected_lateral) <= tolerance
+                    ]
+                    if not candidates:
+                        continue
+                    error, idx, peak = min(candidates, key=lambda item: item[0])
+                    used.add(idx)
+                    selected.append((error, peak))
+                if len(selected) < 2:
+                    continue
+                error_sum = sum(error for error, _ in selected)
+                score = 10.0 * len(selected) - error_sum / max(expected, 1e-6)
+                if score > best_score:
+                    best_score = score
+                    best = [peak for _, peak in sorted(selected, key=lambda item: item[1].lateral)]
+
+        return best
 
     def actual_row_end_from_peak(
         self,
