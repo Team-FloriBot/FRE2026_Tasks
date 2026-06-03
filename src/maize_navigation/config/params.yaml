@@ -91,7 +91,7 @@ maize_navigator:
     enter_stable_frames_required: 3
     acquire_timeout_sec: 8.0
 
-    follow_speed: 0.6
+    follow_speed: 0.5
     slow_speed: 0.12
     enter_speed: 0.22
     turn_speed: 0.22
@@ -110,13 +110,13 @@ maize_navigator:
     # Sicherheitsabstand der Wende-Querlinie hinter dem aeussersten relevanten Peak.
     row_exit_extension_distance: 0.50
 
-    max_linear_speed: 0.45
+    max_linear_speed: 0.50
     max_angular_speed: 1.40
-    follow_max_angular_speed: 0.90
+    follow_max_angular_speed: 1.40
     turn_max_angular_speed: 1.40
     angular_rate_limit: 2.8
 
-    lookahead_distance: 1.4
+    lookahead_distance: 1.2
     turn_lookahead_distance: 0.32
     turn_min_angular_speed: 0.30
 
