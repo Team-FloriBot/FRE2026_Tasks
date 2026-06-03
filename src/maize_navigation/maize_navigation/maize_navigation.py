@@ -91,6 +91,7 @@ class DrivingProfile:
     pure_pursuit_gain: float
     heading_kp: float
     lateral_kp: float
+    lateral_kd: float
     curve_speed_reduction_gain: float
     lateral_speed_reduction_gain: float
     max_angular_speed: float
@@ -199,6 +200,7 @@ class NavigatorParams:
     pure_pursuit_gain: float = 1.0
     heading_kp: float = 0.0
     lateral_kp: float = 0.0
+    lateral_kd: float = 0.0
     lateral_error_limit: float = 0.35
     curve_speed_reduction_gain: float = 1.0
     lateral_speed_reduction_gain: float = 0.0
@@ -436,6 +438,7 @@ class MaizeNavigator(Node):
         self.row_end_direction: Optional[np.ndarray] = None
         self.last_cmd_angular_z: float = 0.0
         self.last_target_point: Optional[np.ndarray] = None
+        self.last_lateral_error: Optional[float] = None
         self.initial_forward_direction: Optional[np.ndarray] = None
         self.row_number_increase_direction: Optional[np.ndarray] = None
         self.pattern_steps: List[PatternStep] = self.parse_pattern(self.p.pattern)
@@ -545,6 +548,7 @@ class MaizeNavigator(Node):
         p.pure_pursuit_gain = float(get_param("pure_pursuit_gain", p.pure_pursuit_gain))
         p.heading_kp = float(get_param("heading_kp", p.heading_kp))
         p.lateral_kp = float(get_param("lateral_kp", p.lateral_kp))
+        p.lateral_kd = float(get_param("lateral_kd", p.lateral_kd))
         p.lateral_error_limit = float(get_param("lateral_error_limit", p.lateral_error_limit))
         p.curve_speed_reduction_gain = float(get_param("curve_speed_reduction_gain", p.curve_speed_reduction_gain))
         p.lateral_speed_reduction_gain = float(
@@ -628,6 +632,7 @@ class MaizeNavigator(Node):
         self.p.pure_pursuit_gain = max(0.05, self.p.pure_pursuit_gain)
         self.p.heading_kp = max(0.0, self.p.heading_kp)
         self.p.lateral_kp = max(0.0, self.p.lateral_kp)
+        self.p.lateral_kd = max(0.0, self.p.lateral_kd)
         self.p.lateral_error_limit = max(0.05, self.p.lateral_error_limit)
         self.p.slow_speed = float(np.clip(self.p.slow_speed, 0.0, self.p.follow_speed))
         self.p.curve_speed_reduction_gain = max(0.0, self.p.curve_speed_reduction_gain)
@@ -705,6 +710,7 @@ class MaizeNavigator(Node):
             pure_pursuit_gain=self.p.pure_pursuit_gain,
             heading_kp=self.p.heading_kp,
             lateral_kp=self.p.lateral_kp,
+            lateral_kd=self.p.lateral_kd,
             curve_speed_reduction_gain=self.p.curve_speed_reduction_gain,
             lateral_speed_reduction_gain=self.p.lateral_speed_reduction_gain,
             max_angular_speed=self.p.max_angular_speed,
@@ -725,6 +731,7 @@ class MaizeNavigator(Node):
                 pure_pursuit_gain=high.pure_pursuit_gain * 0.82,
                 heading_kp=high.heading_kp * 0.75,
                 lateral_kp=high.lateral_kp * 0.75,
+                lateral_kd=high.lateral_kd * 0.75,
                 curve_speed_reduction_gain=high.curve_speed_reduction_gain * 0.55,
                 lateral_speed_reduction_gain=high.lateral_speed_reduction_gain * 0.50,
                 max_angular_speed=high.max_angular_speed * 1.10,
@@ -743,6 +750,7 @@ class MaizeNavigator(Node):
                 pure_pursuit_gain=high.pure_pursuit_gain * 0.68,
                 heading_kp=high.heading_kp * 0.50,
                 lateral_kp=high.lateral_kp * 0.50,
+                lateral_kd=high.lateral_kd * 0.50,
                 curve_speed_reduction_gain=high.curve_speed_reduction_gain * 0.30,
                 lateral_speed_reduction_gain=high.lateral_speed_reduction_gain * 0.25,
                 max_angular_speed=high.max_angular_speed * 1.20,
@@ -779,6 +787,7 @@ class MaizeNavigator(Node):
         self.last_cmd_angular_z = 0.0
         self.last_target_point = None
         self.fused_target_point = None
+        self.last_lateral_error = None
 
     def reset_entrance_state(self) -> None:
         self.entrance_hist_center = None
@@ -2291,11 +2300,19 @@ class MaizeNavigator(Node):
         pursuit_distance = max(0.10, target_distance)
         curvature = self.p.pure_pursuit_gain * 2.0 * math.sin(yaw_error) / pursuit_distance
         lateral_error = 0.0
-        if reference_polyline is not None and self.p.lateral_kp > 0.0:
+        dt = 1.0 / max(1e-6, self.p.control_frequency)
+        if reference_polyline is not None and (self.p.lateral_kp > 0.0 or self.p.lateral_kd > 0.0):
             robot_xy = np.array([self.robot_pose.x, self.robot_pose.y], dtype=float)
             lateral_error = self.signed_lateral_error_to_polyline(reference_polyline, robot_xy)
             lateral_error = float(np.clip(lateral_error, -self.p.lateral_error_limit, self.p.lateral_error_limit))
+            lateral_rate = 0.0
+            if self.last_lateral_error is not None:
+                lateral_rate = (lateral_error - self.last_lateral_error) / dt
+            self.last_lateral_error = lateral_error
             curvature -= self.p.lateral_kp * lateral_error
+            curvature -= self.p.lateral_kd * lateral_rate
+        else:
+            self.last_lateral_error = None
         if reference_polyline is not None and self.p.heading_kp > 0.0:
             robot_xy = np.array([self.robot_pose.x, self.robot_pose.y], dtype=float)
             tangent = self.polyline_tangent_at_point(reference_polyline, robot_xy)
@@ -2318,7 +2335,6 @@ class MaizeNavigator(Node):
         pursuit_angular = cmd.linear.x * curvature
         angular_raw = float(np.clip(pursuit_angular, -max_angular, max_angular))
 
-        dt = 1.0 / max(1e-6, self.p.control_frequency)
         max_delta = self.p.angular_rate_limit * dt
         angular_limited = float(np.clip(
             angular_raw,
