@@ -291,8 +291,9 @@ namespace util
       scan_msg->ranges.assign(ranges_size, scan_msg->range_max + inf_eps_);
     }
 
-    // Iterate through pointcloud
-    std::for_each(std::execution::par_unseq, merged_cloud_->points.begin(), merged_cloud_->points.end(),
+    // Iterate sequentially: multiple points can map to the same ray, so parallel
+    // writes to scan_msg->ranges would be a data race.
+    std::for_each(merged_cloud_->points.begin(), merged_cloud_->points.end(),
         [this, &scan_msg](const auto &point) {
           if (std::isnan(point.x) || std::isnan(point.y) || std::isnan(point.z)) {
             RCLCPP_DEBUG(

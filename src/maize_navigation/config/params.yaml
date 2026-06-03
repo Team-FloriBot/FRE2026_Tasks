@@ -128,9 +128,9 @@ maize_navigator:
     # Verrundete, monoton verfolgte Route fuer das Vorgewende.
     maneuver_speed: 0.16
     maneuver_slow_speed: 0.10
-    maneuver_lookahead_distance: 0.80
+    maneuver_lookahead_distance: 0.7
     maneuver_route_spacing: 0.08
-    maneuver_corner_radius: 0.50
+    maneuver_corner_radius: 0.40
     maneuver_entry_extension_distance: 0.80
     maneuver_max_route_deviation: 0.70
     maneuver_entry_lateral_tolerance: 0.25
