@@ -100,7 +100,7 @@ maize_navigator:
     curve_speed_reduction_gain: 5.0
     lateral_speed_reduction_gain: 4.0
     heading_kp: 1.2
-    lateral_kp: 0.6
+    lateral_kp: 0.8
     stanley_min_speed: 0.10
     min_follow_turn_radius: 0.37
     target_filter_alpha: 0.25
@@ -115,7 +115,7 @@ maize_navigator:
     turn_max_angular_speed: 1.40
     angular_rate_limit: 2.8
 
-    lookahead_distance: 0.8
+    lookahead_distance: 1.2
     turn_lookahead_distance: 0.32
     turn_min_angular_speed: 0.30
 
