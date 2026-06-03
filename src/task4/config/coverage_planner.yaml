@@ -6,7 +6,7 @@ coverage_planner:
     
     # Frames für die Transformation
     input_frame: "base_link"
-    target_frame: "map"
+    target_frame: "odom"
     
     # Roboter & Feldkonfiguration
     operating_width: 1.0
