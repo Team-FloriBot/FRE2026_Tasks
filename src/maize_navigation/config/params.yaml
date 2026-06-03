@@ -59,7 +59,7 @@ maize_navigator:
     laser_follow_enabled: true
     laser_scan_timeout: 0.50
     laser_roi_x_min: 0.0
-    laser_roi_x_max: 2.0
+    laser_roi_x_max: 1.8
     laser_roi_length: 1.55
     laser_roi_width: 0.6
     laser_roi_center_offset_limit: 0.1
@@ -72,8 +72,8 @@ maize_navigator:
     laser_max_center_offset: 0.40
     laser_min_confidence: 0.25
     laser_full_confidence: 0.85
-    laser_max_weight_both_sides: 0.50
-    laser_max_weight_one_side: 0.25
+    laser_max_weight_both_sides: 0.70
+    laser_max_weight_one_side: 0.35
     laser_tracker_alpha: 0.25
 
     tracker_alpha: 0.18
@@ -91,7 +91,7 @@ maize_navigator:
     enter_stable_frames_required: 3
     acquire_timeout_sec: 8.0
 
-    follow_speed: 0.5
+    follow_speed: 0.6
     slow_speed: 0.12
     enter_speed: 0.22
     turn_speed: 0.22
@@ -99,8 +99,8 @@ maize_navigator:
     pure_pursuit_gain: 1.4
     curve_speed_reduction_gain: 7.0
     lateral_speed_reduction_gain: 7.0
-    heading_kp: 0.6
-    lateral_kp: 1.0
+    heading_kp: 0.4
+    lateral_kp: 0.8
     lateral_error_limit: 0.35
     stanley_min_speed: 0.10
     min_follow_turn_radius: 0.37
