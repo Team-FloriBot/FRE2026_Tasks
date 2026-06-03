@@ -68,8 +68,8 @@ Starten (nach Stop)
 ```
 ros2 service call /pure_pursuit_node/set_active std_srvs/srv/SetBool "{data: true}"
 ```
+Da wir mehrere Laser am Roboter verbaut haben, müssen wir zum Testen zwischen den Lasern umschalten können. Aktuell kann man zwischen 3 Laserscantopics für den front_laser umschalten:
 
-Laserscan Merger umschalten
 ```
 ros2 service call /front_scan_mux/set_profile fre2026_task_interfaces/srv/SetScanProfile "{profile: 'rs_crop_scan'}"
 
