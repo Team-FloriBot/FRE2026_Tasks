@@ -177,6 +177,7 @@ class NavigatorParams:
     lookahead_distance: float = 1.10
     yaw_kp: float = 0.6
     pure_pursuit_gain: float = 1.0
+    lateral_kp: float = 0.0
     curve_speed_reduction_gain: float = 1.0
     max_angular_speed: float = 0.40
     min_follow_turn_radius: float = 0.37
@@ -518,6 +519,7 @@ class MaizeNavigator(Node):
         p.lookahead_distance = float(get_param("lookahead_distance", p.lookahead_distance))
         p.yaw_kp = float(get_param("yaw_kp", p.yaw_kp))
         p.pure_pursuit_gain = float(get_param("pure_pursuit_gain", p.pure_pursuit_gain))
+        p.lateral_kp = float(get_param("lateral_kp", p.lateral_kp))
         p.curve_speed_reduction_gain = float(get_param("curve_speed_reduction_gain", p.curve_speed_reduction_gain))
         p.max_angular_speed = float(get_param("follow_max_angular_speed", p.max_angular_speed))
         p.min_follow_turn_radius = float(get_param("min_follow_turn_radius", p.min_follow_turn_radius))
@@ -595,6 +597,7 @@ class MaizeNavigator(Node):
         self.p.row_exit_extension_distance = max(0.0, self.p.row_exit_extension_distance)
         self.p.row_end_goal_outward_distance = max(0.0, self.p.row_end_goal_outward_distance)
         self.p.pure_pursuit_gain = max(0.05, self.p.pure_pursuit_gain)
+        self.p.lateral_kp = max(0.0, self.p.lateral_kp)
         self.p.slow_speed = float(np.clip(self.p.slow_speed, 0.0, self.p.follow_speed))
         self.p.curve_speed_reduction_gain = max(0.0, self.p.curve_speed_reduction_gain)
         self.p.maneuver_goal_xy_tolerance = max(0.05, self.p.maneuver_goal_xy_tolerance)
@@ -803,7 +806,7 @@ class MaizeNavigator(Node):
             target = self.midline[-1]
         target = np.asarray(target, dtype=float)
         self.fused_target_point = self.fuse_follow_target_with_laser(target)
-        self.drive_to_point(self.fused_target_point)
+        self.drive_to_point(self.fused_target_point, reference_polyline=self.midline)
 
     def fuse_follow_target_with_laser(self, map_target: np.ndarray) -> np.ndarray:
         self.laser_follow_result = LaserFollowResult(reason="laser following disabled")
@@ -2131,11 +2134,39 @@ class MaizeNavigator(Node):
             segment_start = segment_end
         return np.asarray(polyline[-1], dtype=float)
 
+    def signed_lateral_error_to_polyline(self, polyline: np.ndarray, point: np.ndarray) -> float:
+        if len(polyline) < 2:
+            return 0.0
+
+        point = np.asarray(point, dtype=float)
+        best_projection: Optional[np.ndarray] = None
+        best_direction: Optional[np.ndarray] = None
+        best_distance = float("inf")
+        for idx in range(len(polyline) - 1):
+            segment = polyline[idx + 1] - polyline[idx]
+            seg_len_sq = float(segment @ segment)
+            if seg_len_sq < 1e-12:
+                continue
+            ratio = float(np.clip(((point - polyline[idx]) @ segment) / seg_len_sq, 0.0, 1.0))
+            projection = polyline[idx] + ratio * segment
+            distance = float(np.linalg.norm(point - projection))
+            if distance < best_distance:
+                best_distance = distance
+                best_projection = projection
+                best_direction = segment / math.sqrt(seg_len_sq)
+
+        if best_projection is None or best_direction is None:
+            return 0.0
+
+        lateral_direction = np.array([-best_direction[1], best_direction[0]], dtype=float)
+        return float((point - best_projection) @ lateral_direction)
+
     def drive_to_point(
         self,
         target: np.ndarray,
         max_speed: Optional[float] = None,
         min_speed: Optional[float] = None,
+        reference_polyline: Optional[np.ndarray] = None,
     ) -> None:
         target = np.asarray(target, dtype=float)
         if self.last_target_point is None:
@@ -2156,6 +2187,10 @@ class MaizeNavigator(Node):
         min_speed = self.p.slow_speed if min_speed is None else min_speed
         pursuit_distance = max(0.10, target_distance)
         curvature = self.p.pure_pursuit_gain * 2.0 * math.sin(yaw_error) / pursuit_distance
+        if reference_polyline is not None and self.p.lateral_kp > 0.0:
+            robot_xy = np.array([self.robot_pose.x, self.robot_pose.y], dtype=float)
+            lateral_error = self.signed_lateral_error_to_polyline(reference_polyline, robot_xy)
+            curvature -= self.p.lateral_kp * lateral_error
         cmd.linear.x = float(np.clip(
             max_speed / (1.0 + self.p.curve_speed_reduction_gain * abs(curvature)),
             min_speed,
