@@ -261,6 +261,23 @@ def test_rois_fall_back_to_robot_heading_without_map_direction():
     assert np.allclose(direction, np.array([1.0, 0.0]))
 
 
+def test_laser_rois_track_previous_valid_ransac_direction_until_reset():
+    follower = LaserRowFollower(NavigatorParams())
+    scan = make_scan([(0.25, 0.375), (0.25, -0.375)])
+
+    first = process_repeatedly(follower, scan, map_slope=0.25, map_target=(1.4, 0.35))
+    second = follower.process_scan(scan, 0.0, np.array([1.4, 0.35]))
+
+    assert first.valid
+    assert second.valid
+    assert second.roi_direction[1] / second.roi_direction[0] > 0.15
+
+    follower.reset()
+    after_reset = follower.process_scan(scan, 0.0, np.array([1.4, 0.35]))
+
+    assert abs(after_reset.roi_direction[1]) < 1e-9
+
+
 def bare_navigator():
     navigator = MaizeNavigator.__new__(MaizeNavigator)
     navigator.p = NavigatorParams()
