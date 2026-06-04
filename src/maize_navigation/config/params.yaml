@@ -2,12 +2,9 @@ maize_navigator:
   ros__parameters:
     cmd_vel_topic: "/cmd_vel"
     base_frame: "base_link"
-    odom_frame: "odom"
     map_topic: "/map"
     map_frame: "map"
     scan_topic: "/sensors/merged_scan"
-    use_slam_map: true
-    require_map_for_turns: true
 
     control_frequency: 30.0
 
@@ -22,30 +19,14 @@ maize_navigator:
     hist_roi_width: 25.0
     hist_bin_size: 0.05
     hist_peak_min_points: 3
-
-    roi_x_min: 0.25
-    roi_x_max: 2.0
-    roi_y_abs_min: 0.18
-    roi_y_abs_max: 0.90
-
-    acquire_roi_x_min: -0.30
-    acquire_roi_x_max: 2.80
-    acquire_roi_y_abs_min: 0.05
-    acquire_roi_y_abs_max: 1.20
-
-    ransac_iterations: 80
-    ransac_distance: 0.08
-    min_inliers: 5
-    min_visible_length: 0.35
-    max_abs_line_slope: 0.9
-    centerline_max_abs_slope: 0.7
+    map_row_occupancy_threshold: 50
 
     # Rechteck-Marching-Reihenerkennung:
     # Die initiale linke/rechte Reihe kommt einmalig aus Histogrammpeaks.
     # Danach werden beide Reihen bei jedem Kartenupdate von dieser Initialgeraden neu berechnet.
     row_segment_point_count: 5
     row_segment_point_spacing: 0.30
-    row_rectangle_width: 0.5
+    row_rectangle_width: 0.6
     row_point_window_length: 0.30
     row_end_min_points_fields_3_to_5: 2
     row_max_march_steps: 120
@@ -76,31 +57,10 @@ maize_navigator:
     laser_max_weight_one_side: 0.15
     laser_tracker_alpha: 0.25
 
-    tracker_alpha: 0.18
-    confidence_decay: 0.95
-
-    front_density_x_min: 0.60
-    front_density_x_max: 2.00
-    front_density_y_abs: 0.45
-    front_density_threshold: 1
-    end_probability_threshold: 0.88
-    end_stable_frames_required: 35
-
-    min_follow_confidence: 0.10
-    min_enter_confidence: 0.12
-    enter_stable_frames_required: 3
-    acquire_timeout_sec: 8.0
-
     follow_speed: 0.5
     slow_speed: 0.12
-    enter_speed: 0.22
-    turn_speed: 0.22
-    yaw_kp: 0.6
     pure_pursuit_gain: 1.4
     curve_speed_reduction_gain: 2.5
-    heading_kp: 1.2
-    lateral_kp: 1.0
-    stanley_min_speed: 0.10
     min_follow_turn_radius: 0.37
     target_filter_alpha: 0.45
     # Ausfahr- und Einfahrziel liegen so weit ausserhalb der Pflanzenenden.
@@ -108,10 +68,7 @@ maize_navigator:
     # Sicherheitsabstand der Wende-Querlinie hinter dem aeussersten relevanten Peak.
     row_exit_extension_distance: 0.50
 
-    max_linear_speed: 0.45
-    max_angular_speed: 1.40
     follow_max_angular_speed: 0.90
-    turn_max_angular_speed: 1.40
     angular_rate_limit: 2.8
 
     lookahead_distance: 2.0
@@ -120,11 +77,10 @@ maize_navigator:
     lookahead_curvature_sample_count: 7
     lookahead_curvature_back_distance: 0.5
     lookahead_lateral_error_gain: 1.0
+    lookahead_filter_alpha: 0.35
     lookahead_speed_reduction_gain: 2.5
-    turn_min_angular_speed: 0.30
 
     path_goal_xy_tolerance: 0.25
-    path_goal_yaw_tolerance: 0.75
     # Fuer Reihenende, Wendepunkt und neue Einfahrt: groessere Pose-Toleranz.
     maneuver_goal_xy_tolerance: 0.25
     maneuver_goal_yaw_tolerance: 0.75
@@ -134,6 +90,10 @@ maize_navigator:
     maneuver_speed: 0.5
     maneuver_slow_speed: 0.10
     maneuver_lookahead_distance: 0.8
+    maneuver_turn_lookahead_distance: 0.35
+    maneuver_lookahead_curvature_gain: 2.5
+    maneuver_lookahead_lateral_error_gain: 0.5
+    maneuver_lookahead_filter_alpha: 0.45
     maneuver_route_spacing: 0.08
     maneuver_corner_radius: 0.40
     maneuver_entry_extension_distance: 0.80
@@ -141,105 +101,11 @@ maize_navigator:
     maneuver_entry_lateral_tolerance: 0.25
     maneuver_entry_yaw_tolerance: 0.45
 
-    exit_distance: 0.70
-    turn_forward_distance: 2.20
-    min_turn_radius: 0.38
-    enter_distance: 0.90
-
     pattern: "3L 6R 5R 4R 3R 2R 1R"
     # Startgasse 1 liegt zwischen Pflanzenreihe 1 und 2.
     # Die Richtung gilt feldfest relativ zur Blickrichtung beim Missionsstart.
     starting_lane_number: 1
     row_numbers_increase_to: "left"
     row_map_output_directory: "~/.ros/maize_navigation"
-
-    row_shift_count: 1
-    row_shift_direction: "L"
-    turn_180: true
-
-    # Vorgewende-Gassenwechsel:
-    # Rausbogen -> pattern-relativer Versatz -> Reinbogen.
-    # Die normale Reihenfahrt bleibt unveraendert.
-    headland_maneuver_enabled: true
-    headland_exit_straight_distance: 0.45
-    headland_exit_straight_speed: 0.18
-    exit_curve_speed: 0.18
-    exit_curve_angular_speed: 0.48
-    exit_curve_yaw_change: 1.35
-
-    headland_shift_speed: 0.22
-    headland_shift_tolerance: 0.04
-    headland_shift_overshoot_tolerance: 0.08
-    headland_yaw_tolerance: 0.25
-    headland_use_map_row_heading: true
-    headland_heading_kp: 1.4
-    headland_heading_max_yaw_error: 0.75
-
-    entry_curve_speed: 0.16
-    entry_curve_angular_speed: 0.427
-    # Automatisch: pi - exit_curve_yaw_change, damit die Wende wirklich ~180 Grad erreicht.
-    headland_total_yaw_change: 3.141592653589793
-    entry_curve_yaw_change: -1.0
-    entry_yaw_accept_tolerance: 0.35
-    entry_shift_accept_tolerance: 0.10
-    entry_row_min_confidence: 0.32
-    entry_row_stable_frames: 10
-    entry_require_full_lane: true
-    entry_center_b_tolerance: 0.14
-    entry_lane_width_tolerance: 0.22
-    entry_row_yaw_tolerance: 0.35
-
-    # Direkter Nachbargassenwechsel 1L/1R:
-    # Zielreihe erst akzeptieren, wenn der Versatz erreicht ist und
-    # die Maisreihe auf der erwarteten Seite sichtbar ist.
-    neighbor_reference_turn_enabled: true
-    neighbor_reference_entry_requires_shift: true
-    neighbor_reference_requires_same_side_row: true
-
-    map_row_detection_enabled: true
-    map_row_occupancy_threshold: 50
-    map_row_search_x_forward: 5.0
-    map_row_search_x_backward: 4.0
-    map_row_search_y_side: 5.0
-    map_row_use_pca_orientation: true
-    map_row_pca_radius: 5.0
-    map_row_pca_min_points: 80
-    map_row_lateral_bin: 0.10
-    map_row_min_band_points: 12
-    map_row_min_band_length: 1.2
-    map_row_max_extrapolated_lanes: 3
-
-    # SLAM-Reihenerkennung ueber Linienfit durch belegte Map-Zellen.
-    # Daraus werden Pflanzenreihen und anschliessend Gassenmittelpunkte berechnet.
-    map_row_line_ransac_iterations: 180
-    map_row_line_distance: 0.12
-    map_row_min_line_inliers: 18
-    map_row_min_line_length: 1.20
-    map_row_max_abs_line_slope: 0.70
-    map_row_max_lines: 12
-    map_row_line_merge_distance: 0.22
-
-    # SLAM darf die Zielgasse nur korrigieren, wenn sie zum Pattern passt.
-    # 1L erwartet ca. +0.75 m, 2R ca. -1.50 m, 3R ca. -2.25 m.
-    # Eine erkannte Lane bei z. B. +2.90 m wird fuer 1L verworfen.
-    # Toleranz fuer pattern-relatives Zählen der SLAM-Reihenlinien.
-    # Beispiel 2R: Zielzentrum ca. -1.50 m relativ zur aktuellen Gasse.
-    # Eine weiter entfernte Linie/Gasse wird verworfen und nicht als Ziel akzeptiert.
-    map_lane_accept_tolerance: 0.45
-
-    turn_replan_enabled: true
-    turn_replan_period_frames: 5
-    turn_replan_max_attempts: 60
-
-    # Wenn die neue Gasse lokal stabil erkannt ist, wird der globale Turn beendet.
-    # Dadurch faehrt der Roboter nicht an der Zielgasse vorbei.
-    turn_exit_on_local_row: true
-    turn_exit_min_confidence: 0.32
-    turn_exit_stable_frames: 10
-
-    enable_safety: false
-
-    obstacle_stop_distance: 0.25
-    obstacle_slow_distance: 0.45
 
     publish_debug: true

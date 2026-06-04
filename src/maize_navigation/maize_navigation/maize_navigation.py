@@ -84,6 +84,34 @@ class PatternStep:
 
 
 @dataclass
+class DrivingProfile:
+    laser_max_weight_both_sides: float
+    laser_max_weight_one_side: float
+    follow_speed: float
+    slow_speed: float
+    pure_pursuit_gain: float
+    curve_speed_reduction_gain: float
+    follow_max_angular_speed: float
+    min_follow_turn_radius: float
+    angular_rate_limit: float
+    target_filter_alpha: float
+    lookahead_distance: float
+    turn_lookahead_distance: float
+    lookahead_curvature_gain: float
+    lookahead_lateral_error_gain: float
+    lookahead_filter_alpha: float
+    lookahead_speed_reduction_gain: float
+    maneuver_speed: float
+    maneuver_slow_speed: float
+    maneuver_lookahead_distance: float
+    maneuver_turn_lookahead_distance: float
+    maneuver_lookahead_curvature_gain: float
+    maneuver_lookahead_lateral_error_gain: float
+    maneuver_lookahead_filter_alpha: float
+    maneuver_corner_radius: float
+
+
+@dataclass
 class EntrancePeak:
     lateral: float
     point: np.ndarray
@@ -168,8 +196,8 @@ class NavigatorParams:
     laser_max_center_offset: float = 0.40
     laser_min_confidence: float = 0.25
     laser_full_confidence: float = 0.85
-    laser_max_weight_both_sides: float = 0.80
-    laser_max_weight_one_side: float = 0.40
+    laser_max_weight_both_sides: float = 0.30
+    laser_max_weight_one_side: float = 0.15
     laser_tracker_alpha: float = 0.25
 
     follow_speed: float = 0.20
@@ -180,11 +208,11 @@ class NavigatorParams:
     lookahead_curvature_sample_count: int = 7
     lookahead_curvature_back_distance: float = 0.50
     lookahead_lateral_error_gain: float = 1.0
+    lookahead_filter_alpha: float = 0.35
     lookahead_speed_reduction_gain: float = 1.5
-    yaw_kp: float = 0.6
     pure_pursuit_gain: float = 1.0
     curve_speed_reduction_gain: float = 1.0
-    max_angular_speed: float = 0.40
+    follow_max_angular_speed: float = 0.40
     min_follow_turn_radius: float = 0.37
     angular_rate_limit: float = 1.2
     target_filter_alpha: float = 0.35
@@ -197,6 +225,10 @@ class NavigatorParams:
     maneuver_speed: float = 0.16
     maneuver_slow_speed: float = 0.10
     maneuver_lookahead_distance: float = 0.80
+    maneuver_turn_lookahead_distance: float = 0.35
+    maneuver_lookahead_curvature_gain: float = 2.5
+    maneuver_lookahead_lateral_error_gain: float = 0.5
+    maneuver_lookahead_filter_alpha: float = 0.45
     maneuver_route_spacing: float = 0.08
     maneuver_corner_radius: float = 0.50
     maneuver_entry_extension_distance: float = 0.80
@@ -402,6 +434,8 @@ class MaizeNavigator(Node):
         self.laser_follower = LaserRowFollower(self.p)
         self.laser_follow_result = LaserFollowResult(reason="not initialized")
         self.fused_target_point: Optional[np.ndarray] = None
+        self.driving_profiles = self.build_driving_profiles()
+        self.current_carefulness = "high"
 
         self.left_row: Optional[RowMarchModel] = None
         self.right_row: Optional[RowMarchModel] = None
@@ -414,6 +448,8 @@ class MaizeNavigator(Node):
         self.last_target_point: Optional[np.ndarray] = None
         self.current_lookahead_distance: float = self.p.lookahead_distance
         self.current_lookahead_curvature: float = 0.0
+        self.current_maneuver_lookahead_distance: float = self.p.maneuver_lookahead_distance
+        self.current_maneuver_lookahead_curvature: float = 0.0
         self.initial_forward_direction: Optional[np.ndarray] = None
         self.row_number_increase_direction: Optional[np.ndarray] = None
         self.pattern_steps: List[PatternStep] = self.parse_pattern(self.p.pattern)
@@ -531,13 +567,13 @@ class MaizeNavigator(Node):
         p.lookahead_lateral_error_gain = float(
             get_param("lookahead_lateral_error_gain", p.lookahead_lateral_error_gain)
         )
+        p.lookahead_filter_alpha = float(get_param("lookahead_filter_alpha", p.lookahead_filter_alpha))
         p.lookahead_speed_reduction_gain = float(
             get_param("lookahead_speed_reduction_gain", p.lookahead_speed_reduction_gain)
         )
-        p.yaw_kp = float(get_param("yaw_kp", p.yaw_kp))
         p.pure_pursuit_gain = float(get_param("pure_pursuit_gain", p.pure_pursuit_gain))
         p.curve_speed_reduction_gain = float(get_param("curve_speed_reduction_gain", p.curve_speed_reduction_gain))
-        p.max_angular_speed = float(get_param("follow_max_angular_speed", p.max_angular_speed))
+        p.follow_max_angular_speed = float(get_param("follow_max_angular_speed", p.follow_max_angular_speed))
         p.min_follow_turn_radius = float(get_param("min_follow_turn_radius", p.min_follow_turn_radius))
         p.angular_rate_limit = float(get_param("angular_rate_limit", p.angular_rate_limit))
         p.target_filter_alpha = float(get_param("target_filter_alpha", p.target_filter_alpha))
@@ -554,6 +590,18 @@ class MaizeNavigator(Node):
         p.maneuver_speed = float(get_param("maneuver_speed", p.maneuver_speed))
         p.maneuver_slow_speed = float(get_param("maneuver_slow_speed", p.maneuver_slow_speed))
         p.maneuver_lookahead_distance = float(get_param("maneuver_lookahead_distance", p.maneuver_lookahead_distance))
+        p.maneuver_turn_lookahead_distance = float(
+            get_param("maneuver_turn_lookahead_distance", p.maneuver_turn_lookahead_distance)
+        )
+        p.maneuver_lookahead_curvature_gain = float(
+            get_param("maneuver_lookahead_curvature_gain", p.maneuver_lookahead_curvature_gain)
+        )
+        p.maneuver_lookahead_lateral_error_gain = float(
+            get_param("maneuver_lookahead_lateral_error_gain", p.maneuver_lookahead_lateral_error_gain)
+        )
+        p.maneuver_lookahead_filter_alpha = float(
+            get_param("maneuver_lookahead_filter_alpha", p.maneuver_lookahead_filter_alpha)
+        )
         p.maneuver_route_spacing = float(get_param("maneuver_route_spacing", p.maneuver_route_spacing))
         p.maneuver_corner_radius = float(get_param("maneuver_corner_radius", p.maneuver_corner_radius))
         p.maneuver_entry_extension_distance = float(
@@ -621,6 +669,7 @@ class MaizeNavigator(Node):
         self.p.lookahead_curvature_sample_count = max(3, self.p.lookahead_curvature_sample_count)
         self.p.lookahead_curvature_back_distance = max(0.0, self.p.lookahead_curvature_back_distance)
         self.p.lookahead_lateral_error_gain = max(0.0, self.p.lookahead_lateral_error_gain)
+        self.p.lookahead_filter_alpha = float(np.clip(self.p.lookahead_filter_alpha, 0.01, 1.0))
         self.p.lookahead_speed_reduction_gain = max(0.0, self.p.lookahead_speed_reduction_gain)
         self.p.slow_speed = float(np.clip(self.p.slow_speed, 0.0, self.p.follow_speed))
         self.p.curve_speed_reduction_gain = max(0.0, self.p.curve_speed_reduction_gain)
@@ -630,6 +679,14 @@ class MaizeNavigator(Node):
         self.p.maneuver_speed = max(0.01, self.p.maneuver_speed)
         self.p.maneuver_slow_speed = float(np.clip(self.p.maneuver_slow_speed, 0.01, self.p.maneuver_speed))
         self.p.maneuver_lookahead_distance = max(0.05, self.p.maneuver_lookahead_distance)
+        self.p.maneuver_turn_lookahead_distance = float(
+            np.clip(self.p.maneuver_turn_lookahead_distance, 0.05, self.p.maneuver_lookahead_distance)
+        )
+        self.p.maneuver_lookahead_curvature_gain = max(0.0, self.p.maneuver_lookahead_curvature_gain)
+        self.p.maneuver_lookahead_lateral_error_gain = max(0.0, self.p.maneuver_lookahead_lateral_error_gain)
+        self.p.maneuver_lookahead_filter_alpha = float(
+            np.clip(self.p.maneuver_lookahead_filter_alpha, 0.01, 1.0)
+        )
         self.p.maneuver_route_spacing = max(0.02, self.p.maneuver_route_spacing)
         self.p.maneuver_corner_radius = max(0.0, self.p.maneuver_corner_radius)
         self.p.maneuver_entry_extension_distance = max(0.10, self.p.maneuver_entry_extension_distance)
@@ -656,8 +713,14 @@ class MaizeNavigator(Node):
             res.success = False
             res.message = "Invalid pattern. Use space-separated steps such as '1L 2R'."
             return res
+        carefulness = getattr(req, "carefulness", "").strip().lower() or "high"
+        if carefulness not in self.driving_profiles:
+            res.success = False
+            res.message = "Invalid carefulness. Use one of: low, medium, high."
+            return res
 
         self.p.pattern = pattern
+        self.apply_driving_profile(carefulness)
         self.pattern_steps = self.parse_pattern(pattern)
         self.left_row = None
         self.right_row = None
@@ -680,8 +743,97 @@ class MaizeNavigator(Node):
         self.fused_target_point = None
         self.state = MissionState.INITIALIZING
         res.success = True
-        res.message = f"Navigation started with pattern: {pattern}"
+        res.message = f"Navigation started with pattern: {pattern}; carefulness: {carefulness}"
         return res
+
+    def build_driving_profiles(self) -> Dict[str, DrivingProfile]:
+        high = DrivingProfile(
+            laser_max_weight_both_sides=self.p.laser_max_weight_both_sides,
+            laser_max_weight_one_side=self.p.laser_max_weight_one_side,
+            follow_speed=self.p.follow_speed,
+            slow_speed=self.p.slow_speed,
+            pure_pursuit_gain=self.p.pure_pursuit_gain,
+            curve_speed_reduction_gain=self.p.curve_speed_reduction_gain,
+            follow_max_angular_speed=self.p.follow_max_angular_speed,
+            min_follow_turn_radius=self.p.min_follow_turn_radius,
+            angular_rate_limit=self.p.angular_rate_limit,
+            target_filter_alpha=self.p.target_filter_alpha,
+            lookahead_distance=self.p.lookahead_distance,
+            turn_lookahead_distance=self.p.turn_lookahead_distance,
+            lookahead_curvature_gain=self.p.lookahead_curvature_gain,
+            lookahead_lateral_error_gain=self.p.lookahead_lateral_error_gain,
+            lookahead_filter_alpha=self.p.lookahead_filter_alpha,
+            lookahead_speed_reduction_gain=self.p.lookahead_speed_reduction_gain,
+            maneuver_speed=self.p.maneuver_speed,
+            maneuver_slow_speed=self.p.maneuver_slow_speed,
+            maneuver_lookahead_distance=self.p.maneuver_lookahead_distance,
+            maneuver_turn_lookahead_distance=self.p.maneuver_turn_lookahead_distance,
+            maneuver_lookahead_curvature_gain=self.p.maneuver_lookahead_curvature_gain,
+            maneuver_lookahead_lateral_error_gain=self.p.maneuver_lookahead_lateral_error_gain,
+            maneuver_lookahead_filter_alpha=self.p.maneuver_lookahead_filter_alpha,
+            maneuver_corner_radius=self.p.maneuver_corner_radius,
+        )
+        return {
+            "high": high,
+            "medium": DrivingProfile(
+                laser_max_weight_both_sides=0.55,
+                laser_max_weight_one_side=0.275,
+                follow_speed=high.follow_speed * 1.30,
+                slow_speed=high.slow_speed * 1.65,
+                pure_pursuit_gain=high.pure_pursuit_gain * 0.82,
+                curve_speed_reduction_gain=high.curve_speed_reduction_gain * 0.60,
+                follow_max_angular_speed=high.follow_max_angular_speed * 1.10,
+                min_follow_turn_radius=high.min_follow_turn_radius * 1.22,
+                angular_rate_limit=high.angular_rate_limit * 1.15,
+                target_filter_alpha=min(1.0, high.target_filter_alpha * 1.15),
+                lookahead_distance=high.lookahead_distance * 1.10,
+                turn_lookahead_distance=high.turn_lookahead_distance * 1.40,
+                lookahead_curvature_gain=high.lookahead_curvature_gain * 0.65,
+                lookahead_lateral_error_gain=high.lookahead_lateral_error_gain * 0.70,
+                lookahead_filter_alpha=min(1.0, high.lookahead_filter_alpha * 1.15),
+                lookahead_speed_reduction_gain=high.lookahead_speed_reduction_gain * 0.60,
+                maneuver_speed=high.maneuver_speed * 1.20,
+                maneuver_slow_speed=high.maneuver_slow_speed * 1.80,
+                maneuver_lookahead_distance=high.maneuver_lookahead_distance * 1.20,
+                maneuver_turn_lookahead_distance=high.maneuver_turn_lookahead_distance * 1.30,
+                maneuver_lookahead_curvature_gain=high.maneuver_lookahead_curvature_gain * 0.70,
+                maneuver_lookahead_lateral_error_gain=high.maneuver_lookahead_lateral_error_gain * 0.75,
+                maneuver_lookahead_filter_alpha=min(1.0, high.maneuver_lookahead_filter_alpha * 1.10),
+                maneuver_corner_radius=high.maneuver_corner_radius * 1.25,
+            ),
+            "low": DrivingProfile(
+                laser_max_weight_both_sides=0.80,
+                laser_max_weight_one_side=0.40,
+                follow_speed=high.follow_speed * 1.60,
+                slow_speed=high.slow_speed * 2.50,
+                pure_pursuit_gain=high.pure_pursuit_gain * 0.68,
+                curve_speed_reduction_gain=high.curve_speed_reduction_gain * 0.35,
+                follow_max_angular_speed=high.follow_max_angular_speed * 1.20,
+                min_follow_turn_radius=high.min_follow_turn_radius * 1.50,
+                angular_rate_limit=high.angular_rate_limit * 1.30,
+                target_filter_alpha=min(1.0, high.target_filter_alpha * 1.30),
+                lookahead_distance=high.lookahead_distance * 1.20,
+                turn_lookahead_distance=high.turn_lookahead_distance * 2.00,
+                lookahead_curvature_gain=high.lookahead_curvature_gain * 0.40,
+                lookahead_lateral_error_gain=high.lookahead_lateral_error_gain * 0.45,
+                lookahead_filter_alpha=min(1.0, high.lookahead_filter_alpha * 1.30),
+                lookahead_speed_reduction_gain=high.lookahead_speed_reduction_gain * 0.35,
+                maneuver_speed=high.maneuver_speed * 1.40,
+                maneuver_slow_speed=high.maneuver_slow_speed * 2.50,
+                maneuver_lookahead_distance=high.maneuver_lookahead_distance * 1.38,
+                maneuver_turn_lookahead_distance=high.maneuver_turn_lookahead_distance * 1.60,
+                maneuver_lookahead_curvature_gain=high.maneuver_lookahead_curvature_gain * 0.45,
+                maneuver_lookahead_lateral_error_gain=high.maneuver_lookahead_lateral_error_gain * 0.50,
+                maneuver_lookahead_filter_alpha=min(1.0, high.maneuver_lookahead_filter_alpha * 1.20),
+                maneuver_corner_radius=high.maneuver_corner_radius * 1.50,
+            ),
+        }
+
+    def apply_driving_profile(self, carefulness: str) -> None:
+        profile = self.driving_profiles[carefulness]
+        for name, value in profile.__dict__.items():
+            setattr(self.p, name, value)
+        self.current_carefulness = carefulness
 
     def stop_cb(self, req, res):
         self.store_current_rows()
@@ -700,6 +852,10 @@ class MaizeNavigator(Node):
         self.last_cmd_angular_z = 0.0
         self.last_target_point = None
         self.fused_target_point = None
+        self.current_lookahead_distance = self.p.lookahead_distance
+        self.current_lookahead_curvature = 0.0
+        self.current_maneuver_lookahead_distance = self.p.maneuver_lookahead_distance
+        self.current_maneuver_lookahead_curvature = 0.0
 
     def reset_entrance_state(self) -> None:
         self.entrance_hist_center = None
@@ -1121,9 +1277,22 @@ class MaizeNavigator(Node):
             projection,
             self.entrance_route_progress_index,
         )
-        lookahead = min(
-            self.p.maneuver_lookahead_distance,
-            max(0.10, 0.60 * self.entrance_route_remaining_distance),
+        lookahead = self.dynamic_maneuver_lookahead(
+            self.entrance_route,
+            projection,
+            self.entrance_route_progress_index,
+            deviation,
+            self.entrance_route_remaining_distance,
+        )
+        self.get_logger().info(
+            (
+                "Maneuver lookahead: "
+                f"distance={lookahead:.3f} "
+                f"curvature={self.current_maneuver_lookahead_curvature:.3f} "
+                f"min={self.p.maneuver_turn_lookahead_distance:.3f} "
+                f"max={self.p.maneuver_lookahead_distance:.3f}"
+            ),
+            throttle_duration_sec=0.5,
         )
         self.entrance_route_target = self.point_at_route_distance(
             self.entrance_route,
@@ -2196,14 +2365,27 @@ class MaizeNavigator(Node):
             segment_end = segment_start
         return np.asarray(polyline[0], dtype=float)
 
-    def estimate_polyline_curvature_ahead(self, polyline: np.ndarray, point: np.ndarray) -> float:
+    def estimate_polyline_curvature_ahead(
+        self,
+        polyline: np.ndarray,
+        point: np.ndarray,
+        lookahead_distance: Optional[float] = None,
+        sample_count: Optional[int] = None,
+        back_distance: Optional[float] = None,
+        projection: Optional[np.ndarray] = None,
+        segment_idx: Optional[int] = None,
+    ) -> float:
         if len(polyline) < 3:
             return 0.0
 
-        projection, segment_idx = self.project_onto_polyline(polyline, point)
-        sample_count = max(3, self.p.lookahead_curvature_sample_count)
+        if projection is None or segment_idx is None:
+            projection, segment_idx = self.project_onto_polyline(polyline, point)
+        lookahead_distance = self.p.lookahead_distance if lookahead_distance is None else lookahead_distance
+        sample_count = self.p.lookahead_curvature_sample_count if sample_count is None else sample_count
+        back_distance = self.p.lookahead_curvature_back_distance if back_distance is None else back_distance
+        sample_count = max(3, sample_count)
         samples = []
-        for distance in np.linspace(-self.p.lookahead_curvature_back_distance, self.p.lookahead_distance, sample_count):
+        for distance in np.linspace(-back_distance, lookahead_distance, sample_count):
             distance = float(distance)
             if distance < 0.0:
                 samples.append(self.point_behind_polyline_projection(polyline, projection, segment_idx, abs(distance)))
@@ -2239,15 +2421,69 @@ class MaizeNavigator(Node):
         curvature = self.estimate_polyline_curvature_ahead(polyline, point)
         projection, _ = self.project_onto_polyline(polyline, point)
         lateral_error = float(np.linalg.norm(np.asarray(point, dtype=float) - projection))
-        lookahead = self.p.lookahead_distance / (
+        raw_lookahead = self.p.lookahead_distance / (
             1.0
             + self.p.lookahead_curvature_gain * abs(curvature)
             + self.p.lookahead_lateral_error_gain * lateral_error
         )
+        raw_lookahead = float(
+            np.clip(raw_lookahead, self.p.turn_lookahead_distance, self.p.lookahead_distance)
+        )
+        alpha = self.p.lookahead_filter_alpha
+        previous_lookahead = getattr(self, "current_lookahead_distance", self.p.lookahead_distance)
+        lookahead = (1.0 - alpha) * previous_lookahead + alpha * raw_lookahead
         lookahead = float(np.clip(lookahead, self.p.turn_lookahead_distance, self.p.lookahead_distance))
         self.current_lookahead_distance = lookahead
         self.current_lookahead_curvature = curvature
         return lookahead
+
+    def dynamic_maneuver_lookahead(
+        self,
+        route: np.ndarray,
+        projection: np.ndarray,
+        segment_idx: int,
+        lateral_error: float,
+        remaining_distance: float,
+    ) -> float:
+        curvature = self.estimate_polyline_curvature_ahead(
+            route,
+            projection,
+            self.p.maneuver_lookahead_distance,
+            self.p.lookahead_curvature_sample_count,
+            self.p.lookahead_curvature_back_distance,
+            projection,
+            segment_idx,
+        )
+        raw_lookahead = self.p.maneuver_lookahead_distance / (
+            1.0
+            + self.p.maneuver_lookahead_curvature_gain * abs(curvature)
+            + self.p.maneuver_lookahead_lateral_error_gain * lateral_error
+        )
+        raw_lookahead = float(
+            np.clip(
+                raw_lookahead,
+                self.p.maneuver_turn_lookahead_distance,
+                self.p.maneuver_lookahead_distance,
+            )
+        )
+        alpha = self.p.maneuver_lookahead_filter_alpha
+        previous_lookahead = getattr(
+            self,
+            "current_maneuver_lookahead_distance",
+            self.p.maneuver_lookahead_distance,
+        )
+        filtered_lookahead = (1.0 - alpha) * previous_lookahead + alpha * raw_lookahead
+        filtered_lookahead = float(
+            np.clip(
+                filtered_lookahead,
+                self.p.maneuver_turn_lookahead_distance,
+                self.p.maneuver_lookahead_distance,
+            )
+        )
+        distance_limited_lookahead = min(filtered_lookahead, max(0.10, 0.60 * remaining_distance))
+        self.current_maneuver_lookahead_distance = distance_limited_lookahead
+        self.current_maneuver_lookahead_curvature = curvature
+        return distance_limited_lookahead
 
     def lookahead_point_from_polyline_projection(
         self,
@@ -2334,7 +2570,7 @@ class MaizeNavigator(Node):
             max_speed,
         ))
         radius_limited_angular = abs(cmd.linear.x) / self.p.min_follow_turn_radius
-        max_angular = min(self.p.max_angular_speed, radius_limited_angular)
+        max_angular = min(self.p.follow_max_angular_speed, radius_limited_angular)
         # Pure-pursuit curvature is calmer around the midline than a direct
         # proportional yaw correction and still works for headland waypoints.
         pursuit_angular = cmd.linear.x * curvature

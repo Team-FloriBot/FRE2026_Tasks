@@ -1,6 +1,7 @@
 import math
 import sys
 import types
+from pathlib import Path
 
 import numpy as np
 
@@ -52,6 +53,7 @@ def install_ros_import_stubs():
 install_ros_import_stubs()
 
 from maize_navigation.maize_navigation import (  # noqa: E402
+    DrivingProfile,
     EntrancePeak,
     LaserRowFollower,
     MaizeNavigator,
@@ -101,29 +103,94 @@ def make_navigator_for_start_callback():
     navigator.p = NavigatorParams()
     navigator.pattern_steps = [PatternStep(1, "L")]
     navigator.laser_follower = types.SimpleNamespace(reset=lambda: None)
+    navigator.driving_profiles = navigator.build_driving_profiles()
+    navigator.current_carefulness = "high"
     return navigator
 
 
 def test_start_callback_sets_requested_pattern():
     navigator = make_navigator_for_start_callback()
 
-    response = navigator.start_cb(types.SimpleNamespace(pattern="3L  2r"), types.SimpleNamespace())
+    request = types.SimpleNamespace(pattern="3L  2r", carefulness="high")
+    response = navigator.start_cb(request, types.SimpleNamespace())
 
     assert response.success
-    assert response.message == "Navigation started with pattern: 3L  2r"
+    assert response.message == "Navigation started with pattern: 3L  2r; carefulness: high"
     assert navigator.p.pattern == "3L  2r"
     assert navigator.pattern_steps == [PatternStep(3, "L"), PatternStep(2, "R")]
     assert navigator.state == MissionState.INITIALIZING
+    assert navigator.current_carefulness == "high"
+
+
+def test_start_callback_defaults_to_high_carefulness_for_empty_value():
+    navigator = make_navigator_for_start_callback()
+
+    response = navigator.start_cb(types.SimpleNamespace(pattern="3L", carefulness=""), types.SimpleNamespace())
+
+    assert response.success
+    assert navigator.current_carefulness == "high"
+
+
+def test_start_callback_applies_requested_carefulness_profile():
+    navigator = make_navigator_for_start_callback()
+    high = navigator.driving_profiles["high"]
+
+    request = types.SimpleNamespace(pattern="3L", carefulness="medium")
+    response = navigator.start_cb(request, types.SimpleNamespace())
+
+    assert response.success
+    assert navigator.current_carefulness == "medium"
+    assert navigator.p.follow_speed > high.follow_speed
+    assert navigator.p.slow_speed > high.slow_speed
+    assert navigator.p.lookahead_speed_reduction_gain < high.lookahead_speed_reduction_gain
+    assert navigator.p.lookahead_curvature_gain < high.lookahead_curvature_gain
+    assert navigator.p.laser_max_weight_both_sides > high.laser_max_weight_both_sides
+    assert navigator.p.laser_max_weight_one_side > high.laser_max_weight_one_side
+    assert navigator.current_lookahead_distance == navigator.p.lookahead_distance
 
 
 def test_start_callback_rejects_invalid_pattern_without_changing_mission():
     navigator = make_navigator_for_start_callback()
 
-    response = navigator.start_cb(types.SimpleNamespace(pattern="3L invalid"), types.SimpleNamespace())
+    request = types.SimpleNamespace(pattern="3L invalid", carefulness="high")
+    response = navigator.start_cb(request, types.SimpleNamespace())
 
     assert not response.success
     assert navigator.p.pattern == "1L 2R"
     assert navigator.pattern_steps == [PatternStep(1, "L")]
+
+
+def test_start_callback_rejects_invalid_carefulness_without_changing_mission():
+    navigator = make_navigator_for_start_callback()
+
+    request = types.SimpleNamespace(pattern="3L", carefulness="turbo")
+    response = navigator.start_cb(request, types.SimpleNamespace())
+
+    assert not response.success
+    assert navigator.p.pattern == "1L 2R"
+    assert navigator.pattern_steps == [PatternStep(1, "L")]
+    assert navigator.current_carefulness == "high"
+
+
+def test_driving_profiles_are_derived_from_high_profile():
+    navigator = make_navigator_for_start_callback()
+    high = navigator.driving_profiles["high"]
+    medium = navigator.driving_profiles["medium"]
+    low = navigator.driving_profiles["low"]
+
+    assert isinstance(high, DrivingProfile)
+    assert math.isclose(high.laser_max_weight_both_sides, 0.30)
+    assert math.isclose(high.laser_max_weight_one_side, 0.15)
+    assert math.isclose(medium.laser_max_weight_both_sides, 0.55)
+    assert math.isclose(medium.laser_max_weight_one_side, 0.275)
+    assert math.isclose(low.laser_max_weight_both_sides, 0.80)
+    assert math.isclose(low.laser_max_weight_one_side, 0.40)
+    assert medium.follow_speed > high.follow_speed
+    assert low.follow_speed > medium.follow_speed
+    assert medium.laser_max_weight_both_sides > high.laser_max_weight_both_sides
+    assert low.laser_max_weight_both_sides > medium.laser_max_weight_both_sides
+    assert medium.lookahead_speed_reduction_gain < high.lookahead_speed_reduction_gain
+    assert low.lookahead_speed_reduction_gain < medium.lookahead_speed_reduction_gain
 
 
 def test_both_rows_produce_centered_high_weight_target():
@@ -135,7 +202,8 @@ def test_both_rows_produce_centered_high_weight_target():
     assert result.valid
     assert result.left_line.valid
     assert result.right_line.valid
-    assert result.weight > 0.70
+    assert result.weight > 0.25
+    assert result.weight <= follower.p.laser_max_weight_both_sides
     assert abs(result.target_base[1]) < 0.02
 
 
@@ -245,6 +313,12 @@ def bare_navigator():
     navigator.entrance_route_target = None
     navigator.entrance_route_remaining_distance = 0.0
     navigator.entrance_route_provisional = False
+    navigator.current_maneuver_lookahead_distance = navigator.p.maneuver_lookahead_distance
+    navigator.current_maneuver_lookahead_curvature = 0.0
+    navigator.get_logger = lambda: types.SimpleNamespace(
+        info=lambda *args, **kwargs: None,
+        warn=lambda *args, **kwargs: None,
+    )
     navigator.entrance_active_step = None
     navigator.entrance_traverse_outward = None
     navigator.entrance_target = None
@@ -416,11 +490,27 @@ def test_dynamic_follow_lookahead_is_clamped_to_turn_distance():
     navigator.p.lookahead_distance = 1.0
     navigator.p.turn_lookahead_distance = 0.45
     navigator.p.lookahead_curvature_gain = 100.0
+    navigator.p.lookahead_filter_alpha = 1.0
     midline = np.array([[0.0, 0.0], [0.5, 0.0], [0.5, 0.5]])
 
     lookahead = navigator.dynamic_follow_lookahead(midline, np.array([0.0, 0.0]))
 
     assert math.isclose(lookahead, navigator.p.turn_lookahead_distance)
+
+
+def test_dynamic_follow_lookahead_filter_smooths_sudden_reduction():
+    navigator = bare_navigator()
+    navigator.p.lookahead_distance = 1.0
+    navigator.p.turn_lookahead_distance = 0.45
+    navigator.p.lookahead_curvature_gain = 100.0
+    navigator.p.lookahead_filter_alpha = 0.25
+    navigator.current_lookahead_distance = 1.0
+    midline = np.array([[0.0, 0.0], [0.5, 0.0], [0.5, 0.5]])
+
+    lookahead = navigator.dynamic_follow_lookahead(midline, np.array([0.0, 0.0]))
+
+    assert navigator.p.turn_lookahead_distance < lookahead < navigator.p.lookahead_distance
+    assert math.isclose(lookahead, 0.8625)
 
 
 def test_small_dynamic_lookahead_reduces_follow_speed_before_curvature_grows():
@@ -507,6 +597,190 @@ def test_route_target_stops_when_deviation_is_too_large():
     target = navigator.update_entrance_route_target()
 
     assert target is None
+
+
+def test_dynamic_maneuver_lookahead_stays_maximum_on_straight_route():
+    navigator = bare_navigator()
+    navigator.p.maneuver_lookahead_distance = 0.8
+    navigator.p.maneuver_turn_lookahead_distance = 0.35
+    navigator.p.maneuver_lookahead_curvature_gain = 2.5
+    navigator.p.maneuver_lookahead_lateral_error_gain = 0.5
+    navigator.p.maneuver_lookahead_filter_alpha = 1.0
+    route = np.array([[0.0, 0.0], [1.0, 0.0], [2.0, 0.0]])
+
+    lookahead = navigator.dynamic_maneuver_lookahead(route, route[0], 0, 0.0, 2.0)
+
+    assert math.isclose(lookahead, navigator.p.maneuver_lookahead_distance)
+    assert math.isclose(navigator.current_maneuver_lookahead_curvature, 0.0)
+
+
+def test_dynamic_maneuver_lookahead_shrinks_on_curved_route():
+    navigator = bare_navigator()
+    navigator.p.maneuver_lookahead_distance = 0.8
+    navigator.p.maneuver_turn_lookahead_distance = 0.35
+    navigator.p.maneuver_lookahead_curvature_gain = 2.5
+    navigator.p.maneuver_lookahead_filter_alpha = 1.0
+    route = np.array([[0.0, 0.0], [0.5, 0.0], [0.5, 0.5], [0.5, 1.0]])
+
+    lookahead = navigator.dynamic_maneuver_lookahead(route, route[0], 0, 0.0, 2.0)
+
+    assert lookahead < navigator.p.maneuver_lookahead_distance
+    assert navigator.current_maneuver_lookahead_curvature > 0.0
+
+
+def test_dynamic_maneuver_lookahead_is_clamped_to_turn_distance():
+    navigator = bare_navigator()
+    navigator.p.maneuver_lookahead_distance = 0.8
+    navigator.p.maneuver_turn_lookahead_distance = 0.35
+    navigator.p.maneuver_lookahead_curvature_gain = 100.0
+    navigator.p.maneuver_lookahead_filter_alpha = 1.0
+    route = np.array([[0.0, 0.0], [0.5, 0.0], [0.5, 0.5]])
+
+    lookahead = navigator.dynamic_maneuver_lookahead(route, route[0], 0, 0.0, 2.0)
+
+    assert math.isclose(lookahead, navigator.p.maneuver_turn_lookahead_distance)
+
+
+def test_dynamic_maneuver_lookahead_filter_smooths_sudden_reduction():
+    navigator = bare_navigator()
+    navigator.p.maneuver_lookahead_distance = 0.8
+    navigator.p.maneuver_turn_lookahead_distance = 0.35
+    navigator.p.maneuver_lookahead_curvature_gain = 100.0
+    navigator.p.maneuver_lookahead_filter_alpha = 0.25
+    navigator.current_maneuver_lookahead_distance = 0.8
+    route = np.array([[0.0, 0.0], [0.5, 0.0], [0.5, 0.5]])
+
+    lookahead = navigator.dynamic_maneuver_lookahead(route, route[0], 0, 0.0, 2.0)
+
+    assert navigator.p.maneuver_turn_lookahead_distance < lookahead < navigator.p.maneuver_lookahead_distance
+    assert math.isclose(lookahead, 0.6875)
+
+
+def test_dynamic_maneuver_lookahead_respects_remaining_distance_limit():
+    navigator = bare_navigator()
+    navigator.p.maneuver_lookahead_distance = 0.8
+    navigator.p.maneuver_turn_lookahead_distance = 0.35
+    navigator.p.maneuver_lookahead_filter_alpha = 1.0
+    route = np.array([[0.0, 0.0], [1.0, 0.0], [2.0, 0.0]])
+
+    lookahead = navigator.dynamic_maneuver_lookahead(route, route[0], 0, 0.0, 0.5)
+
+    assert math.isclose(lookahead, 0.30)
+
+
+def test_active_navigation_cleanup_removed_unused_parameters():
+    source = Path("src/maize_navigation/maize_navigation/maize_navigation.py").read_text()
+    params = Path("src/maize_navigation/config/params.yaml").read_text()
+    param_names = {line.strip().split(":", 1)[0] for line in params.splitlines() if ":" in line}
+
+    assert "yaw_kp" not in source
+    assert "p.max_angular_speed" not in source
+    assert "    max_angular_speed: float" not in source
+    for unused_param in (
+        "odom_frame",
+        "use_slam_map",
+        "require_map_for_turns",
+        "roi_x_min",
+        "roi_x_max",
+        "roi_y_abs_min",
+        "roi_y_abs_max",
+        "acquire_roi_x_min",
+        "acquire_roi_x_max",
+        "acquire_roi_y_abs_min",
+        "acquire_roi_y_abs_max",
+        "ransac_iterations",
+        "ransac_distance",
+        "min_inliers",
+        "min_visible_length",
+        "max_abs_line_slope",
+        "centerline_max_abs_slope",
+        "tracker_alpha",
+        "confidence_decay",
+        "front_density_x_min",
+        "front_density_x_max",
+        "front_density_y_abs",
+        "front_density_threshold",
+        "end_probability_threshold",
+        "end_stable_frames_required",
+        "min_follow_confidence",
+        "min_enter_confidence",
+        "enter_stable_frames_required",
+        "acquire_timeout_sec",
+        "enter_speed",
+        "turn_speed",
+        "heading_kp",
+        "lateral_kp",
+        "stanley_min_speed",
+        "max_linear_speed",
+        "max_angular_speed",
+        "turn_max_angular_speed",
+        "turn_min_angular_speed",
+        "path_goal_yaw_tolerance",
+        "exit_distance",
+        "turn_forward_distance",
+        "min_turn_radius",
+        "enter_distance",
+        "row_shift_count",
+        "row_shift_direction",
+        "turn_180",
+        "headland_maneuver_enabled",
+        "headland_exit_straight_distance",
+        "headland_exit_straight_speed",
+        "exit_curve_speed",
+        "exit_curve_angular_speed",
+        "exit_curve_yaw_change",
+        "headland_shift_speed",
+        "headland_shift_tolerance",
+        "headland_shift_overshoot_tolerance",
+        "headland_yaw_tolerance",
+        "headland_use_map_row_heading",
+        "headland_heading_kp",
+        "headland_heading_max_yaw_error",
+        "entry_curve_speed",
+        "entry_curve_angular_speed",
+        "headland_total_yaw_change",
+        "entry_curve_yaw_change",
+        "entry_yaw_accept_tolerance",
+        "entry_shift_accept_tolerance",
+        "entry_row_min_confidence",
+        "entry_row_stable_frames",
+        "entry_require_full_lane",
+        "entry_center_b_tolerance",
+        "entry_lane_width_tolerance",
+        "entry_row_yaw_tolerance",
+        "neighbor_reference_turn_enabled",
+        "neighbor_reference_entry_requires_shift",
+        "neighbor_reference_requires_same_side_row",
+        "map_row_detection_enabled",
+        "map_row_search_x_forward",
+        "map_row_search_x_backward",
+        "map_row_search_y_side",
+        "map_row_use_pca_orientation",
+        "map_row_pca_radius",
+        "map_row_pca_min_points",
+        "map_row_lateral_bin",
+        "map_row_min_band_points",
+        "map_row_min_band_length",
+        "map_row_max_extrapolated_lanes",
+        "map_row_line_ransac_iterations",
+        "map_row_line_distance",
+        "map_row_min_line_inliers",
+        "map_row_min_line_length",
+        "map_row_max_abs_line_slope",
+        "map_row_max_lines",
+        "map_row_line_merge_distance",
+        "map_lane_accept_tolerance",
+        "turn_replan_enabled",
+        "turn_replan_period_frames",
+        "turn_replan_max_attempts",
+        "turn_exit_on_local_row",
+        "turn_exit_min_confidence",
+        "turn_exit_stable_frames",
+        "enable_safety",
+        "obstacle_stop_distance",
+        "obstacle_slow_distance",
+    ):
+        assert unused_param not in param_names
 
 
 def test_provisional_turn_route_exits_then_moves_to_expected_pattern_offset():
