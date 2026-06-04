@@ -30,6 +30,13 @@ def install_ros_import_stubs():
         message_module = module(f"{package}.{module_type}")
         for name in names:
             setattr(message_module, name, type(name, (), {}))
+        if package == "geometry_msgs":
+            class Twist:
+                def __init__(self):
+                    self.linear = types.SimpleNamespace(x=0.0, y=0.0, z=0.0)
+                    self.angular = types.SimpleNamespace(x=0.0, y=0.0, z=0.0)
+
+            message_module.Twist = Twist
         if package in ("maize_navigation_interfaces", "std_srvs"):
             package_module.srv = message_module
         else:
@@ -362,6 +369,33 @@ def test_dynamic_follow_lookahead_is_clamped_to_turn_distance():
     lookahead = navigator.dynamic_follow_lookahead(midline, np.array([0.0, 0.0]))
 
     assert math.isclose(lookahead, navigator.p.turn_lookahead_distance)
+
+
+def test_small_dynamic_lookahead_reduces_follow_speed_before_curvature_grows():
+    published = []
+    navigator = bare_navigator()
+    navigator.cmd_pub = types.SimpleNamespace(publish=published.append)
+    navigator.robot_pose = Pose2D(0.0, 0.0, 0.0)
+    navigator.last_target_point = None
+    navigator.last_cmd_angular_z = 0.0
+    navigator.p.follow_speed = 0.40
+    navigator.p.slow_speed = 0.10
+    navigator.p.lookahead_distance = 1.0
+    navigator.p.curve_speed_reduction_gain = 0.0
+    navigator.p.lookahead_speed_reduction_gain = 1.5
+    navigator.current_lookahead_distance = 1.0
+
+    navigator.drive_to_point(np.array([1.0, 0.0]))
+    full_lookahead_speed = published[-1].linear.x
+
+    navigator.last_target_point = None
+    navigator.last_cmd_angular_z = 0.0
+    navigator.current_lookahead_distance = 0.5
+    navigator.drive_to_point(np.array([1.0, 0.0]))
+    reduced_lookahead_speed = published[-1].linear.x
+
+    assert math.isclose(full_lookahead_speed, navigator.p.follow_speed)
+    assert reduced_lookahead_speed < full_lookahead_speed
 
 
 def test_rounded_route_replaces_sharp_corner_with_curve():

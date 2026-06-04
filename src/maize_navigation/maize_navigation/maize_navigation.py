@@ -177,6 +177,7 @@ class NavigatorParams:
     lookahead_distance: float = 1.10
     turn_lookahead_distance: float = 0.45
     lookahead_curvature_gain: float = 1.5
+    lookahead_speed_reduction_gain: float = 1.5
     yaw_kp: float = 0.6
     pure_pursuit_gain: float = 1.0
     curve_speed_reduction_gain: float = 1.0
@@ -518,6 +519,9 @@ class MaizeNavigator(Node):
         p.lookahead_distance = float(get_param("lookahead_distance", p.lookahead_distance))
         p.turn_lookahead_distance = float(get_param("turn_lookahead_distance", p.turn_lookahead_distance))
         p.lookahead_curvature_gain = float(get_param("lookahead_curvature_gain", p.lookahead_curvature_gain))
+        p.lookahead_speed_reduction_gain = float(
+            get_param("lookahead_speed_reduction_gain", p.lookahead_speed_reduction_gain)
+        )
         p.yaw_kp = float(get_param("yaw_kp", p.yaw_kp))
         p.pure_pursuit_gain = float(get_param("pure_pursuit_gain", p.pure_pursuit_gain))
         p.curve_speed_reduction_gain = float(get_param("curve_speed_reduction_gain", p.curve_speed_reduction_gain))
@@ -602,6 +606,7 @@ class MaizeNavigator(Node):
             np.clip(self.p.turn_lookahead_distance, 0.05, self.p.lookahead_distance)
         )
         self.p.lookahead_curvature_gain = max(0.0, self.p.lookahead_curvature_gain)
+        self.p.lookahead_speed_reduction_gain = max(0.0, self.p.lookahead_speed_reduction_gain)
         self.p.slow_speed = float(np.clip(self.p.slow_speed, 0.0, self.p.follow_speed))
         self.p.curve_speed_reduction_gain = max(0.0, self.p.curve_speed_reduction_gain)
         self.p.maneuver_goal_xy_tolerance = max(0.05, self.p.maneuver_goal_xy_tolerance)
@@ -2236,12 +2241,21 @@ class MaizeNavigator(Node):
         yaw_error = wrap_to_pi(target_yaw - self.robot_pose.yaw)
 
         cmd = Twist()
+        is_follow_control = max_speed is None and min_speed is None
         max_speed = self.p.follow_speed if max_speed is None else max_speed
         min_speed = self.p.slow_speed if min_speed is None else min_speed
         pursuit_distance = max(0.10, target_distance)
         curvature = self.p.pure_pursuit_gain * 2.0 * math.sin(yaw_error) / pursuit_distance
+        lookahead_speed_penalty = 0.0
+        if is_follow_control and self.p.lookahead_distance > 1e-9:
+            lookahead_ratio = float(np.clip(self.current_lookahead_distance / self.p.lookahead_distance, 0.0, 1.0))
+            lookahead_speed_penalty = self.p.lookahead_speed_reduction_gain * (1.0 - lookahead_ratio)
         cmd.linear.x = float(np.clip(
-            max_speed / (1.0 + self.p.curve_speed_reduction_gain * abs(curvature)),
+            max_speed / (
+                1.0
+                + self.p.curve_speed_reduction_gain * abs(curvature)
+                + lookahead_speed_penalty
+            ),
             min_speed,
             max_speed,
         ))
