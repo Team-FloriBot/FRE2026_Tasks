@@ -396,6 +396,21 @@ def test_dynamic_follow_lookahead_detects_multi_point_bend():
     assert navigator.current_lookahead_curvature > 0.0
 
 
+def test_dynamic_follow_lookahead_can_include_curve_behind_robot():
+    navigator = bare_navigator()
+    navigator.p.lookahead_distance = 1.0
+    navigator.p.turn_lookahead_distance = 0.45
+    navigator.p.lookahead_curvature_gain = 1.5
+    navigator.p.lookahead_curvature_sample_count = 7
+    navigator.p.lookahead_curvature_back_distance = 0.5
+    midline = np.array([[0.0, 0.0], [0.5, 0.0], [0.5, 0.5], [0.5, 1.5]])
+
+    lookahead = navigator.dynamic_follow_lookahead(midline, np.array([0.5, 0.25]))
+
+    assert lookahead < navigator.p.lookahead_distance
+    assert navigator.current_lookahead_curvature > 0.0
+
+
 def test_dynamic_follow_lookahead_is_clamped_to_turn_distance():
     navigator = bare_navigator()
     navigator.p.lookahead_distance = 1.0

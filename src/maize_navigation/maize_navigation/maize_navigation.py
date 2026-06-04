@@ -178,6 +178,7 @@ class NavigatorParams:
     turn_lookahead_distance: float = 0.45
     lookahead_curvature_gain: float = 1.5
     lookahead_curvature_sample_count: int = 7
+    lookahead_curvature_back_distance: float = 0.50
     lookahead_lateral_error_gain: float = 1.0
     lookahead_speed_reduction_gain: float = 1.5
     yaw_kp: float = 0.6
@@ -524,6 +525,9 @@ class MaizeNavigator(Node):
         p.lookahead_curvature_sample_count = int(
             get_param("lookahead_curvature_sample_count", p.lookahead_curvature_sample_count)
         )
+        p.lookahead_curvature_back_distance = float(
+            get_param("lookahead_curvature_back_distance", p.lookahead_curvature_back_distance)
+        )
         p.lookahead_lateral_error_gain = float(
             get_param("lookahead_lateral_error_gain", p.lookahead_lateral_error_gain)
         )
@@ -615,6 +619,7 @@ class MaizeNavigator(Node):
         )
         self.p.lookahead_curvature_gain = max(0.0, self.p.lookahead_curvature_gain)
         self.p.lookahead_curvature_sample_count = max(3, self.p.lookahead_curvature_sample_count)
+        self.p.lookahead_curvature_back_distance = max(0.0, self.p.lookahead_curvature_back_distance)
         self.p.lookahead_lateral_error_gain = max(0.0, self.p.lookahead_lateral_error_gain)
         self.p.lookahead_speed_reduction_gain = max(0.0, self.p.lookahead_speed_reduction_gain)
         self.p.slow_speed = float(np.clip(self.p.slow_speed, 0.0, self.p.follow_speed))
@@ -2166,21 +2171,51 @@ class MaizeNavigator(Node):
             segment_start = segment_end
         return np.asarray(polyline[-1], dtype=float)
 
+    def point_behind_polyline_projection(
+        self,
+        polyline: np.ndarray,
+        projection: np.ndarray,
+        start_idx: int,
+        distance_behind: float,
+    ) -> np.ndarray:
+        if len(polyline) < 2 or distance_behind <= 0.0:
+            return np.asarray(projection, dtype=float)
+
+        start_idx = int(np.clip(start_idx, 0, len(polyline) - 2))
+        travelled = 0.0
+        segment_end = np.asarray(projection, dtype=float)
+        for idx in range(start_idx, -1, -1):
+            segment_start = np.asarray(polyline[idx], dtype=float)
+            segment = segment_start - segment_end
+            seg_len = float(np.linalg.norm(segment))
+            if seg_len >= 1e-9:
+                if travelled + seg_len >= distance_behind:
+                    ratio = (distance_behind - travelled) / seg_len
+                    return segment_end + ratio * segment
+                travelled += seg_len
+            segment_end = segment_start
+        return np.asarray(polyline[0], dtype=float)
+
     def estimate_polyline_curvature_ahead(self, polyline: np.ndarray, point: np.ndarray) -> float:
         if len(polyline) < 3:
             return 0.0
 
         projection, segment_idx = self.project_onto_polyline(polyline, point)
         sample_count = max(3, self.p.lookahead_curvature_sample_count)
-        samples = [
-            self.point_at_polyline_distance_from_projection(
-                polyline,
-                projection,
-                segment_idx,
-                float(distance),
-            )
-            for distance in np.linspace(0.0, self.p.lookahead_distance, sample_count)
-        ]
+        samples = []
+        for distance in np.linspace(-self.p.lookahead_curvature_back_distance, self.p.lookahead_distance, sample_count):
+            distance = float(distance)
+            if distance < 0.0:
+                samples.append(self.point_behind_polyline_projection(polyline, projection, segment_idx, abs(distance)))
+            else:
+                samples.append(
+                    self.point_at_polyline_distance_from_projection(
+                        polyline,
+                        projection,
+                        segment_idx,
+                        distance,
+                    )
+                )
 
         directions: List[float] = []
         arc_length = 0.0
