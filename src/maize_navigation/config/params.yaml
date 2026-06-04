@@ -91,7 +91,7 @@ maize_navigator:
     enter_stable_frames_required: 3
     acquire_timeout_sec: 8.0
 
-    follow_speed: 0.6
+    follow_speed: 0.5
     slow_speed: 0.12
     enter_speed: 0.22
     turn_speed: 0.22
@@ -116,10 +116,10 @@ maize_navigator:
 
     lookahead_distance: 1.8
     turn_lookahead_distance: 0.25
-    lookahead_curvature_gain: 3.5
+    lookahead_curvature_gain: 4.0
     lookahead_curvature_sample_count: 5
     lookahead_lateral_error_gain: 1.5
-    lookahead_speed_reduction_gain: 2.0
+    lookahead_speed_reduction_gain: 2.5
     turn_min_angular_speed: 0.30
 
     path_goal_xy_tolerance: 0.25
@@ -130,9 +130,9 @@ maize_navigator:
     # Virtueller Fuehrungspunkt hinter der Zielpose verhindert Drehen auf der Stelle.
     maneuver_heading_lookahead_distance: 0.1
     # Verrundete, monoton verfolgte Route fuer das Vorgewende.
-    maneuver_speed: 0.35
+    maneuver_speed: 0.5
     maneuver_slow_speed: 0.10
-    maneuver_lookahead_distance: 0.7
+    maneuver_lookahead_distance: 0.8
     maneuver_route_spacing: 0.08
     maneuver_corner_radius: 0.40
     maneuver_entry_extension_distance: 0.80
