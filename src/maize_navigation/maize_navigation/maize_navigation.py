@@ -1978,20 +1978,36 @@ class MaizeNavigator(Node):
             self.get_logger().info(f"Histogram peaks: {[round(p[0], 3) for p in peaks]}", throttle_duration_sec=2.0)
             return None
 
-        best_pair = None
-        best_score = float("inf")
         sorted_peaks = sorted(peaks, key=lambda item: item[0])
+        candidate_pairs: List[Tuple[float, float, int]] = []
         for left_idx in range(len(sorted_peaks) - 1):
             right_peak = sorted_peaks[left_idx][0]
             left_peak = sorted_peaks[left_idx + 1][0]
             sep = left_peak - right_peak
             if sep < self.p.min_lane_width or sep > self.p.max_lane_width:
                 continue
-            count_bonus = 0.01 * (sorted_peaks[left_idx][1] + sorted_peaks[left_idx + 1][1])
-            score = abs(sep - self.p.expected_row_width) - count_bonus
-            if score < best_score:
-                best_score = score
-                best_pair = (left_peak, right_peak)
+
+            pair_count = sorted_peaks[left_idx][1] + sorted_peaks[left_idx + 1][1]
+            candidate_pairs.append((left_peak, right_peak, pair_count))
+
+        if not candidate_pairs:
+            best_pair = None
+        else:
+            # The first measurement defines expected_row_width, so do not score
+            # candidates against the old configured width. Prefer the plant-row
+            # pair that brackets the robot's current lateral position.
+            bracketing_pairs = [
+                pair for pair in candidate_pairs if pair[1] <= 0.0 <= pair[0]
+            ]
+            scored_pairs = bracketing_pairs if bracketing_pairs else candidate_pairs
+            best_left, best_right, _ = min(
+                scored_pairs,
+                key=lambda pair: (
+                    abs(0.5 * (pair[0] + pair[1])),
+                    -pair[2],
+                ),
+            )
+            best_pair = (best_left, best_right)
 
         self.get_logger().info(
             f"Histogram peaks: {[round(p[0], 3) for p in sorted_peaks]}, selected={best_pair}",
