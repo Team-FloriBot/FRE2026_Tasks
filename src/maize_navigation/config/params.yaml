@@ -97,7 +97,7 @@ maize_navigator:
     turn_speed: 0.22
     yaw_kp: 0.6
     pure_pursuit_gain: 1.4
-    curve_speed_reduction_gain: 3.5
+    curve_speed_reduction_gain: 2.5
     heading_kp: 1.2
     lateral_kp: 1.0
     stanley_min_speed: 0.10
@@ -119,7 +119,7 @@ maize_navigator:
     lookahead_curvature_gain: 2.5
     lookahead_curvature_sample_count: 5
     lookahead_lateral_error_gain: 1.5
-    lookahead_speed_reduction_gain: 2.0
+    lookahead_speed_reduction_gain: 1.5
     turn_min_angular_speed: 0.30
 
     path_goal_xy_tolerance: 0.25
