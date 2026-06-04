@@ -1023,7 +1023,7 @@ class MaizeNavigator(Node):
 
     def handle_initializing(self) -> None:
         points = self.get_map_points_in_hist_roi(self.robot_pose)
-        if len(points) < 5:
+        if len(points) < 2:
             self.get_logger().info(f"Not enough occupied map points for histogram: {len(points)}", throttle_duration_sec=2.0)
             return
 
@@ -1076,6 +1076,10 @@ class MaizeNavigator(Node):
         previous_width = self.p.expected_row_width
         self.p.expected_row_width = reference_width
         if abs(reference_width - previous_width) > 1e-6:
+            if hasattr(self, "laser_follower"):
+                self.laser_follower.reset()
+            if hasattr(self, "laser_follow_result"):
+                self.laser_follow_result = LaserFollowResult(reason="row width reference updated")
             self.get_logger().info(
                 f"Using first histogram row width as reference: {reference_width:.3f} m "
                 f"(configured {previous_width:.3f} m)"
@@ -2915,6 +2919,12 @@ class MaizeNavigator(Node):
         roi_direction = result.roi_direction
         if len(roi_centers) != 2:
             roi_centers, roi_direction = self.laser_follower.build_rois(None, np.array([x_max, 0.0], dtype=float))
+        else:
+            roi_direction = self.normalize(roi_direction)
+            roi_perp = np.array([-roi_direction[1], roi_direction[0]], dtype=float)
+            lane_center = 0.5 * (np.asarray(roi_centers[0], dtype=float) + np.asarray(roi_centers[1], dtype=float))
+            half_lane = 0.5 * self.p.expected_row_width
+            roi_centers = [lane_center + half_lane * roi_perp, lane_center - half_lane * roi_perp]
         for center_base, namespace in zip(roi_centers, ("laser_left_roi", "laser_right_roi")):
             markers.markers.append(
                 self.create_rectangle_marker(
@@ -2964,7 +2974,11 @@ class MaizeNavigator(Node):
             marker_id += 1
 
         status_point = self.base_point_to_map(np.array([0.35, 0.0], dtype=float))
-        status = f"laser conf={result.confidence:.2f} weight={result.weight:.2f} {result.reason}"
+        status = (
+            f"laser conf={result.confidence:.2f} weight={result.weight:.2f} "
+            f"row_w={self.p.expected_row_width:.2f} roi_w={self.laser_follower.effective_roi_width():.2f} "
+            f"{result.reason}"
+        )
         markers.markers.append(self.create_text_marker("laser_follow_status", marker_id, status_point, status, (1.0, 1.0, 1.0, 1.0), stamp))
         return marker_id + 1
 
