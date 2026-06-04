@@ -58,16 +58,16 @@ maize_navigator:
     # StartNavigation.carefulness=medium/low derives faster runtime profiles from these values.
     follow_speed: 0.50
     slow_speed: 0.12
-    lookahead_distance: 0.85
-    pose_lateral_gain: 0.22
+    lookahead_distance: 0.75
+    pose_lateral_gain: 0.3
     pose_heading_gain: 0.35
-    pose_curvature_feedforward_gain: 0.08
+    pose_curvature_feedforward_gain: 0.1
     pose_lateral_rate_gain: 1.25
     lateral_error_limit: 0.35
     lateral_rate_limit: 0.45
     curve_speed_reduction_gain: 3.0
     lateral_speed_reduction_gain: 4.0
-    lateral_rate_speed_reduction_gain: 3.5
+    lateral_rate_speed_reduction_gain: 4.0
     linear_accel_limit: 0.25
     angular_control_speed: 0.25
     ackermann_wheelbase: 1.1
