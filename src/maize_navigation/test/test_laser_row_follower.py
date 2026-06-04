@@ -30,13 +30,6 @@ def install_ros_import_stubs():
         message_module = module(f"{package}.{module_type}")
         for name in names:
             setattr(message_module, name, type(name, (), {}))
-        if package == "geometry_msgs":
-            class Twist:
-                def __init__(self):
-                    self.linear = types.SimpleNamespace(x=0.0, y=0.0, z=0.0)
-                    self.angular = types.SimpleNamespace(x=0.0, y=0.0, z=0.0)
-
-            message_module.Twist = Twist
         if package in ("maize_navigation_interfaces", "std_srvs"):
             package_module.srv = message_module
         else:
@@ -101,59 +94,29 @@ def make_navigator_for_start_callback():
     navigator.p = NavigatorParams()
     navigator.pattern_steps = [PatternStep(1, "L")]
     navigator.laser_follower = types.SimpleNamespace(reset=lambda: None)
-    navigator.driving_profiles = navigator.build_driving_profiles()
-    navigator.current_carefulness = "high"
     return navigator
 
 
 def test_start_callback_sets_requested_pattern():
     navigator = make_navigator_for_start_callback()
 
-    request = types.SimpleNamespace(pattern="3L  2r", carefulness="high")
-    response = navigator.start_cb(request, types.SimpleNamespace())
+    response = navigator.start_cb(types.SimpleNamespace(pattern="3L  2r"), types.SimpleNamespace())
 
     assert response.success
-    assert response.message == "Navigation started with pattern: 3L  2r; carefulness: high"
+    assert response.message == "Navigation started with pattern: 3L  2r"
     assert navigator.p.pattern == "3L  2r"
     assert navigator.pattern_steps == [PatternStep(3, "L"), PatternStep(2, "R")]
     assert navigator.state == MissionState.INITIALIZING
-    assert navigator.current_carefulness == "high"
-
-
-def test_start_callback_applies_requested_carefulness_profile():
-    navigator = make_navigator_for_start_callback()
-    high_speed = navigator.p.follow_speed
-
-    request = types.SimpleNamespace(pattern="3L", carefulness="medium")
-    response = navigator.start_cb(request, types.SimpleNamespace())
-
-    assert response.success
-    assert navigator.current_carefulness == "medium"
-    assert navigator.p.follow_speed > high_speed
-    assert navigator.p.slow_speed > NavigatorParams().slow_speed
 
 
 def test_start_callback_rejects_invalid_pattern_without_changing_mission():
     navigator = make_navigator_for_start_callback()
 
-    request = types.SimpleNamespace(pattern="3L invalid", carefulness="high")
-    response = navigator.start_cb(request, types.SimpleNamespace())
+    response = navigator.start_cb(types.SimpleNamespace(pattern="3L invalid"), types.SimpleNamespace())
 
     assert not response.success
     assert navigator.p.pattern == "1L 2R"
     assert navigator.pattern_steps == [PatternStep(1, "L")]
-
-
-def test_start_callback_rejects_invalid_carefulness_without_changing_mission():
-    navigator = make_navigator_for_start_callback()
-
-    request = types.SimpleNamespace(pattern="3L", carefulness="turbo")
-    response = navigator.start_cb(request, types.SimpleNamespace())
-
-    assert not response.success
-    assert navigator.p.pattern == "1L 2R"
-    assert navigator.pattern_steps == [PatternStep(1, "L")]
-    assert navigator.current_carefulness == "high"
 
 
 def test_both_rows_produce_centered_high_weight_target():
@@ -261,24 +224,6 @@ def test_rois_fall_back_to_robot_heading_without_map_direction():
     assert np.allclose(direction, np.array([1.0, 0.0]))
 
 
-def test_laser_rois_track_previous_valid_ransac_direction_until_reset():
-    follower = LaserRowFollower(NavigatorParams())
-    scan = make_scan([(0.25, 0.375), (0.25, -0.375)])
-
-    first = process_repeatedly(follower, scan, map_slope=0.25, map_target=(1.4, 0.35))
-    second = follower.process_scan(scan, 0.0, np.array([1.4, 0.35]))
-    second_roi_slope = second.roi_direction[1] / second.roi_direction[0]
-
-    assert first.valid
-    assert second.valid
-    assert 0.15 < second_roi_slope < first.center_slope
-
-    follower.reset()
-    after_reset = follower.process_scan(scan, 0.0, np.array([1.4, 0.35]))
-
-    assert abs(after_reset.roi_direction[1]) < 1e-9
-
-
 def bare_navigator():
     navigator = MaizeNavigator.__new__(MaizeNavigator)
     navigator.p = NavigatorParams()
@@ -341,26 +286,6 @@ def test_midline_does_not_modify_independent_row_results():
     assert np.allclose(midline[-1], np.array([0.6, 0.575]))
 
 
-def test_laser_roi_direction_uses_local_map_row_marching_direction():
-    navigator = bare_navigator()
-    navigator.left_row = RowMarchModel("left", np.array([0.0, 0.4]), np.array([0.3, 0.4]), np.array([1.0, 0.0]), 2)
-    navigator.right_row = RowMarchModel("right", np.array([0.0, -0.4]), np.array([0.3, -0.4]), np.array([1.0, 0.0]), 1)
-    row_direction = np.array([1.0, 0.2])
-    row_direction = row_direction / np.linalg.norm(row_direction)
-    navigator.left_row.result = RowMarchResult(
-        points=np.array([[0.0, 0.4], [1.0, 0.4]]),
-        point_directions=np.tile(row_direction, (2, 1)),
-    )
-    navigator.right_row.result = RowMarchResult(
-        points=np.array([[0.0, -0.4], [1.0, -0.4]]),
-        point_directions=np.tile(row_direction, (2, 1)),
-    )
-
-    direction = navigator.local_map_row_direction_at(np.array([0.8, 0.0]))
-
-    assert np.allclose(direction, row_direction)
-
-
 def test_end_direction_can_still_average_independent_rows():
     navigator = bare_navigator()
 
@@ -377,31 +302,6 @@ def test_histogram_peak_uses_actual_shifted_row_end():
 
     assert end[0] > 1.8
     assert abs(end[1] + 0.4) < 1e-6
-
-
-def test_entrance_histogram_detects_peak_split_across_neighbor_bins():
-    navigator = bare_navigator()
-    navigator.get_logger = lambda: type("Logger", (), {"info": lambda *args, **kwargs: None})()
-    center = np.array([0.0, 0.0])
-    outgoing = np.array([1.0, 0.0])
-    points = np.array(
-        [
-            [0.0, -0.76],
-            [0.0, -0.75],
-            [0.0, -0.74],
-            [0.0, 0.00],
-            [0.0, 0.01],
-            [0.0, 0.02],
-            [0.0, 0.74],
-            [0.0, 0.75],
-            [0.0, 0.76],
-        ]
-    )
-
-    peaks = navigator.find_entrance_histogram_peaks(points, center, outgoing)
-
-    assert len(peaks) == 3
-    assert any(abs(peak.lateral - 0.75) < 0.05 for peak in peaks)
 
 
 def test_row_end_direction_average_is_kept_per_field_side():
@@ -450,362 +350,6 @@ def test_rounded_route_is_not_capped_by_minimum_follow_radius():
     assert first_curve_point[0] < 1.5
 
 
-def test_angular_limit_uses_control_speed_when_linear_speed_is_reduced():
-    navigator = bare_navigator()
-    published = []
-    navigator.cmd_pub = types.SimpleNamespace(publish=published.append)
-    navigator.robot_pose = Pose2D(0.0, 0.0, 0.0)
-    navigator.last_target_point = None
-    navigator.last_lateral_error = None
-    navigator.last_cmd_linear_x = 0.0
-    navigator.last_cmd_angular_z = 0.0
-    navigator.p.follow_speed = 0.50
-    navigator.p.slow_speed = 0.12
-    navigator.p.pose_lateral_gain = 10.0
-    navigator.p.pose_heading_gain = 0.0
-    navigator.p.pose_curvature_feedforward_gain = 0.0
-    navigator.p.pose_lateral_rate_gain = 0.0
-    navigator.p.curve_speed_reduction_gain = 100.0
-    navigator.p.lateral_speed_reduction_gain = 0.0
-    navigator.p.lateral_rate_speed_reduction_gain = 0.0
-    navigator.p.linear_accel_limit = 0.0
-    navigator.p.angular_control_speed = 0.35
-    navigator.p.max_angular_speed = 1.00
-    navigator.p.min_follow_turn_radius = 0.37
-    navigator.p.angular_rate_limit = 100.0
-
-    navigator.drive_to_point(np.array([0.05, 0.05]))
-
-    assert len(published) == 1
-    assert math.isclose(published[0].linear.x, navigator.p.slow_speed)
-    assert math.isclose(published[0].angular.z, 0.35 / 0.37)
-
-
-def test_ackermann_steering_limit_allows_configured_turn_radius():
-    navigator = bare_navigator()
-    navigator.p.ackermann_wheelbase = 1.0
-    navigator.p.max_steering_angle = 1.25
-    navigator.p.min_follow_turn_radius = 0.37
-
-    max_steering = min(
-        navigator.p.max_steering_angle,
-        math.atan2(navigator.p.ackermann_wheelbase, navigator.p.min_follow_turn_radius),
-    )
-    min_radius_from_steering = navigator.p.ackermann_wheelbase / math.tan(max_steering)
-
-    assert min_radius_from_steering <= navigator.p.min_follow_turn_radius + 0.01
-
-
-def test_pose_curvature_controller_turns_toward_midline_from_lateral_error():
-    navigator = bare_navigator()
-    published = []
-    navigator.cmd_pub = types.SimpleNamespace(publish=published.append)
-    navigator.robot_pose = Pose2D(0.0, -0.20, 0.0)
-    navigator.last_target_point = None
-    navigator.last_lateral_error = None
-    navigator.last_cmd_linear_x = 0.0
-    navigator.last_cmd_angular_z = 0.0
-    navigator.p.follow_speed = 0.40
-    navigator.p.slow_speed = 0.10
-    navigator.p.pose_lateral_gain = 1.0
-    navigator.p.pose_heading_gain = 0.0
-    navigator.p.pose_curvature_feedforward_gain = 0.0
-    navigator.p.pose_lateral_rate_gain = 0.0
-    navigator.p.curve_speed_reduction_gain = 0.0
-    navigator.p.lateral_speed_reduction_gain = 0.0
-    navigator.p.lateral_rate_speed_reduction_gain = 0.0
-    navigator.p.linear_accel_limit = 0.0
-    navigator.p.angular_control_speed = 0.0
-    navigator.p.ackermann_wheelbase = 1.0
-    navigator.p.max_steering_angle = 1.25
-    navigator.p.max_angular_speed = 10.0
-    navigator.p.min_follow_turn_radius = 0.37
-    navigator.p.angular_rate_limit = 100.0
-
-    navigator.drive_to_point(np.array([0.8, 0.0]), reference_polyline=np.array([[0.0, 0.0], [1.0, 0.0]]))
-
-    assert published[-1].angular.z > 0.0
-    assert navigator.controller_pull_direction is not None
-    assert navigator.controller_pull_direction[1] > 0.0
-
-
-def test_laser_reference_offset_drives_steering_when_robot_is_on_midline():
-    navigator = bare_navigator()
-    published = []
-    navigator.cmd_pub = types.SimpleNamespace(publish=published.append)
-    navigator.robot_pose = Pose2D(0.0, 0.0, 0.0)
-    navigator.last_target_point = None
-    navigator.last_lateral_error = None
-    navigator.last_cmd_linear_x = 0.0
-    navigator.last_cmd_angular_z = 0.0
-    navigator.p.follow_speed = 0.40
-    navigator.p.slow_speed = 0.10
-    navigator.p.pose_lateral_gain = 1.0
-    navigator.p.pose_heading_gain = 0.0
-    navigator.p.pose_curvature_feedforward_gain = 0.0
-    navigator.p.pose_lateral_rate_gain = 0.0
-    navigator.p.curve_speed_reduction_gain = 0.0
-    navigator.p.lateral_speed_reduction_gain = 0.0
-    navigator.p.lateral_rate_speed_reduction_gain = 0.0
-    navigator.p.linear_accel_limit = 0.0
-    navigator.p.angular_control_speed = 0.0
-    navigator.p.ackermann_wheelbase = 1.0
-    navigator.p.max_steering_angle = 1.25
-    navigator.p.max_angular_speed = 10.0
-    navigator.p.min_follow_turn_radius = 0.37
-    navigator.p.angular_rate_limit = 100.0
-
-    navigator.drive_to_point(
-        np.array([0.8, 0.0]),
-        reference_polyline=np.array([[0.0, 0.0], [1.0, 0.0]]),
-        desired_lateral_offset=-0.15,
-    )
-
-    assert published[-1].angular.z < 0.0
-    assert navigator.controller_pull_direction is not None
-    assert navigator.controller_pull_direction[1] < 0.0
-
-
-def test_pose_curvature_controller_corrects_heading_on_straight_midline():
-    navigator = bare_navigator()
-    published = []
-    navigator.cmd_pub = types.SimpleNamespace(publish=published.append)
-    navigator.robot_pose = Pose2D(0.0, 0.0, 0.30)
-    navigator.last_target_point = None
-    navigator.last_lateral_error = None
-    navigator.last_cmd_linear_x = 0.0
-    navigator.last_cmd_angular_z = 0.0
-    navigator.p.follow_speed = 0.40
-    navigator.p.slow_speed = 0.10
-    navigator.p.pose_lateral_gain = 0.0
-    navigator.p.pose_heading_gain = 1.2
-    navigator.p.pose_curvature_feedforward_gain = 0.0
-    navigator.p.pose_lateral_rate_gain = 0.0
-    navigator.p.curve_speed_reduction_gain = 0.0
-    navigator.p.lateral_speed_reduction_gain = 0.0
-    navigator.p.lateral_rate_speed_reduction_gain = 0.0
-    navigator.p.linear_accel_limit = 0.0
-    navigator.p.angular_control_speed = 0.0
-    navigator.p.max_angular_speed = 10.0
-    navigator.p.min_follow_turn_radius = 0.37
-    navigator.p.angular_rate_limit = 100.0
-
-    navigator.drive_to_point(np.array([0.8, 0.0]), reference_polyline=np.array([[0.0, 0.0], [1.0, 0.0]]))
-
-    assert published[-1].angular.z < 0.0
-
-
-def test_pose_lateral_rate_uses_heading_to_countersteer_before_crossing_midline():
-    navigator = bare_navigator()
-    published = []
-    navigator.cmd_pub = types.SimpleNamespace(publish=published.append)
-    navigator.robot_pose = Pose2D(0.0, -0.05, 0.30)
-    navigator.last_target_point = None
-    navigator.last_lateral_error = None
-    navigator.last_cmd_linear_x = 0.0
-    navigator.last_cmd_angular_z = 0.0
-    navigator.p.follow_speed = 0.40
-    navigator.p.slow_speed = 0.10
-    navigator.p.pose_lateral_gain = 0.0
-    navigator.p.pose_heading_gain = 0.0
-    navigator.p.pose_curvature_feedforward_gain = 0.0
-    navigator.p.pose_lateral_rate_gain = 1.0
-    navigator.p.curve_speed_reduction_gain = 0.0
-    navigator.p.lateral_speed_reduction_gain = 0.0
-    navigator.p.lateral_rate_speed_reduction_gain = 0.0
-    navigator.p.linear_accel_limit = 0.0
-    navigator.p.angular_control_speed = 0.0
-    navigator.p.max_angular_speed = 10.0
-    navigator.p.min_follow_turn_radius = 0.37
-    navigator.p.angular_rate_limit = 100.0
-
-    navigator.drive_to_point(np.array([0.8, 0.0]), reference_polyline=np.array([[0.0, 0.0], [1.0, 0.0]]))
-
-    assert published[-1].angular.z < 0.0
-
-
-def test_pose_lateral_rate_prefers_heading_when_measured_rate_disagrees_after_curve():
-    navigator = bare_navigator()
-    published = []
-    navigator.cmd_pub = types.SimpleNamespace(publish=published.append)
-    navigator.robot_pose = Pose2D(0.0, -0.05, 0.30)
-    navigator.last_target_point = None
-    navigator.last_lateral_error = -0.20
-    navigator.last_cmd_linear_x = 0.20
-    navigator.last_cmd_angular_z = 0.0
-    navigator.p.follow_speed = 0.40
-    navigator.p.slow_speed = 0.10
-    navigator.p.pose_lateral_gain = 0.0
-    navigator.p.pose_heading_gain = 0.0
-    navigator.p.pose_curvature_feedforward_gain = 0.0
-    navigator.p.pose_lateral_rate_gain = 1.0
-    navigator.p.curve_speed_reduction_gain = 0.0
-    navigator.p.lateral_speed_reduction_gain = 0.0
-    navigator.p.lateral_rate_speed_reduction_gain = 0.0
-    navigator.p.linear_accel_limit = 0.0
-    navigator.p.angular_control_speed = 0.0
-    navigator.p.max_angular_speed = 10.0
-    navigator.p.min_follow_turn_radius = 0.37
-    navigator.p.angular_rate_limit = 100.0
-
-    navigator.drive_to_point(np.array([0.8, 0.0]), reference_polyline=np.array([[0.0, 0.0], [1.0, 0.0]]))
-
-    assert published[-1].angular.z < 0.0
-
-
-def test_pose_curvature_controller_anticipates_ninety_degree_curve():
-    navigator = bare_navigator()
-    published = []
-    navigator.cmd_pub = types.SimpleNamespace(publish=published.append)
-    navigator.robot_pose = Pose2D(0.0, 0.0, 0.0)
-    navigator.last_target_point = None
-    navigator.last_lateral_error = None
-    navigator.last_cmd_linear_x = 0.0
-    navigator.last_cmd_angular_z = 0.0
-    navigator.p.follow_speed = 0.40
-    navigator.p.slow_speed = 0.10
-    navigator.p.lookahead_distance = 0.65
-    navigator.p.pose_lateral_gain = 0.0
-    navigator.p.pose_heading_gain = 1.2
-    navigator.p.pose_curvature_feedforward_gain = 0.8
-    navigator.p.pose_lateral_rate_gain = 0.0
-    navigator.p.curve_speed_reduction_gain = 0.0
-    navigator.p.lateral_speed_reduction_gain = 0.0
-    navigator.p.lateral_rate_speed_reduction_gain = 0.0
-    navigator.p.linear_accel_limit = 0.0
-    navigator.p.angular_control_speed = 0.0
-    navigator.p.max_angular_speed = 10.0
-    navigator.p.min_follow_turn_radius = 0.37
-    navigator.p.angular_rate_limit = 100.0
-    route = np.array([[0.0, 0.0], [0.5, 0.0], [0.5, 0.5]])
-
-    navigator.drive_to_point(np.array([0.5, 0.15]), reference_polyline=route)
-
-    assert published[-1].angular.z > 0.0
-    assert navigator.last_target_point[1] > 0.0
-
-
-def test_maneuver_control_uses_maneuver_angular_limits():
-    navigator = bare_navigator()
-    published = []
-    navigator.cmd_pub = types.SimpleNamespace(publish=published.append)
-    navigator.robot_pose = Pose2D(0.0, -0.20, 0.0)
-    navigator.last_target_point = None
-    navigator.last_lateral_error = None
-    navigator.last_cmd_linear_x = 0.0
-    navigator.last_cmd_angular_z = 0.0
-    navigator.p.pose_lateral_gain = 10.0
-    navigator.p.pose_heading_gain = 0.0
-    navigator.p.pose_curvature_feedforward_gain = 0.0
-    navigator.p.pose_lateral_rate_gain = 0.0
-    navigator.p.curve_speed_reduction_gain = 0.0
-    navigator.p.lateral_speed_reduction_gain = 0.0
-    navigator.p.lateral_rate_speed_reduction_gain = 0.0
-    navigator.p.linear_accel_limit = 0.0
-    navigator.p.angular_control_speed = 0.35
-    navigator.p.ackermann_wheelbase = 1.0
-    navigator.p.max_steering_angle = 1.25
-    navigator.p.max_angular_speed = 0.20
-    navigator.p.maneuver_max_angular_speed = 1.25
-    navigator.p.min_follow_turn_radius = 0.37
-    navigator.p.angular_rate_limit = 0.20
-    navigator.p.maneuver_angular_rate_limit = 100.0
-    navigator.p.maneuver_control_gain_scale = 1.0
-
-    navigator.drive_to_point(
-        np.array([0.8, 0.0]),
-        max_speed=0.32,
-        min_speed=0.10,
-        reference_polyline=np.array([[0.0, 0.0], [1.0, 0.0]]),
-    )
-
-    assert published[-1].angular.z > navigator.p.max_angular_speed
-    assert published[-1].angular.z <= navigator.p.maneuver_max_angular_speed
-
-
-def test_maneuver_control_gain_scale_increases_pose_curvature_response():
-    route = np.array([[0.0, 0.0], [1.0, 0.0]])
-    angular_outputs = []
-    for gain_scale in (1.0, 1.6):
-        navigator = bare_navigator()
-        published = []
-        navigator.cmd_pub = types.SimpleNamespace(publish=published.append)
-        navigator.robot_pose = Pose2D(0.0, -0.20, 0.0)
-        navigator.last_target_point = None
-        navigator.last_lateral_error = None
-        navigator.last_cmd_linear_x = 0.0
-        navigator.last_cmd_angular_z = 0.0
-        navigator.p.pose_lateral_gain = 0.3
-        navigator.p.pose_heading_gain = 0.0
-        navigator.p.pose_curvature_feedforward_gain = 0.0
-        navigator.p.pose_lateral_rate_gain = 0.0
-        navigator.p.curve_speed_reduction_gain = 0.0
-        navigator.p.lateral_speed_reduction_gain = 0.0
-        navigator.p.lateral_rate_speed_reduction_gain = 0.0
-        navigator.p.linear_accel_limit = 0.0
-        navigator.p.angular_control_speed = 0.0
-        navigator.p.max_angular_speed = 10.0
-        navigator.p.maneuver_max_angular_speed = 10.0
-        navigator.p.min_follow_turn_radius = 0.37
-        navigator.p.angular_rate_limit = 100.0
-        navigator.p.maneuver_angular_rate_limit = 100.0
-        navigator.p.maneuver_control_gain_scale = gain_scale
-
-        navigator.drive_to_point(np.array([0.8, 0.0]), max_speed=0.25, min_speed=0.10, reference_polyline=route)
-        angular_outputs.append(abs(published[-1].angular.z))
-
-    assert angular_outputs[1] > angular_outputs[0]
-
-
-def test_reference_polyline_uses_route_lookahead_not_filtered_free_target():
-    navigator = bare_navigator()
-    navigator.cmd_pub = types.SimpleNamespace(publish=lambda _cmd: None)
-    navigator.robot_pose = Pose2D(0.0, 0.0, 0.0)
-    navigator.last_target_point = np.array([0.0, 2.0])
-    navigator.last_lateral_error = None
-    navigator.last_cmd_linear_x = 0.0
-    navigator.last_cmd_angular_z = 0.0
-    navigator.p.target_filter_alpha = 0.10
-
-    target = np.array([1.0, 0.0])
-    route = np.array([[0.0, 0.0], [1.0, 0.0], [1.0, 1.0]])
-
-    navigator.drive_to_point(target, reference_polyline=route)
-
-    assert np.allclose(navigator.last_target_point, np.array([1.0, 0.1]))
-
-
-def test_pose_curvature_controller_turns_toward_midline_side():
-    navigator = bare_navigator()
-    published = []
-    navigator.cmd_pub = types.SimpleNamespace(publish=published.append)
-    navigator.robot_pose = Pose2D(0.0, -0.20, 0.0)
-    navigator.last_target_point = None
-    navigator.last_lateral_error = None
-    navigator.last_cmd_linear_x = 0.0
-    navigator.last_cmd_angular_z = 0.0
-    navigator.p.follow_speed = 0.40
-    navigator.p.slow_speed = 0.10
-    navigator.p.pose_lateral_gain = 1.0
-    navigator.p.pose_heading_gain = 0.0
-    navigator.p.pose_curvature_feedforward_gain = 0.0
-    navigator.p.pose_lateral_rate_gain = 0.0
-    navigator.p.curve_speed_reduction_gain = 0.0
-    navigator.p.lateral_speed_reduction_gain = 0.0
-    navigator.p.lateral_rate_speed_reduction_gain = 0.0
-    navigator.p.linear_accel_limit = 0.0
-    navigator.p.angular_control_speed = 0.0
-    navigator.p.max_angular_speed = 1.00
-    navigator.p.min_follow_turn_radius = 0.10
-    navigator.p.angular_rate_limit = 100.0
-
-    navigator.drive_to_point(np.array([0.8, 0.0]), reference_polyline=np.array([[0.0, 0.0], [1.0, 0.0]]))
-
-    assert published[-1].angular.z > 0.0
-    assert navigator.controller_pull_direction is not None
-    assert navigator.controller_pull_direction[1] > 0.0
-
-
 def test_entry_line_requires_crossing_with_alignment():
     navigator = bare_navigator()
     navigator.entrance_target = np.array([1.0, 0.0])
@@ -828,27 +372,6 @@ def test_route_target_uses_extension_after_missed_entry_point():
 
     assert target is not None
     assert target[0] > 1.10
-
-
-def test_headland_route_following_passes_route_reference_to_controller():
-    navigator = bare_navigator()
-    calls = []
-    navigator.ensure_provisional_entrance_route = lambda: True
-    navigator.lock_next_row_entrance = lambda: True
-    navigator.entry_line_reached = lambda goal, direction: False
-    navigator.update_entrance_route_target = lambda: np.array([1.0, 0.0])
-    navigator.drive_to_point = lambda target, max_speed=None, min_speed=None, reference_polyline=None: calls.append(
-        (target, max_speed, min_speed, reference_polyline)
-    )
-    navigator.entrance_target = np.array([2.0, 0.0])
-    navigator.entrance_target_direction = np.array([1.0, 0.0])
-    navigator.entrance_route = np.array([[0.0, 0.0], [1.0, 0.0], [2.0, 0.0]])
-    navigator.entrance_route_provisional = False
-
-    navigator.handle_find_next_row_entrance()
-
-    assert len(calls) == 1
-    assert calls[0][3] is navigator.entrance_route
 
 
 def test_route_target_stops_when_deviation_is_too_large():
@@ -925,6 +448,21 @@ def test_headland_route_stays_anchored_at_row_exit_goal():
 
     assert np.allclose(navigator.entrance_route[0], navigator.row_exit_goal)
     assert np.allclose(navigator.entrance_route_support[0], navigator.row_exit_goal)
+
+
+def test_entrance_peaks_are_regularized_to_expected_spacing():
+    navigator = bare_navigator()
+    peaks = [
+        EntrancePeak(0.00, np.array([0.0, 0.0])),
+        EntrancePeak(0.74, np.array([0.0, 0.74])),
+        EntrancePeak(1.10, np.array([0.0, 1.10])),
+        EntrancePeak(1.50, np.array([0.0, 1.50])),
+        EntrancePeak(2.25, np.array([0.0, 2.25])),
+    ]
+
+    regularized = navigator.regularize_entrance_peak_spacing(peaks)
+
+    assert [round(peak.lateral, 2) for peak in regularized] == [0.0, 0.74, 1.5, 2.25]
 
 
 def test_locked_turn_route_is_not_resampled_for_small_peak_jitter():
