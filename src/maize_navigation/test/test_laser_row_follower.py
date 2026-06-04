@@ -346,6 +346,21 @@ def test_dynamic_follow_lookahead_stays_maximum_on_straight_midline():
     assert math.isclose(navigator.current_lookahead_curvature, 0.0)
 
 
+def test_dynamic_follow_lookahead_shrinks_when_robot_is_laterally_offset():
+    navigator = bare_navigator()
+    navigator.p.lookahead_distance = 1.0
+    navigator.p.turn_lookahead_distance = 0.45
+    navigator.p.lookahead_curvature_gain = 0.0
+    navigator.p.lookahead_lateral_error_gain = 2.0
+    midline = np.array([[0.0, 0.0], [1.0, 0.0], [2.0, 0.0]])
+
+    centered = navigator.dynamic_follow_lookahead(midline, np.array([0.0, 0.0]))
+    offset = navigator.dynamic_follow_lookahead(midline, np.array([0.0, 0.25]))
+
+    assert math.isclose(centered, navigator.p.lookahead_distance)
+    assert offset < centered
+
+
 def test_dynamic_follow_lookahead_shrinks_on_ninety_degree_midline():
     navigator = bare_navigator()
     navigator.p.lookahead_distance = 1.0

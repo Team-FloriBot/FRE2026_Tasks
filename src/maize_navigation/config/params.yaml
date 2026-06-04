@@ -91,7 +91,7 @@ maize_navigator:
     enter_stable_frames_required: 3
     acquire_timeout_sec: 8.0
 
-    follow_speed: 0.45
+    follow_speed: 0.5
     slow_speed: 0.12
     enter_speed: 0.22
     turn_speed: 0.22
@@ -114,10 +114,11 @@ maize_navigator:
     turn_max_angular_speed: 1.40
     angular_rate_limit: 2.8
 
-    lookahead_distance: 2.0
+    lookahead_distance: 1.5
     turn_lookahead_distance: 0.5
-    lookahead_curvature_gain: 2.5
-    lookahead_curvature_sample_count: 7
+    lookahead_curvature_gain: 3.0
+    lookahead_curvature_sample_count: 5
+    lookahead_lateral_error_gain: 1.5
     lookahead_speed_reduction_gain: 2.5
     turn_min_angular_speed: 0.30
 

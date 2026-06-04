@@ -178,6 +178,7 @@ class NavigatorParams:
     turn_lookahead_distance: float = 0.45
     lookahead_curvature_gain: float = 1.5
     lookahead_curvature_sample_count: int = 7
+    lookahead_lateral_error_gain: float = 1.0
     lookahead_speed_reduction_gain: float = 1.5
     yaw_kp: float = 0.6
     pure_pursuit_gain: float = 1.0
@@ -523,6 +524,9 @@ class MaizeNavigator(Node):
         p.lookahead_curvature_sample_count = int(
             get_param("lookahead_curvature_sample_count", p.lookahead_curvature_sample_count)
         )
+        p.lookahead_lateral_error_gain = float(
+            get_param("lookahead_lateral_error_gain", p.lookahead_lateral_error_gain)
+        )
         p.lookahead_speed_reduction_gain = float(
             get_param("lookahead_speed_reduction_gain", p.lookahead_speed_reduction_gain)
         )
@@ -611,6 +615,7 @@ class MaizeNavigator(Node):
         )
         self.p.lookahead_curvature_gain = max(0.0, self.p.lookahead_curvature_gain)
         self.p.lookahead_curvature_sample_count = max(3, self.p.lookahead_curvature_sample_count)
+        self.p.lookahead_lateral_error_gain = max(0.0, self.p.lookahead_lateral_error_gain)
         self.p.lookahead_speed_reduction_gain = max(0.0, self.p.lookahead_speed_reduction_gain)
         self.p.slow_speed = float(np.clip(self.p.slow_speed, 0.0, self.p.follow_speed))
         self.p.curve_speed_reduction_gain = max(0.0, self.p.curve_speed_reduction_gain)
@@ -2197,7 +2202,13 @@ class MaizeNavigator(Node):
 
     def dynamic_follow_lookahead(self, polyline: np.ndarray, point: np.ndarray) -> float:
         curvature = self.estimate_polyline_curvature_ahead(polyline, point)
-        lookahead = self.p.lookahead_distance / (1.0 + self.p.lookahead_curvature_gain * abs(curvature))
+        projection, _ = self.project_onto_polyline(polyline, point)
+        lateral_error = float(np.linalg.norm(np.asarray(point, dtype=float) - projection))
+        lookahead = self.p.lookahead_distance / (
+            1.0
+            + self.p.lookahead_curvature_gain * abs(curvature)
+            + self.p.lookahead_lateral_error_gain * lateral_error
+        )
         lookahead = float(np.clip(lookahead, self.p.turn_lookahead_distance, self.p.lookahead_distance))
         self.current_lookahead_distance = lookahead
         self.current_lookahead_curvature = curvature
