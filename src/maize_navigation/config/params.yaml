@@ -62,7 +62,7 @@ maize_navigator:
     pose_lateral_gain: 0.15
     pose_heading_gain: 0.4
     pose_curvature_feedforward_gain: 0.1
-    pose_lateral_rate_gain: 0.7
+    pose_lateral_rate_gain: 1.1
     lateral_error_limit: 0.35
     lateral_rate_limit: 0.45
     curve_speed_reduction_gain: 3.0
@@ -74,7 +74,7 @@ maize_navigator:
     max_steering_angle: 1.25
     follow_max_angular_speed: 0.7
     min_follow_turn_radius: 0.37
-    angular_rate_limit: 1.0
+    angular_rate_limit: 1.4
     target_filter_alpha: 0.55
 
     # Row exit and headland maneuver
