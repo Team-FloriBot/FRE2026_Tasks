@@ -367,11 +367,15 @@ class LaserRowFollower:
             return np.empty((0, 2), dtype=float)
         perp = np.array([-direction[1], direction[0]], dtype=float)
         rel = points - np.asarray(center, dtype=float)
+        roi_width = self.effective_roi_width()
         mask = (
             (np.abs(rel @ direction) <= 0.5 * self.p.laser_roi_length)
-            & (np.abs(rel @ perp) <= 0.5 * self.p.laser_roi_width)
+            & (np.abs(rel @ perp) <= 0.5 * roi_width)
         )
         return points[mask]
+
+    def effective_roi_width(self) -> float:
+        return float(min(self.p.laser_roi_width, max(0.05, 0.45 * self.p.expected_row_width)))
 
     def fit_line_in_roi(
         self,
@@ -435,6 +439,7 @@ class MaizeNavigator(Node):
         super().__init__("maize_navigator")
         self.p = self.load_params()
         self.validate_params()
+        self.configured_expected_row_width = self.p.expected_row_width
 
         self.state = MissionState.IDLE
         self.paused_state: Optional[MissionState] = None
@@ -924,6 +929,7 @@ class MaizeNavigator(Node):
         self.get_logger().info(f"SLAM reset response result={result}")
 
     def reset_navigation_state(self, clear_sensor_cache: bool) -> None:
+        self.p.expected_row_width = getattr(self, "configured_expected_row_width", self.p.expected_row_width)
         self.left_row = None
         self.right_row = None
         self.midline = np.empty((0, 2), dtype=float)
@@ -1027,6 +1033,8 @@ class MaizeNavigator(Node):
             return
 
         left_peak, right_peak = peak_pair
+        measured_row_width = left_peak - right_peak
+        self.set_reference_row_width(measured_row_width)
         forward = self.yaw_to_vector(self.robot_pose.yaw)
 
         left_point1 = self.start_point1_from_peak(points, self.robot_pose, left_peak)
@@ -1057,8 +1065,21 @@ class MaizeNavigator(Node):
 
         self.state = MissionState.FOLLOW_ROW
         self.get_logger().info(
-            f"Initial rows locked once from histogram peaks: left={left_peak:.3f}, right={right_peak:.3f}, width={left_peak - right_peak:.3f}"
+            f"Initial rows locked once from histogram peaks: left={left_peak:.3f}, "
+            f"right={right_peak:.3f}, reference_width={self.p.expected_row_width:.3f}"
         )
+
+    def set_reference_row_width(self, measured_width: float) -> None:
+        if not math.isfinite(measured_width):
+            return
+        reference_width = float(np.clip(abs(measured_width), self.p.min_lane_width, self.p.max_lane_width))
+        previous_width = self.p.expected_row_width
+        self.p.expected_row_width = reference_width
+        if abs(reference_width - previous_width) > 1e-6:
+            self.get_logger().info(
+                f"Using first histogram row width as reference: {reference_width:.3f} m "
+                f"(configured {previous_width:.3f} m)"
+            )
 
     def handle_follow_row(self) -> None:
         self.recompute_rows()
@@ -2902,7 +2923,7 @@ class MaizeNavigator(Node):
                     self.base_point_to_map(center_base),
                     self.base_direction_to_map(roi_direction),
                     self.p.laser_roi_length,
-                    self.p.laser_roi_width,
+                    self.laser_follower.effective_roi_width(),
                     (0.2, 0.95, 0.95, 0.65),
                     stamp,
                 )
