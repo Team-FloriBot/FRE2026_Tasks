@@ -326,6 +326,44 @@ def test_route_projection_progress_never_moves_backwards():
     assert second_idx >= first_idx
 
 
+def test_dynamic_follow_lookahead_stays_maximum_on_straight_midline():
+    navigator = bare_navigator()
+    navigator.p.lookahead_distance = 1.0
+    navigator.p.turn_lookahead_distance = 0.45
+    navigator.p.lookahead_curvature_gain = 1.5
+    midline = np.array([[0.0, 0.0], [1.0, 0.0], [2.0, 0.0]])
+
+    lookahead = navigator.dynamic_follow_lookahead(midline, np.array([0.0, 0.0]))
+
+    assert math.isclose(lookahead, navigator.p.lookahead_distance)
+    assert math.isclose(navigator.current_lookahead_curvature, 0.0)
+
+
+def test_dynamic_follow_lookahead_shrinks_on_ninety_degree_midline():
+    navigator = bare_navigator()
+    navigator.p.lookahead_distance = 1.0
+    navigator.p.turn_lookahead_distance = 0.45
+    navigator.p.lookahead_curvature_gain = 1.5
+    midline = np.array([[0.0, 0.0], [0.5, 0.0], [0.5, 0.5], [0.5, 1.0]])
+
+    lookahead = navigator.dynamic_follow_lookahead(midline, np.array([0.0, 0.0]))
+
+    assert lookahead < navigator.p.lookahead_distance
+    assert navigator.current_lookahead_curvature > 0.0
+
+
+def test_dynamic_follow_lookahead_is_clamped_to_turn_distance():
+    navigator = bare_navigator()
+    navigator.p.lookahead_distance = 1.0
+    navigator.p.turn_lookahead_distance = 0.45
+    navigator.p.lookahead_curvature_gain = 100.0
+    midline = np.array([[0.0, 0.0], [0.5, 0.0], [0.5, 0.5]])
+
+    lookahead = navigator.dynamic_follow_lookahead(midline, np.array([0.0, 0.0]))
+
+    assert math.isclose(lookahead, navigator.p.turn_lookahead_distance)
+
+
 def test_rounded_route_replaces_sharp_corner_with_curve():
     navigator = bare_navigator()
     support = np.array([[0.0, 0.0], [1.0, 0.0], [1.0, 1.0]])

@@ -175,6 +175,8 @@ class NavigatorParams:
     follow_speed: float = 0.20
     slow_speed: float = 0.12
     lookahead_distance: float = 1.10
+    turn_lookahead_distance: float = 0.45
+    lookahead_curvature_gain: float = 1.5
     yaw_kp: float = 0.6
     pure_pursuit_gain: float = 1.0
     curve_speed_reduction_gain: float = 1.0
@@ -406,6 +408,8 @@ class MaizeNavigator(Node):
         self.row_end_direction: Optional[np.ndarray] = None
         self.last_cmd_angular_z: float = 0.0
         self.last_target_point: Optional[np.ndarray] = None
+        self.current_lookahead_distance: float = self.p.lookahead_distance
+        self.current_lookahead_curvature: float = 0.0
         self.initial_forward_direction: Optional[np.ndarray] = None
         self.row_number_increase_direction: Optional[np.ndarray] = None
         self.pattern_steps: List[PatternStep] = self.parse_pattern(self.p.pattern)
@@ -512,6 +516,8 @@ class MaizeNavigator(Node):
         p.follow_speed = float(get_param("follow_speed", p.follow_speed))
         p.slow_speed = float(get_param("slow_speed", p.slow_speed))
         p.lookahead_distance = float(get_param("lookahead_distance", p.lookahead_distance))
+        p.turn_lookahead_distance = float(get_param("turn_lookahead_distance", p.turn_lookahead_distance))
+        p.lookahead_curvature_gain = float(get_param("lookahead_curvature_gain", p.lookahead_curvature_gain))
         p.yaw_kp = float(get_param("yaw_kp", p.yaw_kp))
         p.pure_pursuit_gain = float(get_param("pure_pursuit_gain", p.pure_pursuit_gain))
         p.curve_speed_reduction_gain = float(get_param("curve_speed_reduction_gain", p.curve_speed_reduction_gain))
@@ -591,6 +597,11 @@ class MaizeNavigator(Node):
         self.p.row_exit_extension_distance = max(0.0, self.p.row_exit_extension_distance)
         self.p.row_end_goal_outward_distance = max(0.0, self.p.row_end_goal_outward_distance)
         self.p.pure_pursuit_gain = max(0.05, self.p.pure_pursuit_gain)
+        self.p.lookahead_distance = max(0.05, self.p.lookahead_distance)
+        self.p.turn_lookahead_distance = float(
+            np.clip(self.p.turn_lookahead_distance, 0.05, self.p.lookahead_distance)
+        )
+        self.p.lookahead_curvature_gain = max(0.0, self.p.lookahead_curvature_gain)
         self.p.slow_speed = float(np.clip(self.p.slow_speed, 0.0, self.p.follow_speed))
         self.p.curve_speed_reduction_gain = max(0.0, self.p.curve_speed_reduction_gain)
         self.p.maneuver_goal_xy_tolerance = max(0.05, self.p.maneuver_goal_xy_tolerance)
@@ -794,7 +805,8 @@ class MaizeNavigator(Node):
                     self.state = MissionState.FIND_NEXT_ROW_ENTRANCE
                 return
 
-        target = self.lookahead_point_from_polyline_projection(self.midline, robot_xy, self.p.lookahead_distance)
+        lookahead_distance = self.dynamic_follow_lookahead(self.midline, robot_xy)
+        target = self.lookahead_point_from_polyline_projection(self.midline, robot_xy, lookahead_distance)
         if target is None:
             target = self.midline[-1]
         target = np.asarray(target, dtype=float)
@@ -1470,6 +1482,13 @@ class MaizeNavigator(Node):
         )
         return peaks
 
+    def regularize_entrance_peak_spacing(self, peaks: List[EntrancePeak]) -> List[EntrancePeak]:
+        regularized: List[EntrancePeak] = []
+        for peak in sorted(peaks, key=lambda item: item.lateral):
+            if not regularized or abs(peak.lateral - regularized[-1].lateral) >= self.p.min_lane_width:
+                regularized.append(peak)
+        return regularized
+
     def actual_row_end_from_peak(
         self,
         points: np.ndarray,
@@ -2074,6 +2093,82 @@ class MaizeNavigator(Node):
                 return polyline[idx] + ratio * segment
             travelled += seg_len
         return polyline[-1]
+
+    def project_onto_polyline(self, polyline: np.ndarray, point: np.ndarray) -> Tuple[np.ndarray, int]:
+        point = np.asarray(point, dtype=float)
+        if len(polyline) < 2:
+            return point, 0
+
+        best_projection = np.asarray(polyline[0], dtype=float)
+        best_segment_idx = 0
+        best_distance = float("inf")
+        for idx in range(len(polyline) - 1):
+            segment = polyline[idx + 1] - polyline[idx]
+            seg_len_sq = float(segment @ segment)
+            if seg_len_sq < 1e-12:
+                continue
+            ratio = float(np.clip(((point - polyline[idx]) @ segment) / seg_len_sq, 0.0, 1.0))
+            projection = polyline[idx] + ratio * segment
+            distance = float(np.linalg.norm(point - projection))
+            if distance < best_distance:
+                best_distance = distance
+                best_projection = projection
+                best_segment_idx = idx
+        return np.asarray(best_projection, dtype=float), best_segment_idx
+
+    def point_at_polyline_distance_from_projection(
+        self,
+        polyline: np.ndarray,
+        projection: np.ndarray,
+        start_idx: int,
+        distance_ahead: float,
+    ) -> np.ndarray:
+        if len(polyline) < 2:
+            return np.asarray(projection, dtype=float)
+
+        start_idx = int(np.clip(start_idx, 0, len(polyline) - 2))
+        travelled = 0.0
+        segment_start = np.asarray(projection, dtype=float)
+        for idx in range(start_idx, len(polyline) - 1):
+            segment_end = np.asarray(polyline[idx + 1], dtype=float)
+            segment = segment_end - segment_start
+            seg_len = float(np.linalg.norm(segment))
+            if seg_len >= 1e-9:
+                if travelled + seg_len >= distance_ahead:
+                    ratio = (distance_ahead - travelled) / seg_len
+                    return segment_start + ratio * segment
+                travelled += seg_len
+            segment_start = segment_end
+        return np.asarray(polyline[-1], dtype=float)
+
+    def estimate_polyline_curvature_ahead(self, polyline: np.ndarray, point: np.ndarray) -> float:
+        if len(polyline) < 3:
+            return 0.0
+
+        projection, segment_idx = self.project_onto_polyline(polyline, point)
+        mid_distance = max(self.p.turn_lookahead_distance, 0.5 * self.p.lookahead_distance)
+        p0 = projection
+        p1 = self.point_at_polyline_distance_from_projection(polyline, projection, segment_idx, mid_distance)
+        p2 = self.point_at_polyline_distance_from_projection(polyline, projection, segment_idx, self.p.lookahead_distance)
+
+        a = float(np.linalg.norm(p1 - p0))
+        b = float(np.linalg.norm(p2 - p1))
+        c = float(np.linalg.norm(p2 - p0))
+        denominator = a * b * c
+        if denominator < 1e-9:
+            return 0.0
+        first = p1 - p0
+        second = p2 - p0
+        cross = float(first[0] * second[1] - first[1] * second[0])
+        return 2.0 * cross / denominator
+
+    def dynamic_follow_lookahead(self, polyline: np.ndarray, point: np.ndarray) -> float:
+        curvature = self.estimate_polyline_curvature_ahead(polyline, point)
+        lookahead = self.p.lookahead_distance / (1.0 + self.p.lookahead_curvature_gain * abs(curvature))
+        lookahead = float(np.clip(lookahead, self.p.turn_lookahead_distance, self.p.lookahead_distance))
+        self.current_lookahead_distance = lookahead
+        self.current_lookahead_curvature = curvature
+        return lookahead
 
     def lookahead_point_from_polyline_projection(
         self,
