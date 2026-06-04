@@ -715,7 +715,7 @@ class MaizeNavigator(Node):
         self.p.maneuver_lookahead_distance = max(0.05, self.p.maneuver_lookahead_distance)
         self.p.maneuver_route_spacing = max(0.02, self.p.maneuver_route_spacing)
         self.p.maneuver_corner_radius = max(0.0, self.p.maneuver_corner_radius)
-        self.p.maneuver_control_gain_scale = float(np.clip(self.p.maneuver_control_gain_scale, 0.05, 1.0))
+        self.p.maneuver_control_gain_scale = float(np.clip(self.p.maneuver_control_gain_scale, 0.05, 2.0))
         self.p.maneuver_max_angular_speed = max(0.01, self.p.maneuver_max_angular_speed)
         self.p.maneuver_angular_rate_limit = max(0.01, self.p.maneuver_angular_rate_limit)
         self.p.maneuver_entry_extension_distance = max(0.10, self.p.maneuver_entry_extension_distance)
@@ -2504,17 +2504,24 @@ class MaizeNavigator(Node):
         max_steering = min(self.p.max_steering_angle, radius_limited_steering)
         max_curvature = min(1.0 / self.p.min_follow_turn_radius, math.tan(max_steering) / self.p.ackermann_wheelbase)
 
+        gain_scale = self.p.maneuver_control_gain_scale if is_maneuver_control else 1.0
         point_curvature = (
-            self.p.pose_lateral_gain * 2.0 * float(target_base[1]) / max(effective_lookahead * effective_lookahead, 1e-6)
+            gain_scale
+            * self.p.pose_lateral_gain
+            * 2.0
+            * float(target_base[1])
+            / max(effective_lookahead * effective_lookahead, 1e-6)
         )
-        heading_curvature = self.p.pose_heading_gain * math.sin(heading_error) / effective_lookahead
+        heading_curvature = gain_scale * self.p.pose_heading_gain * math.sin(heading_error) / effective_lookahead
         _, lookahead_idx, _ = self.project_onto_polyline(reference_polyline, lookahead_point)
         path_curvature = float(np.clip(self.polyline_curvature_at_index(reference_polyline, lookahead_idx), -max_curvature, max_curvature))
         feedforward_curvature = (
-            self.p.pose_curvature_feedforward_gain * path_curvature
+            gain_scale * self.p.pose_curvature_feedforward_gain * path_curvature
         )
-        lateral_curvature = -0.5 * self.p.pose_lateral_gain * tracking_lateral_error / max(effective_lookahead, 1e-6)
-        damping_curvature = -self.p.pose_lateral_rate_gain * lateral_rate
+        lateral_curvature = (
+            -0.5 * gain_scale * self.p.pose_lateral_gain * tracking_lateral_error / max(effective_lookahead, 1e-6)
+        )
+        damping_curvature = -gain_scale * self.p.pose_lateral_rate_gain * lateral_rate
         curvature_raw = point_curvature + heading_curvature + feedforward_curvature + lateral_curvature + damping_curvature
 
         curvature = float(np.clip(curvature_raw, -max_curvature, max_curvature))

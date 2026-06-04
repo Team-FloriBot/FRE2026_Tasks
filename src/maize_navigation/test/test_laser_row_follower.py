@@ -723,6 +723,40 @@ def test_maneuver_control_uses_maneuver_angular_limits():
     assert published[-1].angular.z <= navigator.p.maneuver_max_angular_speed
 
 
+def test_maneuver_control_gain_scale_increases_pose_curvature_response():
+    route = np.array([[0.0, 0.0], [1.0, 0.0]])
+    angular_outputs = []
+    for gain_scale in (1.0, 1.6):
+        navigator = bare_navigator()
+        published = []
+        navigator.cmd_pub = types.SimpleNamespace(publish=published.append)
+        navigator.robot_pose = Pose2D(0.0, -0.20, 0.0)
+        navigator.last_target_point = None
+        navigator.last_lateral_error = None
+        navigator.last_cmd_linear_x = 0.0
+        navigator.last_cmd_angular_z = 0.0
+        navigator.p.pose_lateral_gain = 0.3
+        navigator.p.pose_heading_gain = 0.0
+        navigator.p.pose_curvature_feedforward_gain = 0.0
+        navigator.p.pose_lateral_rate_gain = 0.0
+        navigator.p.curve_speed_reduction_gain = 0.0
+        navigator.p.lateral_speed_reduction_gain = 0.0
+        navigator.p.lateral_rate_speed_reduction_gain = 0.0
+        navigator.p.linear_accel_limit = 0.0
+        navigator.p.angular_control_speed = 0.0
+        navigator.p.max_angular_speed = 10.0
+        navigator.p.maneuver_max_angular_speed = 10.0
+        navigator.p.min_follow_turn_radius = 0.37
+        navigator.p.angular_rate_limit = 100.0
+        navigator.p.maneuver_angular_rate_limit = 100.0
+        navigator.p.maneuver_control_gain_scale = gain_scale
+
+        navigator.drive_to_point(np.array([0.8, 0.0]), max_speed=0.25, min_speed=0.10, reference_polyline=route)
+        angular_outputs.append(abs(published[-1].angular.z))
+
+    assert angular_outputs[1] > angular_outputs[0]
+
+
 def test_reference_polyline_uses_route_lookahead_not_filtered_free_target():
     navigator = bare_navigator()
     navigator.cmd_pub = types.SimpleNamespace(publish=lambda _cmd: None)
