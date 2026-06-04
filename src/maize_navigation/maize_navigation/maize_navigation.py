@@ -811,6 +811,16 @@ class MaizeNavigator(Node):
                 return
 
         lookahead_distance = self.dynamic_follow_lookahead(self.midline, robot_xy)
+        self.get_logger().info(
+            (
+                "Dynamic lookahead: "
+                f"distance={lookahead_distance:.3f} "
+                f"curvature={self.current_lookahead_curvature:.3f} "
+                f"min={self.p.turn_lookahead_distance:.3f} "
+                f"max={self.p.lookahead_distance:.3f}"
+            ),
+            throttle_duration_sec=0.5,
+        )
         target = self.lookahead_point_from_polyline_projection(self.midline, robot_xy, lookahead_distance)
         if target is None:
             target = self.midline[-1]
