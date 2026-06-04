@@ -58,10 +58,10 @@ maize_navigator:
     # StartNavigation.carefulness=medium/low derives faster runtime profiles from these values.
     follow_speed: 0.42
     slow_speed: 0.12
-    lookahead_distance: 0.8
-    pose_lateral_gain: 0.7
-    pose_heading_gain: 0.9
-    pose_curvature_feedforward_gain: 0.4
+    lookahead_distance: 0.9
+    pose_lateral_gain: 0.5
+    pose_heading_gain: 0.55
+    pose_curvature_feedforward_gain: 0.25
     pose_lateral_rate_gain: 0.4
     lateral_error_limit: 0.35
     lateral_rate_limit: 0.45
@@ -74,7 +74,7 @@ maize_navigator:
     max_steering_angle: 1.25
     follow_max_angular_speed: 0.85
     min_follow_turn_radius: 0.37
-    angular_rate_limit: 1.8
+    angular_rate_limit: 1.2
     target_filter_alpha: 0.55
 
     # Row exit and headland maneuver
@@ -91,7 +91,7 @@ maize_navigator:
     maneuver_corner_radius: 0.37
     maneuver_control_gain_scale: 1.00
     maneuver_max_angular_speed: 1.25
-    maneuver_angular_rate_limit: 2.4
+    maneuver_angular_rate_limit: 1.0
     maneuver_entry_extension_distance: 0.80
     maneuver_max_route_deviation: 0.70
     maneuver_entry_lateral_tolerance: 0.25
