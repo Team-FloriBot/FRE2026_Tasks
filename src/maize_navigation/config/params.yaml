@@ -49,9 +49,9 @@ maize_navigator:
     laser_max_center_offset: 0.40
     laser_min_confidence: 0.25
     laser_full_confidence: 0.85
-    laser_max_weight_both_sides: 0.1
-    laser_max_weight_one_side: 0.05
-    laser_tracker_alpha: 0.25
+    laser_max_weight_both_sides: 0.5
+    laser_max_weight_one_side: 0.25
+    laser_tracker_alpha: 0.2
     laser_roi_map_correction_weight: 0.20
 
     # High-carefulness row-following profile.
@@ -75,7 +75,7 @@ maize_navigator:
     follow_max_angular_speed: 0.65
     min_follow_turn_radius: 0.37
     angular_rate_limit: 1.0
-    target_filter_alpha: 0.55
+    target_filter_alpha: 0.2
 
     # Row exit and headland maneuver
     row_end_goal_outward_distance: 0.30
