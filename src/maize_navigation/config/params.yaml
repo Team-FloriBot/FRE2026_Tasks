@@ -19,7 +19,7 @@ maize_navigator:
     # Histogramm-ROI: quer breit fuer mehr Reihen, laengs kompakter.
     # hist_roi_size bleibt als Fallback fuer alte Konfigurationen erhalten.
     hist_roi_depth: 4.0
-    hist_roi_width: 20.0
+    hist_roi_width: 25.0
     hist_bin_size: 0.05
     hist_peak_min_points: 3
 
@@ -72,8 +72,8 @@ maize_navigator:
     laser_max_center_offset: 0.40
     laser_min_confidence: 0.25
     laser_full_confidence: 0.85
-    laser_max_weight_both_sides: 0.20
-    laser_max_weight_one_side: 0.10
+    laser_max_weight_both_sides: 0.10
+    laser_max_weight_one_side: 0.05
     laser_tracker_alpha: 0.25
 
     tracker_alpha: 0.18
@@ -91,7 +91,7 @@ maize_navigator:
     enter_stable_frames_required: 3
     acquire_timeout_sec: 8.0
 
-    follow_speed: 0.25
+    follow_speed: 0.35
     slow_speed: 0.12
     enter_speed: 0.22
     turn_speed: 0.22
@@ -114,7 +114,7 @@ maize_navigator:
     turn_max_angular_speed: 1.40
     angular_rate_limit: 2.8
 
-    lookahead_distance: 1.0
+    lookahead_distance: 0.8
     turn_lookahead_distance: 0.32
     turn_min_angular_speed: 0.30
 
@@ -126,7 +126,7 @@ maize_navigator:
     # Virtueller Fuehrungspunkt hinter der Zielpose verhindert Drehen auf der Stelle.
     maneuver_heading_lookahead_distance: 0.1
     # Verrundete, monoton verfolgte Route fuer das Vorgewende.
-    maneuver_speed: 0.16
+    maneuver_speed: 0.35
     maneuver_slow_speed: 0.10
     maneuver_lookahead_distance: 0.7
     maneuver_route_spacing: 0.08
