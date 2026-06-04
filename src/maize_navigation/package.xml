@@ -17,6 +17,7 @@
   <depend>std_msgs</depend>
   <depend>std_srvs</depend>
   <depend>visualization_msgs</depend>
+  <depend>fre2026_detection_client</depend>
   <depend>tf2_ros</depend>
   <depend>tf_transformations</depend>
   <depend>python3-numpy</depend>

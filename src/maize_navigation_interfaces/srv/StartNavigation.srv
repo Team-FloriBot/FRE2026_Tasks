@@ -1,5 +1,6 @@
 string pattern
 string carefulness
+string model_path
 ---
 bool success
 string message

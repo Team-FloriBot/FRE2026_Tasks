@@ -16,6 +16,7 @@ import numpy as np
 import rclpy
 from rclpy.node import Node
 
+from fre2026_detection_client import DetectorClient
 from geometry_msgs.msg import Point, Twist
 from maize_navigation_interfaces.srv import StartNavigation
 from nav_msgs.msg import OccupancyGrid
@@ -452,6 +453,10 @@ class MaizeNavigator(Node):
         self.fused_target_point: Optional[np.ndarray] = None
         self.driving_profiles = self.build_driving_profiles()
         self.current_carefulness = "high"
+        self.object_detection_enabled = False
+        self.object_detection_model_path = ""
+        self.object_detection_initialized = False
+        self.object_detection_started = False
 
         self.left_row: Optional[RowMarchModel] = None
         self.right_row: Optional[RowMarchModel] = None
@@ -505,6 +510,7 @@ class MaizeNavigator(Node):
             if SlamToolboxReset is not None
             else None
         )
+        self.detector = DetectorClient(self)
 
         self.start_srv = self.create_service(StartNavigation, "start_navigation", self.start_cb)
         self.stop_srv = self.create_service(Trigger, "stop_navigation", self.stop_cb)
@@ -750,6 +756,12 @@ class MaizeNavigator(Node):
             res.success = False
             res.message = "Invalid carefulness. Use one of: low, medium, high."
             return res
+        model_path = getattr(req, "model_path", "").strip()
+        detection_ok, detection_message = self.prepare_object_detection(model_path)
+        if not detection_ok:
+            res.success = False
+            res.message = detection_message
+            return res
 
         self.p.pattern = pattern
         self.apply_driving_profile(carefulness)
@@ -757,7 +769,10 @@ class MaizeNavigator(Node):
         self.reset_navigation_state(clear_sensor_cache=False)
         self.state = MissionState.INITIALIZING
         res.success = True
-        res.message = f"Navigation started with pattern: {pattern}; carefulness: {carefulness}"
+        res.message = (
+            f"Navigation started with pattern: {pattern}; carefulness: {carefulness}; "
+            f"{detection_message}"
+        )
         return res
 
     def build_driving_profiles(self) -> Dict[str, DrivingProfile]:
@@ -855,6 +870,7 @@ class MaizeNavigator(Node):
     def stop_cb(self, req, res):
         self.store_current_rows()
         export_path = self.export_row_map()
+        self.release_object_detection("navigation stopped")
         self.state = MissionState.IDLE
         self.paused_state = None
         self.reset_entrance_state()
@@ -879,6 +895,7 @@ class MaizeNavigator(Node):
         self.state = MissionState.PAUSED
         self.reset_controller_state()
         self.cmd_pub.publish(Twist())
+        self.stop_object_detection("navigation paused")
         res.success = True
         res.message = f"Navigation paused from state {self.paused_state.name}"
         return res
@@ -892,11 +909,13 @@ class MaizeNavigator(Node):
         self.paused_state = None
         self.state = resume_state
         self.reset_controller_state()
+        self.resume_object_detection()
         res.success = True
         res.message = f"Navigation resumed in state {self.state.name}"
         return res
 
     def reset_cb(self, req, res):
+        self.release_object_detection("navigation reset")
         self.state = MissionState.IDLE
         self.paused_state = None
         self.reset_navigation_state(clear_sensor_cache=True)
@@ -927,6 +946,123 @@ class MaizeNavigator(Node):
             return
         result = getattr(response, "result", None)
         self.get_logger().info(f"SLAM reset response result={result}")
+
+    def prepare_object_detection(self, model_path: str) -> Tuple[bool, str]:
+        if not model_path:
+            self.release_object_detection("object detection disabled for new navigation start")
+            self.object_detection_enabled = False
+            self.object_detection_model_path = ""
+            self.object_detection_initialized = False
+            self.object_detection_started = False
+            if hasattr(self, "detector"):
+                self.detector.clear_results()
+            return True, "object detection disabled"
+
+        if not hasattr(self, "detector"):
+            return False, "Detector client is not initialized; navigation not started."
+        if not self.detector.wait_for_services(timeout_sec=2.0):
+            return False, "Detector services are not available; navigation not started."
+
+        self.release_object_detection("new navigation start")
+        self.object_detection_enabled = True
+        self.object_detection_model_path = model_path
+        self.object_detection_initialized = False
+        self.object_detection_started = False
+        self.detector.clear_results()
+        future = self.detector.init(model_path=model_path)
+        future.add_done_callback(self.handle_detector_init_response)
+        return True, f"object detection init requested with model: {model_path}"
+
+    def handle_detector_init_response(self, future) -> None:
+        if not getattr(self, "object_detection_enabled", False):
+            return
+        if not self.service_response_success(future, "detector init"):
+            self.object_detection_initialized = False
+            self.object_detection_started = False
+            self.release_object_detection("detector init failed")
+            return
+
+        self.object_detection_initialized = True
+        self.start_object_detection("detector initialized")
+
+    def start_object_detection(self, reason: str) -> None:
+        if not getattr(self, "object_detection_enabled", False):
+            return
+        future = self.detector.start()
+        future.add_done_callback(lambda done: self.handle_detector_start_response(done, reason))
+
+    def handle_detector_start_response(self, future, reason: str) -> None:
+        if not getattr(self, "object_detection_enabled", False):
+            return
+        success = self.service_response_success(future, "detector start")
+        self.object_detection_started = success
+        if success:
+            self.get_logger().info(f"Object detection started ({reason})")
+            if self.state == MissionState.PAUSED:
+                self.stop_object_detection("navigation paused")
+        else:
+            self.release_object_detection("detector start failed")
+
+    def stop_object_detection(self, reason: str) -> None:
+        if not getattr(self, "object_detection_enabled", False) or not getattr(
+            self,
+            "object_detection_started",
+            False,
+        ):
+            return
+        self.object_detection_started = False
+        future = self.detector.stop()
+        future.add_done_callback(lambda done: self.service_response_success(done, f"detector stop ({reason})"))
+
+    def resume_object_detection(self) -> None:
+        if not getattr(self, "object_detection_enabled", False):
+            return
+        if getattr(self, "object_detection_initialized", False):
+            self.start_object_detection("navigation resumed")
+            return
+        if getattr(self, "object_detection_model_path", ""):
+            future = self.detector.init(model_path=self.object_detection_model_path)
+            future.add_done_callback(self.handle_detector_init_response)
+
+    def release_object_detection(self, reason: str) -> None:
+        if not getattr(self, "object_detection_enabled", False):
+            return
+        if not hasattr(self, "detector"):
+            return
+        was_started = self.object_detection_started
+        self.object_detection_enabled = False
+        self.object_detection_initialized = False
+        self.object_detection_started = False
+        self.object_detection_model_path = ""
+        self.detector.clear_results()
+        if was_started:
+            future = self.detector.stop()
+            future.add_done_callback(lambda done: self.release_object_detection_after_stop(done, reason))
+            return
+        future = self.detector.release()
+        future.add_done_callback(lambda done: self.service_response_success(done, f"detector release ({reason})"))
+
+    def release_object_detection_after_stop(self, future, reason: str) -> None:
+        self.service_response_success(future, f"detector stop before release ({reason})")
+        release_future = self.detector.release()
+        release_future.add_done_callback(
+            lambda done: self.service_response_success(done, f"detector release ({reason})")
+        )
+
+    def service_response_success(self, future, action_name: str) -> bool:
+        try:
+            response = future.result()
+        except Exception as exc:
+            self.get_logger().error(f"{action_name} failed: {exc}")
+            return False
+        if response is None:
+            self.get_logger().error(f"{action_name} returned no response")
+            return False
+        success = bool(getattr(response, "success", False))
+        if not success:
+            message = getattr(response, "message", "")
+            self.get_logger().error(f"{action_name} failed: {message}")
+        return success
 
     def reset_navigation_state(self, clear_sensor_cache: bool) -> None:
         self.p.expected_row_width = getattr(self, "configured_expected_row_width", self.p.expected_row_width)
@@ -1102,6 +1238,7 @@ class MaizeNavigator(Node):
                 if self.finish_after_current_row:
                     self.get_logger().info("Last pattern row completed. Mission finished.")
                     self.export_row_map()
+                    self.release_object_detection("mission finished")
                     self.state = MissionState.FINISHED
                 else:
                     self.get_logger().info("Row exit reached. Finding the next row entrance.")

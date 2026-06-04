@@ -45,9 +45,14 @@ ros2 launch maize_navigation maize_navigation.launch.py
 Die Konfiguration erfolgt über die config/params.yaml. Hier können das Fahrmuster sowie wietere Paramter angepasst werden.
 
 Zum Starten der Maisnavigation folgenden Service in der Kommandozeile aufrufen:
+Ohne Object Detection kann `model_path` leer bleiben:
 ```
-ros2 service call /start_navigation maize_navigation_interfaces/srv/StartNavigation "{pattern: '3L 6R 5R', carefulness: 'high'}"
-``` 
+ros2 service call /start_navigation maize_navigation_interfaces/srv/StartNavigation "{pattern: '3L 6R 5R', carefulness: 'high', model_path: ''}"
+```
+Mit Object Detection:
+```
+ros2 service call /start_navigation maize_navigation_interfaces/srv/StartNavigation "{pattern: '3L 6R 5R', carefulness: 'high', model_path: '/path/to/model.pt'}"
+```
 `carefulness` kann `high`, `medium` oder `low` sein. `high` ist vorsichtig, `low` ist am schnellsten.
 
 Weitere Navigationsservices:

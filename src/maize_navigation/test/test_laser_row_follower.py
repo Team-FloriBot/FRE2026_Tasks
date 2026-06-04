@@ -19,6 +19,7 @@ def install_ros_import_stubs():
 
     for package, names in (
         ("geometry_msgs", ("Point", "Twist")),
+        ("fre2026_tasks_interfaces", ("SetNavigationPattern", "GetNavigationStatus")),
         ("maize_navigation_interfaces", ("StartNavigation",)),
         ("nav_msgs", ("OccupancyGrid",)),
         ("sensor_msgs", ("LaserScan",)),
@@ -27,7 +28,11 @@ def install_ros_import_stubs():
         ("visualization_msgs", ("Marker", "MarkerArray")),
     ):
         package_module = module(package)
-        module_type = "srv" if package in ("maize_navigation_interfaces", "std_srvs") else "msg"
+        module_type = "srv" if package in (
+            "fre2026_tasks_interfaces",
+            "maize_navigation_interfaces",
+            "std_srvs",
+        ) else "msg"
         message_module = module(f"{package}.{module_type}")
         for name in names:
             setattr(message_module, name, type(name, (), {}))
@@ -38,7 +43,7 @@ def install_ros_import_stubs():
                     self.angular = types.SimpleNamespace(x=0.0, y=0.0, z=0.0)
 
             message_module.Twist = Twist
-        if package in ("maize_navigation_interfaces", "std_srvs"):
+        if package in ("fre2026_tasks_interfaces", "maize_navigation_interfaces", "std_srvs"):
             package_module.srv = message_module
         else:
             package_module.msg = message_module
@@ -48,6 +53,14 @@ def install_ros_import_stubs():
     tf2_ros.TransformListener = object
     transformations = module("tf_transformations")
     transformations.euler_from_quaternion = lambda quaternion: (0.0, 0.0, 0.0)
+
+    detection_client = module("fre2026_detection_client")
+
+    class DetectorClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+    detection_client.DetectorClient = DetectorClient
 
 
 install_ros_import_stubs()
@@ -124,7 +137,9 @@ def test_start_callback_sets_requested_pattern():
     response = navigator.start_cb(request, types.SimpleNamespace())
 
     assert response.success
-    assert response.message == "Navigation started with pattern: 3L  2r; carefulness: high"
+    assert response.message == (
+        "Navigation started with pattern: 3L  2r; carefulness: high; object detection disabled"
+    )
     assert navigator.p.pattern == "3L  2r"
     assert navigator.pattern_steps == [PatternStep(3, "L"), PatternStep(2, "R")]
     assert navigator.state == MissionState.INITIALIZING
