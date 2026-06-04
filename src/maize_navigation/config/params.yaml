@@ -19,7 +19,7 @@ maize_navigator:
     # Histogramm-ROI: quer breit fuer mehr Reihen, laengs kompakter.
     # hist_roi_size bleibt als Fallback fuer alte Konfigurationen erhalten.
     hist_roi_depth: 4.0
-    hist_roi_width: 25.0
+    hist_roi_width: 20.0
     hist_bin_size: 0.05
     hist_peak_min_points: 3
 
@@ -72,8 +72,8 @@ maize_navigator:
     laser_max_center_offset: 0.40
     laser_min_confidence: 0.25
     laser_full_confidence: 0.85
-    laser_max_weight_both_sides: 0.4
-    laser_max_weight_one_side: 0.2
+    laser_max_weight_both_sides: 0.20
+    laser_max_weight_one_side: 0.10
     laser_tracker_alpha: 0.25
 
     tracker_alpha: 0.18
@@ -91,18 +91,18 @@ maize_navigator:
     enter_stable_frames_required: 3
     acquire_timeout_sec: 8.0
 
-    follow_speed: 0.35
+    follow_speed: 0.25
     slow_speed: 0.12
     enter_speed: 0.22
     turn_speed: 0.22
     yaw_kp: 0.6
     pure_pursuit_gain: 1.4
-    curve_speed_reduction_gain: 3.5
-    heading_kp: 1.5
-    lateral_kp: 1.2
+    curve_speed_reduction_gain: 2.5
+    heading_kp: 1.2
+    lateral_kp: 1.0
     stanley_min_speed: 0.10
     min_follow_turn_radius: 0.37
-    target_filter_alpha: 0.35
+    target_filter_alpha: 0.45
     # Ausfahr- und Einfahrziel liegen so weit ausserhalb der Pflanzenenden.
     row_end_goal_outward_distance: 0.30
     # Sicherheitsabstand der Wende-Querlinie hinter dem aeussersten relevanten Peak.
@@ -126,7 +126,7 @@ maize_navigator:
     # Virtueller Fuehrungspunkt hinter der Zielpose verhindert Drehen auf der Stelle.
     maneuver_heading_lookahead_distance: 0.1
     # Verrundete, monoton verfolgte Route fuer das Vorgewende.
-    maneuver_speed: 0.5
+    maneuver_speed: 0.16
     maneuver_slow_speed: 0.10
     maneuver_lookahead_distance: 0.7
     maneuver_route_spacing: 0.08
