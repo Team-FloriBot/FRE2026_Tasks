@@ -88,10 +88,10 @@ class DrivingProfile:
     follow_speed: float
     slow_speed: float
     lookahead_distance: float
-    pure_pursuit_gain: float
-    heading_kp: float
-    lateral_kp: float
-    lateral_kd: float
+    pose_lateral_gain: float
+    pose_heading_gain: float
+    pose_curvature_feedforward_gain: float
+    pose_lateral_rate_gain: float
     lateral_rate_limit: float
     curve_speed_reduction_gain: float
     lateral_speed_reduction_gain: float
@@ -100,7 +100,6 @@ class DrivingProfile:
     angular_control_speed: float
     ackermann_wheelbase: float
     max_steering_angle: float
-    stanley_min_speed: float
     max_angular_speed: float
     min_follow_turn_radius: float
     angular_rate_limit: float
@@ -207,11 +206,10 @@ class NavigatorParams:
     follow_speed: float = 0.20
     slow_speed: float = 0.12
     lookahead_distance: float = 1.10
-    yaw_kp: float = 0.6
-    pure_pursuit_gain: float = 1.0
-    heading_kp: float = 0.0
-    lateral_kp: float = 0.0
-    lateral_kd: float = 0.0
+    pose_lateral_gain: float = 1.00
+    pose_heading_gain: float = 1.20
+    pose_curvature_feedforward_gain: float = 0.80
+    pose_lateral_rate_gain: float = 0.25
     lateral_error_limit: float = 0.35
     lateral_rate_limit: float = 0.60
     curve_speed_reduction_gain: float = 1.0
@@ -221,7 +219,6 @@ class NavigatorParams:
     angular_control_speed: float = 0.30
     ackermann_wheelbase: float = 0.40
     max_steering_angle: float = 1.40
-    stanley_min_speed: float = 0.10
     max_angular_speed: float = 0.40
     min_follow_turn_radius: float = 0.37
     angular_rate_limit: float = 1.2
@@ -594,11 +591,12 @@ class MaizeNavigator(Node):
         p.follow_speed = float(get_param("follow_speed", p.follow_speed))
         p.slow_speed = float(get_param("slow_speed", p.slow_speed))
         p.lookahead_distance = float(get_param("lookahead_distance", p.lookahead_distance))
-        p.yaw_kp = float(get_param("yaw_kp", p.yaw_kp))
-        p.pure_pursuit_gain = float(get_param("pure_pursuit_gain", p.pure_pursuit_gain))
-        p.heading_kp = float(get_param("heading_kp", p.heading_kp))
-        p.lateral_kp = float(get_param("lateral_kp", p.lateral_kp))
-        p.lateral_kd = float(get_param("lateral_kd", p.lateral_kd))
+        p.pose_lateral_gain = float(get_param("pose_lateral_gain", p.pose_lateral_gain))
+        p.pose_heading_gain = float(get_param("pose_heading_gain", p.pose_heading_gain))
+        p.pose_curvature_feedforward_gain = float(
+            get_param("pose_curvature_feedforward_gain", p.pose_curvature_feedforward_gain)
+        )
+        p.pose_lateral_rate_gain = float(get_param("pose_lateral_rate_gain", p.pose_lateral_rate_gain))
         p.lateral_error_limit = float(get_param("lateral_error_limit", p.lateral_error_limit))
         p.lateral_rate_limit = float(get_param("lateral_rate_limit", p.lateral_rate_limit))
         p.curve_speed_reduction_gain = float(get_param("curve_speed_reduction_gain", p.curve_speed_reduction_gain))
@@ -612,7 +610,6 @@ class MaizeNavigator(Node):
         p.angular_control_speed = float(get_param("angular_control_speed", p.angular_control_speed))
         p.ackermann_wheelbase = float(get_param("ackermann_wheelbase", p.ackermann_wheelbase))
         p.max_steering_angle = float(get_param("max_steering_angle", p.max_steering_angle))
-        p.stanley_min_speed = float(get_param("stanley_min_speed", p.stanley_min_speed))
         p.max_angular_speed = float(get_param("follow_max_angular_speed", p.max_angular_speed))
         p.min_follow_turn_radius = float(get_param("min_follow_turn_radius", p.min_follow_turn_radius))
         p.angular_rate_limit = float(get_param("angular_rate_limit", p.angular_rate_limit))
@@ -696,10 +693,10 @@ class MaizeNavigator(Node):
         self.p.target_filter_alpha = float(np.clip(self.p.target_filter_alpha, 0.01, 1.0))
         self.p.row_exit_extension_distance = max(0.0, self.p.row_exit_extension_distance)
         self.p.row_end_goal_outward_distance = max(0.0, self.p.row_end_goal_outward_distance)
-        self.p.pure_pursuit_gain = max(0.05, self.p.pure_pursuit_gain)
-        self.p.heading_kp = max(0.0, self.p.heading_kp)
-        self.p.lateral_kp = max(0.0, self.p.lateral_kp)
-        self.p.lateral_kd = max(0.0, self.p.lateral_kd)
+        self.p.pose_lateral_gain = max(0.0, self.p.pose_lateral_gain)
+        self.p.pose_heading_gain = max(0.0, self.p.pose_heading_gain)
+        self.p.pose_curvature_feedforward_gain = max(0.0, self.p.pose_curvature_feedforward_gain)
+        self.p.pose_lateral_rate_gain = max(0.0, self.p.pose_lateral_rate_gain)
         self.p.lateral_error_limit = max(0.05, self.p.lateral_error_limit)
         self.p.lateral_rate_limit = max(0.05, self.p.lateral_rate_limit)
         self.p.slow_speed = float(np.clip(self.p.slow_speed, 0.0, self.p.follow_speed))
@@ -710,7 +707,6 @@ class MaizeNavigator(Node):
         self.p.angular_control_speed = max(0.0, self.p.angular_control_speed)
         self.p.ackermann_wheelbase = max(0.05, self.p.ackermann_wheelbase)
         self.p.max_steering_angle = float(np.clip(self.p.max_steering_angle, 0.05, 1.50))
-        self.p.stanley_min_speed = max(0.01, self.p.stanley_min_speed)
         self.p.maneuver_goal_xy_tolerance = max(0.05, self.p.maneuver_goal_xy_tolerance)
         self.p.maneuver_goal_yaw_tolerance = max(0.05, self.p.maneuver_goal_yaw_tolerance)
         self.p.maneuver_heading_lookahead_distance = max(0.05, self.p.maneuver_heading_lookahead_distance)
@@ -784,10 +780,10 @@ class MaizeNavigator(Node):
             follow_speed=self.p.follow_speed,
             slow_speed=self.p.slow_speed,
             lookahead_distance=self.p.lookahead_distance,
-            pure_pursuit_gain=self.p.pure_pursuit_gain,
-            heading_kp=self.p.heading_kp,
-            lateral_kp=self.p.lateral_kp,
-            lateral_kd=self.p.lateral_kd,
+            pose_lateral_gain=self.p.pose_lateral_gain,
+            pose_heading_gain=self.p.pose_heading_gain,
+            pose_curvature_feedforward_gain=self.p.pose_curvature_feedforward_gain,
+            pose_lateral_rate_gain=self.p.pose_lateral_rate_gain,
             lateral_rate_limit=self.p.lateral_rate_limit,
             curve_speed_reduction_gain=self.p.curve_speed_reduction_gain,
             lateral_speed_reduction_gain=self.p.lateral_speed_reduction_gain,
@@ -796,7 +792,6 @@ class MaizeNavigator(Node):
             angular_control_speed=self.p.angular_control_speed,
             ackermann_wheelbase=self.p.ackermann_wheelbase,
             max_steering_angle=self.p.max_steering_angle,
-            stanley_min_speed=self.p.stanley_min_speed,
             max_angular_speed=self.p.max_angular_speed,
             min_follow_turn_radius=self.p.min_follow_turn_radius,
             angular_rate_limit=self.p.angular_rate_limit,
@@ -815,10 +810,10 @@ class MaizeNavigator(Node):
                 follow_speed=high.follow_speed * 1.30,
                 slow_speed=high.slow_speed * 1.65,
                 lookahead_distance=high.lookahead_distance * 1.12,
-                pure_pursuit_gain=high.pure_pursuit_gain * 0.82,
-                heading_kp=high.heading_kp * 0.75,
-                lateral_kp=high.lateral_kp * 0.75,
-                lateral_kd=high.lateral_kd * 0.75,
+                pose_lateral_gain=high.pose_lateral_gain * 0.85,
+                pose_heading_gain=high.pose_heading_gain * 0.85,
+                pose_curvature_feedforward_gain=high.pose_curvature_feedforward_gain * 0.85,
+                pose_lateral_rate_gain=high.pose_lateral_rate_gain * 0.80,
                 lateral_rate_limit=high.lateral_rate_limit * 1.15,
                 curve_speed_reduction_gain=high.curve_speed_reduction_gain * 0.55,
                 lateral_speed_reduction_gain=high.lateral_speed_reduction_gain * 0.50,
@@ -827,7 +822,6 @@ class MaizeNavigator(Node):
                 angular_control_speed=high.angular_control_speed * 1.10,
                 ackermann_wheelbase=high.ackermann_wheelbase,
                 max_steering_angle=high.max_steering_angle,
-                stanley_min_speed=high.stanley_min_speed * 1.20,
                 max_angular_speed=high.max_angular_speed * 1.10,
                 min_follow_turn_radius=high.min_follow_turn_radius * 1.22,
                 angular_rate_limit=high.angular_rate_limit * 1.15,
@@ -844,10 +838,10 @@ class MaizeNavigator(Node):
                 follow_speed=high.follow_speed * 1.60,
                 slow_speed=high.slow_speed * 2.50,
                 lookahead_distance=high.lookahead_distance * 1.30,
-                pure_pursuit_gain=high.pure_pursuit_gain * 0.68,
-                heading_kp=high.heading_kp * 0.50,
-                lateral_kp=high.lateral_kp * 0.50,
-                lateral_kd=high.lateral_kd * 0.50,
+                pose_lateral_gain=high.pose_lateral_gain * 0.70,
+                pose_heading_gain=high.pose_heading_gain * 0.70,
+                pose_curvature_feedforward_gain=high.pose_curvature_feedforward_gain * 0.70,
+                pose_lateral_rate_gain=high.pose_lateral_rate_gain * 0.65,
                 lateral_rate_limit=high.lateral_rate_limit * 1.30,
                 curve_speed_reduction_gain=high.curve_speed_reduction_gain * 0.30,
                 lateral_speed_reduction_gain=high.lateral_speed_reduction_gain * 0.25,
@@ -856,7 +850,6 @@ class MaizeNavigator(Node):
                 angular_control_speed=high.angular_control_speed * 1.20,
                 ackermann_wheelbase=high.ackermann_wheelbase,
                 max_steering_angle=high.max_steering_angle,
-                stanley_min_speed=high.stanley_min_speed * 1.40,
                 max_angular_speed=high.max_angular_speed * 1.20,
                 min_follow_turn_radius=high.min_follow_turn_radius * 1.50,
                 angular_rate_limit=high.angular_rate_limit * 1.30,
@@ -1027,13 +1020,14 @@ class MaizeNavigator(Node):
         if target is None:
             target = self.midline[-1]
         target = np.asarray(target, dtype=float)
-        self.fused_target_point = self.fuse_follow_target_with_laser(target)
-        self.drive_to_point(self.fused_target_point, reference_polyline=self.midline)
+        desired_lateral_offset = self.follow_laser_reference_offset(target)
+        self.drive_to_point(target, reference_polyline=self.midline, desired_lateral_offset=desired_lateral_offset)
 
-    def fuse_follow_target_with_laser(self, map_target: np.ndarray) -> np.ndarray:
+    def follow_laser_reference_offset(self, map_target: np.ndarray) -> float:
+        self.fused_target_point = np.asarray(map_target, dtype=float)
         self.laser_follow_result = LaserFollowResult(reason="laser following disabled")
         if not self.p.laser_follow_enabled:
-            return np.asarray(map_target, dtype=float)
+            return 0.0
 
         scan = self.latest_scan
         if self.latest_scan_received_ns is None:
@@ -1063,9 +1057,12 @@ class MaizeNavigator(Node):
         self.laser_follow_result = self.laser_follower.process_scan(scan, map_slope, map_target_base, roi_prior_base)
         result = self.laser_follow_result
         if not result.valid or result.target_base is None or result.weight <= 0.0:
-            return np.asarray(map_target, dtype=float)
+            return 0.0
         fused_base = (1.0 - result.weight) * map_target_base + result.weight * result.target_base
-        return self.base_point_to_map(fused_base)
+        self.fused_target_point = self.base_point_to_map(fused_base)
+        _, _, map_target_lateral = self.project_onto_polyline(self.midline, map_target)
+        _, _, fused_target_lateral = self.project_onto_polyline(self.midline, self.fused_target_point)
+        return float(np.clip(fused_target_lateral - map_target_lateral, -self.p.lateral_error_limit, self.p.lateral_error_limit))
 
     def map_point_to_base(self, point: np.ndarray) -> np.ndarray:
         rel = np.asarray(point, dtype=float) - np.array([self.robot_pose.x, self.robot_pose.y], dtype=float)
@@ -2382,13 +2379,14 @@ class MaizeNavigator(Node):
             segment_start = segment_end
         return np.asarray(polyline[-1], dtype=float)
 
-    def signed_lateral_error_to_polyline(self, polyline: np.ndarray, point: np.ndarray) -> float:
+    def project_onto_polyline(self, polyline: np.ndarray, point: np.ndarray) -> Tuple[np.ndarray, int, float]:
         if len(polyline) < 2:
-            return 0.0
+            return np.asarray(point, dtype=float), 0, 0.0
 
         point = np.asarray(point, dtype=float)
         best_projection: Optional[np.ndarray] = None
         best_direction: Optional[np.ndarray] = None
+        best_idx = 0
         best_distance = float("inf")
         for idx in range(len(polyline) - 1):
             segment = polyline[idx + 1] - polyline[idx]
@@ -2402,12 +2400,45 @@ class MaizeNavigator(Node):
                 best_distance = distance
                 best_projection = projection
                 best_direction = segment / math.sqrt(seg_len_sq)
+                best_idx = idx
 
         if best_projection is None or best_direction is None:
-            return 0.0
+            return np.asarray(point, dtype=float), 0, 0.0
 
         lateral_direction = np.array([-best_direction[1], best_direction[0]], dtype=float)
-        return float((point - best_projection) @ lateral_direction)
+        lateral_error = float((point - best_projection) @ lateral_direction)
+        return np.asarray(best_projection, dtype=float), best_idx, lateral_error
+
+    def polyline_curvature_at_index(self, polyline: np.ndarray, idx: int) -> float:
+        if len(polyline) < 3:
+            return 0.0
+
+        idx = int(np.clip(idx, 0, len(polyline) - 2))
+        previous_segment = None
+        next_segment = None
+        for prev_idx in range(idx, -1, -1):
+            segment = polyline[prev_idx + 1] - polyline[prev_idx]
+            if float(segment @ segment) > 1e-12:
+                previous_segment = segment
+                break
+        for next_idx in range(idx + 1, len(polyline) - 1):
+            segment = polyline[next_idx + 1] - polyline[next_idx]
+            if float(segment @ segment) > 1e-12:
+                next_segment = segment
+                break
+        if previous_segment is None or next_segment is None:
+            return 0.0
+
+        previous_length = float(np.linalg.norm(previous_segment))
+        next_length = float(np.linalg.norm(next_segment))
+        previous_yaw = math.atan2(float(previous_segment[1]), float(previous_segment[0]))
+        next_yaw = math.atan2(float(next_segment[1]), float(next_segment[0]))
+        arc_length = max(0.5 * (previous_length + next_length), 1e-6)
+        return wrap_to_pi(next_yaw - previous_yaw) / arc_length
+
+    def signed_lateral_error_to_polyline(self, polyline: np.ndarray, point: np.ndarray) -> float:
+        _, _, lateral_error = self.project_onto_polyline(polyline, point)
+        return lateral_error
 
     def drive_to_point(
         self,
@@ -2415,59 +2446,71 @@ class MaizeNavigator(Node):
         max_speed: Optional[float] = None,
         min_speed: Optional[float] = None,
         reference_polyline: Optional[np.ndarray] = None,
+        desired_lateral_offset: float = 0.0,
     ) -> None:
         is_maneuver_control = max_speed is not None or min_speed is not None
-        target = np.asarray(target, dtype=float)
-        if self.last_target_point is None or reference_polyline is not None:
-            filtered_target = target
-        else:
-            alpha = self.p.target_filter_alpha
-            filtered_target = (1.0 - alpha) * self.last_target_point + alpha * target
-        self.last_target_point = np.asarray(filtered_target, dtype=float)
-
         cmd = Twist()
         max_speed = self.p.follow_speed if max_speed is None else max_speed
         min_speed = self.p.slow_speed if min_speed is None else min_speed
-        target_base = self.map_point_to_base(filtered_target)
-        lateral_error = 0.0
-        lateral_rate = 0.0
-        heading_error = 0.0
         dt = 1.0 / max(1e-6, self.p.control_frequency)
-        if reference_polyline is not None and (self.p.lateral_kp > 0.0 or self.p.lateral_kd > 0.0):
-            robot_xy = np.array([self.robot_pose.x, self.robot_pose.y], dtype=float)
-            raw_lateral_error = self.signed_lateral_error_to_polyline(reference_polyline, robot_xy)
-            lateral_error = float(np.clip(raw_lateral_error, -self.p.lateral_error_limit, self.p.lateral_error_limit))
-            if self.last_lateral_error is not None:
-                lateral_rate = (raw_lateral_error - self.last_lateral_error) / dt
-                lateral_rate = float(np.clip(lateral_rate, -self.p.lateral_rate_limit, self.p.lateral_rate_limit))
-            self.last_lateral_error = raw_lateral_error
-        else:
-            self.last_lateral_error = None
-        if reference_polyline is not None and self.p.heading_kp > 0.0:
-            tangent = self.polyline_tangent_at_point(reference_polyline, filtered_target)
-            path_yaw = math.atan2(float(tangent[1]), float(tangent[0]))
-            heading_error = wrap_to_pi(path_yaw - self.robot_pose.yaw)
-        stanley_speed = max(abs(self.last_cmd_linear_x), self.p.stanley_min_speed)
-        gain_scale = self.p.maneuver_control_gain_scale if is_maneuver_control and reference_polyline is not None else 1.0
-        cross_track_error = -lateral_error if reference_polyline is not None else float(target_base[1])
-        steering_angle = (
-            gain_scale * self.p.heading_kp * math.sin(heading_error)
-            + math.atan2(gain_scale * self.p.lateral_kp * cross_track_error, stanley_speed)
-            - gain_scale * self.p.lateral_kd * lateral_rate
+
+        robot_xy = np.array([self.robot_pose.x, self.robot_pose.y], dtype=float)
+        if reference_polyline is None or len(reference_polyline) < 2:
+            reference_polyline = np.vstack((robot_xy, np.asarray(target, dtype=float)))
+        reference_polyline = np.asarray(reference_polyline, dtype=float)
+
+        projection, projection_idx, raw_lateral_error = self.project_onto_polyline(reference_polyline, robot_xy)
+        lookahead_distance = self.p.maneuver_lookahead_distance if is_maneuver_control else self.p.lookahead_distance
+        lookahead_point = self.point_at_route_distance(
+            reference_polyline,
+            projection,
+            projection_idx,
+            lookahead_distance,
         )
+        self.last_target_point = np.asarray(lookahead_point, dtype=float)
+
+        lateral_error = float(np.clip(raw_lateral_error, -self.p.lateral_error_limit, self.p.lateral_error_limit))
+        desired_lateral_offset = float(np.clip(desired_lateral_offset, -self.p.lateral_error_limit, self.p.lateral_error_limit))
+        tracking_lateral_error = float(
+            np.clip(lateral_error - desired_lateral_offset, -self.p.lateral_error_limit, self.p.lateral_error_limit)
+        )
+        lateral_rate = 0.0
+        if self.last_lateral_error is not None:
+            lateral_rate = (raw_lateral_error - self.last_lateral_error) / dt
+            lateral_rate = float(np.clip(lateral_rate, -self.p.lateral_rate_limit, self.p.lateral_rate_limit))
+        self.last_lateral_error = raw_lateral_error
+
+        target_base = self.map_point_to_base(lookahead_point)
+        tangent = self.polyline_tangent_at_point(reference_polyline, lookahead_point)
+        path_yaw = math.atan2(float(tangent[1]), float(tangent[0]))
+        heading_error = wrap_to_pi(path_yaw - self.robot_pose.yaw)
+        effective_lookahead = max(float(np.linalg.norm(target_base)), 0.05)
+
+        point_curvature = 2.0 * float(target_base[1]) / max(effective_lookahead * effective_lookahead, 1e-6)
+        heading_curvature = self.p.pose_heading_gain * math.sin(heading_error) / effective_lookahead
+        _, lookahead_idx, _ = self.project_onto_polyline(reference_polyline, lookahead_point)
+        feedforward_curvature = (
+            self.p.pose_curvature_feedforward_gain * self.polyline_curvature_at_index(reference_polyline, lookahead_idx)
+        )
+        lateral_curvature = -self.p.pose_lateral_gain * tracking_lateral_error / max(effective_lookahead, 1e-6)
+        damping_curvature = -self.p.pose_lateral_rate_gain * lateral_rate
+        curvature_raw = point_curvature + heading_curvature + feedforward_curvature + lateral_curvature + damping_curvature
+
         radius_limited_steering = math.atan2(self.p.ackermann_wheelbase, self.p.min_follow_turn_radius)
         max_steering = min(self.p.max_steering_angle, radius_limited_steering)
+        max_curvature = min(1.0 / self.p.min_follow_turn_radius, math.tan(max_steering) / self.p.ackermann_wheelbase)
+        curvature = float(np.clip(curvature_raw, -max_curvature, max_curvature))
+        steering_angle = math.atan(self.p.ackermann_wheelbase * curvature)
         steering_angle = float(np.clip(steering_angle, -max_steering, max_steering))
         self.controller_steering_angle = steering_angle
         self.controller_pull_direction = self.base_direction_to_map(
             np.array([math.cos(steering_angle), math.sin(steering_angle)], dtype=float)
         )
-        curvature = math.tan(steering_angle) / self.p.ackermann_wheelbase
         linear_raw = float(np.clip(
             max_speed / (
                 1.0
                 + self.p.curve_speed_reduction_gain * abs(curvature)
-                + self.p.lateral_speed_reduction_gain * abs(lateral_error)
+                + self.p.lateral_speed_reduction_gain * abs(tracking_lateral_error)
                 + self.p.lateral_rate_speed_reduction_gain * abs(lateral_rate)
             ),
             min_speed,
