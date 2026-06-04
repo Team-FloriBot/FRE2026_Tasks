@@ -60,7 +60,7 @@ maize_navigator:
     slow_speed: 0.12
     lookahead_distance: 0.75
     pose_lateral_gain: 0.3
-    pose_heading_gain: 0.35
+    pose_heading_gain: 0.3
     pose_curvature_feedforward_gain: 0.1
     pose_lateral_rate_gain: 1.25
     lateral_error_limit: 0.35
