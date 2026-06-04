@@ -58,11 +58,11 @@ maize_navigator:
     # StartNavigation.carefulness=medium/low derives faster runtime profiles from these values.
     follow_speed: 0.5
     slow_speed: 0.12
-    lookahead_distance: 0.80
+    lookahead_distance: 1.0
     yaw_kp: 0.6
-    pure_pursuit_gain: 1.4
-    heading_kp: 0.25
-    lateral_kp: 0.45
+    pure_pursuit_gain: 1.2
+    heading_kp: 0.2
+    lateral_kp: 0.3
     lateral_kd: 0.3
     lateral_error_limit: 0.35
     lateral_rate_limit: 0.45
@@ -86,11 +86,12 @@ maize_navigator:
     maneuver_goal_xy_tolerance: 0.25
     maneuver_goal_yaw_tolerance: 0.75
     maneuver_heading_lookahead_distance: 0.10
-    maneuver_speed: 0.5
+    maneuver_speed: 0.50
     maneuver_slow_speed: 0.10
-    maneuver_lookahead_distance: 0.70
+    maneuver_lookahead_distance: 1.0
     maneuver_route_spacing: 0.08
-    maneuver_corner_radius: 0.40
+    maneuver_corner_radius: 0.70
+    maneuver_control_gain_scale: 0.50
     maneuver_entry_extension_distance: 0.80
     maneuver_max_route_deviation: 0.70
     maneuver_entry_lateral_tolerance: 0.25

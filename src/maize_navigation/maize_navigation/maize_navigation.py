@@ -109,6 +109,7 @@ class DrivingProfile:
     maneuver_slow_speed: float
     maneuver_lookahead_distance: float
     maneuver_corner_radius: float
+    maneuver_control_gain_scale: float
 
 
 @dataclass
@@ -234,6 +235,7 @@ class NavigatorParams:
     maneuver_lookahead_distance: float = 0.80
     maneuver_route_spacing: float = 0.08
     maneuver_corner_radius: float = 0.50
+    maneuver_control_gain_scale: float = 0.55
     maneuver_entry_extension_distance: float = 0.80
     maneuver_max_route_deviation: float = 0.70
     maneuver_entry_lateral_tolerance: float = 0.25
@@ -626,6 +628,7 @@ class MaizeNavigator(Node):
         p.maneuver_lookahead_distance = float(get_param("maneuver_lookahead_distance", p.maneuver_lookahead_distance))
         p.maneuver_route_spacing = float(get_param("maneuver_route_spacing", p.maneuver_route_spacing))
         p.maneuver_corner_radius = float(get_param("maneuver_corner_radius", p.maneuver_corner_radius))
+        p.maneuver_control_gain_scale = float(get_param("maneuver_control_gain_scale", p.maneuver_control_gain_scale))
         p.maneuver_entry_extension_distance = float(
             get_param("maneuver_entry_extension_distance", p.maneuver_entry_extension_distance)
         )
@@ -706,6 +709,7 @@ class MaizeNavigator(Node):
         self.p.maneuver_lookahead_distance = max(0.05, self.p.maneuver_lookahead_distance)
         self.p.maneuver_route_spacing = max(0.02, self.p.maneuver_route_spacing)
         self.p.maneuver_corner_radius = max(0.0, self.p.maneuver_corner_radius)
+        self.p.maneuver_control_gain_scale = float(np.clip(self.p.maneuver_control_gain_scale, 0.05, 1.0))
         self.p.maneuver_entry_extension_distance = max(0.10, self.p.maneuver_entry_extension_distance)
         self.p.maneuver_max_route_deviation = max(0.10, self.p.maneuver_max_route_deviation)
         self.p.maneuver_entry_lateral_tolerance = max(0.05, self.p.maneuver_entry_lateral_tolerance)
@@ -789,6 +793,7 @@ class MaizeNavigator(Node):
             maneuver_slow_speed=self.p.maneuver_slow_speed,
             maneuver_lookahead_distance=self.p.maneuver_lookahead_distance,
             maneuver_corner_radius=self.p.maneuver_corner_radius,
+            maneuver_control_gain_scale=self.p.maneuver_control_gain_scale,
         )
         return {
             "high": high,
@@ -817,6 +822,7 @@ class MaizeNavigator(Node):
                 maneuver_slow_speed=high.maneuver_slow_speed * 1.80,
                 maneuver_lookahead_distance=high.maneuver_lookahead_distance * 1.20,
                 maneuver_corner_radius=high.maneuver_corner_radius * 1.25,
+                maneuver_control_gain_scale=high.maneuver_control_gain_scale * 0.85,
             ),
             "low": DrivingProfile(
                 follow_speed=high.follow_speed * 1.60,
@@ -843,6 +849,7 @@ class MaizeNavigator(Node):
                 maneuver_slow_speed=high.maneuver_slow_speed * 2.50,
                 maneuver_lookahead_distance=high.maneuver_lookahead_distance * 1.38,
                 maneuver_corner_radius=high.maneuver_corner_radius * 1.50,
+                maneuver_control_gain_scale=high.maneuver_control_gain_scale * 0.70,
             ),
         }
 
@@ -2391,6 +2398,7 @@ class MaizeNavigator(Node):
         min_speed: Optional[float] = None,
         reference_polyline: Optional[np.ndarray] = None,
     ) -> None:
+        is_maneuver_control = max_speed is not None or min_speed is not None
         target = np.asarray(target, dtype=float)
         if self.last_target_point is None:
             filtered_target = target
@@ -2422,10 +2430,11 @@ class MaizeNavigator(Node):
             path_yaw = math.atan2(float(tangent[1]), float(tangent[0]))
             heading_error = wrap_to_pi(path_yaw - self.robot_pose.yaw)
         stanley_speed = max(abs(self.last_cmd_linear_x), self.p.stanley_min_speed)
+        gain_scale = self.p.maneuver_control_gain_scale if is_maneuver_control and reference_polyline is not None else 1.0
         steering_angle = (
-            self.p.heading_kp * math.sin(heading_error)
-            + math.atan2(self.p.lateral_kp * float(target_base[1]), stanley_speed)
-            - self.p.lateral_kd * lateral_rate
+            gain_scale * self.p.heading_kp * math.sin(heading_error)
+            + math.atan2(gain_scale * self.p.lateral_kp * float(target_base[1]), stanley_speed)
+            - gain_scale * self.p.lateral_kd * lateral_rate
         )
         radius_limited_steering = math.atan2(self.p.ackermann_wheelbase, self.p.min_follow_turn_radius)
         max_steering = min(self.p.max_steering_angle, radius_limited_steering)
