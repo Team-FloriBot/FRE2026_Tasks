@@ -27,6 +27,11 @@ from visualization_msgs.msg import Marker, MarkerArray
 import tf2_ros
 from tf_transformations import euler_from_quaternion
 
+try:
+    from slam_toolbox.srv import Reset as SlamToolboxReset
+except ImportError:
+    SlamToolboxReset = None
+
 
 def wrap_to_pi(angle: float) -> float:
     return (angle + math.pi) % (2.0 * math.pi) - math.pi
@@ -108,6 +113,7 @@ class DrivingProfile:
     maneuver_lookahead_curvature_gain: float
     maneuver_lookahead_lateral_error_gain: float
     maneuver_lookahead_filter_alpha: float
+    maneuver_lookahead_speed_reduction_gain: float
     maneuver_corner_radius: float
 
 
@@ -149,6 +155,7 @@ class MissionState(Enum):
     FOLLOW_ROW = 2
     FIND_NEXT_ROW_ENTRANCE = 3
     FINISHED = 4
+    PAUSED = 5
 
 
 @dataclass
@@ -229,6 +236,7 @@ class NavigatorParams:
     maneuver_lookahead_curvature_gain: float = 2.5
     maneuver_lookahead_lateral_error_gain: float = 0.5
     maneuver_lookahead_filter_alpha: float = 0.45
+    maneuver_lookahead_speed_reduction_gain: float = 1.2
     maneuver_route_spacing: float = 0.08
     maneuver_corner_radius: float = 0.50
     maneuver_entry_extension_distance: float = 0.80
@@ -236,6 +244,7 @@ class NavigatorParams:
     maneuver_entry_lateral_tolerance: float = 0.25
     maneuver_entry_yaw_tolerance: float = 0.45
     row_map_output_directory: str = "~/.ros/maize_navigation"
+    slam_reset_service: str = "/slam_toolbox/reset"
 
     pattern: str = "1L 2R"
     starting_lane_number: int = 1
@@ -427,6 +436,7 @@ class MaizeNavigator(Node):
         self.validate_params()
 
         self.state = MissionState.IDLE
+        self.paused_state: Optional[MissionState] = None
         self.latest_map: Optional[OccupancyGrid] = None
         self.latest_scan: Optional[LaserScan] = None
         self.latest_scan_received_ns: Optional[int] = None
@@ -484,9 +494,17 @@ class MaizeNavigator(Node):
         self.scan_sub = self.create_subscription(LaserScan, self.p.scan_topic, self.scan_callback, 10)
         self.cmd_pub = self.create_publisher(Twist, self.p.cmd_vel_topic, 10)
         self.marker_pub = self.create_publisher(MarkerArray, "navigation_markers", 10)
+        self.slam_reset_client = (
+            self.create_client(SlamToolboxReset, self.p.slam_reset_service)
+            if SlamToolboxReset is not None
+            else None
+        )
 
         self.start_srv = self.create_service(StartNavigation, "start_navigation", self.start_cb)
         self.stop_srv = self.create_service(Trigger, "stop_navigation", self.stop_cb)
+        self.pause_srv = self.create_service(Trigger, "pause_navigation", self.pause_cb)
+        self.resume_srv = self.create_service(Trigger, "resume_navigation", self.resume_cb)
+        self.reset_srv = self.create_service(Trigger, "reset_navigation", self.reset_cb)
         self.timer = self.create_timer(1.0 / self.p.control_frequency, self.control_loop)
 
         self.get_logger().info("Maize Navigator initialized with rectangle marching row detection")
@@ -602,6 +620,9 @@ class MaizeNavigator(Node):
         p.maneuver_lookahead_filter_alpha = float(
             get_param("maneuver_lookahead_filter_alpha", p.maneuver_lookahead_filter_alpha)
         )
+        p.maneuver_lookahead_speed_reduction_gain = float(
+            get_param("maneuver_lookahead_speed_reduction_gain", p.maneuver_lookahead_speed_reduction_gain)
+        )
         p.maneuver_route_spacing = float(get_param("maneuver_route_spacing", p.maneuver_route_spacing))
         p.maneuver_corner_radius = float(get_param("maneuver_corner_radius", p.maneuver_corner_radius))
         p.maneuver_entry_extension_distance = float(
@@ -617,6 +638,7 @@ class MaizeNavigator(Node):
             get_param("maneuver_entry_yaw_tolerance", p.maneuver_entry_yaw_tolerance)
         )
         p.row_map_output_directory = str(get_param("row_map_output_directory", p.row_map_output_directory))
+        p.slam_reset_service = str(get_param("slam_reset_service", p.slam_reset_service))
 
         p.pattern = str(get_param("pattern", p.pattern))
         p.starting_lane_number = int(get_param("starting_lane_number", p.starting_lane_number))
@@ -687,6 +709,10 @@ class MaizeNavigator(Node):
         self.p.maneuver_lookahead_filter_alpha = float(
             np.clip(self.p.maneuver_lookahead_filter_alpha, 0.01, 1.0)
         )
+        self.p.maneuver_lookahead_speed_reduction_gain = max(
+            0.0,
+            self.p.maneuver_lookahead_speed_reduction_gain,
+        )
         self.p.maneuver_route_spacing = max(0.02, self.p.maneuver_route_spacing)
         self.p.maneuver_corner_radius = max(0.0, self.p.maneuver_corner_radius)
         self.p.maneuver_entry_extension_distance = max(0.10, self.p.maneuver_entry_extension_distance)
@@ -722,25 +748,7 @@ class MaizeNavigator(Node):
         self.p.pattern = pattern
         self.apply_driving_profile(carefulness)
         self.pattern_steps = self.parse_pattern(pattern)
-        self.left_row = None
-        self.right_row = None
-        self.midline = np.empty((0, 2), dtype=float)
-        self.plant_row_end_point = None
-        self.row_exit_goal = None
-        self.row_exit_heading_goal = None
-        self.row_end_direction = None
-        self.initial_forward_direction = None
-        self.row_number_increase_direction = None
-        self.pattern_index = 0
-        self.finish_after_current_row = len(self.pattern_steps) == 0
-        self.stored_rows = {}
-        self.row_end_directions_by_side = {"forward": [], "backward": []}
-        self.row_map_exported = False
-        self.reset_entrance_state()
-        self.reset_controller_state()
-        self.laser_follower.reset()
-        self.laser_follow_result = LaserFollowResult(reason="navigation started")
-        self.fused_target_point = None
+        self.reset_navigation_state(clear_sensor_cache=False)
         self.state = MissionState.INITIALIZING
         res.success = True
         res.message = f"Navigation started with pattern: {pattern}; carefulness: {carefulness}"
@@ -771,6 +779,7 @@ class MaizeNavigator(Node):
             maneuver_lookahead_curvature_gain=self.p.maneuver_lookahead_curvature_gain,
             maneuver_lookahead_lateral_error_gain=self.p.maneuver_lookahead_lateral_error_gain,
             maneuver_lookahead_filter_alpha=self.p.maneuver_lookahead_filter_alpha,
+            maneuver_lookahead_speed_reduction_gain=self.p.maneuver_lookahead_speed_reduction_gain,
             maneuver_corner_radius=self.p.maneuver_corner_radius,
         )
         return {
@@ -780,25 +789,26 @@ class MaizeNavigator(Node):
                 laser_max_weight_one_side=0.275,
                 follow_speed=high.follow_speed * 1.30,
                 slow_speed=high.slow_speed * 1.65,
-                pure_pursuit_gain=high.pure_pursuit_gain * 0.82,
+                pure_pursuit_gain=high.pure_pursuit_gain * 0.9,
                 curve_speed_reduction_gain=high.curve_speed_reduction_gain * 0.60,
                 follow_max_angular_speed=high.follow_max_angular_speed * 1.10,
-                min_follow_turn_radius=high.min_follow_turn_radius * 1.22,
+                min_follow_turn_radius=high.min_follow_turn_radius,
                 angular_rate_limit=high.angular_rate_limit * 1.15,
                 target_filter_alpha=min(1.0, high.target_filter_alpha * 1.15),
                 lookahead_distance=high.lookahead_distance * 1.10,
                 turn_lookahead_distance=high.turn_lookahead_distance * 1.40,
-                lookahead_curvature_gain=high.lookahead_curvature_gain * 0.65,
-                lookahead_lateral_error_gain=high.lookahead_lateral_error_gain * 0.70,
+                lookahead_curvature_gain=high.lookahead_curvature_gain * 0.9,
+                lookahead_lateral_error_gain=high.lookahead_lateral_error_gain * 0.9,
                 lookahead_filter_alpha=min(1.0, high.lookahead_filter_alpha * 1.15),
-                lookahead_speed_reduction_gain=high.lookahead_speed_reduction_gain * 0.60,
+                lookahead_speed_reduction_gain=high.lookahead_speed_reduction_gain * 0.9,
                 maneuver_speed=high.maneuver_speed * 1.20,
                 maneuver_slow_speed=high.maneuver_slow_speed * 1.80,
                 maneuver_lookahead_distance=high.maneuver_lookahead_distance * 1.20,
                 maneuver_turn_lookahead_distance=high.maneuver_turn_lookahead_distance * 1.30,
-                maneuver_lookahead_curvature_gain=high.maneuver_lookahead_curvature_gain * 0.70,
-                maneuver_lookahead_lateral_error_gain=high.maneuver_lookahead_lateral_error_gain * 0.75,
+                maneuver_lookahead_curvature_gain=high.maneuver_lookahead_curvature_gain * 0.9,
+                maneuver_lookahead_lateral_error_gain=high.maneuver_lookahead_lateral_error_gain * 0.9,
                 maneuver_lookahead_filter_alpha=min(1.0, high.maneuver_lookahead_filter_alpha * 1.10),
+                maneuver_lookahead_speed_reduction_gain=high.maneuver_lookahead_speed_reduction_gain * 0.9,
                 maneuver_corner_radius=high.maneuver_corner_radius * 1.25,
             ),
             "low": DrivingProfile(
@@ -806,25 +816,26 @@ class MaizeNavigator(Node):
                 laser_max_weight_one_side=0.40,
                 follow_speed=high.follow_speed * 1.60,
                 slow_speed=high.slow_speed * 2.50,
-                pure_pursuit_gain=high.pure_pursuit_gain * 0.68,
+                pure_pursuit_gain=high.pure_pursuit_gain * 0.8,
                 curve_speed_reduction_gain=high.curve_speed_reduction_gain * 0.35,
                 follow_max_angular_speed=high.follow_max_angular_speed * 1.20,
-                min_follow_turn_radius=high.min_follow_turn_radius * 1.50,
+                min_follow_turn_radius=high.min_follow_turn_radius,
                 angular_rate_limit=high.angular_rate_limit * 1.30,
                 target_filter_alpha=min(1.0, high.target_filter_alpha * 1.30),
                 lookahead_distance=high.lookahead_distance * 1.20,
                 turn_lookahead_distance=high.turn_lookahead_distance * 2.00,
-                lookahead_curvature_gain=high.lookahead_curvature_gain * 0.40,
-                lookahead_lateral_error_gain=high.lookahead_lateral_error_gain * 0.45,
+                lookahead_curvature_gain=high.lookahead_curvature_gain * 0.8,
+                lookahead_lateral_error_gain=high.lookahead_lateral_error_gain * 0.8,
                 lookahead_filter_alpha=min(1.0, high.lookahead_filter_alpha * 1.30),
-                lookahead_speed_reduction_gain=high.lookahead_speed_reduction_gain * 0.35,
+                lookahead_speed_reduction_gain=high.lookahead_speed_reduction_gain * 0.8,
                 maneuver_speed=high.maneuver_speed * 1.40,
                 maneuver_slow_speed=high.maneuver_slow_speed * 2.50,
                 maneuver_lookahead_distance=high.maneuver_lookahead_distance * 1.38,
                 maneuver_turn_lookahead_distance=high.maneuver_turn_lookahead_distance * 1.60,
-                maneuver_lookahead_curvature_gain=high.maneuver_lookahead_curvature_gain * 0.45,
-                maneuver_lookahead_lateral_error_gain=high.maneuver_lookahead_lateral_error_gain * 0.50,
+                maneuver_lookahead_curvature_gain=high.maneuver_lookahead_curvature_gain * 0.8,
+                maneuver_lookahead_lateral_error_gain=high.maneuver_lookahead_lateral_error_gain * 0.8,
                 maneuver_lookahead_filter_alpha=min(1.0, high.maneuver_lookahead_filter_alpha * 1.20),
+                maneuver_lookahead_speed_reduction_gain=high.maneuver_lookahead_speed_reduction_gain * 0.8,
                 maneuver_corner_radius=high.maneuver_corner_radius * 1.50,
             ),
         }
@@ -839,6 +850,7 @@ class MaizeNavigator(Node):
         self.store_current_rows()
         export_path = self.export_row_map()
         self.state = MissionState.IDLE
+        self.paused_state = None
         self.reset_entrance_state()
         self.reset_controller_state()
         self.cmd_pub.publish(Twist())
@@ -847,6 +859,94 @@ class MaizeNavigator(Node):
         if export_path is not None:
             res.message += f"; row map saved to {export_path}"
         return res
+
+    def pause_cb(self, req, res):
+        if self.state == MissionState.PAUSED:
+            res.success = True
+            res.message = "Navigation already paused"
+            return res
+        if self.state in (MissionState.IDLE, MissionState.FINISHED):
+            res.success = False
+            res.message = f"Cannot pause navigation while state is {self.state.name}"
+            return res
+        self.paused_state = self.state
+        self.state = MissionState.PAUSED
+        self.reset_controller_state()
+        self.cmd_pub.publish(Twist())
+        res.success = True
+        res.message = f"Navigation paused from state {self.paused_state.name}"
+        return res
+
+    def resume_cb(self, req, res):
+        if self.state != MissionState.PAUSED or self.paused_state is None:
+            res.success = False
+            res.message = "Navigation is not paused"
+            return res
+        resume_state = self.paused_state
+        self.paused_state = None
+        self.state = resume_state
+        self.reset_controller_state()
+        res.success = True
+        res.message = f"Navigation resumed in state {self.state.name}"
+        return res
+
+    def reset_cb(self, req, res):
+        self.state = MissionState.IDLE
+        self.paused_state = None
+        self.reset_navigation_state(clear_sensor_cache=True)
+        self.cmd_pub.publish(Twist())
+        slam_requested, slam_message = self.request_slam_reset()
+        res.success = True
+        res.message = f"Navigation reset; {slam_message}"
+        if not slam_requested:
+            self.get_logger().warn(slam_message)
+        return res
+
+    def request_slam_reset(self) -> Tuple[bool, str]:
+        if SlamToolboxReset is None or self.slam_reset_client is None:
+            return False, "slam_toolbox reset service type is not available"
+        if not self.slam_reset_client.wait_for_service(timeout_sec=0.2):
+            return False, f"SLAM reset service unavailable: {self.p.slam_reset_service}"
+        request = SlamToolboxReset.Request()
+        request.pause_new_measurements = False
+        future = self.slam_reset_client.call_async(request)
+        future.add_done_callback(self.handle_slam_reset_response)
+        return True, f"SLAM reset requested via {self.p.slam_reset_service}"
+
+    def handle_slam_reset_response(self, future) -> None:
+        try:
+            response = future.result()
+        except Exception as exc:
+            self.get_logger().error(f"SLAM reset failed: {exc}")
+            return
+        result = getattr(response, "result", None)
+        self.get_logger().info(f"SLAM reset response result={result}")
+
+    def reset_navigation_state(self, clear_sensor_cache: bool) -> None:
+        self.left_row = None
+        self.right_row = None
+        self.midline = np.empty((0, 2), dtype=float)
+        self.plant_row_end_point = None
+        self.row_exit_goal = None
+        self.row_exit_heading_goal = None
+        self.row_end_direction = None
+        self.initial_forward_direction = None
+        self.row_number_increase_direction = None
+        self.pattern_index = 0
+        self.finish_after_current_row = len(self.pattern_steps) == 0
+        self.stored_rows = {}
+        self.row_end_directions_by_side = {"forward": [], "backward": []}
+        self.row_map_exported = False
+        self.reset_entrance_state()
+        self.reset_controller_state()
+        self.laser_follower.reset()
+        self.laser_follow_result = LaserFollowResult(reason="navigation reset")
+        self.fused_target_point = None
+        if clear_sensor_cache:
+            self.latest_map = None
+            self.latest_scan = None
+            self.latest_scan_received_ns = None
+            self.robot_pose = None
 
     def reset_controller_state(self) -> None:
         self.last_cmd_angular_z = 0.0
@@ -908,6 +1008,8 @@ class MaizeNavigator(Node):
         elif self.state == MissionState.FIND_NEXT_ROW_ENTRANCE:
             self.handle_find_next_row_entrance()
         elif self.state == MissionState.FINISHED:
+            self.cmd_pub.publish(Twist())
+        elif self.state == MissionState.PAUSED:
             self.cmd_pub.publish(Twist())
 
         self.publish_visuals()
@@ -2554,12 +2656,26 @@ class MaizeNavigator(Node):
         is_follow_control = max_speed is None and min_speed is None
         max_speed = self.p.follow_speed if max_speed is None else max_speed
         min_speed = self.p.slow_speed if min_speed is None else min_speed
+        is_maneuver_control = (
+            not is_follow_control
+            and math.isclose(max_speed, self.p.maneuver_speed)
+            and math.isclose(min_speed, self.p.maneuver_slow_speed)
+        )
         pursuit_distance = max(0.10, target_distance)
         curvature = self.p.pure_pursuit_gain * 2.0 * math.sin(yaw_error) / pursuit_distance
         lookahead_speed_penalty = 0.0
         if is_follow_control and self.p.lookahead_distance > 1e-9:
             lookahead_ratio = float(np.clip(self.current_lookahead_distance / self.p.lookahead_distance, 0.0, 1.0))
             lookahead_speed_penalty = self.p.lookahead_speed_reduction_gain * (1.0 - lookahead_ratio)
+        elif is_maneuver_control and self.p.maneuver_lookahead_distance > 1e-9:
+            lookahead_ratio = float(
+                np.clip(
+                    self.current_maneuver_lookahead_distance / self.p.maneuver_lookahead_distance,
+                    0.0,
+                    1.0,
+                )
+            )
+            lookahead_speed_penalty = self.p.maneuver_lookahead_speed_reduction_gain * (1.0 - lookahead_ratio)
         cmd.linear.x = float(np.clip(
             max_speed / (
                 1.0

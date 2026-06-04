@@ -105,6 +105,15 @@ def make_navigator_for_start_callback():
     navigator.laser_follower = types.SimpleNamespace(reset=lambda: None)
     navigator.driving_profiles = navigator.build_driving_profiles()
     navigator.current_carefulness = "high"
+    navigator.paused_state = None
+    navigator.published_cmds = []
+    navigator.cmd_pub = types.SimpleNamespace(publish=lambda msg: navigator.published_cmds.append(msg))
+    navigator.slam_reset_client = None
+    navigator.get_logger = lambda: types.SimpleNamespace(
+        warn=lambda *args, **kwargs: None,
+        info=lambda *args, **kwargs: None,
+        error=lambda *args, **kwargs: None,
+    )
     return navigator
 
 
@@ -170,6 +179,75 @@ def test_start_callback_rejects_invalid_carefulness_without_changing_mission():
     assert navigator.p.pattern == "1L 2R"
     assert navigator.pattern_steps == [PatternStep(1, "L")]
     assert navigator.current_carefulness == "high"
+
+
+def test_pause_and_resume_keep_mission_state_and_profile():
+    navigator = make_navigator_for_start_callback()
+    navigator.state = MissionState.FOLLOW_ROW
+    navigator.current_carefulness = "medium"
+    navigator.p.follow_speed = navigator.driving_profiles["medium"].follow_speed
+    navigator.midline = np.array([[0.0, 0.0], [1.0, 0.0]])
+
+    pause_response = navigator.pause_cb(types.SimpleNamespace(), types.SimpleNamespace())
+
+    assert pause_response.success
+    assert navigator.state == MissionState.PAUSED
+    assert navigator.paused_state == MissionState.FOLLOW_ROW
+    assert navigator.current_carefulness == "medium"
+    assert np.array_equal(navigator.midline, np.array([[0.0, 0.0], [1.0, 0.0]]))
+    assert len(navigator.published_cmds) == 1
+
+    resume_response = navigator.resume_cb(types.SimpleNamespace(), types.SimpleNamespace())
+
+    assert resume_response.success
+    assert navigator.state == MissionState.FOLLOW_ROW
+    assert navigator.paused_state is None
+    assert navigator.current_carefulness == "medium"
+
+
+def test_pause_rejects_idle_navigation():
+    navigator = make_navigator_for_start_callback()
+    navigator.state = MissionState.IDLE
+
+    response = navigator.pause_cb(types.SimpleNamespace(), types.SimpleNamespace())
+
+    assert not response.success
+    assert navigator.state == MissionState.IDLE
+
+
+def test_resume_rejects_when_not_paused():
+    navigator = make_navigator_for_start_callback()
+    navigator.state = MissionState.FOLLOW_ROW
+
+    response = navigator.resume_cb(types.SimpleNamespace(), types.SimpleNamespace())
+
+    assert not response.success
+    assert navigator.state == MissionState.FOLLOW_ROW
+
+
+def test_reset_clears_navigation_and_sensor_state():
+    navigator = make_navigator_for_start_callback()
+    navigator.state = MissionState.FOLLOW_ROW
+    navigator.paused_state = MissionState.FIND_NEXT_ROW_ENTRANCE
+    navigator.latest_map = object()
+    navigator.latest_scan = object()
+    navigator.latest_scan_received_ns = 123
+    navigator.robot_pose = Pose2D(1.0, 2.0, 0.5)
+    navigator.midline = np.array([[0.0, 0.0], [1.0, 0.0]])
+    navigator.stored_rows = {1: np.array([[0.0, 0.0]])}
+
+    response = navigator.reset_cb(types.SimpleNamespace(), types.SimpleNamespace())
+
+    assert response.success
+    assert navigator.state == MissionState.IDLE
+    assert navigator.paused_state is None
+    assert navigator.latest_map is None
+    assert navigator.latest_scan is None
+    assert navigator.latest_scan_received_ns is None
+    assert navigator.robot_pose is None
+    assert len(navigator.midline) == 0
+    assert navigator.stored_rows == {}
+    assert len(navigator.published_cmds) == 1
 
 
 def test_driving_profiles_are_derived_from_high_profile():
@@ -537,6 +615,33 @@ def test_small_dynamic_lookahead_reduces_follow_speed_before_curvature_grows():
     reduced_lookahead_speed = published[-1].linear.x
 
     assert math.isclose(full_lookahead_speed, navigator.p.follow_speed)
+    assert reduced_lookahead_speed < full_lookahead_speed
+
+
+def test_small_dynamic_maneuver_lookahead_reduces_maneuver_speed_before_curvature_grows():
+    published = []
+    navigator = bare_navigator()
+    navigator.cmd_pub = types.SimpleNamespace(publish=published.append)
+    navigator.robot_pose = Pose2D(0.0, 0.0, 0.0)
+    navigator.last_target_point = None
+    navigator.last_cmd_angular_z = 0.0
+    navigator.p.maneuver_speed = 0.40
+    navigator.p.maneuver_slow_speed = 0.10
+    navigator.p.maneuver_lookahead_distance = 1.0
+    navigator.p.curve_speed_reduction_gain = 0.0
+    navigator.p.maneuver_lookahead_speed_reduction_gain = 1.2
+    navigator.current_maneuver_lookahead_distance = 1.0
+
+    navigator.drive_to_point(np.array([1.0, 0.0]), navigator.p.maneuver_speed, navigator.p.maneuver_slow_speed)
+    full_lookahead_speed = published[-1].linear.x
+
+    navigator.last_target_point = None
+    navigator.last_cmd_angular_z = 0.0
+    navigator.current_maneuver_lookahead_distance = 0.5
+    navigator.drive_to_point(np.array([1.0, 0.0]), navigator.p.maneuver_speed, navigator.p.maneuver_slow_speed)
+    reduced_lookahead_speed = published[-1].linear.x
+
+    assert math.isclose(full_lookahead_speed, navigator.p.maneuver_speed)
     assert reduced_lookahead_speed < full_lookahead_speed
 
 
