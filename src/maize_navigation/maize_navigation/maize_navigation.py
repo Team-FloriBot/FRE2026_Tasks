@@ -22,7 +22,7 @@ from nav_msgs.msg import OccupancyGrid
 from sensor_msgs.msg import LaserScan
 from std_msgs.msg import Header
 from std_srvs.srv import Trigger
-from fre2026_task_interfaces.srv import SetNavigationPattern, GetNavigationStatus
+from fre2026_tasks_interfaces.srv import SetNavigationPattern, GetNavigationStatus
 from visualization_msgs.msg import Marker, MarkerArray
 
 import tf2_ros
