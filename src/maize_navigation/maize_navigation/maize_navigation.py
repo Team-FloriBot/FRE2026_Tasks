@@ -110,6 +110,8 @@ class DrivingProfile:
     maneuver_lookahead_distance: float
     maneuver_corner_radius: float
     maneuver_control_gain_scale: float
+    maneuver_max_angular_speed: float
+    maneuver_angular_rate_limit: float
 
 
 @dataclass
@@ -236,6 +238,8 @@ class NavigatorParams:
     maneuver_route_spacing: float = 0.08
     maneuver_corner_radius: float = 0.50
     maneuver_control_gain_scale: float = 0.55
+    maneuver_max_angular_speed: float = 0.80
+    maneuver_angular_rate_limit: float = 1.8
     maneuver_entry_extension_distance: float = 0.80
     maneuver_max_route_deviation: float = 0.70
     maneuver_entry_lateral_tolerance: float = 0.25
@@ -629,6 +633,12 @@ class MaizeNavigator(Node):
         p.maneuver_route_spacing = float(get_param("maneuver_route_spacing", p.maneuver_route_spacing))
         p.maneuver_corner_radius = float(get_param("maneuver_corner_radius", p.maneuver_corner_radius))
         p.maneuver_control_gain_scale = float(get_param("maneuver_control_gain_scale", p.maneuver_control_gain_scale))
+        p.maneuver_max_angular_speed = float(
+            get_param("maneuver_max_angular_speed", p.maneuver_max_angular_speed)
+        )
+        p.maneuver_angular_rate_limit = float(
+            get_param("maneuver_angular_rate_limit", p.maneuver_angular_rate_limit)
+        )
         p.maneuver_entry_extension_distance = float(
             get_param("maneuver_entry_extension_distance", p.maneuver_entry_extension_distance)
         )
@@ -710,6 +720,8 @@ class MaizeNavigator(Node):
         self.p.maneuver_route_spacing = max(0.02, self.p.maneuver_route_spacing)
         self.p.maneuver_corner_radius = max(0.0, self.p.maneuver_corner_radius)
         self.p.maneuver_control_gain_scale = float(np.clip(self.p.maneuver_control_gain_scale, 0.05, 1.0))
+        self.p.maneuver_max_angular_speed = max(0.01, self.p.maneuver_max_angular_speed)
+        self.p.maneuver_angular_rate_limit = max(0.01, self.p.maneuver_angular_rate_limit)
         self.p.maneuver_entry_extension_distance = max(0.10, self.p.maneuver_entry_extension_distance)
         self.p.maneuver_max_route_deviation = max(0.10, self.p.maneuver_max_route_deviation)
         self.p.maneuver_entry_lateral_tolerance = max(0.05, self.p.maneuver_entry_lateral_tolerance)
@@ -794,6 +806,8 @@ class MaizeNavigator(Node):
             maneuver_lookahead_distance=self.p.maneuver_lookahead_distance,
             maneuver_corner_radius=self.p.maneuver_corner_radius,
             maneuver_control_gain_scale=self.p.maneuver_control_gain_scale,
+            maneuver_max_angular_speed=self.p.maneuver_max_angular_speed,
+            maneuver_angular_rate_limit=self.p.maneuver_angular_rate_limit,
         )
         return {
             "high": high,
@@ -823,6 +837,8 @@ class MaizeNavigator(Node):
                 maneuver_lookahead_distance=high.maneuver_lookahead_distance * 1.20,
                 maneuver_corner_radius=high.maneuver_corner_radius * 1.25,
                 maneuver_control_gain_scale=high.maneuver_control_gain_scale * 0.85,
+                maneuver_max_angular_speed=high.maneuver_max_angular_speed * 1.05,
+                maneuver_angular_rate_limit=high.maneuver_angular_rate_limit * 1.10,
             ),
             "low": DrivingProfile(
                 follow_speed=high.follow_speed * 1.60,
@@ -850,6 +866,8 @@ class MaizeNavigator(Node):
                 maneuver_lookahead_distance=high.maneuver_lookahead_distance * 1.38,
                 maneuver_corner_radius=high.maneuver_corner_radius * 1.50,
                 maneuver_control_gain_scale=high.maneuver_control_gain_scale * 0.70,
+                maneuver_max_angular_speed=high.maneuver_max_angular_speed * 1.10,
+                maneuver_angular_rate_limit=high.maneuver_angular_rate_limit * 1.20,
             ),
         }
 
@@ -2431,9 +2449,10 @@ class MaizeNavigator(Node):
             heading_error = wrap_to_pi(path_yaw - self.robot_pose.yaw)
         stanley_speed = max(abs(self.last_cmd_linear_x), self.p.stanley_min_speed)
         gain_scale = self.p.maneuver_control_gain_scale if is_maneuver_control and reference_polyline is not None else 1.0
+        cross_track_error = -lateral_error if reference_polyline is not None else float(target_base[1])
         steering_angle = (
             gain_scale * self.p.heading_kp * math.sin(heading_error)
-            + math.atan2(gain_scale * self.p.lateral_kp * float(target_base[1]), stanley_speed)
+            + math.atan2(gain_scale * self.p.lateral_kp * cross_track_error, stanley_speed)
             - gain_scale * self.p.lateral_kd * lateral_rate
         )
         radius_limited_steering = math.atan2(self.p.ackermann_wheelbase, self.p.min_follow_turn_radius)
@@ -2463,13 +2482,15 @@ class MaizeNavigator(Node):
         self.last_cmd_linear_x = cmd.linear.x
         angular_reference_speed = min(max_speed, max(cmd.linear.x, self.p.angular_control_speed))
         radius_limited_angular = angular_reference_speed / self.p.min_follow_turn_radius
-        max_angular = min(self.p.max_angular_speed, radius_limited_angular)
+        angular_speed_limit = self.p.maneuver_max_angular_speed if is_maneuver_control else self.p.max_angular_speed
+        max_angular = min(angular_speed_limit, radius_limited_angular)
         # Pure-pursuit curvature is calmer around the midline than a direct
         # proportional yaw correction and still works for headland waypoints.
         pursuit_angular = angular_reference_speed * curvature
         angular_raw = float(np.clip(pursuit_angular, -max_angular, max_angular))
 
-        max_delta = self.p.angular_rate_limit * dt
+        angular_rate_limit = self.p.maneuver_angular_rate_limit if is_maneuver_control else self.p.angular_rate_limit
+        max_delta = angular_rate_limit * dt
         angular_limited = float(np.clip(
             angular_raw,
             self.last_cmd_angular_z - max_delta,

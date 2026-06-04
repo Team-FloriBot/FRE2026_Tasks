@@ -479,6 +479,92 @@ def test_angular_limit_uses_control_speed_when_linear_speed_is_reduced():
     assert math.isclose(published[0].angular.z, 0.35 / 0.37)
 
 
+def test_ackermann_steering_limit_allows_configured_turn_radius():
+    navigator = bare_navigator()
+    navigator.p.ackermann_wheelbase = 1.0
+    navigator.p.max_steering_angle = 1.25
+    navigator.p.min_follow_turn_radius = 0.37
+
+    max_steering = min(
+        navigator.p.max_steering_angle,
+        math.atan2(navigator.p.ackermann_wheelbase, navigator.p.min_follow_turn_radius),
+    )
+    min_radius_from_steering = navigator.p.ackermann_wheelbase / math.tan(max_steering)
+
+    assert min_radius_from_steering <= navigator.p.min_follow_turn_radius + 0.01
+
+
+def test_reference_polyline_cross_track_error_drives_stanley_term():
+    navigator = bare_navigator()
+    published = []
+    navigator.cmd_pub = types.SimpleNamespace(publish=published.append)
+    navigator.robot_pose = Pose2D(0.0, -0.20, 0.0)
+    navigator.last_target_point = None
+    navigator.last_lateral_error = None
+    navigator.last_cmd_linear_x = 0.0
+    navigator.last_cmd_angular_z = 0.0
+    navigator.p.follow_speed = 0.40
+    navigator.p.slow_speed = 0.10
+    navigator.p.heading_kp = 0.0
+    navigator.p.lateral_kp = 1.0
+    navigator.p.lateral_kd = 0.0
+    navigator.p.curve_speed_reduction_gain = 0.0
+    navigator.p.lateral_speed_reduction_gain = 0.0
+    navigator.p.lateral_rate_speed_reduction_gain = 0.0
+    navigator.p.linear_accel_limit = 0.0
+    navigator.p.angular_control_speed = 0.0
+    navigator.p.ackermann_wheelbase = 1.0
+    navigator.p.max_steering_angle = 1.25
+    navigator.p.stanley_min_speed = 0.35
+    navigator.p.max_angular_speed = 10.0
+    navigator.p.min_follow_turn_radius = 0.37
+    navigator.p.angular_rate_limit = 100.0
+
+    navigator.drive_to_point(np.array([0.8, 0.0]), reference_polyline=np.array([[0.0, 0.0], [1.0, 0.0]]))
+
+    expected_steering = math.atan2(0.20, navigator.p.stanley_min_speed)
+    expected_angular = published[-1].linear.x * math.tan(expected_steering) / navigator.p.ackermann_wheelbase
+    assert math.isclose(published[-1].angular.z, expected_angular)
+
+
+def test_maneuver_control_uses_maneuver_angular_limits():
+    navigator = bare_navigator()
+    published = []
+    navigator.cmd_pub = types.SimpleNamespace(publish=published.append)
+    navigator.robot_pose = Pose2D(0.0, -0.20, 0.0)
+    navigator.last_target_point = None
+    navigator.last_lateral_error = None
+    navigator.last_cmd_linear_x = 0.0
+    navigator.last_cmd_angular_z = 0.0
+    navigator.p.heading_kp = 0.0
+    navigator.p.lateral_kp = 10.0
+    navigator.p.lateral_kd = 0.0
+    navigator.p.curve_speed_reduction_gain = 0.0
+    navigator.p.lateral_speed_reduction_gain = 0.0
+    navigator.p.lateral_rate_speed_reduction_gain = 0.0
+    navigator.p.linear_accel_limit = 0.0
+    navigator.p.angular_control_speed = 0.35
+    navigator.p.ackermann_wheelbase = 1.0
+    navigator.p.max_steering_angle = 1.25
+    navigator.p.stanley_min_speed = 0.35
+    navigator.p.max_angular_speed = 0.20
+    navigator.p.maneuver_max_angular_speed = 1.25
+    navigator.p.min_follow_turn_radius = 0.37
+    navigator.p.angular_rate_limit = 0.20
+    navigator.p.maneuver_angular_rate_limit = 100.0
+    navigator.p.maneuver_control_gain_scale = 1.0
+
+    navigator.drive_to_point(
+        np.array([0.8, 0.0]),
+        max_speed=0.32,
+        min_speed=0.10,
+        reference_polyline=np.array([[0.0, 0.0], [1.0, 0.0]]),
+    )
+
+    assert published[-1].angular.z > navigator.p.max_angular_speed
+    assert published[-1].angular.z <= navigator.p.maneuver_max_angular_speed
+
+
 def test_lookahead_pose_controller_turns_toward_midline_side():
     navigator = bare_navigator()
     published = []
