@@ -4,7 +4,7 @@ from functools import partial
 from typing import Dict
 
 import rclpy
-from fre2026_task_interfaces.srv import SetScanProfile
+from fre2026_tasks_interfaces.srv import SetScanProfile
 from rclpy.node import Node
 from rclpy.parameter import Parameter
 from rclpy.qos import QoSProfile, ReliabilityPolicy

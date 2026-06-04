@@ -83,10 +83,10 @@ ros2 service call /pure_pursuit_node/set_active std_srvs/srv/SetBool "{data: tru
 Da wir mehrere Laser am Roboter verbaut haben, müssen wir zum Testen zwischen den Lasern umschalten können. Aktuell kann man zwischen 3 Laserscantopics für den front_laser umschalten:
 
 ```
-ros2 service call /front_scan_mux/set_profile fre2026_task_interfaces/srv/SetScanProfile "{profile: 'rs_crop_scan'}"
+ros2 service call /front_scan_mux/set_profile fre2026_tasks_interfaces/srv/SetScanProfile "{profile: 'rs_crop_scan'}"
 
-ros2 service call /front_scan_mux/set_profile fre2026_task_interfaces/srv/SetScanProfile "{profile: 'rs_nonground_scan'}"
+ros2 service call /front_scan_mux/set_profile fre2026_tasks_interfaces/srv/SetScanProfile "{profile: 'rs_nonground_scan'}"
 
-ros2 service call /front_scan_mux/set_profile fre2026_task_interfaces/srv/SetScanProfile "{profile: 'sick_front'}"
+ros2 service call /front_scan_mux/set_profile fre2026_tasks_interfaces/srv/SetScanProfile "{profile: 'sick_front'}"
 ```
 Profile: rs_crop_scan (Robosense Scan nur Pflanzen), rs_nonground_scan (Robosense Scan alles außer Boden), sick_front (2D Laser oder Simulation)

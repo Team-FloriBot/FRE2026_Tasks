@@ -10,7 +10,7 @@
 
   <buildtool_depend>ament_python</buildtool_depend>
 
-  <depend>fre2026_task_interfaces</depend>
+  <depend>fre2026_tasks_interfaces</depend>
   <depend>rclpy</depend>
   <depend>sensor_msgs</depend>
 

@@ -1,6 +1,6 @@
 <?xml version="1.0"?>
 <package format="3">
-  <name>fre2026_task_interfaces</name>
+  <name>fre2026_tasks_interfaces</name>
   <version>0.0.1</version>
   <description>ROS 2 interfaces for FRE2026 navigation task control.</description>
 
