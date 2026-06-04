@@ -359,6 +359,28 @@ def test_dynamic_follow_lookahead_shrinks_on_ninety_degree_midline():
     assert navigator.current_lookahead_curvature > 0.0
 
 
+def test_dynamic_follow_lookahead_detects_multi_point_bend():
+    navigator = bare_navigator()
+    navigator.p.lookahead_distance = 1.0
+    navigator.p.turn_lookahead_distance = 0.45
+    navigator.p.lookahead_curvature_gain = 1.5
+    navigator.p.lookahead_curvature_sample_count = 7
+    midline = np.array(
+        [
+            [0.0, 0.0],
+            [0.25, 0.00],
+            [0.50, 0.04],
+            [0.75, 0.13],
+            [1.00, 0.27],
+        ]
+    )
+
+    lookahead = navigator.dynamic_follow_lookahead(midline, np.array([0.0, 0.0]))
+
+    assert lookahead < navigator.p.lookahead_distance
+    assert navigator.current_lookahead_curvature > 0.0
+
+
 def test_dynamic_follow_lookahead_is_clamped_to_turn_distance():
     navigator = bare_navigator()
     navigator.p.lookahead_distance = 1.0

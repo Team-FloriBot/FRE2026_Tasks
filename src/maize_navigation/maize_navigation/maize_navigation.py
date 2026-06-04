@@ -177,6 +177,7 @@ class NavigatorParams:
     lookahead_distance: float = 1.10
     turn_lookahead_distance: float = 0.45
     lookahead_curvature_gain: float = 1.5
+    lookahead_curvature_sample_count: int = 7
     lookahead_speed_reduction_gain: float = 1.5
     yaw_kp: float = 0.6
     pure_pursuit_gain: float = 1.0
@@ -519,6 +520,9 @@ class MaizeNavigator(Node):
         p.lookahead_distance = float(get_param("lookahead_distance", p.lookahead_distance))
         p.turn_lookahead_distance = float(get_param("turn_lookahead_distance", p.turn_lookahead_distance))
         p.lookahead_curvature_gain = float(get_param("lookahead_curvature_gain", p.lookahead_curvature_gain))
+        p.lookahead_curvature_sample_count = int(
+            get_param("lookahead_curvature_sample_count", p.lookahead_curvature_sample_count)
+        )
         p.lookahead_speed_reduction_gain = float(
             get_param("lookahead_speed_reduction_gain", p.lookahead_speed_reduction_gain)
         )
@@ -606,6 +610,7 @@ class MaizeNavigator(Node):
             np.clip(self.p.turn_lookahead_distance, 0.05, self.p.lookahead_distance)
         )
         self.p.lookahead_curvature_gain = max(0.0, self.p.lookahead_curvature_gain)
+        self.p.lookahead_curvature_sample_count = max(3, self.p.lookahead_curvature_sample_count)
         self.p.lookahead_speed_reduction_gain = max(0.0, self.p.lookahead_speed_reduction_gain)
         self.p.slow_speed = float(np.clip(self.p.slow_speed, 0.0, self.p.follow_speed))
         self.p.curve_speed_reduction_gain = max(0.0, self.p.curve_speed_reduction_gain)
@@ -2161,21 +2166,34 @@ class MaizeNavigator(Node):
             return 0.0
 
         projection, segment_idx = self.project_onto_polyline(polyline, point)
-        mid_distance = max(self.p.turn_lookahead_distance, 0.5 * self.p.lookahead_distance)
-        p0 = projection
-        p1 = self.point_at_polyline_distance_from_projection(polyline, projection, segment_idx, mid_distance)
-        p2 = self.point_at_polyline_distance_from_projection(polyline, projection, segment_idx, self.p.lookahead_distance)
+        sample_count = max(3, self.p.lookahead_curvature_sample_count)
+        samples = [
+            self.point_at_polyline_distance_from_projection(
+                polyline,
+                projection,
+                segment_idx,
+                float(distance),
+            )
+            for distance in np.linspace(0.0, self.p.lookahead_distance, sample_count)
+        ]
 
-        a = float(np.linalg.norm(p1 - p0))
-        b = float(np.linalg.norm(p2 - p1))
-        c = float(np.linalg.norm(p2 - p0))
-        denominator = a * b * c
-        if denominator < 1e-9:
+        directions: List[float] = []
+        arc_length = 0.0
+        for start, end in zip(samples[:-1], samples[1:]):
+            segment = end - start
+            segment_length = float(np.linalg.norm(segment))
+            if segment_length < 1e-9:
+                continue
+            arc_length += segment_length
+            directions.append(math.atan2(float(segment[1]), float(segment[0])))
+
+        if len(directions) < 2 or arc_length < 1e-9:
             return 0.0
-        first = p1 - p0
-        second = p2 - p0
-        cross = float(first[0] * second[1] - first[1] * second[0])
-        return 2.0 * cross / denominator
+
+        total_heading_change = 0.0
+        for previous, current in zip(directions[:-1], directions[1:]):
+            total_heading_change += abs(wrap_to_pi(current - previous))
+        return total_heading_change / arc_length
 
     def dynamic_follow_lookahead(self, polyline: np.ndarray, point: np.ndarray) -> float:
         curvature = self.estimate_polyline_curvature_ahead(polyline, point)
