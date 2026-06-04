@@ -464,6 +464,8 @@ class MaizeNavigator(Node):
         self.laser_follower = LaserRowFollower(self.p)
         self.laser_follow_result = LaserFollowResult(reason="not initialized")
         self.fused_target_point: Optional[np.ndarray] = None
+        self.controller_pull_direction: Optional[np.ndarray] = None
+        self.controller_steering_angle: float = 0.0
         self.driving_profiles = self.build_driving_profiles()
         self.current_carefulness = "high"
 
@@ -869,6 +871,8 @@ class MaizeNavigator(Node):
         self.last_target_point = None
         self.fused_target_point = None
         self.last_lateral_error = None
+        self.controller_pull_direction = None
+        self.controller_steering_angle = 0.0
 
     def reset_entrance_state(self) -> None:
         self.entrance_hist_center = None
@@ -2426,6 +2430,10 @@ class MaizeNavigator(Node):
         radius_limited_steering = math.atan2(self.p.ackermann_wheelbase, self.p.min_follow_turn_radius)
         max_steering = min(self.p.max_steering_angle, radius_limited_steering)
         steering_angle = float(np.clip(steering_angle, -max_steering, max_steering))
+        self.controller_steering_angle = steering_angle
+        self.controller_pull_direction = self.base_direction_to_map(
+            np.array([math.cos(steering_angle), math.sin(steering_angle)], dtype=float)
+        )
         curvature = math.tan(steering_angle) / self.p.ackermann_wheelbase
         linear_raw = float(np.clip(
             max_speed / (
@@ -2519,6 +2527,31 @@ class MaizeNavigator(Node):
             marker_id += 1
         if self.robot_pose is not None and self.p.laser_follow_enabled:
             marker_id = self.add_laser_follow_markers(markers, marker_id, stamp)
+        if self.robot_pose is not None and self.controller_pull_direction is not None:
+            robot_point = np.array([self.robot_pose.x, self.robot_pose.y], dtype=float)
+            markers.markers.append(
+                self.create_arrow_marker(
+                    "controller_pull_direction",
+                    marker_id,
+                    robot_point,
+                    self.controller_pull_direction,
+                    (0.05, 0.95, 1.0, 1.0),
+                    stamp,
+                    length=0.85,
+                )
+            )
+            marker_id += 1
+            markers.markers.append(
+                self.create_text_marker(
+                    "controller_steering_status",
+                    marker_id,
+                    robot_point + np.array([0.0, 0.25], dtype=float),
+                    f"steer={math.degrees(self.controller_steering_angle):.1f} deg",
+                    (0.05, 0.95, 1.0, 1.0),
+                    stamp,
+                )
+            )
+            marker_id += 1
         if self.fused_target_point is not None:
             markers.markers.append(self.create_sphere_marker("fused_target_point", marker_id, self.fused_target_point, (0.95, 0.25, 0.95, 1.0), 0.14, stamp))
             marker_id += 1
@@ -2938,13 +2971,14 @@ class MaizeNavigator(Node):
         direction: np.ndarray,
         color: Tuple[float, float, float, float],
         stamp,
+        length: float = 0.55,
     ) -> Marker:
         marker = Marker(header=Header(frame_id=self.p.map_frame, stamp=stamp))
         marker.ns = namespace
         marker.id = marker_id
         marker.type = Marker.ARROW
         marker.action = Marker.ADD
-        marker.scale.x = 0.55
+        marker.scale.x = float(length)
         marker.scale.y = 0.10
         marker.scale.z = 0.10
         marker.color.r, marker.color.g, marker.color.b, marker.color.a = color

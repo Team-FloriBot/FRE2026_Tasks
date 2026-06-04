@@ -506,6 +506,8 @@ def test_lookahead_pose_controller_turns_toward_midline_side():
     navigator.drive_to_point(np.array([0.8, 0.0]), reference_polyline=np.array([[0.0, 0.0], [1.0, 0.0]]))
 
     assert published[-1].angular.z > 0.0
+    assert navigator.controller_pull_direction is not None
+    assert navigator.controller_pull_direction[1] > 0.0
 
 
 def test_entry_line_requires_crossing_with_alignment():
