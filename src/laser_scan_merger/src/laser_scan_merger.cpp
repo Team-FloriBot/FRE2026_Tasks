@@ -96,7 +96,10 @@ namespace util
       {
         topics += topic + ", ";
       }
-      topics.erase(topics.end() - 2, topics.end() - 1);
+      if (!topics.empty())
+      {
+        topics.erase(topics.end() - 2, topics.end());
+      }
 
       RCLCPP_INFO_STREAM(get_logger(), " (" << __func__
         << ") Laser scan topics: "
@@ -127,10 +130,10 @@ namespace util
       );
       return;
     }
-    else if (scan_topics_.size() < 2)
+    else if (scan_topics_.size() < 1)
     {
       RCLCPP_ERROR_STREAM(get_logger(), " (" << __func__
-        << ") input scan topic is less than 2."
+        << ") input scan topic is less than 1."
       );
       return;
     }
@@ -494,6 +497,31 @@ namespace util
   {
     // Initialize merged laser scan
     merged_cloud_ = std::make_shared<pointCloudT>();
+    // Initialize merged publisher before subscriptions can trigger callbacks.
+    merged_pub_ = create_publisher<sensor_msgs::msg::LaserScan>(output_topic_, 1);
+    // Prepare local transformation list
+    transforms_.reserve(scan_topics_.size());
+
+    if (scan_topics_.size() == 1)
+    {
+      if (scan_policies_[0] == 0)
+      {
+        qos_prof_.reliable();
+      }
+      else
+      {
+        qos_prof_.best_effort();
+      }
+
+      single_scan_sub_ = create_subscription<laserScanMsgT>(
+        scan_topics_[0],
+        qos_prof_,
+        [this](laserScanCBMsgPtrT msg)
+        {
+          laserScanMergerCB({msg});
+        });
+      return;
+    }
 
     std::for_each(indexes_.begin(), indexes_.end(),
       [this](auto &index)
@@ -556,10 +584,5 @@ namespace util
         );
         return;
     }
-
-    // Initialize merged publisher
-    merged_pub_ = create_publisher<sensor_msgs::msg::LaserScan>(output_topic_, 1);
-    // Prepare local transformation list
-    transforms_.reserve(scan_topics_.size());
   }
 } // util

@@ -1,13 +1,10 @@
 maize_navigator:
   ros__parameters:
-    scan_topic: "/sensors/merged_scan"
-    cmd_vel_topic: "/cmd_vel/task1"
+    cmd_vel_topic: "/cmd_vel"
     base_frame: "base_link"
-    odom_frame: "odom"
     map_topic: "/map"
     map_frame: "map"
-    use_slam_map: true
-    require_map_for_turns: true
+    scan_topic: "/sensors/merged_scan"
 
     control_frequency: 30.0
 
@@ -15,47 +12,63 @@ maize_navigator:
     min_lane_width: 0.55
     max_lane_width: 1.20
 
-    roi_x_min: 0.25
-    roi_x_max: 2.0
-    roi_y_abs_min: 0.18
-    roi_y_abs_max: 0.90
+    hist_roi_size: 5.0
+    # Histogramm-ROI: quer breit fuer mehr Reihen, laengs kompakter.
+    # hist_roi_size bleibt als Fallback fuer alte Konfigurationen erhalten.
+    hist_roi_depth: 4.0
+    hist_roi_width: 25.0
+    hist_bin_size: 0.05
+    hist_peak_min_points: 3
+    map_row_occupancy_threshold: 50
 
-    acquire_roi_x_min: -0.30
-    acquire_roi_x_max: 2.80
-    acquire_roi_y_abs_min: 0.05
-    acquire_roi_y_abs_max: 1.20
+    # Rechteck-Marching-Reihenerkennung:
+    # Die initiale linke/rechte Reihe kommt einmalig aus Histogrammpeaks.
+    # Danach werden beide Reihen bei jedem Kartenupdate von dieser Initialgeraden neu berechnet.
+    row_segment_point_count: 5
+    row_segment_point_spacing: 0.30
+    row_rectangle_width: 0.6
+    row_point_window_length: 0.30
+    row_end_min_points_fields_3_to_5: 2
+    row_max_march_steps: 120
+    row_min_fit_points: 3
+    # Bereits passierte Kartenpunkte bis zur aktuellen Roboterhoehe bleiben stabil.
+    # Linke und rechte Kartenreihe werden weiterhin unabhaengig erkannt.
+    row_freeze_behind_distance: 0.0
 
-    ransac_iterations: 80
-    ransac_distance: 0.08
-    min_inliers: 5
-    min_visible_length: 0.35
-    max_abs_line_slope: 0.9
-    centerline_max_abs_slope: 0.7
+    # Lokale LaserScan-Feinfuehrung innerhalb der Reihe.
+    # Karte bleibt Prior und Fallback; Reihenende und Vorgewende bleiben kartenbasiert.
+    laser_follow_enabled: true
+    laser_scan_timeout: 0.50
+    laser_roi_x_min: 0.1
+    laser_roi_x_max: 1.7
+    laser_roi_length: 1.55
+    laser_roi_width: 0.5
+    laser_roi_center_offset_limit: 0.2
+    laser_ransac_iterations: 80
+    laser_ransac_distance: 0.08
+    laser_min_inliers: 5
+    laser_min_visible_length: 0.35
+    laser_max_abs_line_slope: 0.90
+    laser_max_angle_to_map: 0.45
+    laser_max_center_offset: 0.40
+    laser_min_confidence: 0.25
+    laser_full_confidence: 0.85
+    laser_max_weight_both_sides: 0.30
+    laser_max_weight_one_side: 0.15
+    laser_tracker_alpha: 0.25
 
-    tracker_alpha: 0.18
-    confidence_decay: 0.95
-
-    front_density_x_min: 0.60
-    front_density_x_max: 2.00
-    front_density_y_abs: 0.45
-    front_density_threshold: 1
-    end_probability_threshold: 0.88
-    end_stable_frames_required: 35
-
-    min_follow_confidence: 0.10
-    min_enter_confidence: 0.12
-    enter_stable_frames_required: 3
-    acquire_timeout_sec: 8.0
-
-    follow_speed: 0.35
+    follow_speed: 0.5
     slow_speed: 0.12
-    enter_speed: 0.22
-    turn_speed: 0.24
+    pure_pursuit_gain: 1.4
+    curve_speed_reduction_gain: 2.5
+    min_follow_turn_radius: 0.37
+    target_filter_alpha: 0.45
+    # Ausfahr- und Einfahrziel liegen so weit ausserhalb der Pflanzenenden.
+    row_end_goal_outward_distance: 0.30
+    # Sicherheitsabstand der Wende-Querlinie hinter dem aeussersten relevanten Peak.
+    row_exit_extension_distance: 0.50
 
-    max_linear_speed: 0.45
-    max_angular_speed: 1.40
     follow_max_angular_speed: 0.90
-    turn_max_angular_speed: 1.40
     angular_rate_limit: 2.8
 
     lookahead_distance: 0.75
@@ -70,29 +83,29 @@ maize_navigator:
     min_turn_radius: 0.38
     enter_distance: 0.90
 
+    pattern: "1L 2R 1L 3R"
+
+    row_shift_count: 1
+    row_shift_direction: "L"
     turn_180: true
 
     # Vorgewende-Gassenwechsel:
     # Rausbogen -> pattern-relativer Versatz -> Reinbogen.
     # Die normale Reihenfahrt bleibt unveraendert.
     headland_maneuver_enabled: true
-    # Direkt nach erkannter Reihenende-Bedingung in den Ausfahrbogen wechseln.
-    # Vorher: 0.45 m Geradeaus-Ausfahrt vor dem Bogen.
-    headland_exit_straight_distance: 0.0
+    headland_exit_straight_distance: 0.45
     headland_exit_straight_speed: 0.18
     exit_curve_speed: 0.18
     exit_curve_angular_speed: 0.48
-    exit_curve_yaw_change: 1.5707963267948966
+    exit_curve_yaw_change: 1.35
 
     headland_shift_speed: 0.22
     headland_shift_tolerance: 0.04
-    headland_shift_lookahead_distance: 0.45
     headland_shift_overshoot_tolerance: 0.08
     headland_yaw_tolerance: 0.25
     headland_use_map_row_heading: true
     headland_heading_kp: 1.4
     headland_heading_max_yaw_error: 0.75
-    headland_map_heading_min_confidence: 0.20
 
     entry_curve_speed: 0.16
     entry_curve_angular_speed: 0.427
@@ -108,31 +121,12 @@ maize_navigator:
     entry_lane_width_tolerance: 0.22
     entry_row_yaw_tolerance: 0.35
 
-    # Exakte Pattern-Geometrie am Vorgewende:
-    # 1L/1R: Halbkreis in Nachbargasse.
-    # 2L/2R: 90°-Bogen, Gerade zum Ueberspringen einer Gasse, 90°-Bogen.
-    multirow_entry_extra_shift: 0.0
-    multirow_straight_trim: 0.15
-    multirow_entry_shift_overshoot_rows: 1.50
-    multirow_local_takeover_min_yaw_progress: 2.00
-    multirow_local_takeover_min_confidence: 0.55
-    map_multirow_require_counted_rows: true
-    map_counted_row_min_width_ratio: 0.40
-    map_multirow_counted_target_tolerance: 0.22
-    map_multirow_reference_row_min_ratio: 0.45
-
     # Direkter Nachbargassenwechsel 1L/1R:
     # Zielreihe erst akzeptieren, wenn der Versatz erreicht ist und
     # die Maisreihe auf der erwarteten Seite sichtbar ist.
     neighbor_reference_turn_enabled: true
     neighbor_reference_entry_requires_shift: true
     neighbor_reference_requires_same_side_row: true
-    neighbor_local_takeover_enabled: true
-    neighbor_local_takeover_min_confidence: 0.80
-    neighbor_local_takeover_target_tolerance: 0.12
-    neighbor_local_takeover_center_tolerance: 0.30
-    neighbor_local_takeover_row_yaw_tolerance: 0.45
-    neighbor_local_takeover_min_yaw_progress: 2.85
 
     map_row_detection_enabled: true
     map_row_occupancy_threshold: 50
@@ -142,41 +136,20 @@ maize_navigator:
     map_row_use_pca_orientation: true
     map_row_pca_radius: 5.0
     map_row_pca_min_points: 80
-    map_field_orientation_enabled: false
-    map_field_orientation_radius: 12.0
-    map_field_orientation_min_points: 160
-    map_field_orientation_min_confidence: 0.25
-    map_field_orientation_alpha: 0.12
-    map_field_orientation_max_local_deviation: 0.55
-    map_row_lateral_bin: 0.05
-    map_row_min_band_points: 6
-    map_row_min_band_length: 0.8
+    map_row_lateral_bin: 0.10
+    map_row_min_band_points: 12
+    map_row_min_band_length: 1.2
     map_row_max_extrapolated_lanes: 3
-
-    # Histogramm-basierte Reihenerkennung fuer punktfoermige, leicht gekruemmte Maiskarten.
-    # Die belegten Map-Zellen werden in die Reihenbasis transformiert. Peaks im Quer-
-    # Histogramm sind Pflanzenreihen; groessere Luecken werden mit expected_row_width
-    # ergaenzt, damit 2R/2L als diskreter Reihenindex gezaehlt werden kann.
-    map_row_histogram_enabled: true
-    map_row_histogram_bin: 0.05
-    map_row_histogram_smoothing_bins: 3
-    map_row_peak_min_points: 6
-    map_row_peak_window_ratio: 0.32
-    map_row_peak_min_distance_ratio: 0.45
-    map_row_spacing_regularization: true
-    map_row_spacing_tolerance_ratio: 0.35
-    map_row_insert_missing_peaks: true
-    map_row_insert_missing_max_gap_rows: 3
 
     # SLAM-Reihenerkennung ueber Linienfit durch belegte Map-Zellen.
     # Daraus werden Pflanzenreihen und anschliessend Gassenmittelpunkte berechnet.
     map_row_line_ransac_iterations: 180
-    map_row_line_distance: 0.15
-    map_row_min_line_inliers: 10
-    map_row_min_line_length: 0.80
+    map_row_line_distance: 0.12
+    map_row_min_line_inliers: 18
+    map_row_min_line_length: 1.20
     map_row_max_abs_line_slope: 0.70
-    map_row_max_lines: 14
-    map_row_line_merge_distance: 0.18
+    map_row_max_lines: 12
+    map_row_line_merge_distance: 0.22
 
     # SLAM darf die Zielgasse nur korrigieren, wenn sie zum Pattern passt.
     # 1L erwartet ca. +0.75 m, 2R ca. -1.50 m, 3R ca. -2.25 m.

@@ -46,8 +46,18 @@ Die Konfiguration erfolgt über die config/params.yaml. Hier können das Fahrmus
 
 Zum Starten der Maisnavigation folgenden Service in der Kommandozeile aufrufen:
 ```
-ros2 service call /start_navigation std_srvs/srv/Trigger {}
+ros2 service call /start_navigation maize_navigation_interfaces/srv/StartNavigation "{pattern: '3L 6R 5R', carefulness: 'high'}"
 ``` 
+`carefulness` kann `high`, `medium` oder `low` sein. `high` ist vorsichtig, `low` ist am schnellsten.
+
+Weitere Navigationsservices:
+```
+ros2 service call /pause_navigation std_srvs/srv/Trigger {}
+ros2 service call /resume_navigation std_srvs/srv/Trigger {}
+ros2 service call /stop_navigation std_srvs/srv/Trigger {}
+ros2 service call /reset_navigation std_srvs/srv/Trigger {}
+```
+
 
 ## Task 4
 

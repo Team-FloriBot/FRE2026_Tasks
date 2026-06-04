@@ -10,7 +10,7 @@
 
 | Parameter Name | Type | Default Value | Description |
 | --- | --- | --- | --- |
-| `scan_topics` | `std::vector<std::string>` | `[]` | List of input laser scan topics to merge. [2 <= scan_topics <= 9] |
+| `scan_topics` | `std::vector<std::string>` | `[]` | List of input laser scan topics to merge or normalize. [1 <= scan_topics <= 9] |
 | `scan_policies` | `std::vector<int64_t>` | `[]` | Sync policies for each scan topic [0 - reliable, 1 - best effort] |
 | `merged_frame_id` | `std::string` | `"base_link"` | Frame ID for the merged laser scan output. |
 | `output_topic` | `std::string` | `"merged_scan"` | Topic name to publish the merged laser scan. |

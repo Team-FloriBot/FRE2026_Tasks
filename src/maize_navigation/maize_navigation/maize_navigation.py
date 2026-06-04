@@ -2,55 +2,40 @@
 
 from __future__ import annotations
 
+import csv
 import math
-import random
+import os
+import re
 from dataclasses import dataclass, field
+from datetime import datetime
 from enum import Enum
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 
 import rclpy
 from rclpy.node import Node
-from rclpy.duration import Duration
 
-from geometry_msgs.msg import Twist, PoseStamped, Point
-from nav_msgs.msg import OccupancyGrid, Path
+from geometry_msgs.msg import Point, Twist
+from maize_navigation_interfaces.srv import StartNavigation
+from nav_msgs.msg import OccupancyGrid
 from sensor_msgs.msg import LaserScan
-from std_msgs.msg import Float32, String
+from std_msgs.msg import Header
 from std_srvs.srv import Trigger
 from fre2026_task_interfaces.srv import SetNavigationPattern, GetNavigationStatus
 from visualization_msgs.msg import Marker, MarkerArray
 
 import tf2_ros
+from tf_transformations import euler_from_quaternion
 
-
-def clamp(value: float, lo: float, hi: float) -> float:
-    return max(lo, min(hi, value))
+try:
+    from slam_toolbox.srv import Reset as SlamToolboxReset
+except ImportError:
+    SlamToolboxReset = None
 
 
 def wrap_to_pi(angle: float) -> float:
-    while angle > math.pi:
-        angle -= 2.0 * math.pi
-    while angle < -math.pi:
-        angle += 2.0 * math.pi
-    return angle
-
-
-def yaw_from_quaternion(q) -> float:
-    siny_cosp = 2.0 * (q.w * q.z + q.x * q.y)
-    cosy_cosp = 1.0 - 2.0 * (q.y * q.y + q.z * q.z)
-    return math.atan2(siny_cosp, cosy_cosp)
-
-
-def quaternion_from_yaw(yaw: float):
-    half = 0.5 * yaw
-    return (
-        0.0,
-        0.0,
-        math.sin(half),
-        math.cos(half),
-    )
+    return (angle + math.pi) % (2.0 * math.pi) - math.pi
 
 
 @dataclass
@@ -61,4652 +46,3175 @@ class Pose2D:
 
 
 @dataclass
-class ScanPoint:
-    x: float
-    y: float
+class SegmentDebug:
+    line_points: np.ndarray
+    direction: np.ndarray
+    big_rect_center: np.ndarray
+    big_rect_length: float
+    big_rect_width: float
+    point3_rect_center: np.ndarray
+    point3_rect_length: float
+    point3_rect_width: float
+    support_count: int
+    end_field_count: int
 
 
 @dataclass
-class LineFit:
+class RowMarchResult:
+    points: np.ndarray = field(default_factory=lambda: np.empty((0, 2), dtype=float))
+    point_directions: np.ndarray = field(default_factory=lambda: np.empty((0, 2), dtype=float))
+    frozen_count: int = 0
+    debug_segments: List[SegmentDebug] = field(default_factory=list)
+    current_line_points: np.ndarray = field(default_factory=lambda: np.empty((0, 2), dtype=float))
+    ended: bool = False
+    end_point: Optional[np.ndarray] = None
+    end_direction: Optional[np.ndarray] = None
+
+
+@dataclass
+class RowMarchModel:
+    side: str
+    initial_point1: np.ndarray
+    initial_point2: np.ndarray
+    initial_direction: np.ndarray
+    row_number: int
+    result: RowMarchResult = field(default_factory=RowMarchResult)
+    frozen_points: np.ndarray = field(default_factory=lambda: np.empty((0, 2), dtype=float))
+    frozen_directions: np.ndarray = field(default_factory=lambda: np.empty((0, 2), dtype=float))
+
+
+@dataclass
+class PatternStep:
+    lane_shift: int
+    direction: str
+
+
+@dataclass
+class DrivingProfile:
+    laser_max_weight_both_sides: float
+    laser_max_weight_one_side: float
+    follow_speed: float
+    slow_speed: float
+    pure_pursuit_gain: float
+    curve_speed_reduction_gain: float
+    follow_max_angular_speed: float
+    min_follow_turn_radius: float
+    angular_rate_limit: float
+    target_filter_alpha: float
+    lookahead_distance: float
+    turn_lookahead_distance: float
+    lookahead_curvature_gain: float
+    lookahead_lateral_error_gain: float
+    lookahead_filter_alpha: float
+    lookahead_speed_reduction_gain: float
+    maneuver_speed: float
+    maneuver_slow_speed: float
+    maneuver_lookahead_distance: float
+    maneuver_turn_lookahead_distance: float
+    maneuver_lookahead_curvature_gain: float
+    maneuver_lookahead_lateral_error_gain: float
+    maneuver_lookahead_filter_alpha: float
+    maneuver_lookahead_speed_reduction_gain: float
+    maneuver_corner_radius: float
+
+
+@dataclass
+class EntrancePeak:
+    lateral: float
+    point: np.ndarray
+    row_number: Optional[int] = None
+    selected: bool = False
+
+
+@dataclass
+class LaserLineFit:
     valid: bool = False
-    a: float = 0.0
-    b: float = 0.0
+    slope: float = 0.0
+    intercept: float = 0.0
     inliers: int = 0
     visible_length: float = 0.0
 
 
 @dataclass
-class RowDetection:
-    left_valid: bool = False
-    right_valid: bool = False
-
-    left_a: float = 0.0
-    left_b: float = 0.0
-    right_a: float = 0.0
-    right_b: float = 0.0
-
-    center_a: float = 0.0
-    center_b: float = 0.0
-
-    lane_width: float = 0.0
-    confidence: float = 0.0
-    end_probability: float = 0.0
-
-    points_left: List[ScanPoint] = field(default_factory=list)
-    points_right: List[ScanPoint] = field(default_factory=list)
-    points_all: List[ScanPoint] = field(default_factory=list)
-
-
-@dataclass
-class RowModel:
+class LaserFollowResult:
     valid: bool = False
+    left_line: LaserLineFit = field(default_factory=LaserLineFit)
+    right_line: LaserLineFit = field(default_factory=LaserLineFit)
+    center_slope: float = 0.0
+    center_intercept: float = 0.0
     confidence: float = 0.0
-
-    center_a: float = 0.0
-    center_b: float = 0.0
-
-    row_yaw_base: float = 0.0
-    row_width: float = 0.75
-
-    end_probability: float = 0.0
-    end_detected: bool = False
-
-    missing_frames: int = 0
-    last_detection: Optional[RowDetection] = None
-
-
-@dataclass
-class PathPoint:
-    x: float
-    y: float
-    yaw: float
-    v: float
-
-
-@dataclass
-class LocalPath:
-    points: List[PathPoint]
-    valid: bool
-    frame_id: str = "base_link"
+    weight: float = 0.0
+    target_base: Optional[np.ndarray] = None
     reason: str = ""
-
-
-@dataclass(frozen=True)
-class PatternStep:
-    row_shift_count: int
-    row_shift_direction: str
-
-
-@dataclass
-class MapRowBand:
-    valid: bool = False
-    lateral_v: float = 0.0
-    u_min: float = 0.0
-    u_max: float = 0.0
-    points: int = 0
-
-
-@dataclass
-class MapRowLine:
-    valid: bool = False
-    a: float = 0.0
-    b: float = 0.0
-    yaw: float = 0.0
-    inliers: int = 0
-    length: float = 0.0
-    lateral_v: float = 0.0
-    confidence: float = 0.0
-
-
-@dataclass
-class MapLane:
-    valid: bool = False
-    center_v: float = 0.0
-    left_row_v: float = 0.0
-    right_row_v: float = 0.0
-    width: float = 0.0
-    confidence: float = 0.0
-    source: str = ""
-
-
-def parse_pattern(pattern: str) -> List[PatternStep]:
-    """Parse patterns like "1L 2R 3 L" or "1L-1R-2L"."""
-    normalized = pattern.replace("-", " ").replace(",", " ").upper()
-    raw_tokens = [token for token in normalized.split() if token]
-
-    steps: List[PatternStep] = []
-    pending_count: Optional[int] = None
-
-    for token in raw_tokens:
-        if token.isdigit():
-            pending_count = int(token)
-            continue
-
-        if token in ("L", "R") and pending_count is not None:
-            steps.append(PatternStep(max(1, pending_count), token))
-            pending_count = None
-            continue
-
-        if len(token) >= 2 and token[:-1].isdigit() and token[-1] in ("L", "R"):
-            steps.append(PatternStep(max(1, int(token[:-1])), token[-1]))
-            pending_count = None
-            continue
-
-        raise ValueError(
-            f"Invalid pattern token '{token}'. Use e.g. '1L 2R 3L' or '1 L 2 R'."
-        )
-
-    if pending_count is not None:
-        raise ValueError("Pattern ends with a number but no direction L/R.")
-
-    return steps
-
-
-def normalize_pattern(pattern: str) -> Tuple[str, List[PatternStep]]:
-    steps = parse_pattern(pattern)
-
-    if not steps:
-        raise ValueError("Pattern darf nicht leer sein.")
-
-    normalized = " ".join(
-        f"{step.row_shift_count}{step.row_shift_direction}"
-        for step in steps
-    )
-    return normalized, steps
+    roi_centers: List[np.ndarray] = field(default_factory=list)
+    roi_direction: np.ndarray = field(default_factory=lambda: np.array([1.0, 0.0], dtype=float))
 
 
 class MissionState(Enum):
     IDLE = 0
-    FOLLOW_ROW = 1
-    EXIT_ROW = 2
-    PLAN_TURN = 3
-    EXECUTE_TURN = 4
-    ACQUIRE_ROW = 5
-    ENTER_ROW = 6
-    FINISHED = 7
-
-    # Vorgewende-Manoever fuer robusten Gassenwechsel:
-    # gesteuerter Bogen raus -> relativer Versatz -> gesteuerter Bogen rein.
-    EXIT_CURVE = 8
-    HEADLAND_SHIFT = 9
-    ENTRY_CURVE = 10
-    PAUSED = 11
+    INITIALIZING = 1
+    FOLLOW_ROW = 2
+    FIND_NEXT_ROW_ENTRANCE = 3
+    FINISHED = 4
+    PAUSED = 5
 
 
 @dataclass
 class NavigatorParams:
-    scan_topic: str = "/sensors/merged_scan"
     cmd_vel_topic: str = "/cmd_vel"
     base_frame: str = "base_link"
-    odom_frame: str = "odom"
-    map_topic: str = "/map"
     map_frame: str = "map"
-    use_slam_map: bool = True
-    require_map_for_turns: bool = True
+    map_topic: str = "/map"
+    scan_topic: str = "/sensors/merged_scan"
 
     control_frequency: float = 30.0
-
     expected_row_width: float = 0.75
     min_lane_width: float = 0.55
     max_lane_width: float = 1.20
 
-    roi_x_min: float = 0.25
-    roi_x_max: float = 2.0
-    roi_y_abs_min: float = 0.18
-    roi_y_abs_max: float = 0.90
+    hist_roi_size: float = 5.0
+    hist_roi_depth: float = 5.0
+    hist_roi_width: float = 5.0
+    hist_bin_size: float = 0.05
+    hist_peak_min_points: int = 3
+    occ_threshold: int = 50
 
-    acquire_roi_x_min: float = -0.30
-    acquire_roi_x_max: float = 2.80
-    acquire_roi_y_abs_min: float = 0.05
-    acquire_roi_y_abs_max: float = 1.20
+    row_segment_point_count: int = 5
+    row_segment_point_spacing: float = 0.3
+    row_rectangle_width: float = 0.5
+    row_point_window_length: float = 0.3
+    row_end_min_points_fields_3_to_5: int = 2
+    row_max_march_steps: int = 120
+    row_min_fit_points: int = 3
+    row_freeze_behind_distance: float = 0.0
 
-    ransac_iterations: int = 80
-    ransac_distance: float = 0.08
-    min_inliers: int = 5
-    min_visible_length: float = 0.35
-    max_abs_line_slope: float = 0.9
+    laser_follow_enabled: bool = True
+    laser_scan_timeout: float = 0.50
+    laser_roi_x_min: float = 0.25
+    laser_roi_x_max: float = 1.80
+    laser_roi_length: float = 1.55
+    laser_roi_width: float = 0.32
+    laser_roi_center_offset_limit: float = 0.25
+    laser_ransac_iterations: int = 80
+    laser_ransac_distance: float = 0.08
+    laser_min_inliers: int = 5
+    laser_min_visible_length: float = 0.35
+    laser_max_abs_line_slope: float = 0.9
+    laser_max_angle_to_map: float = 0.45
+    laser_max_center_offset: float = 0.40
+    laser_min_confidence: float = 0.25
+    laser_full_confidence: float = 0.85
+    laser_max_weight_both_sides: float = 0.30
+    laser_max_weight_one_side: float = 0.15
+    laser_tracker_alpha: float = 0.25
 
-    centerline_max_abs_slope: float = 0.7
-
-    tracker_alpha: float = 0.18
-    confidence_decay: float = 0.95
-
-    front_density_x_min: float = 0.60
-    front_density_x_max: float = 2.00
-    front_density_y_abs: float = 0.45
-    front_density_threshold: int = 1
-    end_probability_threshold: float = 0.88
-    end_stable_frames_required: int = 35
-
-    min_follow_confidence: float = 0.10
-    min_enter_confidence: float = 0.12
-    enter_stable_frames_required: int = 3
-    acquire_timeout_sec: float = 8.0
-
-    follow_speed: float = 0.35
+    follow_speed: float = 0.20
     slow_speed: float = 0.12
-    enter_speed: float = 0.22
-    turn_speed: float = 0.28
-    max_linear_speed: float = 0.45
-    max_angular_speed: float = 1.20
-    follow_max_angular_speed: float = 0.90
-    turn_max_angular_speed: float = 1.00
-    angular_rate_limit: float = 1.8
-
-    lookahead_distance: float = 0.75
-    turn_lookahead_distance: float = 0.32
-    turn_min_angular_speed: float = 0.30
+    lookahead_distance: float = 1.10
+    turn_lookahead_distance: float = 0.45
+    lookahead_curvature_gain: float = 1.5
+    lookahead_curvature_sample_count: int = 7
+    lookahead_curvature_back_distance: float = 0.50
+    lookahead_lateral_error_gain: float = 1.0
+    lookahead_filter_alpha: float = 0.35
+    lookahead_speed_reduction_gain: float = 1.5
+    pure_pursuit_gain: float = 1.0
+    curve_speed_reduction_gain: float = 1.0
+    follow_max_angular_speed: float = 0.40
+    min_follow_turn_radius: float = 0.37
+    angular_rate_limit: float = 1.2
+    target_filter_alpha: float = 0.35
+    row_exit_extension_distance: float = 0.30
+    row_end_goal_outward_distance: float = 0.30
     path_goal_xy_tolerance: float = 0.20
-    path_goal_yaw_tolerance: float = 0.40
+    maneuver_goal_xy_tolerance: float = 0.35
+    maneuver_goal_yaw_tolerance: float = 0.45
+    maneuver_heading_lookahead_distance: float = 0.70
+    maneuver_speed: float = 0.16
+    maneuver_slow_speed: float = 0.10
+    maneuver_lookahead_distance: float = 0.80
+    maneuver_turn_lookahead_distance: float = 0.35
+    maneuver_lookahead_curvature_gain: float = 2.5
+    maneuver_lookahead_lateral_error_gain: float = 0.5
+    maneuver_lookahead_filter_alpha: float = 0.45
+    maneuver_lookahead_speed_reduction_gain: float = 1.2
+    maneuver_route_spacing: float = 0.08
+    maneuver_corner_radius: float = 0.50
+    maneuver_entry_extension_distance: float = 0.80
+    maneuver_max_route_deviation: float = 0.70
+    maneuver_entry_lateral_tolerance: float = 0.25
+    maneuver_entry_yaw_tolerance: float = 0.45
+    row_map_output_directory: str = "~/.ros/maize_navigation"
+    slam_reset_service: str = "/slam_toolbox/reset"
 
-    exit_distance: float = 0.70
-    turn_forward_distance: float = 2.20
-    min_turn_radius: float = 0.38
-    enter_distance: float = 0.90
-    # Laufzeitwerte des aktuell auszufuehrenden Pattern-Schritts.
-    # Sie werden ausschliesslich durch ein per Service geladenes Pattern gesetzt.
-    row_shift_count: int = 0
-    row_shift_direction: str = ""
-    turn_180: bool = True
-
-    # Robuster Gassenwechsel im Vorgewende.
-    # Die Reihenfahrt selbst bleibt davon unberuehrt.
-    headland_maneuver_enabled: bool = True
-    # Vor dem eigentlichen Ausfahrbogen wird erst gerade aus der Gasse herausgefahren.
-    # Das verhindert, dass der Roboter beim Rechts-/Linksbogen noch an den letzten Pflanzen haengen bleibt.
-    headland_exit_straight_distance: float = 0.45
-    headland_exit_straight_speed: float = 0.18
-    exit_curve_speed: float = 0.18
-    exit_curve_angular_speed: float = 0.48
-    exit_curve_yaw_change: float = math.pi / 2.0
-
-    headland_shift_speed: float = 0.22
-    headland_shift_tolerance: float = 0.04
-    # Lookahead for bounded pursuit during multi-row headland shift.
-    # Must exist in NavigatorParams because compute_cmd_odom uses it for
-    # HEADLAND_SHIFT_MULTIROW_TARGET.
-    headland_shift_lookahead_distance: float = 0.45
-    # Schutztoleranz: Wenn der seitliche Versatz beim Einfahrbogen darueber hinausgeht,
-    # wird der Bogen abgebrochen. Das verhindert, dass 1L/1R eine weitere Reihe ueberspringt.
-    headland_shift_overshoot_tolerance: float = 0.08
-    headland_yaw_tolerance: float = 0.25
-    # HEADLAND_SHIFT wird in der Map parallel zum Reihenende ausgerichtet.
-    # Die Reihenrichtung wird aus der SLAM-Map per PCA auf belegten Pflanzenpunkten geschaetzt.
-    headland_use_map_row_heading: bool = True
-    headland_heading_kp: float = 1.4
-    headland_heading_max_yaw_error: float = 0.75
-    # Wenn die Reihenrichtung aus der SLAM-Map vorliegt, wird die Vorgewende-
-    # Querfahrt hart auf die dazu senkrechte Richtung gelegt. Der Wert ist nur
-    # noch ein Fallback-Grenzwert fuer sehr schlechte Map-Yaw-Schaetzungen.
-    headland_map_heading_min_confidence: float = 0.20
-
-    entry_curve_speed: float = 0.16
-    entry_curve_angular_speed: float = 0.427
-    # Gesamt-Drehwinkel des Vorgewende-Manoevers. Fuer U-Turns muss die
-    # Endausrichtung der Gegenrichtung entsprechen.
-    headland_total_yaw_change: float = math.pi
-    # Falls kleiner/gleich 0, wird der benoetigte Einfahrbogen automatisch als
-    # headland_total_yaw_change - exit_curve_yaw_change berechnet.
-    entry_curve_yaw_change: float = -1.0
-    # ENTRY_CURVE darf erst lokal uebergeben, wenn Yaw und Versatz plausibel sind.
-    entry_yaw_accept_tolerance: float = 0.35
-    entry_shift_accept_tolerance: float = 0.12
-    entry_row_min_confidence: float = 0.32
-    entry_row_stable_frames: int = 10
-    # Eine lokal erkannte Zielgasse wird erst akzeptiert, wenn sie geometrisch
-    # plausibel ist: beide Begrenzungsreihen sichtbar, Gassenmitte nahe y=0,
-    # Breite passend und Reihenwinkel klein. Das verhindert Einfaedeln gegen
-    # eine einzelne Pflanzenreihe und hilft, mittiger in die neue Gasse zu fahren.
-    entry_require_full_lane: bool = True
-    entry_center_b_tolerance: float = 0.14
-    entry_lane_width_tolerance: float = 0.22
-    entry_row_yaw_tolerance: float = 0.35
-    # Nach dem U-Turn darf die Umschaltung nicht dauerhaft blockieren, nur weil
-    # am Reihenanfang kurzzeitig nur eine Begrenzungsreihe sichtbar ist. Sobald
-    # Querposition und Gesamt-Gierwinkel erreicht sind, reicht fuer ACQUIRE/ENTER
-    # eine stabile, mittige und nahezu gerade lokale Reihenhypothese aus.
-    entry_relaxed_geometry_after_yaw_shift: bool = True
-    entry_relaxed_center_b_tolerance: float = 0.28
-    entry_relaxed_row_yaw_tolerance: float = 0.45
-    # Vorgewende-Geometrie:
-    # 1L/1R ergibt zwei 90-Grad-Boegen ohne Gerade dazwischen, also eine
-    # echte 180-Grad-Halbkreiswende in die Nachbargasse.
-    # 2L/2R und groesser ergeben: 90-Grad-Bogen -> Gerade entlang des
-    # Reihenendes -> 90-Grad-Bogen in die Zielgasse. Der gerade Anteil ergibt
-    # sich aus Pattern-Sollversatz minus den Queranteilen beider Boegen.
-    # Deshalb ist der Zusatzversatz standardmaessig 0.0; ein positiver Wert
-    # waere nur eine bewusst eingestellte Sicherheitsreserve.
-    multirow_entry_extra_shift: float = 0.0
-    # Funktionierende Trim-Version: HEADLAND_SHIFT fuer 2L/2R bewusst frueher beenden,
-    # weil Regel-/Planer-Nachlauf sonst die Gerade um ca. 10-15 cm verlaengert.
-    multirow_straight_trim: float = 0.15
-    # Wenn die per Reihenzaehlung erkannte Zielgasse bei 2R/2L nach innen
-    # gegenueber dem Pattern-Sollzentrum verschoben ist, wird sie nicht als
-    # Zielzentrum akzeptiert. Das tritt am Reihenende auf, wenn die vordere
-    # Pflanzenreihe in die Gasse hineinragt; dann bleibt das pattern-relative
-    # Zielzentrum massgebend.
-    map_counted_lane_inward_bias_tolerance: float = 0.08
-    # Bei Mehrreihen-Manovern (2L/2R/...) muss die Zielgasse aus
-    # gezählten Maisreihen der SLAM-Map bestätigt sein. Extrapolation darf
-    # dann nicht als Freigabe für das Einbiegen dienen, weil sonst 2R als 1R
-    # enden kann. Die Breitenprüfung ist hier etwas toleranter, weil die
-    # sichtbaren Reihenenden ungleich weit herausragen können.
-    map_multirow_require_counted_rows: bool = True
-    map_counted_row_min_width_ratio: float = 0.45
-    # Mehrreihen-Zielgassen duerfen nur dann gelatcht werden, wenn die
-    # gezählte Zielgasse wirklich nahe am Pattern-Soll liegt. Die allgemeine
-    # map_lane_accept_tolerance=0.45 ist fuer 2R zu weich und akzeptierte im
-    # Log eine erste rechte Gasse bei -1.08 m als 2R-Ziel.
-    map_multirow_counted_target_tolerance: float = 0.22
-    # Die erste gezählte Reihenlinie auf der Zielseite muss plausibel die
-    # Begrenzungsreihe der aktuellen Gasse sein. Ist sie viel zu nah an v=0,
-    # stammt die Zählung vom Reihenende/Referenzwechsel und kann 2R auf 1R
-    # verkürzen.
-    map_multirow_reference_row_min_ratio: float = 0.65
-    # Bei Mehrreihensprüngen ist die Map-Querposition am Einfahren weniger
-    # belastbar als die lokale Reihenhypothese: durch U-Turn-Geometrie,
-    # Schlupf und Reihenanfangs-Asymmetrie kann der gemessene Versatz um
-    # ungefähr eine Gassenbreite überschießen. Das darf ACQUIRE_ROW nicht
-    # blockieren, sobald die lokale Reihe stabil und gerade ist.
-    multirow_entry_shift_overshoot_rows: float = 1.50
-    multirow_local_takeover_min_yaw_progress: float = 2.00
-    multirow_local_takeover_min_confidence: float = 0.55
-
-    # Direkter Nachbargassenwechsel 1L/1R:
-    # Beim Einfahren wird die lokale Zielreihe erst akzeptiert, wenn der
-    # pattern-relative Versatz wirklich erreicht ist und die Maisreihe auf
-    # der erwarteten Seite sichtbar ist. Dadurch wird verhindert, dass 1L/1R
-    # eine Reihe zu weit springt.
-    neighbor_reference_turn_enabled: bool = True
-    neighbor_reference_entry_requires_shift: bool = True
-    neighbor_reference_requires_same_side_row: bool = True
-    # Lokale Uebernahme fuer 1L/1R: Wenn die Zielgasse nach der 180-Grad-Wende
-    # bereits stabil und mit korrektem Pattern-Offset erkannt ist, darf die
-    # Reihenfuehrung uebernehmen, auch wenn der absolute Map-Shift wegen
-    # ungleich langer Reihenenden noch zu klein projiziert wird.
-    neighbor_local_takeover_enabled: bool = True
-    neighbor_local_takeover_min_confidence: float = 0.80
-    neighbor_local_takeover_target_tolerance: float = 0.12
-    neighbor_local_takeover_center_tolerance: float = 0.30
-    neighbor_local_takeover_row_yaw_tolerance: float = 0.45
-    neighbor_local_takeover_min_yaw_progress: float = 2.85
-
-    map_row_detection_enabled: bool = True
-    map_row_occupancy_threshold: int = 50
-    map_row_search_x_forward: float = 4.0
-    map_row_search_x_backward: float = 4.0
-    map_row_search_y_side: float = 4.0
-    # Reihenrichtung aus belegten SLAM-Map-Punkten schaetzen.
-    # Wichtig im Vorgewende: dort ist die Roboter-Yaw nicht mehr parallel zur Reihenrichtung.
-    map_row_use_pca_orientation: bool = True
-    map_row_pca_radius: float = 5.0
-    map_row_pca_min_points: int = 80
-    # Grobe feldfeste Reihenachse. Diese Orientierung wird aus einem deutlich
-    # groesseren SLAM-Kartenausschnitt geschaetzt und ueber die Zeit geglaettet.
-    # Sie wird fuer die Vorgewendefahrt verwendet, damit die Querfahrt exakt
-    # 90 Grad zur Feld-/Reihenrichtung bleibt, auch wenn einzelne Reihenenden
-    # unterschiedlich weit herausragen.
-    map_field_orientation_enabled: bool = False
-    map_field_orientation_radius: float = 12.0
-    map_field_orientation_min_points: int = 160
-    map_field_orientation_min_confidence: float = 0.25
-    map_field_orientation_alpha: float = 0.12
-    map_field_orientation_max_local_deviation: float = 0.55
-    map_row_lateral_bin: float = 0.10
-    map_row_min_band_points: int = 12
-    map_row_min_band_length: float = 1.2
-    map_row_max_extrapolated_lanes: int = 3
-
-    # SLAM-Reihenerkennung ueber Linienfit durch belegte Map-Zellen.
-    map_row_line_ransac_iterations: int = 180
-    map_row_line_distance: float = 0.12
-    map_row_min_line_inliers: int = 18
-    map_row_min_line_length: float = 1.20
-    map_row_max_abs_line_slope: float = 0.70
-    map_row_max_lines: int = 12
-    map_row_line_merge_distance: float = 0.22
-
-    # Zusaetzliche SLAM-Reihenerkennung ueber Quer-Histogramm.
-    # Diese Variante ist fuer punktfoermige, lueckenhafte Maiskarten robuster
-    # als ein reiner globaler Linienfit. Die Karte wird zuerst in die
-    # Reihenbasis (u entlang der Reihe, v quer zur Reihe) transformiert; Peaks
-    # im v-Histogramm sind Pflanzenreihen. Fehlende Peaks werden mit dem
-    # erwarteten Reihenabstand ergaenzt, damit 2R/2L diskret gezaehlt werden kann.
-    map_row_histogram_enabled: bool = True
-    map_row_histogram_bin: float = 0.05
-    map_row_histogram_smoothing_bins: int = 3
-    map_row_peak_min_points: int = 6
-    map_row_peak_window_ratio: float = 0.32
-    map_row_peak_min_distance_ratio: float = 0.45
-    map_row_spacing_regularization: bool = True
-    map_row_spacing_tolerance_ratio: float = 0.35
-    map_row_insert_missing_peaks: bool = True
-    map_row_insert_missing_max_gap_rows: int = 3
-
-    # SLAM-Zielgassen duerfen das Pattern nur korrigieren, nicht beliebig weit ueberschreiben.
-    # Beispiel: 1L erwartet ca. +expected_row_width. Eine erkannte Lane bei +3 m wird verworfen.
-    map_lane_accept_tolerance: float = 0.45
-
-    turn_replan_enabled: bool = True
-    turn_replan_period_frames: int = 5
-    turn_replan_max_attempts: int = 60
-
-    # Wenn die neue Gasse lokal mit LiDAR stabil erkannt wird, wird EXECUTE_TURN beendet.
-    # Dadurch faehrt der Roboter nicht an der richtigen Gasse vorbei.
-    turn_exit_on_local_row: bool = True
-    turn_exit_min_confidence: float = 0.32
-    turn_exit_stable_frames: int = 10
-
-    enable_safety: bool = False
-
-    obstacle_stop_distance: float = 0.25
-    obstacle_slow_distance: float = 0.45
-
+    pattern: str = "1L 2R"
+    starting_lane_number: int = 1
+    row_numbers_increase_to: str = "left"
     publish_debug: bool = True
 
 
-class MapRowDetector:
-    def __init__(self, params: NavigatorParams):
+class LaserRowFollower:
+    def __init__(self, params: NavigatorParams) -> None:
         self.p = params
-        self.last_target_reason: str = "not evaluated"
-        self.last_expected_target_offset: float = 0.0
-        self.last_detected_target_offset: float = 0.0
-        self.last_target_offset_error: float = 0.0
-        self.last_reference_row_v: float = 0.0
-        self.last_target_row_v: float = 0.0
-        self.last_candidate_rows_text: str = ""
-        self.last_row_yaw_map: Optional[float] = None
-        self.last_row_yaw_confidence: float = 0.0
-        self.last_field_row_yaw_map: Optional[float] = None
-        self.last_field_row_yaw_confidence: float = 0.0
+        self.filtered_confidence = 0.0
 
-    def detect_lanes(self, grid: Optional[OccupancyGrid], pose: Pose2D) -> Tuple[List[MapLane], List[MapRowBand], str]:
-        """Detect plant rows from occupied SLAM-map cells and derive lane centerlines.
+    def reset(self) -> None:
+        self.filtered_confidence = 0.0
 
-        The map is transformed into a row-oriented local coordinate system:
-        u = along the crop rows, v = lateral across the crop rows.
+    def reject(self, result: LaserFollowResult, reason: str) -> LaserFollowResult:
+        self.filtered_confidence *= 1.0 - self.p.laser_tracker_alpha
+        result.confidence = self.filtered_confidence
+        result.reason = reason
+        return result
 
-        Two complementary detectors are used:
-        1. RANSAC line fitting on occupied plant cells.
-        2. A v-histogram peak detector. This is intentionally dominant for the
-           FRE-style maize map, where rows are visible as dotted, slightly curved
-           structures rather than clean continuous lines.
-
-        The output MapRowBand list represents plant-row positions in v. Adjacent
-        row positions define lane centers. Target selection later counts these
-        row positions on the commanded side, so a 2R turn is a discrete two-row
-        jump instead of a free geometric guess during the headland turn.
-        """
-        if grid is None:
-            return [], [], "no OccupancyGrid"
-
-        if not self.p.map_row_detection_enabled:
-            return [], [], "map row detection disabled"
-
-        u, v, reason = self._occupied_points_local(grid, pose)
-        if u is None or v is None:
-            return [], [], reason
-
-        min_points = min(
-            max(4, int(self.p.map_row_min_line_inliers)),
-            max(4, int(self.p.map_row_peak_min_points)),
-        )
-        if len(u) < min_points:
-            return [], [], f"not enough occupied cells in local map window: {len(u)}"
-
-        line_bands: List[MapRowBand] = []
-        row_lines: List[MapRowLine] = []
-        if len(u) >= max(4, int(self.p.map_row_min_line_inliers)):
-            row_lines = self._fit_row_lines(u, v)
-            row_lines = self._merge_row_lines(row_lines)
-            row_lines.sort(key=lambda line: line.lateral_v)
-            line_bands = [
-                MapRowBand(
-                    valid=True,
-                    lateral_v=float(line.lateral_v),
-                    u_min=-0.5 * float(line.length),
-                    u_max=0.5 * float(line.length),
-                    points=int(line.inliers),
-                )
-                for line in row_lines
-            ]
-
-        histogram_bands: List[MapRowBand] = []
-        if self.p.map_row_histogram_enabled:
-            histogram_bands = self._fit_row_bands_histogram(u, v)
-
-        # Merge both estimates. The histogram detector gives robust row counts;
-        # the line detector adds stability where rows are locally straight.
-        bands = self._merge_row_bands(line_bands + histogram_bands)
-        if self.p.map_row_spacing_regularization:
-            bands = self._regularize_row_bands(bands)
-
-        bands = [band for band in bands if band.valid and math.isfinite(band.lateral_v)]
-        bands.sort(key=lambda band: band.lateral_v)
-
-        if len(bands) < 2:
-            return [], bands, (
-                f"not enough row positions: linefit_rows={len(row_lines)}, "
-                f"hist_rows={len(histogram_bands)}, merged={len(bands)}"
-            )
-
-        lanes: List[MapLane] = []
-        width_min = max(0.05, float(self.p.min_lane_width))
-        width_max = max(width_min, float(self.p.max_lane_width))
-        expected = max(0.05, float(self.p.expected_row_width))
-
-        for right, left in zip(bands[:-1], bands[1:]):
-            width_v = float(left.lateral_v - right.lateral_v)
-            if not (width_min <= width_v <= width_max):
-                continue
-
-            width_error = abs(width_v - expected)
-            width_score = clamp(1.0 - width_error / expected, 0.0, 1.0)
-            length = min(float(left.u_max - left.u_min), float(right.u_max - right.u_min))
-            length_score = clamp(length / max(float(self.p.map_row_min_band_length), 1e-3), 0.0, 1.0)
-            point_score = clamp(
-                min(float(left.points), float(right.points)) / max(float(self.p.map_row_peak_min_points), 1.0),
-                0.0,
-                1.0,
-            )
-            confidence = clamp(0.45 * width_score + 0.30 * length_score + 0.25 * point_score, 0.0, 1.0)
-
-            lanes.append(
-                MapLane(
-                    valid=True,
-                    center_v=0.5 * (float(right.lateral_v) + float(left.lateral_v)),
-                    left_row_v=float(left.lateral_v),
-                    right_row_v=float(right.lateral_v),
-                    width=width_v,
-                    confidence=confidence,
-                    source="detected_map_row_peaks",
-                )
-            )
-
-        lanes.sort(key=lambda lane: lane.center_v)
-
-        if not lanes:
-            return [], bands, (
-                f"row positions found, but no valid lane gap: rows={len(bands)}, "
-                f"linefit_rows={len(row_lines)}, hist_rows={len(histogram_bands)}"
-            )
-
-        return lanes, bands, (
-            f"ok: rows={len(bands)}, lanes={len(lanes)}, "
-            f"linefit_rows={len(row_lines)}, hist_rows={len(histogram_bands)}"
-        )
-
-    def _update_field_row_orientation(self, dx_all: np.ndarray, dy_all: np.ndarray, pose: Pose2D) -> None:
-        """Estimate a coarse, field-fixed row axis from a large map window.
-
-        The local row-yaw PCA used for lane fitting can be biased at the headland
-        when row ends have different lengths. This estimator intentionally uses a
-        larger window and latches/smooths the axial orientation. The resulting
-        yaw is used as headland reference so the headland straight segment is
-        driven perpendicular to the actual field rows, not to the jagged end line.
-        """
-        if not self.p.map_field_orientation_enabled:
-            return
-
-        radius = max(2.0, float(self.p.map_field_orientation_radius))
-        mask = (dx_all * dx_all + dy_all * dy_all) <= radius * radius
-        x = dx_all[mask]
-        y = dy_all[mask]
-
-        if len(x) < max(20, int(self.p.map_field_orientation_min_points)):
-            return
-
-        x0 = x - float(np.mean(x))
-        y0 = y - float(np.mean(y))
-        cov_xx = float(np.mean(x0 * x0))
-        cov_yy = float(np.mean(y0 * y0))
-        cov_xy = float(np.mean(x0 * y0))
-        angle = 0.5 * math.atan2(2.0 * cov_xy, cov_xx - cov_yy)
-
-        lambda_sum = cov_xx + cov_yy
-        lambda_diff = math.sqrt((cov_xx - cov_yy) ** 2 + 4.0 * cov_xy * cov_xy)
-        conf = clamp(lambda_diff / max(lambda_sum, 1e-6), 0.0, 1.0)
-
-        if conf < max(0.0, float(self.p.map_field_orientation_min_confidence)):
-            return
-
-        ref = self.last_field_row_yaw_map if self.last_field_row_yaw_map is not None else pose.yaw
-        if abs(wrap_to_pi(angle + math.pi - float(ref))) < abs(wrap_to_pi(angle - float(ref))):
-            angle = wrap_to_pi(angle + math.pi)
-
-        if self.last_field_row_yaw_map is None:
-            self.last_field_row_yaw_map = float(angle)
-            self.last_field_row_yaw_confidence = float(conf)
-            return
-
-        alpha = clamp(float(self.p.map_field_orientation_alpha), 0.0, 1.0)
-        old = float(self.last_field_row_yaw_map)
-        c = (1.0 - alpha) * math.cos(2.0 * old) + alpha * math.cos(2.0 * angle)
-        ss = (1.0 - alpha) * math.sin(2.0 * old) + alpha * math.sin(2.0 * angle)
-        smoothed = 0.5 * math.atan2(ss, c)
-        if abs(wrap_to_pi(smoothed + math.pi - old)) < abs(wrap_to_pi(smoothed - old)):
-            smoothed = wrap_to_pi(smoothed + math.pi)
-
-        self.last_field_row_yaw_map = float(smoothed)
-        self.last_field_row_yaw_confidence = float(max(conf, self.last_field_row_yaw_confidence * 0.95))
-
-    def _occupied_points_local(
+    def process_scan(
         self,
-        grid: OccupancyGrid,
-        pose: Pose2D,
-    ) -> Tuple[Optional[np.ndarray], Optional[np.ndarray], str]:
-        width = int(grid.info.width)
-        height = int(grid.info.height)
-        resolution = float(grid.info.resolution)
-
-        if width <= 0 or height <= 0 or resolution <= 0.0:
-            return None, None, "invalid OccupancyGrid metadata"
-
-        data = np.asarray(grid.data, dtype=np.int16).reshape((height, width))
-        occ_r, occ_c = np.where(data >= int(self.p.map_row_occupancy_threshold))
-
-        if len(occ_r) == 0:
-            return None, None, "no occupied map cells"
-
-        # Deterministic downsampling for real-time behavior on large maps.
-        max_cells = 35000
-        if len(occ_r) > max_cells:
-            idx = np.linspace(0, len(occ_r) - 1, max_cells).astype(int)
-            occ_r = occ_r[idx]
-            occ_c = occ_c[idx]
-
-        origin = grid.info.origin
-        origin_yaw = yaw_from_quaternion(origin.orientation)
-        co = math.cos(origin_yaw)
-        so = math.sin(origin_yaw)
-
-        gx = (occ_c.astype(float) + 0.5) * resolution
-        gy = (occ_r.astype(float) + 0.5) * resolution
-
-        mx = origin.position.x + co * gx - so * gy
-        my = origin.position.y + so * gx + co * gy
-
-        dx = mx - pose.x
-        dy = my - pose.y
-
-        self._update_field_row_orientation(dx, dy, pose)
-
-        # Die Linien der Maisreihen sollen in der SLAM-Map erkannt werden,
-        # auch wenn der Roboter im Vorgewende quer zu den Reihen steht.
-        # Deshalb wird die Reihenrichtung nicht aus pose.yaw abgeleitet,
-        # sondern aus den belegten Kartenpunkten per PCA geschaetzt.
-        row_yaw = pose.yaw
-        self.last_row_yaw_map = None
-        self.last_row_yaw_confidence = 0.0
-
-        if self.p.map_row_use_pca_orientation:
-            radius = max(1.0, float(self.p.map_row_pca_radius))
-            near = (dx * dx + dy * dy) <= radius * radius
-            near_dx = dx[near]
-            near_dy = dy[near]
-
-            if len(near_dx) >= max(10, int(self.p.map_row_pca_min_points)):
-                x0 = near_dx - float(np.mean(near_dx))
-                y0 = near_dy - float(np.mean(near_dy))
-                cov_xx = float(np.mean(x0 * x0))
-                cov_yy = float(np.mean(y0 * y0))
-                cov_xy = float(np.mean(x0 * y0))
-                angle = 0.5 * math.atan2(2.0 * cov_xy, cov_xx - cov_yy)
-
-                # PCA liefert eine Achse ohne Richtung. Fuer konsistente u-Koordinaten
-                # wird die Achse so gewaehlt, dass sie moeglichst zur aktuellen oder
-                # entgegengesetzten Fahrtrichtung passt.
-                if abs(wrap_to_pi(angle + math.pi - pose.yaw)) < abs(wrap_to_pi(angle - pose.yaw)):
-                    angle = wrap_to_pi(angle + math.pi)
-
-                lambda_sum = cov_xx + cov_yy
-                lambda_diff = math.sqrt((cov_xx - cov_yy) ** 2 + 4.0 * cov_xy * cov_xy)
-                conf = clamp(lambda_diff / max(lambda_sum, 1e-6), 0.0, 1.0)
-
-                if conf >= 0.20:
-                    row_yaw = angle
-                    self.last_row_yaw_map = float(row_yaw)
-                    self.last_row_yaw_confidence = float(conf)
-
-        cp = math.cos(row_yaw)
-        sp = math.sin(row_yaw)
-
-        # Row-local map coordinates:
-        # u: entlang der Maisreihen, v: quer ueber die Reihen.
-        u = cp * dx + sp * dy
-        v = -sp * dx + cp * dy
-
-        mask = (
-            (u >= -self.p.map_row_search_x_backward)
-            & (u <= self.p.map_row_search_x_forward)
-            & (np.abs(v) <= self.p.map_row_search_y_side)
-        )
-
-        u = u[mask]
-        v = v[mask]
-
-        if len(u) == 0:
-            return None, None, "no occupied cells inside row-oriented map window"
-
-        return u.astype(float), v.astype(float), "ok"
-
-    def _fit_row_lines(self, u: np.ndarray, v: np.ndarray) -> List[MapRowLine]:
-        lines: List[MapRowLine] = []
-
-        remaining_u = np.asarray(u, dtype=float)
-        remaining_v = np.asarray(v, dtype=float)
-
-        rng = random.Random(42)
-        max_lines = max(1, int(self.p.map_row_max_lines))
-
-        for _ in range(max_lines):
-            if len(remaining_u) < self.p.map_row_min_line_inliers:
-                break
-
-            line, inlier_mask = self._fit_one_line_ransac(remaining_u, remaining_v, rng)
-
-            if not line.valid or inlier_mask is None:
-                break
-
-            lines.append(line)
-
-            keep = ~inlier_mask
-            remaining_u = remaining_u[keep]
-            remaining_v = remaining_v[keep]
-
-        return lines
-
-    def _fit_one_line_ransac(
-        self,
-        u: np.ndarray,
-        v: np.ndarray,
-        rng: random.Random,
-    ) -> Tuple[MapRowLine, Optional[np.ndarray]]:
-        n = len(u)
-        if n < self.p.map_row_min_line_inliers:
-            return MapRowLine(valid=False), None
-
-        best_mask: Optional[np.ndarray] = None
-        best_count = 0
-        best_a = 0.0
-        best_b = 0.0
-
-        iterations = max(1, int(self.p.map_row_line_ransac_iterations))
-        distance_threshold = max(0.02, float(self.p.map_row_line_distance))
-        max_slope = max(0.05, float(self.p.map_row_max_abs_line_slope))
-
-        indices = list(range(n))
-
-        for _ in range(iterations):
-            i1, i2 = rng.sample(indices, 2)
-            du = float(u[i2] - u[i1])
-            if abs(du) < 1e-3:
-                continue
-
-            a = float((v[i2] - v[i1]) / du)
-            if abs(a) > max_slope:
-                continue
-
-            b = float(v[i1] - a * u[i1])
-            denom = math.sqrt(a * a + 1.0)
-            distances = np.abs(a * u - v + b) / denom
-            mask = distances <= distance_threshold
-            count = int(np.count_nonzero(mask))
-
-            if count > best_count:
-                best_count = count
-                best_mask = mask
-                best_a = a
-                best_b = b
-
-        if best_mask is None or best_count < self.p.map_row_min_line_inliers:
-            return MapRowLine(valid=False), None
-
-        inlier_u = u[best_mask]
-        inlier_v = v[best_mask]
-
-        if len(inlier_u) < self.p.map_row_min_line_inliers:
-            return MapRowLine(valid=False), None
-
-        try:
-            a, b = np.polyfit(inlier_u, inlier_v, 1)
-            a = float(a)
-            b = float(b)
-        except Exception:
-            a = best_a
-            b = best_b
-
-        if abs(a) > max_slope:
-            return MapRowLine(valid=False), None
-
-        length = float(max(inlier_u) - min(inlier_u)) if len(inlier_u) else 0.0
-        if length < self.p.map_row_min_line_length:
-            return MapRowLine(valid=False), None
-
-        yaw = math.atan(a)
-        confidence = clamp(
-            0.55 * (best_count / max(float(self.p.map_row_min_line_inliers), 1.0))
-            + 0.45 * (length / max(float(self.p.map_row_min_line_length), 1e-3)),
-            0.0,
-            1.0,
-        )
-
-        return (
-            MapRowLine(
-                valid=True,
-                a=float(a),
-                b=float(b),
-                yaw=float(yaw),
-                inliers=int(best_count),
-                length=float(length),
-                lateral_v=float(b),
-                confidence=float(confidence),
-            ),
-            best_mask,
-        )
-
-    def _merge_row_lines(self, lines: List[MapRowLine]) -> List[MapRowLine]:
-        valid_lines = [line for line in lines if line.valid]
-        valid_lines.sort(key=lambda line: line.lateral_v)
-
-        if not valid_lines:
-            return []
-
-        merge_distance = max(0.05, float(self.p.map_row_line_merge_distance))
-        merged: List[MapRowLine] = []
-
-        for line in valid_lines:
-            if not merged:
-                merged.append(line)
-                continue
-
-            prev = merged[-1]
-            if abs(line.lateral_v - prev.lateral_v) <= merge_distance:
-                total = max(prev.inliers + line.inliers, 1)
-                w_prev = prev.inliers / total
-                w_line = line.inliers / total
-
-                merged[-1] = MapRowLine(
-                    valid=True,
-                    a=w_prev * prev.a + w_line * line.a,
-                    b=w_prev * prev.b + w_line * line.b,
-                    yaw=w_prev * prev.yaw + w_line * line.yaw,
-                    inliers=prev.inliers + line.inliers,
-                    length=max(prev.length, line.length),
-                    lateral_v=w_prev * prev.lateral_v + w_line * line.lateral_v,
-                    confidence=max(prev.confidence, line.confidence),
-                )
-            else:
-                merged.append(line)
-
-        return merged
-
-    def _fit_row_bands_histogram(self, u: np.ndarray, v: np.ndarray) -> List[MapRowBand]:
-        """Find plant-row positions as peaks in the lateral v histogram."""
-        if len(v) == 0:
-            return []
-
-        bin_width = max(0.02, float(self.p.map_row_histogram_bin))
-        v_min = float(np.min(v))
-        v_max = float(np.max(v))
-        if not math.isfinite(v_min) or not math.isfinite(v_max) or v_max <= v_min:
-            return []
-
-        # Pad by one bin so edge rows are not lost.
-        edges = np.arange(v_min - bin_width, v_max + 2.0 * bin_width, bin_width)
-        if len(edges) < 4:
-            return []
-
-        hist, edges = np.histogram(v, bins=edges)
-        smooth = hist.astype(float)
-        smoothing_bins = max(1, int(self.p.map_row_histogram_smoothing_bins))
-        if smoothing_bins > 1:
-            kernel = np.ones(smoothing_bins, dtype=float) / float(smoothing_bins)
-            smooth = np.convolve(smooth, kernel, mode="same")
-
-        centers = 0.5 * (edges[:-1] + edges[1:])
-        threshold = max(1.0, float(self.p.map_row_peak_min_points))
-        min_distance = max(
-            0.05,
-            float(self.p.map_row_peak_min_distance_ratio) * float(self.p.expected_row_width),
-        )
-
-        candidates = []
-        for i in range(1, len(smooth) - 1):
-            if smooth[i] < threshold:
-                continue
-            if smooth[i] < smooth[i - 1] or smooth[i] < smooth[i + 1]:
-                continue
-            candidates.append((float(smooth[i]), float(centers[i])))
-
-        # Strongest peaks first, then non-maximum suppression in v.
-        candidates.sort(key=lambda item: item[0], reverse=True)
-        selected: List[Tuple[float, float]] = []
-        for score, center in candidates:
-            if all(abs(center - existing_center) >= min_distance for _, existing_center in selected):
-                selected.append((score, center))
-
-        selected.sort(key=lambda item: item[1])
-
-        bands: List[MapRowBand] = []
-        half_window = max(
-            bin_width,
-            float(self.p.map_row_peak_window_ratio) * float(self.p.expected_row_width),
-        )
-        min_points = max(1, int(self.p.map_row_peak_min_points))
-        min_length = max(0.0, float(self.p.map_row_min_band_length))
-
-        for _, peak_v in selected:
-            mask = np.abs(v - peak_v) <= half_window
-            if int(np.count_nonzero(mask)) < min_points:
-                continue
-            uu = u[mask]
-            vv = v[mask]
-            if len(uu) == 0:
-                continue
-            length = float(np.max(uu) - np.min(uu))
-            if length < min_length:
-                # Histogram peaks at row ends can still be useful for counting,
-                # but reject extremely short clusters to avoid isolated outliers.
-                continue
-            bands.append(
-                MapRowBand(
-                    valid=True,
-                    lateral_v=float(np.median(vv)),
-                    u_min=float(np.min(uu)),
-                    u_max=float(np.max(uu)),
-                    points=int(len(uu)),
-                )
-            )
-
-        return bands
-
-    def _merge_row_bands(self, bands: List[MapRowBand]) -> List[MapRowBand]:
-        valid = [band for band in bands if band.valid and math.isfinite(band.lateral_v)]
-        valid.sort(key=lambda band: band.lateral_v)
-        if not valid:
-            return []
-
-        merge_distance = max(
-            0.05,
-            min(
-                float(self.p.map_row_line_merge_distance),
-                0.35 * float(self.p.expected_row_width),
-            ),
-        )
-        merged: List[MapRowBand] = []
-        for band in valid:
-            if not merged or abs(float(band.lateral_v) - float(merged[-1].lateral_v)) > merge_distance:
-                merged.append(band)
-                continue
-
-            prev = merged[-1]
-            w_prev = max(1, int(prev.points))
-            w_new = max(1, int(band.points))
-            total = float(w_prev + w_new)
-            merged[-1] = MapRowBand(
-                valid=True,
-                lateral_v=(w_prev * float(prev.lateral_v) + w_new * float(band.lateral_v)) / total,
-                u_min=min(float(prev.u_min), float(band.u_min)),
-                u_max=max(float(prev.u_max), float(band.u_max)),
-                points=int(prev.points + band.points),
-            )
-
-        return merged
-
-    def _regularize_row_bands(self, bands: List[MapRowBand]) -> List[MapRowBand]:
-        """Insert missing row positions when neighbouring peaks imply skipped rows."""
-        valid = [band for band in bands if band.valid and math.isfinite(band.lateral_v)]
-        valid.sort(key=lambda band: band.lateral_v)
-        if len(valid) < 2:
-            return valid
-
-        spacing = max(0.05, float(self.p.expected_row_width))
-        tol = max(0.05, float(self.p.map_row_spacing_tolerance_ratio) * spacing)
-        max_insert_rows = max(0, int(self.p.map_row_insert_missing_max_gap_rows))
-        insert_missing = bool(self.p.map_row_insert_missing_peaks) and max_insert_rows > 0
-
-        out: List[MapRowBand] = [valid[0]]
-        for nxt in valid[1:]:
-            prev = out[-1]
-            gap = float(nxt.lateral_v) - float(prev.lateral_v)
-            if insert_missing and gap > spacing + tol:
-                missing = int(round(gap / spacing)) - 1
-                missing = max(0, min(missing, max_insert_rows))
-                if missing > 0:
-                    local_spacing = gap / float(missing + 1)
-                    # Only fill gaps that are still plausibly integer multiples
-                    # of the expected crop spacing.
-                    if abs(local_spacing - spacing) <= tol:
-                        for k in range(1, missing + 1):
-                            out.append(
-                                MapRowBand(
-                                    valid=True,
-                                    lateral_v=float(prev.lateral_v) + k * local_spacing,
-                                    u_min=max(float(prev.u_min), float(nxt.u_min)),
-                                    u_max=min(float(prev.u_max), float(nxt.u_max)),
-                                    points=max(1, min(int(prev.points), int(nxt.points)) // 2),
-                                )
-                            )
-            out.append(nxt)
-
-        return self._merge_row_bands(out)
-
-    def _make_band(self, u_values: np.ndarray, v_values: np.ndarray) -> MapRowBand:
-        # Kept for compatibility with older debug semantics.
-        if len(u_values) == 0:
-            return MapRowBand(valid=False)
-
-        return MapRowBand(
-            valid=True,
-            lateral_v=float(np.median(v_values)),
-            u_min=float(np.min(u_values)),
-            u_max=float(np.max(u_values)),
-            points=int(len(u_values)),
-        )
-
-    def select_target_lane(
-        self,
-        lanes: List[MapLane],
-        row_bands: List[MapRowBand],
-        direction: str,
-        count: int,
-    ) -> Optional[MapLane]:
-        """Select the target lane by counting fitted plant-row lines from the current side row.
-
-        This is deliberately row-line-relative, not absolute-lane-relative:
-        - nL counts plant rows to the left of the currently driven lane.
-        - nR counts plant rows to the right of the currently driven lane.
-
-        For 1L, the current left plant row and the next left plant row form the
-        target lane. For 2R, the second and third right-side row lines form the
-        target lane. If the SLAM map does not yet contain enough row lines, the
-        target is extrapolated from the nearest visible reference row instead of
-        choosing an arbitrary far-away lane.
-        """
-        step = max(1, int(count))
-        sign = 1 if direction.upper() == "L" else -1
-        expected_offset = sign * step * self.p.expected_row_width
-        tolerance = max(0.05, float(self.p.map_lane_accept_tolerance))
-        if step >= 2:
-            tolerance = min(
-                tolerance,
-                max(0.05, float(self.p.map_multirow_counted_target_tolerance)),
-            )
-
-        self.last_expected_target_offset = float(expected_offset)
-        self.last_detected_target_offset = 0.0
-        self.last_target_offset_error = 0.0
-        self.last_reference_row_v = 0.0
-        self.last_target_row_v = 0.0
-        self.last_candidate_rows_text = ""
-
-        width = clamp(
-            float(self.p.expected_row_width),
-            self.p.min_lane_width,
-            self.p.max_lane_width,
-        )
-
-        row_positions = sorted(
-            float(band.lateral_v)
-            for band in row_bands
-            if band.valid and math.isfinite(band.lateral_v)
-        )
-
-        if sign > 0:
-            side_rows = [v for v in row_positions if v > 0.0]
-            side_rows.sort(key=lambda value: value)
-        else:
-            side_rows = [v for v in row_positions if v < 0.0]
-            side_rows.sort(key=lambda value: -value)
-
-        self.last_candidate_rows_text = ",".join(f"{v:.3f}" for v in side_rows[:8])
-
-        # Primary mode: count fitted plant-row lines on the requested side.
-        # side_rows[0] is the current boundary row. The target lane for step k lies
-        # between side_rows[k-1] and side_rows[k].
-        if len(side_rows) >= step + 1:
-            inner_row_v = float(side_rows[step - 1])
-            outer_row_v = float(side_rows[step])
-            center_v = 0.5 * (inner_row_v + outer_row_v)
-            detected_offset = float(center_v)
-            error = abs(detected_offset - expected_offset)
-
-            self.last_reference_row_v = float(side_rows[0])
-            self.last_target_row_v = outer_row_v
-            self.last_detected_target_offset = detected_offset
-            self.last_target_offset_error = float(error)
-
-            # A counted target is only valid if both the pattern-relative center
-            # and the row spacing are plausible. The previous version accepted
-            # row pairs with only ~0.25...0.43 m separation for a 0.75 m crop row.
-            # That creates a false "lane" on a plant row and makes 2R drive into
-            # the crop. Narrow row pairs are rejected and the deterministic
-            # pattern-limited center is used instead.
-            measured_width = abs(outer_row_v - inner_row_v)
-            width_min = max(0.05, float(self.p.min_lane_width))
-            width_max = max(width_min, float(self.p.max_lane_width))
-            if step >= 2:
-                # Fuer 2R/2L zaehlt die Reihenfolge der Pflanzenreihen. Am
-                # Reihenende koennen die aus der SLAM-Map gefitteten Abstaende
-                # lokal deutlich kleiner sein als die nominale Gassenbreite.
-                # Der aktuelle Log-Fall hatte ein korrektes 2R-Zentrum
-                # center=-1.324 m bei expected=-1.500 m, wurde aber nur wegen
-                # width=0.376 m verworfen. Deshalb darf die Breite bei
-                # Mehrreihen-Manovern nicht wieder die korrekte Zaehllogik
-                # aushebeln. Untergrenze hart auf 0.40*row_width begrenzen,
-                # auch wenn ein altes params.yaml noch 0.55 setzt.
-                configured_min = float(self.p.map_counted_row_min_width_ratio) * float(self.p.expected_row_width)
-                counted_min = max(0.05, min(configured_min, 0.40 * float(self.p.expected_row_width)))
-                width_ok = counted_min <= measured_width <= width_max
-            else:
-                counted_min = width_min
-                width_ok = width_min <= measured_width <= width_max
-            # signed_outward_error > 0: counted lane is farther outward than the
-            # pattern target. signed_outward_error < 0: counted lane is shifted
-            # inward, i.e. back toward the currently driven lane. For multi-row
-            # turns this inward bias is dangerous at the headland because a
-            # protruding front row can pull the target center into the crop.
-            signed_outward_error = sign * (detected_offset - expected_offset)
-            inward_bias_limit = max(0.0, float(self.p.map_counted_lane_inward_bias_tolerance))
-            # Bei Mehrreihen-Manovern wird die Zielgasse durch die gezählten
-            # Pflanzenreihen selbst definiert. Ein leicht nach innen verschobenes
-            # Zentrum ist am ungleich langen Reihenende normal und darf 2R nicht
-            # wieder auf eine extrapolierte 1R-ähnliche Bahn zurückwerfen.
-            inward_bias_ok = True if step >= 2 else not (signed_outward_error < -inward_bias_limit)
-
-            reference_min = 0.0
-            reference_ok = True
-            if step >= 2:
-                reference_min = max(
-                    0.05,
-                    float(self.p.map_multirow_reference_row_min_ratio)
-                    * float(self.p.expected_row_width),
-                )
-                reference_ok = abs(float(side_rows[0])) >= reference_min
-
-            if error <= tolerance and width_ok and inward_bias_ok and reference_ok:
-                width = float(measured_width)
-                self.last_target_reason = (
-                    f"row-line counted target accepted: direction={direction.upper()}, "
-                    f"step={step}, reference_row={side_rows[0]:.3f}, "
-                    f"inner_row={inner_row_v:.3f}, outer_row={outer_row_v:.3f}, "
-                    f"center={center_v:.3f}, expected={expected_offset:.3f}, "
-                    f"error={error:.3f}, width={measured_width:.3f}, "
-                    f"signed_outward_error={signed_outward_error:.3f}, "
-                    f"width_range=[{counted_min:.3f},{width_max:.3f}], tolerance={tolerance:.3f}, "
-                    f"reference_ok={reference_ok}, reference_min={reference_min:.3f}, "
-                    f"side_rows=[{self.last_candidate_rows_text}]"
-                )
-                return MapLane(
-                    valid=True,
-                    center_v=float(center_v),
-                    left_row_v=float(max(inner_row_v, outer_row_v)),
-                    right_row_v=float(min(inner_row_v, outer_row_v)),
-                    width=float(width),
-                    confidence=0.98,
-                    source="detected_counted_row_lines",
-                )
-
-            self.last_target_reason = (
-                f"row-line counted target rejected: direction={direction.upper()}, "
-                f"step={step}, reference_row={side_rows[0]:.3f}, "
-                f"inner_row={inner_row_v:.3f}, outer_row={outer_row_v:.3f}, "
-                f"center={center_v:.3f}, expected={expected_offset:.3f}, "
-                f"error={error:.3f}, width={measured_width:.3f}, "
-                f"width_ok={width_ok}, inward_bias_ok={inward_bias_ok}, "
-                f"reference_ok={reference_ok}, reference_min={reference_min:.3f}, "
-                f"signed_outward_error={signed_outward_error:.3f}, "
-                f"width_range=[{counted_min:.3f},{width_max:.3f}], "
-                f"tolerance={tolerance:.3f}, side_rows=[{self.last_candidate_rows_text}]"
-            )
-
-        elif len(side_rows) >= 1:
-            # If only the current boundary row is known, extrapolate from it.
-            reference_row_v = float(side_rows[0])
-            center_v = reference_row_v + sign * (step - 0.5) * self.p.expected_row_width
-            error = abs(center_v - expected_offset)
-
-            self.last_reference_row_v = reference_row_v
-            self.last_target_row_v = reference_row_v + sign * step * self.p.expected_row_width
-            self.last_detected_target_offset = float(center_v)
-            self.last_target_offset_error = float(error)
-
-            self.last_target_reason = (
-                f"not enough fitted row lines on requested side; "
-                f"direction={direction.upper()}, step={step}, "
-                f"reference_row={reference_row_v:.3f}, side_rows=[{self.last_candidate_rows_text}]; "
-                f"using reference-row extrapolated lane center={center_v:.3f}"
-            )
-
-            return MapLane(
-                valid=True,
-                center_v=float(center_v),
-                left_row_v=float(center_v + 0.5 * width),
-                right_row_v=float(center_v - 0.5 * width),
-                width=float(width),
-                confidence=0.55,
-                source="extrapolated_from_reference_row",
-            )
-
-        else:
-            self.last_target_reason = (
-                f"no fitted reference row on requested side: direction={direction.upper()}, "
-                f"step={step}, rows={len(row_positions)}"
-            )
-
-        if step >= 2 and self.p.map_multirow_require_counted_rows:
-            self.last_target_reason += (
-                "; multirow requires counted SLAM row lines, rejecting lane/extrapolation fallback"
-            )
-            return None
-
-        # Secondary fallback: use a fitted lane only if its relative offset matches the pattern.
-        lanes_sorted = sorted(lanes, key=lambda lane: lane.center_v)
-        candidates = []
-        for lane in lanes_sorted:
-            detected_offset = float(lane.center_v)
-            error = abs(detected_offset - expected_offset)
-            same_side = (sign > 0 and detected_offset > 0.0) or (sign < 0 and detected_offset < 0.0)
-            if same_side:
-                candidates.append((error, lane))
-
-        if candidates:
-            candidates.sort(key=lambda item: item[0])
-            best_error, best_lane = candidates[0]
-            self.last_detected_target_offset = float(best_lane.center_v)
-            self.last_target_offset_error = float(best_error)
-
-            if best_error <= tolerance:
-                best_lane.source = "detected_lane_fallback"
-                self.last_target_reason += (
-                    f"; fallback fitted lane accepted: expected={expected_offset:.3f}, "
-                    f"detected={best_lane.center_v:.3f}, error={best_error:.3f}"
-                )
-                return best_lane
-
-            self.last_target_reason += (
-                f"; fallback fitted lane rejected: expected={expected_offset:.3f}, "
-                f"detected={best_lane.center_v:.3f}, error={best_error:.3f}, "
-                f"tolerance={tolerance:.3f}"
-            )
-
-        if step > self.p.map_row_max_extrapolated_lanes:
-            self.last_target_reason += (
-                f"; no extrapolation because requested step {step} exceeds "
-                f"map_row_max_extrapolated_lanes={self.p.map_row_max_extrapolated_lanes}"
-            )
-            return None
-
-        # Last resort: pure pattern-limited lane center. This never jumps beyond
-        # the requested count.
-        center_v = expected_offset
-        self.last_detected_target_offset = float(center_v)
-        self.last_target_offset_error = 0.0
-        self.last_target_reason += (
-            f"; using pure pattern-limited extrapolated lane center={center_v:.3f} m"
-        )
-
-        return MapLane(
-            valid=True,
-            center_v=float(center_v),
-            left_row_v=float(center_v + 0.5 * width),
-            right_row_v=float(center_v - 0.5 * width),
-            width=float(width),
-            confidence=0.40,
-            source="extrapolated_pattern_limited",
-        )
-
-
-class RowPerception:
-    def __init__(self, params: NavigatorParams):
-        self.p = params
-        self.mode = MissionState.FOLLOW_ROW
-
-    def set_mode(self, mode: MissionState) -> None:
-        self.mode = mode
-
-    def process_scan(self, scan: LaserScan) -> RowDetection:
-        points = self.scan_to_points(scan)
-        points = self.filter_roi(points)
-
-        det = RowDetection()
-        det.points_all = points
-        det.points_left = self.select_nearest_side_points(points, "left")
-        det.points_right = self.select_nearest_side_points(points, "right")
-
-        left_line = self.fit_line_ransac(det.points_left)
-        right_line = self.fit_line_ransac(det.points_right)
-
-        if left_line.valid:
-            det.left_valid = True
-            det.left_a = left_line.a
-            det.left_b = left_line.b
-
-        if right_line.valid:
-            det.right_valid = True
-            det.right_a = right_line.a
-            det.right_b = right_line.b
-
-        self.compute_centerline(det)
-        self.compute_confidence(det, left_line, right_line)
-        self.compute_end_probability(det)
-
-        return det
-
-    def current_roi(self) -> Tuple[float, float, float, float]:
-        if self.mode in (MissionState.ACQUIRE_ROW, MissionState.ENTER_ROW):
-            return (
-                self.p.acquire_roi_x_min,
-                self.p.acquire_roi_x_max,
-                self.p.acquire_roi_y_abs_min,
-                self.p.acquire_roi_y_abs_max,
-            )
-
-        return (
-            self.p.roi_x_min,
-            self.p.roi_x_max,
-            self.p.roi_y_abs_min,
-            self.p.roi_y_abs_max,
-        )
-
-    def current_y_abs_min(self) -> float:
-        return self.current_roi()[2]
-
-    def scan_to_points(self, scan: LaserScan) -> List[ScanPoint]:
-        points: List[ScanPoint] = []
-        angle = scan.angle_min
-
-        for r in scan.ranges:
-            if math.isfinite(r) and scan.range_min < r < scan.range_max:
-                x = r * math.cos(angle)
-                y = r * math.sin(angle)
-                points.append(ScanPoint(x, y))
-
-            angle += scan.angle_increment
-
-        return points
-
-    def filter_roi(self, points: List[ScanPoint]) -> List[ScanPoint]:
-        x_min, x_max, y_abs_min, y_abs_max = self.current_roi()
-
-        out = []
-        for pt in points:
-            if x_min <= pt.x <= x_max and y_abs_min <= abs(pt.y) <= y_abs_max:
-                out.append(pt)
-
-        return out
-
-    def select_nearest_side_points(
-        self,
-        points: List[ScanPoint],
-        side: str,
-    ) -> List[ScanPoint]:
-        if side == "left":
-            side_points = [p for p in points if p.y > self.current_y_abs_min()]
-            side_points.sort(key=lambda p: p.y)
-        else:
-            side_points = [p for p in points if p.y < -self.current_y_abs_min()]
-            side_points.sort(key=lambda p: abs(p.y))
-
-        if len(side_points) < self.p.min_inliers:
-            return side_points
-
-        nearest_y_abs = abs(side_points[0].y)
-        band_width = 0.35
-
-        selected = [
-            p for p in side_points
-            if abs(abs(p.y) - nearest_y_abs) <= band_width
-        ]
-
-        return selected
-
-    def fit_line_ransac(self, points: List[ScanPoint]) -> LineFit:
-        if len(points) < self.p.min_inliers:
-            return LineFit(valid=False)
-
-        best_a = 0.0
-        best_b = 0.0
-        best_inliers: List[ScanPoint] = []
-
-        rng = random.Random(42)
-
-        for _ in range(self.p.ransac_iterations):
-            p1, p2 = rng.sample(points, 2)
-            dx = p2.x - p1.x
-
-            if abs(dx) < 1e-3:
-                continue
-
-            a = (p2.y - p1.y) / dx
-
-            if abs(a) > self.p.max_abs_line_slope:
-                continue
-
-            b = p1.y - a * p1.x
-
-            inliers = []
-            denom = math.sqrt(a * a + 1.0)
-
-            for p in points:
-                dist = abs(a * p.x - p.y + b) / denom
-                if dist < self.p.ransac_distance:
-                    inliers.append(p)
-
-            if len(inliers) > len(best_inliers):
-                best_inliers = inliers
-                best_a = a
-                best_b = b
-
-        if len(best_inliers) < self.p.min_inliers:
-            return LineFit(valid=False)
-
-        xs = np.array([p.x for p in best_inliers], dtype=float)
-        ys = np.array([p.y for p in best_inliers], dtype=float)
-
-        try:
-            a, b = np.polyfit(xs, ys, 1)
-        except Exception:
-            a, b = best_a, best_b
-
-        visible_length = float(max(xs) - min(xs)) if len(xs) else 0.0
-        valid = visible_length >= self.p.min_visible_length
-
-        return LineFit(
-            valid=valid,
-            a=float(a),
-            b=float(b),
-            inliers=len(best_inliers),
-            visible_length=visible_length,
-        )
-
-    def compute_centerline(self, det: RowDetection) -> None:
-        if det.left_valid and det.right_valid:
-            x_ref = 1.0
-
-            left_y = det.left_a * x_ref + det.left_b
-            right_y = det.right_a * x_ref + det.right_b
-
-            det.lane_width = left_y - right_y
-
-            if det.lane_width < self.p.min_lane_width or det.lane_width > self.p.max_lane_width:
-                det.left_valid = False
-                det.right_valid = False
-                det.center_a = 0.0
-                det.center_b = 0.0
-                det.lane_width = 0.0
-                return
-
-            det.center_a = 0.5 * (det.left_a + det.right_a)
-            det.center_b = 0.5 * (det.left_b + det.right_b)
-            return
-
-        if det.left_valid:
-            det.center_a = det.left_a
-            det.center_b = det.left_b - self.p.expected_row_width / 2.0
-            det.lane_width = self.p.expected_row_width
-            return
-
-        if det.right_valid:
-            det.center_a = det.right_a
-            det.center_b = det.right_b + self.p.expected_row_width / 2.0
-            det.lane_width = self.p.expected_row_width
-            return
-
-        det.center_a = 0.0
-        det.center_b = 0.0
-        det.lane_width = 0.0
-
-    def compute_confidence(self, det: RowDetection, left: LineFit, right: LineFit) -> None:
-        score = 0.0
-
-        if self.mode in (MissionState.ACQUIRE_ROW, MissionState.ENTER_ROW):
-            if det.left_valid or det.right_valid:
-                score += 0.40
-
-            if det.left_valid and det.right_valid:
-                score += 0.20
-
-            if left.visible_length >= self.p.min_visible_length or right.visible_length >= self.p.min_visible_length:
-                score += 0.20
-
-            if self.p.min_lane_width <= det.lane_width <= self.p.max_lane_width:
-                score += 0.10
-
-            if abs(det.center_a) < 1.2:
-                score += 0.10
-
-            det.confidence = clamp(score, 0.0, 1.0)
-            return
-
-        if det.left_valid:
-            score += 0.25
-
-        if det.right_valid:
-            score += 0.25
-
-        if det.left_valid and det.right_valid:
-            if self.p.min_lane_width <= det.lane_width <= self.p.max_lane_width:
-                score += 0.25
-
-            if abs(det.left_a - det.right_a) < 0.35:
-                score += 0.15
-        else:
-            score += 0.10
-
-        if abs(det.center_a) < 1.2:
-            score += 0.10
-
-        det.confidence = clamp(score, 0.0, 1.0)
-
-    def compute_end_probability(self, det: RowDetection) -> None:
-        # Konservative Reihenende-Erkennung.
-        #
-        # Ziel:
-        # - Keine Reihenenden bei kurzen Luecken, duennen Pflanzen oder
-        #   kurzzeitig schlechter Linienerkennung.
-        # - Ein Reihenende nur dann erkennen, wenn ueber mehrere Frames
-        #   beide Seitenstrukturen fehlen und die Detektionskonfidenz niedrig ist.
-
-        forward_side_points = [
-            p for p in det.points_all
-            if self.p.front_density_x_min <= p.x <= self.p.front_density_x_max
-            and self.current_y_abs_min() <= abs(p.y) <= self.current_roi()[3]
-        ]
-
-        side_density = len(forward_side_points)
-
-        both_missing = not det.left_valid and not det.right_valid
-        one_missing = det.left_valid != det.right_valid
-
-        low_confidence = det.confidence < 0.20
-        very_low_confidence = det.confidence < 0.08
-
-        side_window_empty = side_density < self.p.front_density_threshold
-
-        score = 0.0
-
-        # Sicheres Reihenende:
-        # Beide Seiten fehlen, im Vorwaerts-Seitenfenster sind keine Punkte,
-        # und die Konfidenz ist sehr niedrig.
-        if both_missing and side_window_empty and very_low_confidence:
-            score = 1.0
-
-        # Wahrscheinliches Reihenende:
-        # Beide Seiten fehlen und das Seitenfenster ist leer.
-        elif both_missing and side_window_empty and low_confidence:
-            score = 0.85
-
-        # Moegliches Reihenende:
-        # Beide Seiten fehlen, aber es gibt noch einzelne Seitenpunkte.
-        # Das kann auch eine Luecke in der Reihe sein, deshalb nur schwach werten.
-        elif both_missing and low_confidence:
-            score = 0.35
-
-        # Eine einzelne fehlende Seite ist kein Reihenende.
-        # Das passiert haeufig bei schiefen Pflanzen, Luecken oder asymmetrischer Sicht.
-        elif one_missing and side_window_empty and very_low_confidence:
-            score = 0.15
-
-        else:
-            score = 0.0
-
-        det.end_probability = clamp(score, 0.0, 1.0)
-
-
-class RowTracker:
-    def __init__(self, params: NavigatorParams):
-        self.p = params
-        self.model = RowModel(row_width=params.expected_row_width)
-
-    def update(self, det: RowDetection) -> RowModel:
-        if det.confidence > 0.15 and (det.left_valid or det.right_valid):
-            if not self.model.valid:
-                self.model.center_a = det.center_a
-                self.model.center_b = det.center_b
-                self.model.valid = True
-            else:
-                a = self.p.tracker_alpha
-                self.model.center_a = (1.0 - a) * self.model.center_a + a * det.center_a
-                self.model.center_b = (1.0 - a) * self.model.center_b + a * det.center_b
-
-            self.model.confidence = clamp(
-                0.80 * self.model.confidence + 0.20 * det.confidence,
-                0.0,
-                1.0,
-            )
-
-            self.model.row_yaw_base = math.atan(self.model.center_a)
-
-            if det.lane_width > 0.1:
-                self.model.row_width = (
-                    0.90 * self.model.row_width + 0.10 * det.lane_width
-                )
-
-            self.model.missing_frames = 0
-            self.model.last_detection = det
-        else:
-            self.model.missing_frames += 1
-            self.model.confidence *= self.p.confidence_decay
-
-            if self.model.confidence < 0.01 and self.model.missing_frames > 20:
-                self.model.valid = False
-
-        # Reihenende asymmetrisch filtern:
-        # - langsamer Anstieg, damit kurze Luecken nicht sofort ein Ende ausloesen
-        # - schneller Abfall, damit falsche Ende-Hypothesen rasch verschwinden
-        if det.end_probability > self.model.end_probability:
-            self.model.end_probability = (
-                0.90 * self.model.end_probability + 0.10 * det.end_probability
-            )
-        else:
-            self.model.end_probability = (
-                0.55 * self.model.end_probability + 0.45 * det.end_probability
-            )
-
-        self.model.end_detected = (
-            self.model.end_probability >= self.p.end_probability_threshold
-        )
-
-        return self.model
-
-
-class LocalPlanner:
-    def __init__(self, params: NavigatorParams):
-        self.p = params
-
-    def plan_follow_row(self, row: RowModel, speed: Optional[float] = None) -> LocalPath:
-        if not row.valid:
-            return LocalPath([], False, "base_link", "row model invalid")
-
-        v = self.p.follow_speed if speed is None else speed
-
-        if row.confidence < self.p.min_follow_confidence:
-            v = min(v, self.p.slow_speed)
-
-        points: List[PathPoint] = []
-
-        center_a = clamp(
-            row.center_a,
-            -self.p.centerline_max_abs_slope,
-            self.p.centerline_max_abs_slope,
-        )
-
-        # Groessere seitliche Fehler duerfen korrigiert werden.
-        # Bei grosser Querabweichung wird die Geschwindigkeit reduziert, damit
-        # der Roboter bei breiten/kurvigen Reihen nicht aggressiv ausschert.
-        center_b = clamp(row.center_b, -0.45, 0.45)
-        lateral_error = abs(center_b)
-
-        if lateral_error > 0.35:
-            v = min(v, self.p.slow_speed)
-        elif lateral_error > 0.25:
-            v *= 0.70
-
-        path_x_max = max(1.2, min(3.0, self.p.roi_x_max))
-
-        for x in np.linspace(0.25, path_x_max, 40):
-            y = center_a * float(x) + center_b
-            yaw = math.atan(center_a)
-            points.append(PathPoint(float(x), float(y), float(yaw), float(v)))
-
-        return LocalPath(points, True, "base_link")
-
-    def plan_exit_row(self) -> LocalPath:
-        points: List[PathPoint] = []
-
-        if self.p.exit_distance <= 0.01:
-            points.append(PathPoint(0.0, 0.0, 0.0, self.p.slow_speed))
-            return LocalPath(points, True, "base_link")
-
-        for x in np.linspace(0.05, self.p.exit_distance, 12):
-            points.append(PathPoint(float(x), 0.0, 0.0, self.p.slow_speed))
-
-        return LocalPath(points, True, "base_link")
-
-    def plan_acquire_row(self, row: RowModel) -> LocalPath:
-        if row.valid and row.confidence > 0.12:
-            return self.plan_follow_row(row, speed=self.p.enter_speed)
-
-        points: List[PathPoint] = []
-
-        for x in np.linspace(0.20, 1.40, 18):
-            xf = float(x)
-            y = 0.18 * math.sin(2.6 * xf)
-            yaw = 0.20 * math.sin(2.6 * xf)
-            points.append(PathPoint(xf, y, yaw, self.p.enter_speed * 0.65))
-
-        return LocalPath(points, True, "base_link")
-
-    def plan_enter_row(self, row: RowModel) -> LocalPath:
-        if row.valid:
-            return self.plan_follow_row(row, speed=self.p.enter_speed)
-
-        points: List[PathPoint] = []
-
-        for x in np.linspace(0.2, self.p.enter_distance, 18):
-            points.append(PathPoint(float(x), 0.0, 0.0, self.p.enter_speed))
-
-        return LocalPath(points, True, "base_link")
-
-    def plan_turn_path_odom(self, start: Pose2D) -> LocalPath:
-        return self.plan_turn_path_global(start, self.p.odom_frame)
-
-    def plan_turn_path_map(self, start: Pose2D) -> LocalPath:
-        return self.plan_turn_path_global(start, self.p.map_frame)
-
-    def plan_turn_path_global(self, start: Pose2D, frame_id: str) -> LocalPath:
-        direction = 1.0 if self.p.row_shift_direction.upper() == "L" else -1.0
-
-        row_shift = self.p.row_shift_count * self.p.expected_row_width
-        radius = max(row_shift / 2.0, self.p.min_turn_radius)
-
-        if radius <= 0.05:
-            return LocalPath([], False, frame_id, "invalid turn radius")
-
-        local: List[PathPoint] = []
-
-        if self.p.exit_distance > 0.01:
-            for x in np.linspace(0.0, self.p.exit_distance, 12):
-                local.append(PathPoint(float(x), 0.0, 0.0, self.p.slow_speed))
-
-        x_offset = self.p.exit_distance
-
-        for phi in np.linspace(-math.pi / 2.0, math.pi / 2.0, 90):
-            x = x_offset + radius * math.cos(phi)
-            y = direction * (radius + radius * math.sin(phi))
-
-            dx_dphi = -radius * math.sin(phi)
-            dy_dphi = direction * radius * math.cos(phi)
-
-            yaw = math.atan2(dy_dphi, dx_dphi)
-
-            local.append(
-                PathPoint(
-                    float(x),
-                    float(y),
-                    float(yaw),
-                    self.p.turn_speed,
-                )
-            )
-
-        end_y = direction * (2.0 * radius)
-
-        if self.p.enter_distance > 0.01:
-            for s in np.linspace(0.0, self.p.enter_distance, 20):
-                x = x_offset - float(s)
-                y = end_y
-                yaw = math.pi
-
-                local.append(
-                    PathPoint(
-                        float(x),
-                        float(y),
-                        float(yaw),
-                        self.p.enter_speed,
-                    )
-                )
-
-        odom_points: List[PathPoint] = []
-
-        c = math.cos(start.yaw)
-        s = math.sin(start.yaw)
-
-        for p in local:
-            ox = start.x + c * p.x - s * p.y
-            oy = start.y + s * p.x + c * p.y
-            oyaw = wrap_to_pi(start.yaw + p.yaw)
-
-            odom_points.append(
-                PathPoint(
-                    float(ox),
-                    float(oy),
-                    float(oyaw),
-                    float(p.v),
-                )
-            )
-
-        return LocalPath(odom_points, True, frame_id, "TURN_GEOMETRIC_UTURN")
-
-
-    def plan_turn_path_to_map_lane(self, start: Pose2D, target_lane: MapLane) -> LocalPath:
-        if not target_lane.valid:
-            return LocalPath([], False, self.p.map_frame, "invalid target map lane")
-
-        row_shift = float(target_lane.center_v)
-
-        if abs(row_shift) < 0.10:
-            return LocalPath([], False, self.p.map_frame, "target map lane too close to current lane")
-
-        direction = 1.0 if row_shift > 0.0 else -1.0
-        radius = max(abs(row_shift) / 2.0, self.p.min_turn_radius)
-
-        if radius <= 0.05:
-            return LocalPath([], False, self.p.map_frame, "invalid map lane turn radius")
-
-        local: List[PathPoint] = []
-
-        if self.p.exit_distance > 0.01:
-            for x in np.linspace(0.0, self.p.exit_distance, 12):
-                local.append(PathPoint(float(x), 0.0, 0.0, self.p.slow_speed))
-
-        x_offset = self.p.exit_distance
-
-        for phi in np.linspace(-math.pi / 2.0, math.pi / 2.0, 90):
-            x = x_offset + radius * math.cos(phi)
-            y = direction * (radius + radius * math.sin(phi))
-
-            dx_dphi = -radius * math.sin(phi)
-            dy_dphi = direction * radius * math.cos(phi)
-            yaw = math.atan2(dy_dphi, dx_dphi)
-
-            local.append(PathPoint(float(x), float(y), float(yaw), self.p.turn_speed))
-
-        end_y = row_shift
-
-        if self.p.enter_distance > 0.01:
-            for s in np.linspace(0.0, self.p.enter_distance, 20):
-                x = x_offset - float(s)
-                y = end_y
-                yaw = math.pi
-                local.append(PathPoint(float(x), float(y), float(yaw), self.p.enter_speed))
-
-        map_points: List[PathPoint] = []
-        c = math.cos(start.yaw)
-        s = math.sin(start.yaw)
-
-        for p in local:
-            mx = start.x + c * p.x - s * p.y
-            my = start.y + s * p.x + c * p.y
-            myaw = wrap_to_pi(start.yaw + p.yaw)
-            map_points.append(PathPoint(float(mx), float(my), float(myaw), float(p.v)))
-
-        return LocalPath(map_points, True, self.p.map_frame, "TURN_SLAM_LANE_UTURN")
-
-
-    def plan_constant_curve_base_link(
-        self,
-        direction: float,
-        speed: float,
-        angular_speed: float,
-        duration_hint: float = 3.0,
-        reason: str = "MANEUVER_CURVE",
-    ) -> LocalPath:
-        """Generate a short base_link arc used as a commanded forward curve.
-
-        This does not replace row following. It is only used in the headland
-        maneuver where a controlled left/right arc is desired.
-        """
-        direction = 1.0 if direction >= 0.0 else -1.0
-        v = clamp(abs(speed), 0.0, self.p.max_linear_speed)
-        w = max(abs(angular_speed), 1e-3)
-        radius = max(v / w, 0.05)
-        total_angle = min(abs(w * max(duration_hint, 0.5)), 1.6)
-
-        points: List[PathPoint] = []
-        for phi in np.linspace(0.05, total_angle, 36):
-            x = radius * math.sin(float(phi))
-            y = direction * radius * (1.0 - math.cos(float(phi)))
-            yaw = direction * float(phi)
-            points.append(PathPoint(float(x), float(y), float(yaw), float(v)))
-
-        return LocalPath(points, True, "base_link", reason)
-
-    def plan_headland_shift_base_link(
-        self,
-        speed: Optional[float] = None,
-        reason: str = "HEADLAND_SHIFT",
-    ) -> LocalPath:
-        """Drive forward in the current heading during the headland lateral shift."""
-        v = self.p.headland_shift_speed if speed is None else speed
-        v = clamp(abs(v), 0.0, self.p.max_linear_speed)
-        points: List[PathPoint] = []
-        for x in np.linspace(0.20, 1.60, 24):
-            points.append(PathPoint(float(x), 0.0, 0.0, float(v)))
-        return LocalPath(points, True, "base_link", reason)
-
-    def plan_headland_shift_map_heading(
-        self,
-        pose: Pose2D,
-        desired_yaw: float,
-        speed: Optional[float] = None,
-        reason: str = "HEADLAND_SHIFT_MAP",
-    ) -> LocalPath:
-        """Map-frame straight segment used to keep the headland drive parallel to row ends."""
-        v = self.p.headland_shift_speed if speed is None else speed
-        v = clamp(abs(v), 0.0, self.p.max_linear_speed)
-        points: List[PathPoint] = []
-        c = math.cos(desired_yaw)
-        s = math.sin(desired_yaw)
-        for d in np.linspace(0.25, 1.80, 28):
-            dist = float(d)
-            points.append(
-                PathPoint(
-                    float(pose.x + c * dist),
-                    float(pose.y + s * dist),
-                    float(desired_yaw),
-                    float(v),
-                )
-            )
-        return LocalPath(points, True, self.p.map_frame, reason)
-
-    def plan_headland_shift_map_to_lateral_target(
-        self,
-        pose: Pose2D,
-        row_yaw: float,
-        target_v: float,
-        speed: Optional[float] = None,
-        reason: str = "HEADLAND_SHIFT_MULTIROW_TARGET",
-    ) -> LocalPath:
-        """Drive on an explicit map-frame line to a latched multi-row pre-entry lateral coordinate.
-
-        For 2L/2R the counted SLAM target lane is already known. A plain heading
-        command can still let pure pursuit cut into the first neighbouring gap
-        because it does not constrain the lateral coordinate. This path keeps the
-        along-row coordinate approximately constant and samples directly towards
-        the latched pre-entry v-coordinate in the fixed row basis.
-        """
-        v_cmd = self.p.headland_shift_speed if speed is None else speed
-        v_cmd = clamp(abs(v_cmd), 0.0, self.p.max_linear_speed)
-
-        cy = math.cos(float(row_yaw))
-        sy = math.sin(float(row_yaw))
-        current_u = cy * float(pose.x) + sy * float(pose.y)
-        current_v = -sy * float(pose.x) + cy * float(pose.y)
-        dv_total = float(target_v) - current_v
-
-        # Positive v means row_yaw + 90 deg, negative v means row_yaw - 90 deg.
-        direction = 1.0 if dv_total >= 0.0 else -1.0
-        desired_yaw = wrap_to_pi(float(row_yaw) + direction * math.pi / 2.0)
-
-        # Keep a useful lookahead even when we are close to the target; the state
-        # machine decides when to switch to ENTRY_CURVE.
-        max_len = max(0.35, min(1.80, abs(dv_total)))
-        points: List[PathPoint] = []
-        for d in np.linspace(0.10, max_len, 28):
-            step_v = current_v + direction * float(d)
-            # Do not overshoot the latched pre-entry line in the generated path.
-            if direction > 0.0:
-                step_v = min(step_v, float(target_v))
-            else:
-                step_v = max(step_v, float(target_v))
-
-            x = cy * current_u - sy * step_v
-            y = sy * current_u + cy * step_v
-            points.append(PathPoint(float(x), float(y), float(desired_yaw), float(v_cmd)))
-
-        return LocalPath(points, True, self.p.map_frame, reason)
-
-
-class PathFollower:
-    def __init__(self, params: NavigatorParams):
-        self.p = params
-        self.last_w_base = 0.0
-        self.last_w_odom = 0.0
-
-    def compute_cmd(self, path: LocalPath, pose_odom: Optional[Pose2D]) -> Twist:
-        cmd = Twist()
-
-        if not path.valid or len(path.points) == 0:
-            self.last_w_base = 0.0
-            self.last_w_odom = 0.0
-            return cmd
-
-        if path.frame_id == "base_link":
-            return self.compute_cmd_base_link(path)
-
-        if path.frame_id in (self.p.odom_frame, self.p.map_frame):
-            if pose_odom is None:
-                return cmd
-
-            return self.compute_cmd_odom(path, pose_odom)
-
-        return cmd
-
-    def compute_cmd_base_link(self, path: LocalPath) -> Twist:
-        cmd = Twist()
-        target = self.find_lookahead_base_link(path.points)
-
-        if target is None:
-            return cmd
-
-        # Vorgewende-Kurven werden als direktes Geschwindigkeitskommando gefahren,
-        # nicht mit Pure Pursuit. Dadurch ergibt sich ein reproduzierbarer Radius:
-        # R = v / omega. Mit den Defaultwerten liegt R bei ca. 0.375 m.
-        if path.reason in ("EXIT_CURVE", "ENTRY_CURVE"):
-            direction = 1.0
-            if len(path.points) > 0 and (path.points[-1].yaw < 0.0 or path.points[-1].y < 0.0):
-                direction = -1.0
-
-            if path.reason == "EXIT_CURVE":
-                v_cmd = clamp(abs(self.p.exit_curve_speed), 0.0, self.p.max_linear_speed)
-                w_cmd = direction * min(abs(self.p.exit_curve_angular_speed), self.p.turn_max_angular_speed)
-            else:
-                v_cmd = clamp(abs(self.p.entry_curve_speed), 0.0, self.p.max_linear_speed)
-                w_cmd = direction * min(abs(self.p.entry_curve_angular_speed), self.p.turn_max_angular_speed)
-
-            w_cmd = self.rate_limit(w_cmd, self.last_w_base)
-            self.last_w_base = w_cmd
-            cmd.linear.x = v_cmd
-            cmd.angular.z = w_cmd
-            return cmd
-
-        alpha = math.atan2(target.y, target.x)
-        curvature = 2.0 * math.sin(alpha) / max(self.p.lookahead_distance, 1e-3)
-
-        v = clamp(target.v, 0.0, self.p.max_linear_speed)
-
-        abs_curvature = abs(curvature)
-
-        # Bei engen Kurven innerhalb der Reihe wird die Geschwindigkeit reduziert.
-        # Dadurch bleibt die benoetigte Winkelgeschwindigkeit erreichbar und der
-        # Roboter schneidet Kurven weniger stark.
-        if abs_curvature > 1.6:
-            v *= 0.40
-        elif abs_curvature > 1.1:
-            v *= 0.55
-        elif abs_curvature > 0.7:
-            v *= 0.75
-
-        w = clamp(
-            v * curvature,
-            -self.p.follow_max_angular_speed,
-            self.p.follow_max_angular_speed,
-        )
-        w = self.rate_limit(w, self.last_w_base)
-        self.last_w_base = w
-
-        cmd.linear.x = v
-        cmd.angular.z = w
-
-        return cmd
-
-    def compute_cmd_odom(self, path: LocalPath, pose: Pose2D) -> Twist:
-        cmd = Twist()
-
-        is_turn_path = path.reason.startswith("TURN")
-
-        if is_turn_path:
-            target = self.find_lookahead_odom(
-                path.points,
-                pose,
-                lookahead_distance=self.p.turn_lookahead_distance,
-            )
-        else:
-            target = self.find_lookahead_odom(path.points, pose)
-
-        if target is None:
-            return cmd
-
-        if path.reason == "HEADLAND_SHIFT_MULTIROW_STRAIGHT":
-            # Deterministic straight leg for 2L/2R/...:
-            # follow the fixed map heading stored in the path yaw. This keeps the
-            # robot exactly perpendicular to the row direction while the state
-            # machine measures the traveled distance along the same axis.
-            goal = path.points[-1]
-            desired_yaw = float(goal.yaw)
-            yaw_err = wrap_to_pi(desired_yaw - float(pose.yaw))
-
-            base_v = clamp(goal.v, 0.0, self.p.max_linear_speed)
-            heading_scale = 1.0 if abs(yaw_err) < 0.20 else max(0.55, math.cos(min(abs(yaw_err), math.pi / 2.0)))
-            v = base_v * heading_scale
-
-            # Nur kleine Winkelfehler ausregeln. Die Richtung wurde bereits
-            # axial passend zur aktuellen Roboterpose gewaehlt; ein grosser
-            # Korrekturbefehl waere hier ein Fehler und wuerde wieder in die
-            # erste Nachbargasse eindrehen.
-            w_limit = min(0.12, float(self.p.turn_max_angular_speed), float(self.p.follow_max_angular_speed))
-            w = clamp(0.75 * float(self.p.headland_heading_kp) * yaw_err, -w_limit, w_limit)
-            w = self.rate_limit(w, self.last_w_odom)
-            self.last_w_odom = w
-
-            cmd.linear.x = v
-            cmd.angular.z = w
-            return cmd
-
-        # Multi-row headland shifts (2L/2R/...) are gated by the latched SLAM
-        # target lane in the mission state machine. This segment must neither
-        # be normal pure-pursuit (v9 cut into the first visible right gap) nor
-        # a hard heading-hold (v10 spun with raw_cmd angular.z about 1.4 rad/s),
-        # nor dead-straight open-loop (v11 kept angular.z=0 and the measured
-        # shift moved back toward zero, so no row was entered).
-        #
-        # Use a bounded pursuit controller toward the latched pre-entry line:
-        # it steers gently toward the generated map target, but angular speed is
-        # deliberately limited well below the turn controller. The state machine
-        # still decides when the pre-entry coordinate for the second lane has
-        # been reached and then switches to ENTRY_CURVE.
-        if path.reason == "HEADLAND_SHIFT_MULTIROW_TARGET":
-            lookahead = max(0.25, min(0.70, float(self.p.headland_shift_lookahead_distance)))
-            target = self.find_lookahead_odom(path.points, pose, lookahead_distance=lookahead) or path.points[-1]
-            desired_yaw = math.atan2(float(target.y) - float(pose.y), float(target.x) - float(pose.x))
-            yaw_err = wrap_to_pi(desired_yaw - float(pose.yaw))
-
-            goal = path.points[-1]
-            base_v = clamp(goal.v, 0.0, self.p.max_linear_speed)
-            # Keep moving while correcting, but slow down if the target line is
-            # far off the current heading. This prevents both spinning and a
-            # large cut into the first neighbouring gap.
-            heading_scale = max(0.35, math.cos(min(abs(yaw_err), math.pi / 2.0)))
-            v = base_v * heading_scale
-            # Nur sanft korrigieren. Das Fahrzeug soll parallel am
-            # Reihenende weiterfahren und nicht erneut wie in v10/v14 in die
-            # naechste Gasse hineindrehen.
-            w_limit = min(0.22, float(self.p.turn_max_angular_speed), float(self.p.follow_max_angular_speed))
-            w = clamp(0.70 * yaw_err, -w_limit, w_limit)
-            w = self.rate_limit(w, self.last_w_odom)
-            self.last_w_odom = w
-
-            cmd.linear.x = v
-            cmd.angular.z = w
-            return cmd
-
-        goal = path.points[-1]
-        goal_dist = math.hypot(goal.x - pose.x, goal.y - pose.y)
-        goal_yaw_err = wrap_to_pi(goal.yaw - pose.yaw)
-
-        if goal_dist < self.p.path_goal_xy_tolerance:
-            if abs(goal_yaw_err) > self.p.path_goal_yaw_tolerance:
-                cmd.linear.x = 0.0
-                cmd.angular.z = clamp(
-                    1.5 * goal_yaw_err,
-                    -self.p.turn_max_angular_speed,
-                    self.p.turn_max_angular_speed,
-                )
-                return cmd
-
-            cmd.linear.x = 0.0
-            cmd.angular.z = 0.0
-            return cmd
-
-        dx = target.x - pose.x
-        dy = target.y - pose.y
-
-        c = math.cos(-pose.yaw)
-        s = math.sin(-pose.yaw)
-
-        bx = c * dx - s * dy
-        by = s * dx + c * dy
-
-        alpha = math.atan2(by, bx)
-
-        if bx < -0.05:
-            cmd.linear.x = 0.0
-            cmd.angular.z = clamp(
-                1.2 * alpha,
-                -self.p.turn_max_angular_speed,
-                self.p.turn_max_angular_speed,
-            )
-            return cmd
-
-        lookahead = self.p.turn_lookahead_distance if is_turn_path else self.p.lookahead_distance
-        curvature = 2.0 * math.sin(alpha) / max(lookahead, 1e-3)
-
-        v = clamp(target.v, 0.0, self.p.max_linear_speed)
-
-        abs_curvature = abs(curvature)
-
-        if is_turn_path:
-            # Beim Vorgewende-U-Turn muss aktiv eingelenkt werden.
-            # Zu grosser Lookahead fuehrt sonst zu fast gerader Fahrt entlang des Reihenendes.
-            if abs_curvature > 1.5:
-                v *= 0.70
-            elif abs_curvature > 0.9:
-                v *= 0.85
-        else:
-            if abs_curvature > 1.5:
-                v *= 0.45
-            elif abs_curvature > 0.9:
-                v *= 0.65
-
-        w = clamp(v * curvature, -self.p.turn_max_angular_speed, self.p.turn_max_angular_speed)
-
-        if is_turn_path and abs(w) > 1e-4:
-            w = math.copysign(
-                max(abs(w), self.p.turn_min_angular_speed),
-                w,
-            )
-            w = clamp(w, -self.p.turn_max_angular_speed, self.p.turn_max_angular_speed)
-
-        w = self.rate_limit(w, self.last_w_odom)
-        self.last_w_odom = w
-
-        cmd.linear.x = v
-        cmd.angular.z = w
-
-        return cmd
-
-    def find_lookahead_base_link(self, points: List[PathPoint]) -> Optional[PathPoint]:
-        follow_lookahead = self.p.lookahead_distance
-
-        for p in points:
-            d = math.hypot(p.x, p.y)
-            if d >= follow_lookahead and p.x > 0.0:
-                return p
-
-        return points[-1] if points else None
-
-    def rate_limit(self, target_w: float, last_w: float) -> float:
-        if self.p.control_frequency <= 0.0 or self.p.angular_rate_limit <= 0.0:
-            return target_w
-
-        max_delta = self.p.angular_rate_limit / self.p.control_frequency
-        return clamp(target_w, last_w - max_delta, last_w + max_delta)
-
-    def find_lookahead_odom(
-        self,
-        points: List[PathPoint],
-        pose: Pose2D,
-        lookahead_distance: Optional[float] = None,
-    ) -> Optional[PathPoint]:
-        if not points:
-            return None
-
-        follow_lookahead = self.p.lookahead_distance if lookahead_distance is None else lookahead_distance
-
-        closest_idx = 0
-        closest_dist = float("inf")
-
-        for i, p in enumerate(points):
-            d = math.hypot(p.x - pose.x, p.y - pose.y)
-            if d < closest_dist:
-                closest_dist = d
-                closest_idx = i
-
-        acc = 0.0
-
-        for i in range(closest_idx, len(points) - 1):
-            p0 = points[i]
-            p1 = points[i + 1]
-            segment = math.hypot(p1.x - p0.x, p1.y - p0.y)
-            acc += segment
-
-            if acc >= follow_lookahead:
-                return p1
-
-        return points[-1]
-
-    def path_goal_distance(self, path: LocalPath, pose: Pose2D) -> float:
-        if not path.points:
-            return float("inf")
-
-        goal = path.points[-1]
-
-        return math.hypot(goal.x - pose.x, goal.y - pose.y)
-
-    def path_goal_reached(self, path: LocalPath, pose: Pose2D) -> bool:
-        if not path.valid or not path.points:
-            return False
-
-        goal = path.points[-1]
-        d = math.hypot(goal.x - pose.x, goal.y - pose.y)
-        yaw_err = abs(wrap_to_pi(goal.yaw - pose.yaw))
-
-        return d < self.p.path_goal_xy_tolerance and yaw_err < self.p.path_goal_yaw_tolerance
-
-
-class SafetySupervisor:
-    def __init__(self, params: NavigatorParams):
-        self.p = params
-
-    def filter_cmd(
-        self,
-        cmd: Twist,
         scan: Optional[LaserScan],
-        row: RowModel,
-        state: MissionState,
-    ) -> Twist:
-        # Safety ist per Parameter abschaltbar.
-        # Bei enable_safety=false werden Hindernisse nicht mehr fuer Stop/Slowdown
-        # verwendet. Die globalen Geschwindigkeitslimits bleiben aktiv.
-        if not self.p.enable_safety:
-            cmd.linear.x = clamp(
-                cmd.linear.x,
-                -self.p.max_linear_speed,
-                self.p.max_linear_speed,
-            )
-            cmd.angular.z = clamp(
-                cmd.angular.z,
-                -self.p.max_angular_speed,
-                self.p.max_angular_speed,
-            )
-            return cmd
-
+        map_slope: Optional[float],
+        map_target_base: np.ndarray,
+    ) -> LaserFollowResult:
         if scan is None:
-            return self.stop()
+            return self.reject(LaserFollowResult(), "no scan")
 
-        front_min = self.front_min_distance(scan, state)
-
-        if front_min < self.p.obstacle_stop_distance:
-            return self.stop()
-
-        if front_min < self.p.obstacle_slow_distance:
-            cmd.linear.x *= 0.35
-            cmd.angular.z *= 0.7
-
-        if state == MissionState.FOLLOW_ROW:
-            if row.confidence < 0.05:
-                cmd.linear.x *= 0.3
-
-            if row.confidence < self.p.min_follow_confidence:
-                cmd.linear.x *= 0.6
-
-        cmd.linear.x = clamp(
-            cmd.linear.x,
-            -self.p.max_linear_speed,
-            self.p.max_linear_speed,
+        points = self.scan_to_points(scan)
+        roi_centers, roi_direction = self.build_rois(map_slope, map_target_base)
+        left_line = self.fit_line_in_roi(points, roi_centers[0], roi_direction)
+        right_line = self.fit_line_in_roi(points, roi_centers[1], roi_direction)
+        result = LaserFollowResult(
+            left_line=left_line,
+            right_line=right_line,
+            roi_centers=roi_centers,
+            roi_direction=roi_direction,
         )
-        cmd.angular.z = clamp(
-            cmd.angular.z,
-            -self.p.max_angular_speed,
-            self.p.max_angular_speed,
-        )
+        target_x = float(np.clip(map_target_base[0], self.p.laser_roi_x_min, self.p.laser_roi_x_max))
 
-        return cmd
-
-    def front_min_distance(self, scan: LaserScan, state: MissionState) -> float:
-        angle = scan.angle_min
-        min_r = float("inf")
-
-        if state == MissionState.FOLLOW_ROW:
-            front_angle = math.radians(8.0)
-        elif state in (
-            MissionState.EXECUTE_TURN,
-            MissionState.ACQUIRE_ROW,
-            MissionState.ENTER_ROW,
-            MissionState.EXIT_ROW,
-            MissionState.PLAN_TURN,
-        ):
-            front_angle = math.radians(35.0)
+        if left_line.valid and right_line.valid:
+            left_y = left_line.slope * target_x + left_line.intercept
+            right_y = right_line.slope * target_x + right_line.intercept
+            width = left_y - right_y
+            if not self.p.min_lane_width <= width <= self.p.max_lane_width:
+                return self.reject(result, "invalid lane width")
+            if abs(left_line.slope - right_line.slope) > 0.35:
+                return self.reject(result, "side lines not parallel")
+            result.center_slope = 0.5 * (left_line.slope + right_line.slope)
+            result.center_intercept = 0.5 * (left_line.intercept + right_line.intercept)
+            raw_confidence = 1.0
+            max_weight = self.p.laser_max_weight_both_sides
+        elif left_line.valid:
+            result.center_slope = left_line.slope
+            result.center_intercept = left_line.intercept - 0.5 * self.p.expected_row_width
+            raw_confidence = 0.60
+            max_weight = self.p.laser_max_weight_one_side
+        elif right_line.valid:
+            result.center_slope = right_line.slope
+            result.center_intercept = right_line.intercept + 0.5 * self.p.expected_row_width
+            raw_confidence = 0.60
+            max_weight = self.p.laser_max_weight_one_side
         else:
-            front_angle = math.radians(15.0)
-
-        for r in scan.ranges:
-            if math.isfinite(r) and scan.range_min < r < scan.range_max:
-                if abs(angle) < front_angle:
-                    min_r = min(min_r, r)
-
-            angle += scan.angle_increment
-
-        return min_r
-
-    def stop(self) -> Twist:
-        return Twist()
-
-
-class MissionManager:
-    def __init__(self, node: Node, params: NavigatorParams):
-        self.node = node
-        self.p = params
-
-        self.state = MissionState.IDLE
-        self.active_turn_path: Optional[LocalPath] = None
-        self.active_turn_uses_map_lane = False
-        self.turn_replan_attempts = 0
-        self.turn_replan_frame_counter = 0
-        self.turn_local_row_stable_frames = 0
-
-        # Vorgewende-Manoever-Zustand.
-        self.headland_start_pose_map: Optional[Pose2D] = None
-        self.exit_curve_start_yaw: Optional[float] = None
-        self.entry_curve_start_yaw: Optional[float] = None
-        self.headland_direction: float = 1.0
-        self.headland_required_shift: float = 0.0
-        self.headland_measured_shift: float = 0.0
-        self.headland_exit_forward_distance: float = 0.0
-        # Deterministische Gerade entlang des Vorgewendes fuer 2L/2R.
-        # Nach der Ausfahrkurve wird die aktuelle Pose gelatcht; danach wird
-        # stumpf (row_shift_count-1)*row_width geradeaus gefahren, bevor die
-        # Einfahrkurve startet. Damit kann die lokale Map-/LiDAR-Erkennung den
-        # Roboter nicht mehr in die erste Nachbargasse ziehen.
-        self.headland_shift_start_pose_map: Optional[Pose2D] = None
-        self.headland_shift_start_yaw_map: Optional[float] = None
-        # Feste Vorgewende-Achse fuer 2L/2R: exakt senkrecht zur gelatchten
-        # Reihenrichtung. Die Gerade wird nicht in aktueller Fahrzeugrichtung,
-        # sondern entlang dieser Map-Achse gefahren.
-        self.headland_shift_axis_yaw_map: Optional[float] = None
-        self.headland_shift_forward_distance: float = 0.0
-        self.headland_reference_row_yaw_map: Optional[float] = None
-        self.entry_row_stable_frames: int = 0
-        self.entry_reference_side_ok: bool = False
-        self.entry_shift_ok: bool = False
-
-        self.map_lanes: List[MapLane] = []
-        self.map_row_bands: List[MapRowBand] = []
-        self.target_map_lane: Optional[MapLane] = None
-        self.last_map_row_reason: str = ""
-        self.last_target_lane_reason: str = "not evaluated"
-        self.expected_target_offset: float = 0.0
-        self.detected_target_offset: float = 0.0
-        self.target_offset_error: float = 0.0
-        # For multi-row headland turns (2L/2R/...), the counted SLAM target
-        # must be latched once it has been seen. Otherwise the reference row
-        # changes while driving along the headland and the controller can drift
-        # back into the first neighbouring lane although the pattern is 2R/2L.
-        self.multirow_counted_target_latched: bool = False
-        self.multirow_latched_target_offset: float = 0.0
-        self.multirow_latched_target_error: float = 0.0
-        # Global map lock for multi-row targets. The relative target offset from
-        # the detector changes while the robot moves along the headland. For
-        # 2R/2L this can make the first neighbouring gap look like the target.
-        # Therefore latch the counted target as a fixed map-v coordinate.
-        self.multirow_latched_row_yaw_map: Optional[float] = None
-        self.multirow_latched_target_global_v: Optional[float] = None
-        self.multirow_latched_preentry_global_v: Optional[float] = None
-        self.multirow_shift_sign_correction: float = 1.0
-        self.reference_row_v: float = 0.0
-        self.target_row_v: float = 0.0
-        self.candidate_rows_text: str = ""
-        self.loaded_pattern: str = ""
-        self.pattern_steps: List[PatternStep] = []
-        self.pattern_index = 0
-        self.pattern_completed = False
-
-        self.end_stable_frames = 0
-        self.enter_stable_frames = 0
-
-        self.acquire_start_time = None
-
-        self.started = False
-        self.resume_state: Optional[MissionState] = None
-
-    def has_loaded_pattern(self) -> bool:
-        return bool(self.pattern_steps)
-
-    def set_pattern(self, pattern: str) -> str:
-        if self.state != MissionState.IDLE:
-            raise ValueError(
-                "Pattern kann momentan nur im Zustand IDLE gesetzt werden."
-            )
-
-        normalized, steps = normalize_pattern(pattern)
-        self.loaded_pattern = normalized
-        self.pattern_steps = steps
-        self.pattern_index = 0
-        self.pattern_completed = False
-        self.apply_current_pattern_step()
-        self.node.get_logger().info(
-            f"Navigation pattern loaded via service: {self.loaded_pattern}"
-        )
-        return self.loaded_pattern
-
-    def clear_pattern(self) -> None:
-        self.loaded_pattern = ""
-        self.pattern_steps = []
-        self.pattern_index = 0
-        self.pattern_completed = False
-        self.p.row_shift_count = 0
-        self.p.row_shift_direction = ""
-
-    def active_pattern_step_text(self) -> str:
-        if not self.pattern_steps or self.pattern_index >= len(self.pattern_steps):
-            return ""
-
-        step = self.pattern_steps[self.pattern_index]
-        return f"{step.row_shift_count}{step.row_shift_direction}"
-
-    def start(self) -> None:
-        if self.state != MissionState.IDLE:
-            raise ValueError("Navigation kann nur aus dem Zustand IDLE gestartet werden.")
-
-        if not self.has_loaded_pattern():
-            raise ValueError(
-                "Kein Pattern geladen. Vor dem Start muss ein Pattern per Service uebertragen werden."
-            )
-
-        self.pattern_index = 0
-        self.pattern_completed = False
-        self.apply_current_pattern_step()
-        self.started = True
-        self.resume_state = None
-        self.transition(MissionState.FOLLOW_ROW, "start requested")
-
-    def pause(self) -> None:
-        if not self.started or self.state in (MissionState.IDLE, MissionState.FINISHED):
-            raise ValueError("Navigation ist nicht aktiv.")
-        if self.state == MissionState.PAUSED:
-            raise ValueError("Navigation ist bereits pausiert.")
-
-        self.resume_state = self.state
-        self.transition(MissionState.PAUSED, "pause requested")
-
-    def resume(self) -> None:
-        if self.state != MissionState.PAUSED or self.resume_state is None:
-            raise ValueError("Navigation ist nicht pausiert.")
-
-        resumed_state = self.resume_state
-        self.resume_state = None
-        self.node.get_logger().info(
-            f"State transition: {self.state.name} -> {resumed_state.name} (resume requested)"
-        )
-        self.state = resumed_state
-
-    def stop(self) -> None:
-        self.started = False
-        self.resume_state = None
-        self.active_turn_path = None
-        self.active_turn_uses_map_lane = False
-        self.turn_replan_attempts = 0
-        self.turn_replan_frame_counter = 0
-        self.turn_local_row_stable_frames = 0
-        self.headland_start_pose_map = None
-        self.exit_curve_start_yaw = None
-        self.entry_curve_start_yaw = None
-        self.headland_direction = 1.0
-        self.headland_required_shift = 0.0
-        self.headland_measured_shift = 0.0
-        self.headland_exit_forward_distance = 0.0
-        self.headland_shift_start_pose_map = None
-        self.headland_shift_start_yaw_map = None
-        self.headland_shift_axis_yaw_map = None
-        self.headland_shift_forward_distance = 0.0
-        self.headland_reference_row_yaw_map = None
-        self.entry_row_stable_frames = 0
-        self.entry_reference_side_ok = False
-        self.entry_shift_ok = False
-        self.target_map_lane = None
-        self.map_lanes = []
-        self.map_row_bands = []
-        self.last_target_lane_reason = "not evaluated"
-        self.expected_target_offset = 0.0
-        self.detected_target_offset = 0.0
-        self.target_offset_error = 0.0
-        self.multirow_counted_target_latched = False
-        self.multirow_latched_target_offset = 0.0
-        self.multirow_latched_target_error = 0.0
-        self.multirow_latched_row_yaw_map = None
-        self.multirow_latched_target_global_v = None
-        self.multirow_latched_preentry_global_v = None
-        self.multirow_shift_sign_correction = 1.0
-        self.reference_row_v = 0.0
-        self.target_row_v = 0.0
-        self.candidate_rows_text = ""
-        self.clear_pattern()
-        self.transition(MissionState.IDLE, "stop requested")
-
-    def apply_current_pattern_step(self) -> None:
-        if not self.pattern_steps:
-            return
-
-        step = self.pattern_steps[self.pattern_index]
-        self.p.row_shift_count = step.row_shift_count
-        self.p.row_shift_direction = step.row_shift_direction
-        self.node.get_logger().info(
-            f"Pattern step {self.pattern_index + 1}/{len(self.pattern_steps)}: "
-            f"{self.p.row_shift_count}{self.p.row_shift_direction}"
-        )
-
-    def advance_pattern(self) -> bool:
-        if self.pattern_index + 1 >= len(self.pattern_steps):
-            return False
-
-        self.pattern_index += 1
-        self.apply_current_pattern_step()
-        return True
-
-    def transition(self, new_state: MissionState, reason: str = "") -> None:
-        if new_state == self.state:
-            return
-
-        self.node.get_logger().info(
-            f"State transition: {self.state.name} -> {new_state.name}"
-            + (f" ({reason})" if reason else "")
-        )
-
-        self.state = new_state
-
-        if new_state == MissionState.PLAN_TURN:
-            self.active_turn_uses_map_lane = False
-            self.turn_replan_attempts = 0
-            self.turn_replan_frame_counter = 0
-            self.turn_local_row_stable_frames = 0
-
-        if new_state == MissionState.EXIT_CURVE:
-            self.active_turn_path = None
-            self.headland_start_pose_map = None
-            self.active_turn_uses_map_lane = False
-            self.turn_replan_attempts = 0
-            self.turn_replan_frame_counter = 0
-            self.turn_local_row_stable_frames = 0
-            self.exit_curve_start_yaw = None
-            self.entry_curve_start_yaw = None
-            self.entry_row_stable_frames = 0
-            self.headland_direction = 1.0 if self.p.row_shift_direction.upper() == "L" else -1.0
-            self.headland_required_shift = self.headland_direction * self.p.row_shift_count * self.p.expected_row_width
-            self.headland_measured_shift = 0.0
-            self.headland_exit_forward_distance = 0.0
-            self.headland_reference_row_yaw_map = None
-            self.multirow_counted_target_latched = False
-            self.multirow_latched_target_offset = 0.0
-            self.multirow_latched_target_error = 0.0
-            self.multirow_latched_row_yaw_map = None
-            self.multirow_latched_target_global_v = None
-            self.multirow_latched_preentry_global_v = None
-
-        if new_state == MissionState.HEADLAND_SHIFT:
-            self.entry_curve_start_yaw = None
-            self.entry_row_stable_frames = 0
-
-        if new_state == MissionState.ENTRY_CURVE:
-            self.entry_curve_start_yaw = None
-            self.entry_row_stable_frames = 0
-            self.entry_reference_side_ok = False
-            self.entry_shift_ok = False
-
-        if new_state == MissionState.ACQUIRE_ROW:
-            self.acquire_start_time = self.node.get_clock().now()
-            self.enter_stable_frames = 0
-            self.active_turn_uses_map_lane = False
-            self.turn_replan_attempts = 0
-            self.turn_replan_frame_counter = 0
-            self.turn_local_row_stable_frames = 0
-
-        if new_state == MissionState.FOLLOW_ROW:
-            self.end_stable_frames = 0
-            self.active_turn_uses_map_lane = False
-            self.turn_replan_attempts = 0
-            self.turn_replan_frame_counter = 0
-            self.turn_local_row_stable_frames = 0
-
-        if new_state == MissionState.ENTER_ROW:
-            self.turn_local_row_stable_frames = 0
-
-    def _update_headland_measured_shift(self, pose_map: Optional[Pose2D]) -> None:
-        if pose_map is None or self.headland_start_pose_map is None:
-            return
-
-        dx = pose_map.x - self.headland_start_pose_map.x
-        dy = pose_map.y - self.headland_start_pose_map.y
-        # Fuer Vorgewende-Manoever wird der Quer-Versatz in der Map-
-        # Reihenbasis gemessen, sobald diese verfuegbar ist. Damit haengt der
-        # Versatz nicht mehr davon ab, ob der Roboter beim Reihenende schon
-        # leicht schraeg stand.
-        yaw0 = self.headland_reference_row_yaw_map
-        if yaw0 is None:
-            yaw0 = self.headland_start_pose_map.yaw
-        self.headland_measured_shift = -math.sin(float(yaw0)) * dx + math.cos(float(yaw0)) * dy
-
-    def _update_headland_exit_forward_distance(self, pose_map: Optional[Pose2D]) -> None:
-        if pose_map is None or self.headland_start_pose_map is None:
-            return
-
-        dx = pose_map.x - self.headland_start_pose_map.x
-        dy = pose_map.y - self.headland_start_pose_map.y
-        yaw0 = self.headland_start_pose_map.yaw
-        self.headland_exit_forward_distance = math.cos(yaw0) * dx + math.sin(yaw0) * dy
-
-    def _update_headland_shift_forward_distance(self, pose_map: Optional[Pose2D]) -> None:
-        if pose_map is None or self.headland_shift_start_pose_map is None:
-            return
-
-        yaw0 = self.headland_shift_axis_yaw_map
-        if yaw0 is None:
-            yaw0 = self.headland_shift_start_yaw_map
-        if yaw0 is None:
-            yaw0 = self.headland_shift_start_pose_map.yaw
-
-        dx = pose_map.x - self.headland_shift_start_pose_map.x
-        dy = pose_map.y - self.headland_shift_start_pose_map.y
-        # Signed distance along the fixed headland axis. For 2L/2R this axis is
-        # latched to row_yaw +/- 90 deg, therefore the robot changes gaps exactly
-        # perpendicular to the row ends instead of drifting in its current body yaw.
-        self.headland_shift_forward_distance = math.cos(float(yaw0)) * dx + math.sin(float(yaw0)) * dy
-
-    def _multirow_deterministic_straight_target(self) -> float:
-        # 1L/1R: no straight part between the two 90 degree arcs.
-        # 2L/2R: one row spacing straight, trimmed by the observed controller lag.
-        # nL/nR: n-1 spacings straight, same trim once for the straight segment.
-        step = max(1, int(self.p.row_shift_count))
-        nominal = max(0.0, float(step - 1) * float(self.p.expected_row_width))
-        if step >= 2:
-            nominal = max(0.0, nominal - max(0.0, float(getattr(self.p, "multirow_straight_trim", 0.15))))
-        return nominal
-
-    def _effective_entry_curve_yaw_change(self) -> float:
-        if self.p.entry_curve_yaw_change > 0.0:
-            return self.p.entry_curve_yaw_change
-
-        return max(0.20, self.p.headland_total_yaw_change - self.p.exit_curve_yaw_change)
-
-    def _predicted_entry_lateral_shift(self) -> float:
-        # Der zweite Bogen veraendert den lateralen Versatz weiter.
-        # Bisher wurde HEADLAND_SHIFT bis zum gesamten Reihenabstand gefahren
-        # und danach kam nochmals seitlicher Versatz durch ENTRY_CURVE dazu.
-        # Das erzeugt genau den Fehler: bei 1L landet der Roboter eine oder
-        # mehrere Reihen zu weit. Deshalb wird HEADLAND_SHIFT vor dem Einfahrbogen
-        # gestoppt. Der fehlende Rest wird vom Einfahrbogen erzeugt.
-        direction = 1.0 if self.headland_direction >= 0.0 else -1.0
-        entry_yaw = self._effective_entry_curve_yaw_change()
-        exit_yaw = max(0.0, self.p.exit_curve_yaw_change)
-        radius = max(abs(self.p.entry_curve_speed) / max(abs(self.p.entry_curve_angular_speed), 1e-3), 0.05)
-
-        lateral = radius * (math.cos(exit_yaw) - math.cos(exit_yaw + entry_yaw))
-        return direction * lateral
-
-    def _headland_pre_entry_shift_target(self) -> float:
-        required = abs(self.headland_required_shift)
-        predicted_entry = abs(self._predicted_entry_lateral_shift())
-
-        # Ziel ist eine reine Vorgewende-Geometrie:
-        # - 1L/1R: Ausfahrbogen und Einfahrbogen liefern zusammen genau eine
-        #   Gassenbreite; HEADLAND_SHIFT wird dadurch praktisch 0.
-        # - 2L/2R: Nach dem ersten 90-Grad-Bogen wird gerade entlang des
-        #   Reihenendes gefahren, bis noch genau der Queranteil des
-        #   Einfahrbogens fehlt. Dadurch wird eine Gasse uebersprungen.
-        # - 3L/3R/...: identisch, nur mit laengerer Gerade.
-        # multirow_entry_extra_shift bleibt ein optionaler Reserveparameter,
-        # standardmaessig aber 0.0, damit das Pattern geometrisch exakt bleibt.
-        extra_shift = 0.0
-        if int(self.p.row_shift_count) >= 2:
-            extra_shift = max(0.0, float(self.p.multirow_entry_extra_shift))
-
-        return max(0.0, required - predicted_entry + extra_shift)
-
-    def _headland_shift_reached(self) -> bool:
-        required = self._headland_pre_entry_shift_target()
-        measured = abs(self.headland_measured_shift)
-        if required <= 1e-6:
-            return True
-        return measured >= required - max(0.0, self.p.headland_shift_tolerance)
-
-    def _entry_shift_window_ok(self) -> bool:
-        required = abs(self.headland_required_shift)
-        measured = abs(self.headland_measured_shift)
-        if required <= 1e-6:
-            return True
-
-        tolerance = max(0.0, float(self.p.entry_shift_accept_tolerance))
-
-        # Für direkte Nachbargassenwechsel muss die Querposition eng um das
-        # Sollzentrum liegen; sonst wird leicht eine Reihe übersprungen.
-        if int(self.p.row_shift_count) <= 1:
-            return abs(measured - required) <= tolerance
-
-        # Bei 2R/3R/... darf ein moderater Überschuss nicht dazu führen, dass
-        # ACQUIRE_ROW minutenlang geradeaus weiterfährt. Genau das erzeugte im
-        # 3R-Log den Drift: required=2.25 m, measured≈3.0 m, lokale Reihe stabil,
-        # aber entry_shift_ok blieb false. Mehrreihige Turns akzeptieren deshalb
-        # "Sollversatz erreicht" plus begrenzten Überschuss. Die Begrenzung
-        # verhindert, dass eine komplett falsche Gasse übernommen wird.
-        max_overshoot = max(
-            tolerance,
-            max(0.0, float(self.p.multirow_entry_shift_overshoot_rows))
-            * max(0.05, float(self.p.expected_row_width)),
-        )
-        return (measured >= required - tolerance) and (measured <= required + max_overshoot)
-
-    def _headland_total_yaw_progress(self, pose_map: Optional[Pose2D]) -> float:
-        if pose_map is None or self.exit_curve_start_yaw is None:
-            return 0.0
-
-        # Der U-Turn liegt nominal bei pi rad. wrap_to_pi() springt direkt nach
-        # Ueberschreiten von pi auf negative Werte. Genau dadurch wurde im Log
-        # aus einer bereits ueberdrehten Rechtswende ein Fortschritt von ca.
-        # -2.95 rad; _entry_yaw_ok() blieb false und ACQUIRE_ROW blockierte
-        # dauerhaft. Der Drehfortschritt wird deshalb entlang der gewuenschten
-        # Drehrichtung auf [0, 2*pi) entrollt.
-        progress = self.headland_direction * wrap_to_pi(pose_map.yaw - float(self.exit_curve_start_yaw))
-        target = max(0.0, float(self.p.headland_total_yaw_change))
-
-        if target > math.pi / 2.0 and progress < -max(0.0, float(self.p.entry_yaw_accept_tolerance)):
-            progress += 2.0 * math.pi
-
-        return progress
-
-    def _entry_yaw_ok(self, pose_map: Optional[Pose2D]) -> bool:
-        tolerance = max(0.0, float(self.p.entry_yaw_accept_tolerance))
-        map_target_yaw = self._target_entry_row_yaw_from_map(pose_map, None)
-        if pose_map is not None and map_target_yaw is not None:
-            return abs(wrap_to_pi(float(map_target_yaw) - pose_map.yaw)) <= tolerance
-
-        progress = self._headland_total_yaw_progress(pose_map)
-        target = max(0.0, float(self.p.headland_total_yaw_change))
-        return progress >= target - tolerance
-
-    def _entry_reference_side_detected(self, row: RowModel) -> bool:
-        if not self.p.neighbor_reference_turn_enabled:
-            return True
-
-        if self.p.row_shift_count != 1:
-            return True
-
-        if not self.p.neighbor_reference_requires_same_side_row:
-            return True
-
-        det = row.last_detection
-        if det is None:
-            return False
-
-        direction = self.p.row_shift_direction.upper()
-        if direction == "L":
-            return bool(det.left_valid)
-        if direction == "R":
-            return bool(det.right_valid)
-
-        return True
-
-    def _entry_row_geometry_ok(self, row: RowModel) -> bool:
-        if not self.p.entry_require_full_lane:
-            return True
-
-        if not row.valid:
-            return False
-
-        det = row.last_detection
-        if det is None:
-            return False
-
-        both_rows_visible = bool(det.left_valid and det.right_valid)
-        center_ok = abs(row.center_b) <= max(0.02, float(self.p.entry_center_b_tolerance))
-        yaw_ok = abs(row.row_yaw_base) <= max(0.02, float(self.p.entry_row_yaw_tolerance))
-
-        width_ok = True
-        if det.lane_width > 0.05:
-            width_ok = abs(det.lane_width - self.p.expected_row_width) <= max(0.05, float(self.p.entry_lane_width_tolerance))
-
-        return bool(both_rows_visible and center_ok and yaw_ok and width_ok)
-
-    def _entry_row_relaxed_geometry_ok(self, row: RowModel) -> bool:
-        if not self.p.entry_relaxed_geometry_after_yaw_shift:
-            return False
-
-        if not row.valid:
-            return False
-
-        center_ok = abs(row.center_b) <= max(0.02, float(self.p.entry_relaxed_center_b_tolerance))
-        yaw_ok = abs(row.row_yaw_base) <= max(0.02, float(self.p.entry_relaxed_row_yaw_tolerance))
-        return bool(center_ok and yaw_ok)
-
-    def _entry_local_row_takeover_ok(self, row: RowModel, pose_map: Optional[Pose2D]) -> bool:
-        if int(self.p.row_shift_count) < 2:
-            return False
-
-        if not row.valid:
-            return False
-
-        min_conf = max(
-            float(self.p.entry_row_min_confidence),
-            float(self.p.multirow_local_takeover_min_confidence),
-        )
-        if row.confidence < min_conf:
-            return False
-
-        if not self._multirow_counted_target_locked():
-            return False
-
-        if not self._entry_row_relaxed_geometry_ok(row):
-            return False
-
-        progress = self._headland_total_yaw_progress(pose_map)
-        min_progress = max(0.0, float(self.p.multirow_local_takeover_min_yaw_progress))
-        return progress >= min_progress
-
-    def _map_v_coordinate(self, pose_map: Pose2D, row_yaw: float) -> float:
-        """Signed lateral map coordinate in the fixed row basis."""
-        return -math.sin(float(row_yaw)) * float(pose_map.x) + math.cos(float(row_yaw)) * float(pose_map.y)
-
-    def _multirow_remaining_to_preentry(self, pose_map: Optional[Pose2D]) -> Optional[float]:
-        if (
-            pose_map is None
-            or self.multirow_latched_row_yaw_map is None
-            or self.multirow_latched_preentry_global_v is None
-        ):
-            return None
-
-        current_v = self._map_v_coordinate(pose_map, float(self.multirow_latched_row_yaw_map))
-        return float(self.multirow_latched_preentry_global_v) - current_v
-
-    def _refresh_multirow_shift_sign_correction(self) -> None:
-        """Keep travelled shift in the same signed basis as the counted 2L/2R target.
-
-        The row axis from the SLAM/PCA detector is axial. When the headland
-        reference row yaw is latched, headland_measured_shift may change sign
-        although the robot is still physically driving to the same side. In the
-        failing 2R logs the target was latched at about -1.5 m, but the measured
-        shift became +0.79 m after the map row basis was latched. A one-time
-        correction computed before that basis change is therefore stale.
-
-        Recompute the correction from the current measured shift and the locked
-        target every time it is used. This is deterministic because the locked
-        target offset is fixed for the whole multi-row maneuver.
-        """
-        if not self.multirow_counted_target_latched:
-            self.multirow_shift_sign_correction = 1.0
-            return
-
-        target = float(self.multirow_latched_target_offset)
-        measured = float(self.headland_measured_shift)
-        if abs(target) <= 0.05 or abs(measured) <= 0.05:
-            return
-
-        self.multirow_shift_sign_correction = 1.0 if measured * target >= 0.0 else -1.0
-
-    def _multirow_corrected_headland_shift(self) -> float:
-        # headland_measured_shift is calculated in an axial PCA row basis. That
-        # basis may be flipped by pi relative to the signed lane offsets returned
-        # by select_target_lane(). Always refresh the correction after the map
-        # row-yaw reference has been latched; otherwise 2R can look like +0.8 m
-        # travelled although the counted target is -1.5 m.
-        self._refresh_multirow_shift_sign_correction()
-        return float(self.multirow_shift_sign_correction) * float(self.headland_measured_shift)
-
-    def _multirow_relative_preentry_shift(self) -> Optional[float]:
-        if not self.multirow_counted_target_latched:
-            return None
-        # At the start of ENTRY_CURVE the robot must still be one entry-arc
-        # lateral component away from the final target lane center. This value is
-        # pattern-relative and therefore immune to row-yaw sign flips in the map.
-        return float(self.multirow_latched_target_offset) - float(self._predicted_entry_lateral_shift())
-
-    def _update_multirow_counted_target_latch(self, pose_map: Optional[Pose2D] = None) -> None:
-        if int(self.p.row_shift_count) < 2:
-            return
-        if not self.p.map_multirow_require_counted_rows:
-            return
-
-        reason = str(self.last_target_lane_reason)
-        if "row-line counted target accepted" not in reason:
-            return
-
-        tolerance = min(
-            max(0.05, float(self.p.map_lane_accept_tolerance)),
-            max(0.05, float(self.p.map_multirow_counted_target_tolerance)),
-        )
-        if abs(float(self.target_offset_error)) > tolerance:
-            return
-
-        reference_min = max(
-            0.05,
-            float(self.p.map_multirow_reference_row_min_ratio)
-            * float(self.p.expected_row_width),
-        )
-        if abs(float(self.reference_row_v)) < reference_min:
-            return
-
-        # The selected center has to be on the commanded side. This prevents a
-        # later noisy re-reference around the first neighbouring lane from
-        # replacing the already counted 2R/2L target.
-        direction = 1.0 if self.headland_direction >= 0.0 else -1.0
-        if direction * float(self.detected_target_offset) <= 0.0:
-            return
-
-        # If a good target is already locked, do not overwrite the global target
-        # with later detections from a different local reference row.
-        if self.multirow_counted_target_latched and self.multirow_latched_target_global_v is not None:
-            return
-
-        self.multirow_counted_target_latched = True
-        self.multirow_latched_target_offset = float(self.detected_target_offset)
-        self.multirow_latched_target_error = float(self.target_offset_error)
-
-        # Do not permanently latch the shift sign here. At this point the
-        # headland reference row-yaw may have just been captured, and
-        # headland_measured_shift can still be expressed in the previous basis.
-        # The correction is refreshed dynamically in
-        # _multirow_corrected_headland_shift().
-        self._refresh_multirow_shift_sign_correction()
-
-        if pose_map is None:
-            return
-
-        row_yaw = self.headland_reference_row_yaw_map
-        if row_yaw is None:
-            return
-
-        current_v = self._map_v_coordinate(pose_map, float(row_yaw))
-        target_global_v = current_v + float(self.detected_target_offset)
-        preentry_global_v = target_global_v - float(self._predicted_entry_lateral_shift())
-
-        self.multirow_latched_row_yaw_map = float(row_yaw)
-        self.multirow_latched_target_global_v = float(target_global_v)
-        self.multirow_latched_preentry_global_v = float(preentry_global_v)
-
-    def _multirow_counted_target_locked(self) -> bool:
-        if int(self.p.row_shift_count) < 2:
-            return True
-        if not self.p.map_multirow_require_counted_rows:
-            return True
-
-        self._update_multirow_counted_target_latch()
-        return bool(self.multirow_counted_target_latched)
-
-    def _multirow_map_preentry_reached(self, pose_map: Optional[Pose2D] = None) -> bool:
-        if int(self.p.row_shift_count) < 2:
-            return False
-        if not self._multirow_counted_target_locked():
-            return False
-
-        tol = max(0.03, float(self.p.headland_shift_tolerance))
-
-        # Do not decide 2R/2L completion from the raw global PCA-v coordinate:
-        # its sign can be opposite to the signed row offsets used by the target
-        # counter. Instead compare travelled headland shift and latched target in
-        # the same corrected pattern-relative coordinate system. This is the
-        # failure seen in the log: target=-1.48 m, but measured_shift=+0.80 m.
-        preentry = self._multirow_relative_preentry_shift()
-        if preentry is not None:
-            current = self._multirow_corrected_headland_shift()
-            direction = 1.0 if float(preentry) >= 0.0 else -1.0
-            pattern_reached = direction * float(current) >= direction * float(preentry) - tol
-
-            # Backup completion test in the fixed latched map-row basis. This
-            # avoids getting stuck when the corrected pattern-relative shift is
-            # degraded by a changing local PCA row-yaw estimate while the global
-            # pre-entry line itself has already been reached.
-            remaining_global = self._multirow_remaining_to_preentry(pose_map)
-            global_reached = False
-            if remaining_global is not None:
-                global_reached = direction * float(remaining_global) <= tol
-
-            return bool(pattern_reached or global_reached)
-
-        travelled = abs(float(self.headland_measured_shift))
-        target = self._headland_pre_entry_shift_target()
-        return travelled >= target - tol
-
-    def _entry_yaw_or_local_row_ok(self, row: RowModel, pose_map: Optional[Pose2D]) -> bool:
-        if self._entry_yaw_ok(pose_map):
-            return True
-
-        # Bei 3R war die lokale Reihe bereits mit hoher Konfidenz erfasst, der
-        # entrollte Gesamt-Gierfortschritt lag aber noch bei ca. 2.23 rad. Das
-        # blockierte ACQUIRE_ROW, obwohl das Weiterfahren ohne Reihenführung den
-        # Roboter quer aus der Gasse driften ließ. Eine stabile, mittige und
-        # gerade lokale Reihenhypothese darf deshalb den restlichen Yaw-Fehler
-        # übernehmen.
-        return self._entry_local_row_takeover_ok(row, pose_map)
-
-    def _multirow_safe_acquire_steering_ok(self, row: RowModel, shift_ok: bool) -> bool:
-        # Zurueck zur funktionierenden Version: keine vorzeitige lokale
-        # Uebernahme in ACQUIRE_ROW/ENTER_ROW, solange die Full-Lane-Geometrie
-        # nicht stabil ist.
-        return False
-
-    def _neighbor_target_offset_ok(self) -> bool:
-        if int(self.p.row_shift_count) != 1:
-            return False
-
-        required = abs(float(self.headland_required_shift))
-        expected = abs(float(self.expected_target_offset))
-        detected = abs(float(self.detected_target_offset))
-        tolerance = max(0.02, float(self.p.neighbor_local_takeover_target_tolerance))
-
-        if required <= 1e-6:
-            required = max(0.05, float(self.p.expected_row_width))
-
-        return (
-            abs(expected - required) <= tolerance
-            and abs(detected - required) <= tolerance
-            and abs(float(self.target_offset_error)) <= tolerance
-        )
-
-    def _neighbor_local_takeover_ok(self, row: RowModel, pose_map: Optional[Pose2D]) -> bool:
-        if not self.p.neighbor_local_takeover_enabled:
-            return False
-        if int(self.p.row_shift_count) != 1:
-            return False
-        if not row.valid:
-            return False
-        if row.confidence < max(float(self.p.entry_row_min_confidence), float(self.p.neighbor_local_takeover_min_confidence)):
-            return False
-        if not self._neighbor_target_offset_ok():
-            return False
-        if not self._entry_reference_side_detected(row):
-            return False
-
-        progress = self._headland_total_yaw_progress(pose_map)
-        min_progress = max(0.0, float(self.p.neighbor_local_takeover_min_yaw_progress))
-        if progress < min_progress and not self._entry_yaw_ok(pose_map):
-            return False
-
-        center_ok = abs(row.center_b) <= max(0.02, float(self.p.neighbor_local_takeover_center_tolerance))
-        yaw_ok = abs(row.row_yaw_base) <= max(0.02, float(self.p.neighbor_local_takeover_row_yaw_tolerance))
-        return bool(center_ok and yaw_ok)
-
-    def _entry_geometry_accept_ok(self, row: RowModel, shift_ok: bool, yaw_ok: bool) -> bool:
-        if self._entry_row_geometry_ok(row):
-            return True
-
-        # Fuer 2R/2L und groessere Spruenge verhindert die volle Gassenpruefung
-        # das fruehe Einhaken in eine einzelne Reihe. Sobald der pattern-relative
-        # Versatz und die U-Turn-Ausrichtung bzw. eine stabile lokale
-        # Reihenhypothese erreicht sind, darf die Uebergabe ausloesen. Sonst
-        # bleibt ACQUIRE_ROW am Reihenanfang stehen, wenn nur eine Begrenzungsreihe
-        # im Sichtfeld liegt.
-        if int(self.p.row_shift_count) >= 2 and shift_ok and yaw_ok:
-            if not self._multirow_counted_target_locked():
-                return False
-            return self._entry_row_relaxed_geometry_ok(row)
-
-        return False
-
-    def _capture_headland_reference_row_yaw(self, map_detector: Optional[MapRowDetector]) -> None:
-        """Latch the map row axis for the whole headland maneuver.
-
-        PCA yaw is axial and can flip by pi between frames. Latching one
-        orientation prevents sign changes in the lateral shift calculation and
-        keeps the headland path exactly perpendicular to the map rows.
-        """
-        if not self.p.headland_use_map_row_heading:
-            return
-        if self.headland_reference_row_yaw_map is not None:
-            return
-        if map_detector is None:
-            return
-
-        min_conf = max(0.0, float(self.p.headland_map_heading_min_confidence))
-        local_yaw: Optional[float] = None
-        local_conf = 0.0
-        if map_detector.last_row_yaw_map is not None and map_detector.last_row_yaw_confidence >= min_conf:
-            local_yaw = float(map_detector.last_row_yaw_map)
-            local_conf = float(map_detector.last_row_yaw_confidence)
-
-        # Wichtig: Für die eigentliche Vorgewende-Geometrie wird ausschließlich
-        # die lokale Reihenachse aus den Map-Reihenlinien verwendet. Die grobe
-        # Feldorientierung kann an ungleich langen Reihenenden um fast 90° kippen
-        # und hat im Log field_row_yaw≈0.08 rad geliefert, während map_row_yaw
-        # ≈1.21 rad betrug. Das machte aus 1L effektiv 2L und führte zu einem
-        # schrägen Eintritt. Deshalb darf field_row_yaw hier nicht mehr als
-        # Fallback oder Ersatz für map_row_yaw verwendet werden.
-        row_yaw: Optional[float] = local_yaw
-
-        if row_yaw is None:
-            return
-        if self.headland_start_pose_map is not None:
-            # PCA has no direction. Use the orientation closest to the row yaw at
-            # the moment the robot left the previous row.
-            if abs(wrap_to_pi(row_yaw + math.pi - self.headland_start_pose_map.yaw)) < abs(wrap_to_pi(row_yaw - self.headland_start_pose_map.yaw)):
-                row_yaw = wrap_to_pi(row_yaw + math.pi)
-
-        self.headland_reference_row_yaw_map = row_yaw
-
-    def _desired_headland_shift_yaw(self, pose_map: Pose2D, map_detector: Optional[MapRowDetector]) -> Optional[float]:
-        if not self.p.headland_use_map_row_heading:
-            return None
-
-        # Funktionierende Version: Bei 2L/2R bleibt die Mittelstrecke in der
-        # Richtung, die nach EXIT_CURVE erreicht wurde. Die Map-Reihen werden nur
-        # zum Zaehlen/Latchen der Zielgasse verwendet, nicht als Lenkwinkelquelle
-        # fuer HEADLAND_SHIFT. Das verhindert, dass PCA-Flip oder Reihenende die
-        # Gerade erneut verdreht.
-        if int(self.p.row_shift_count) >= 2:
-            if self.headland_shift_start_yaw_map is not None:
-                return float(self.headland_shift_start_yaw_map)
-            return float(pose_map.yaw)
-
-        self._capture_headland_reference_row_yaw(map_detector)
-        if self.headland_reference_row_yaw_map is None:
-            return None
-
-        row_yaw = float(self.headland_reference_row_yaw_map)
-        desired = wrap_to_pi(row_yaw + self.headland_direction * math.pi / 2.0)
-        alt = wrap_to_pi(desired + math.pi)
-        if abs(wrap_to_pi(alt - float(pose_map.yaw))) < abs(wrap_to_pi(desired - float(pose_map.yaw))):
-            desired = alt
-        return desired
-
-    def _target_entry_row_yaw_from_map(self, pose_map: Optional[Pose2D], map_detector: Optional[MapRowDetector]) -> Optional[float]:
-        if pose_map is None or not self.p.headland_use_map_row_heading:
-            return None
-
-        self._capture_headland_reference_row_yaw(map_detector)
-        if self.headland_reference_row_yaw_map is None:
-            return None
-
-        row_yaw = float(self.headland_reference_row_yaw_map)
-        if self.exit_curve_start_yaw is not None:
-            nominal = wrap_to_pi(float(self.exit_curve_start_yaw) + self.headland_direction * max(0.0, float(self.p.headland_total_yaw_change)))
-        else:
-            nominal = wrap_to_pi(pose_map.yaw + self.headland_direction * max(0.0, float(self.p.headland_total_yaw_change)))
-
-        candidates = [wrap_to_pi(row_yaw), wrap_to_pi(row_yaw + math.pi)]
-        return min(candidates, key=lambda yaw: abs(wrap_to_pi(yaw - nominal)))
-
-    def update(
+            return self.reject(result, "no valid side line")
+
+        laser_target_y = result.center_slope * target_x + result.center_intercept
+        angle_error = 0.0 if map_slope is None else abs(wrap_to_pi(math.atan(result.center_slope) - math.atan(map_slope)))
+        if map_slope is not None and angle_error > self.p.laser_max_angle_to_map:
+            return self.reject(result, "angle differs from map")
+        if abs(laser_target_y - float(map_target_base[1])) > self.p.laser_max_center_offset:
+            return self.reject(result, "center differs from map")
+
+        alpha = self.p.laser_tracker_alpha
+        self.filtered_confidence = (1.0 - alpha) * self.filtered_confidence + alpha * raw_confidence
+        confidence_range = max(1e-6, self.p.laser_full_confidence - self.p.laser_min_confidence)
+        scale = (self.filtered_confidence - self.p.laser_min_confidence) / confidence_range
+        result.valid = True
+        result.confidence = self.filtered_confidence
+        result.weight = float(np.clip(scale, 0.0, 1.0)) * max_weight
+        result.target_base = np.array([target_x, laser_target_y], dtype=float)
+        result.reason = "ok"
+        return result
+
+    def scan_to_points(self, scan: LaserScan) -> np.ndarray:
+        ranges = np.asarray(scan.ranges, dtype=float)
+        angles = scan.angle_min + np.arange(len(ranges), dtype=float) * scan.angle_increment
+        mask = np.isfinite(ranges) & (ranges > scan.range_min) & (ranges < scan.range_max)
+        return np.column_stack((ranges[mask] * np.cos(angles[mask]), ranges[mask] * np.sin(angles[mask])))
+
+    def build_rois(
         self,
-        row: RowModel,
-        pose_odom: Optional[Pose2D],
-        pose_map: Optional[Pose2D],
-        planner: LocalPlanner,
-        controller: PathFollower,
-        map_detector: Optional[MapRowDetector] = None,
-        latest_map: Optional[OccupancyGrid] = None,
-    ) -> LocalPath:
-        if not self.started or self.state == MissionState.IDLE:
-            return LocalPath([], False, "base_link", "idle")
-
-        if self.state == MissionState.PAUSED:
-            return LocalPath([], False, "base_link", "paused")
-
-        if self.state == MissionState.FOLLOW_ROW:
-            # Normale Reihenende-Erkennung ueber end_probability.
-            if row.end_detected:
-                self.end_stable_frames += 1
-            else:
-                self.end_stable_frames = 0
-
-            if self.end_stable_frames >= self.p.end_stable_frames_required:
-                if self.pattern_completed:
-                    self.transition(MissionState.FINISHED, "final row end detected by end_probability")
-                    return LocalPath([], False, "base_link", "pattern complete at final row end")
-
-                if self.p.headland_maneuver_enabled:
-                    self.transition(MissionState.EXIT_CURVE, "row end detected; starting headland maneuver")
-                    return planner.plan_headland_shift_base_link(
-                        speed=self.p.headland_exit_straight_speed,
-                        reason="EXIT_STRAIGHT",
-                    )
-
-                self.transition(MissionState.EXIT_ROW, "row end detected by end_probability")
-                return planner.plan_exit_row()
-
-            # Fallback fuer das echte Reihenende:
-            # Wenn am Reihenende beide Reihenstrukturen aus dem LiDAR verschwinden,
-            # wird das RowModel ungueltig. Ohne diesen Fallback bleibt der Roboter
-            # in FOLLOW_ROW stehen, weil plan_follow_row() dann keinen Pfad erzeugt.
-            # Die Bedingung ist absichtlich ueber mehrere Frames stabilisiert, damit
-            # kurze Luecken in der Reihe nicht sofort als Reihenende interpretiert werden.
-            if (
-                not row.valid
-                and row.missing_frames >= 18
-                and row.confidence < 0.03
-            ):
-                if self.pattern_completed:
-                    self.node.get_logger().warn(
-                        "FOLLOW_ROW fallback: final row lost for several frames, "
-                        "interpreting as final row end and stopping"
-                    )
-                    self.transition(MissionState.FINISHED, "final row lost fallback")
-                    return LocalPath([], False, "base_link", "pattern complete at final row end")
-
-                self.node.get_logger().warn(
-                    "FOLLOW_ROW fallback: row lost for several frames, "
-                    "interpreting as row end and switching to EXIT_ROW"
-                )
-                if self.p.headland_maneuver_enabled:
-                    self.transition(MissionState.EXIT_CURVE, "row lost fallback; starting headland maneuver")
-                    return planner.plan_headland_shift_base_link(
-                        speed=self.p.headland_exit_straight_speed,
-                        reason="EXIT_STRAIGHT",
-                    )
-
-                self.transition(MissionState.EXIT_ROW, "row lost fallback")
-                return planner.plan_exit_row()
-
-            return planner.plan_follow_row(row)
-
-
-        if self.state == MissionState.EXIT_CURVE:
-            if not self.p.use_slam_map or not self.p.require_map_for_turns:
-                return LocalPath([], False, self.p.map_frame, "headland maneuver requires map pose")
-
-            if pose_map is None:
-                return LocalPath([], False, self.p.map_frame, "EXIT_CURVE blocked: no map pose")
-
-            if self.headland_start_pose_map is None:
-                self.headland_start_pose_map = pose_map
-                self.exit_curve_start_yaw = None
-                self.headland_direction = 1.0 if self.p.row_shift_direction.upper() == "L" else -1.0
-                self.headland_required_shift = self.headland_direction * self.p.row_shift_count * self.p.expected_row_width
-                self.headland_measured_shift = 0.0
-                self.headland_exit_forward_distance = 0.0
-                self.node.get_logger().info(
-                    f"HEADLAND_EXIT_STRAIGHT start: direction={self.p.row_shift_direction}, "
-                    f"count={self.p.row_shift_count}, required_shift={self.headland_required_shift:.3f} m, "
-                    f"straight_distance={self.p.headland_exit_straight_distance:.3f} m"
-                )
-
-            # Zuerst gerade aus der Reihe herausfahren. Erst danach beginnt der eigentliche
-            # Links-/Rechtsbogen. Das schafft am Reihenende Abstand zu den letzten Pflanzen
-            # und verhindert besonders beim 2. Manöver, dass der Bogen noch in die Reihe schneidet.
-            self._update_headland_exit_forward_distance(pose_map)
-            self._update_headland_measured_shift(pose_map)
-
-            if self.exit_curve_start_yaw is None:
-                if self.headland_exit_forward_distance < max(0.0, self.p.headland_exit_straight_distance):
-                    return planner.plan_headland_shift_base_link(
-                        speed=self.p.headland_exit_straight_speed,
-                        reason="EXIT_STRAIGHT",
-                    )
-
-                self.exit_curve_start_yaw = pose_map.yaw
-                self.node.get_logger().info(
-                    f"EXIT_CURVE arc start after straight clearance: "
-                    f"forward={self.headland_exit_forward_distance:.3f} m"
-                )
-
-            yaw_progress = self.headland_direction * wrap_to_pi(pose_map.yaw - float(self.exit_curve_start_yaw))
-            if yaw_progress >= self.p.exit_curve_yaw_change:
-                self.transition(MissionState.HEADLAND_SHIFT, "exit curve yaw reached")
-                self.headland_shift_start_pose_map = pose_map
-                self.headland_shift_start_yaw_map = pose_map.yaw
-                self.headland_shift_forward_distance = 0.0
-                return planner.plan_headland_shift_base_link(reason="HEADLAND_SHIFT_MULTIROW_STRAIGHT" if int(self.p.row_shift_count) >= 2 else "HEADLAND_SHIFT")
-
-            return planner.plan_constant_curve_base_link(
-                self.headland_direction,
-                self.p.exit_curve_speed,
-                self.p.exit_curve_angular_speed,
-                reason="EXIT_CURVE",
-            )
-
-        if self.state == MissionState.HEADLAND_SHIFT:
-            if pose_map is None:
-                return LocalPath([], False, self.p.map_frame, "HEADLAND_SHIFT blocked: no map pose")
-
-            if self.headland_start_pose_map is None:
-                self.headland_start_pose_map = pose_map
-                self.headland_direction = 1.0 if self.p.row_shift_direction.upper() == "L" else -1.0
-                self.headland_required_shift = self.headland_direction * self.p.row_shift_count * self.p.expected_row_width
-
-            self._update_headland_measured_shift(pose_map)
-
-            remaining = self._headland_pre_entry_shift_target() - abs(self.headland_measured_shift)
-
-            # SLAM-Reihenlinien weiterhin auswerten, aber hier nur fuer Diagnose und
-            # Plausibilisierung. Das Manoever faehrt nicht beliebig zu einer absoluten
-            # Map-Lane, sondern nur den pattern-relativen Sollversatz.
-            if self.p.map_row_detection_enabled and latest_map is not None and map_detector is not None:
-                self.map_lanes, self.map_row_bands, self.last_map_row_reason = map_detector.detect_lanes(
-                    latest_map,
-                    pose_map,
-                )
-                _ = map_detector.select_target_lane(
-                    self.map_lanes,
-                    self.map_row_bands,
-                    self.p.row_shift_direction,
-                    self.p.row_shift_count,
-                )
-                self.last_target_lane_reason = map_detector.last_target_reason
-                self.expected_target_offset = map_detector.last_expected_target_offset
-                self.detected_target_offset = map_detector.last_detected_target_offset
-                self.target_offset_error = map_detector.last_target_offset_error
-                self.reference_row_v = map_detector.last_reference_row_v
-                self.target_row_v = map_detector.last_target_row_v
-                self.candidate_rows_text = map_detector.last_candidate_rows_text
-                self._capture_headland_reference_row_yaw(map_detector)
-                self._update_multirow_counted_target_latch(pose_map)
-                self._update_headland_measured_shift(pose_map)
-                self._refresh_multirow_shift_sign_correction()
-                remaining = self._headland_pre_entry_shift_target() - abs(self.headland_measured_shift)
-
-            if int(self.p.row_shift_count) >= 2:
-                if self.headland_shift_start_pose_map is None:
-                    self.headland_shift_start_pose_map = pose_map
-                    self.headland_shift_start_yaw_map = pose_map.yaw
-                    self.headland_shift_forward_distance = 0.0
-
-                desired_shift_yaw = self._desired_headland_shift_yaw(pose_map, map_detector)
-                if self.headland_shift_axis_yaw_map is None:
-                    self.headland_shift_axis_yaw_map = desired_shift_yaw if desired_shift_yaw is not None else self.headland_shift_start_yaw_map
-
-                self._update_headland_shift_forward_distance(pose_map)
-                straight_target = self._multirow_deterministic_straight_target()
-
-                # 2R-Regel:
-                # Nach dem ersten 90°-Bogen wird (step-1)*row_width entlang
-                # der festen Vorgewende-Achse gefahren. Diese Achse ist aus der
-                # SLAM-Reihenrichtung abgeleitet: row_yaw +/- 90°. Damit ist die
-                # Gerade geometrisch quer zu den Reihenenden und nicht nur
-                # "geradeaus in Fahrzeugrichtung".
-                if self.headland_shift_forward_distance >= straight_target - max(0.02, float(self.p.headland_shift_tolerance)):
-                    self.transition(MissionState.ENTRY_CURVE, "deterministic multirow perpendicular distance reached")
-                    return planner.plan_constant_curve_base_link(
-                        self.headland_direction,
-                        self.p.entry_curve_speed,
-                        self.p.entry_curve_angular_speed,
-                        reason="ENTRY_CURVE",
-                    )
-
-                if self.headland_shift_axis_yaw_map is not None:
-                    return planner.plan_headland_shift_map_heading(
-                        pose_map,
-                        float(self.headland_shift_axis_yaw_map),
-                        reason="HEADLAND_SHIFT_MULTIROW_STRAIGHT",
-                    )
-
-                return planner.plan_headland_shift_base_link(reason="HEADLAND_SHIFT_MULTIROW_STRAIGHT")
-
-            if remaining <= self.p.headland_shift_tolerance:
-                self.transition(MissionState.ENTRY_CURVE, "required headland shift reached")
-                return planner.plan_constant_curve_base_link(
-                    self.headland_direction,
-                    self.p.entry_curve_speed,
-                    self.p.entry_curve_angular_speed,
-                    reason="ENTRY_CURVE",
-                )
-
-            desired_shift_yaw = self._desired_headland_shift_yaw(pose_map, map_detector)
-            if desired_shift_yaw is not None:
-                return planner.plan_headland_shift_map_heading(
-                    pose_map,
-                    desired_shift_yaw,
-                    reason="HEADLAND_SHIFT_MAP",
-                )
-
-            return planner.plan_headland_shift_base_link(reason="HEADLAND_SHIFT")
-
-        if self.state == MissionState.ENTRY_CURVE:
-            if pose_map is None:
-                return LocalPath([], False, self.p.map_frame, "ENTRY_CURVE blocked: no map pose")
-
-            if self.entry_curve_start_yaw is None:
-                self.entry_curve_start_yaw = pose_map.yaw
-                self.entry_row_stable_frames = 0
-
-            # Sobald die Zielgasse lokal stabil sichtbar ist, uebernimmt die
-            # vorhandene gute Einfahr-/Reihenfuehrung.
-            # Fuer direkte Nachbargassenwechsel 1L/1R wird die lokale Reihe aber
-            # erst akzeptiert, wenn der geforderte seitliche Versatz erreicht ist
-            # und die Maisreihe auf der erwarteten Seite sichtbar ist. Das verhindert,
-            # dass eine frueh erkannte falsche Struktur als Zielgasse genommen wird.
-            self._update_headland_measured_shift(pose_map)
-
-            # Harte Begrenzung gegen Ueberspringen: Wenn der seitliche
-            # Gesamtversatz groesser ist als der Pattern-Sollversatz plus
-            # Schutztoleranz, wird nicht weiter in die Kurve hineingefahren.
-            # Danach wird langsam lokal gesucht, statt weiter seitlich abzudriften.
-            overshoot_tolerance = max(0.0, float(self.p.headland_shift_overshoot_tolerance))
-            if int(self.p.row_shift_count) >= 2:
-                overshoot_tolerance += max(0.0, float(self.p.multirow_entry_extra_shift))
-
-            if abs(self.headland_measured_shift) > abs(self.headland_required_shift) + overshoot_tolerance:
-                self.node.get_logger().warn(
-                    f"ENTRY_CURVE overshoot guard: measured_shift={self.headland_measured_shift:.3f}, "
-                    f"required_shift={self.headland_required_shift:.3f}, "
-                    f"tolerance={overshoot_tolerance:.3f}. Switching to ACQUIRE_ROW."
-                )
-                self.transition(MissionState.ACQUIRE_ROW, "entry curve overshoot guard")
-                return planner.plan_acquire_row(row)
-
-            self.entry_shift_ok = self._entry_shift_window_ok()
-            self.entry_reference_side_ok = self._entry_reference_side_detected(row)
-            entry_yaw_ok = self._entry_yaw_or_local_row_ok(row, pose_map)
-            entry_geometry_ok = self._entry_geometry_accept_ok(row, self.entry_shift_ok, entry_yaw_ok)
-            neighbor_takeover_ok = self._neighbor_local_takeover_ok(row, pose_map)
-
-            if neighbor_takeover_ok:
-                self.entry_shift_ok = True
-                entry_yaw_ok = True
-                entry_geometry_ok = True
-
-            if self.p.neighbor_reference_entry_requires_shift and self.p.row_shift_count == 1:
-                entry_shift_condition = self.entry_shift_ok
-            else:
-                # Auch bei uebersprungenen Gassen darf lokal erst uebergeben werden,
-                # wenn der pattern-relative Versatz plausibel ist. Sonst kann eine
-                # zufaellige Zwischenstruktur als Zielgasse akzeptiert werden.
-                entry_shift_condition = self.entry_shift_ok
-
-            if (
-                row.valid
-                and row.confidence >= self.p.entry_row_min_confidence
-                and entry_shift_condition
-                and entry_yaw_ok
-                and self.entry_reference_side_ok
-                and entry_geometry_ok
-            ):
-                self.entry_row_stable_frames += 1
-            else:
-                self.entry_row_stable_frames = 0
-
-            if self.entry_row_stable_frames >= max(1, self.p.entry_row_stable_frames):
-                self.transition(MissionState.ENTER_ROW, "target row detected during entry curve with yaw/shift/reference checks")
-                return planner.plan_enter_row(row)
-
-            map_target_yaw = self._target_entry_row_yaw_from_map(pose_map, map_detector)
-            if map_target_yaw is not None:
-                yaw_error_to_map_row = abs(wrap_to_pi(float(map_target_yaw) - pose_map.yaw))
-                if yaw_error_to_map_row <= max(0.0, float(self.p.entry_yaw_accept_tolerance)):
-                    self.transition(MissionState.ACQUIRE_ROW, "entry curve aligned to map row yaw; target lane not geometrically centered yet")
-                    return planner.plan_acquire_row(row)
-
-            yaw_progress = self.headland_direction * wrap_to_pi(pose_map.yaw - float(self.entry_curve_start_yaw))
-            target_entry_yaw = self._effective_entry_curve_yaw_change()
-            if yaw_progress >= target_entry_yaw:
-                self.transition(MissionState.ACQUIRE_ROW, "entry curve completed; target lane not geometrically centered yet")
-                return planner.plan_acquire_row(row)
-
-            return planner.plan_constant_curve_base_link(
-                self.headland_direction,
-                self.p.entry_curve_speed,
-                self.p.entry_curve_angular_speed,
-                reason="ENTRY_CURVE",
-            )
-
-        if self.state == MissionState.EXIT_ROW:
-            self.transition(MissionState.PLAN_TURN, "exit row complete")
-            return planner.plan_exit_row()
-
-        if self.state == MissionState.PLAN_TURN:
-            if self.p.use_slam_map and self.p.require_map_for_turns:
-                if pose_map is None:
-                    self.node.get_logger().warn(
-                        "PLAN_TURN blocked: no map pose available. "
-                        "Check TF map -> base_link and SLAM/localization."
-                    )
-                    return LocalPath([], False, self.p.map_frame, "PLAN_TURN blocked: no map pose")
-
-                if self.p.map_row_detection_enabled:
-                    if latest_map is None:
-                        return LocalPath([], False, self.p.map_frame, "PLAN_TURN blocked: no SLAM map")
-
-                    if map_detector is None:
-                        return LocalPath([], False, self.p.map_frame, "PLAN_TURN blocked: no MapRowDetector")
-
-                    self.map_lanes, self.map_row_bands, self.last_map_row_reason = map_detector.detect_lanes(
-                        latest_map,
-                        pose_map,
-                    )
-                    self.target_map_lane = map_detector.select_target_lane(
-                        self.map_lanes,
-                        self.map_row_bands,
-                        self.p.row_shift_direction,
-                        self.p.row_shift_count,
-                    )
-                    self.last_target_lane_reason = map_detector.last_target_reason
-                    self.expected_target_offset = map_detector.last_expected_target_offset
-                    self.detected_target_offset = map_detector.last_detected_target_offset
-                    self.target_offset_error = map_detector.last_target_offset_error
-                    self.reference_row_v = map_detector.last_reference_row_v
-                    self.target_row_v = map_detector.last_target_row_v
-                    self.candidate_rows_text = map_detector.last_candidate_rows_text
-
-                    if self.target_map_lane is not None:
-                        self.active_turn_path = planner.plan_turn_path_to_map_lane(
-                            pose_map,
-                            self.target_map_lane,
-                        )
-
-                        if not self.active_turn_path.valid or len(self.active_turn_path.points) == 0:
-                            self.node.get_logger().warn(
-                                f"PLAN_TURN failed: invalid SLAM-map lane turn path. "
-                                f"reason='{self.active_turn_path.reason}', "
-                                f"target_v={self.target_map_lane.center_v:.3f}, "
-                                f"lanes={len(self.map_lanes)}, bands={len(self.map_row_bands)}. "
-                                f"Falling back to geometric map-frame turn."
-                            )
-                            self.active_turn_path = planner.plan_turn_path_map(pose_map)
-                            self.target_map_lane = None
-                        else:
-                            # Nur echte, in der SLAM-Map detektierte Zielgassen gelten als final.
-                            # Extrapolierte Zielgassen werden gefahren, duerfen aber waehrend
-                            # EXECUTE_TURN neu geplant werden, sobald die echte Zielgasse sichtbar wird.
-                            self.active_turn_uses_map_lane = self.target_map_lane.source.startswith("detected")
-                            self.turn_replan_attempts = 0
-                            self.turn_replan_frame_counter = 0
-                            self.node.get_logger().info(
-                                f"PLAN_TURN ok: target lane v={self.target_map_lane.center_v:.3f} m, "
-                                f"width={self.target_map_lane.width:.3f} m, "
-                                f"source={self.target_map_lane.source}, "
-                                f"final_slam_lane={self.active_turn_uses_map_lane}, "
-                                f"path_points={len(self.active_turn_path.points)}"
-                            )
-                            self.transition(MissionState.EXECUTE_TURN, "turn path planned to target lane")
-                            return self.active_turn_path
-                    else:
-                        # Die Zielgasse kann erst dann aus der SLAM-Map erkannt werden,
-                        # wenn sie bereits gemappt wurde. Bei einer noch unbekannten
-                        # Zielgasse wird deshalb NICHT blockiert. Stattdessen wird im
-                        # map-Frame geometrisch anhand expected_row_width gewendet.
-                        # Danach faengt ACQUIRE_ROW die neue Gasse lokal mit LiDAR ein,
-                        # waehrend SLAM die Zielgasse weiter aufbaut.
-                        self.node.get_logger().warn(
-                            f"PLAN_TURN fallback: no target lane in SLAM map "
-                            f"({self.last_map_row_reason}, lanes={len(self.map_lanes)}, "
-                            f"bands={len(self.map_row_bands)}). "
-                            f"Using geometric map-frame turn."
-                        )
-                        self.active_turn_path = planner.plan_turn_path_map(pose_map)
-
-                    if not self.active_turn_path.valid or len(self.active_turn_path.points) == 0:
-                        self.node.get_logger().warn(
-                            f"PLAN_TURN failed: invalid geometric map-frame fallback path. "
-                            f"reason='{self.active_turn_path.reason}', "
-                            f"points={len(self.active_turn_path.points)}"
-                        )
-                        return self.active_turn_path
-
-                    self.active_turn_uses_map_lane = False
-                    self.turn_replan_attempts = 0
-                    self.turn_replan_frame_counter = 0
-                    self.transition(MissionState.EXECUTE_TURN, "turn path planned in map frame with geometric fallback")
-                    return self.active_turn_path
-
-                self.active_turn_path = planner.plan_turn_path_map(pose_map)
-                self.active_turn_uses_map_lane = False
-                self.turn_replan_attempts = 0
-                self.turn_replan_frame_counter = 0
-                self.transition(MissionState.EXECUTE_TURN, "turn path planned in map frame")
-                return self.active_turn_path
-
-            if self.p.use_slam_map and pose_map is not None:
-                self.active_turn_path = planner.plan_turn_path_map(pose_map)
-                self.active_turn_uses_map_lane = False
-                self.turn_replan_attempts = 0
-                self.turn_replan_frame_counter = 0
-                self.transition(MissionState.EXECUTE_TURN, "turn path planned in map frame")
-                return self.active_turn_path
-
-            if pose_odom is not None:
-                self.active_turn_path = planner.plan_turn_path_odom(pose_odom)
-                self.active_turn_uses_map_lane = False
-                self.turn_replan_attempts = 0
-                self.turn_replan_frame_counter = 0
-                self.transition(MissionState.EXECUTE_TURN, "turn path planned in odom frame")
-                return self.active_turn_path
-
-            return LocalPath([], False, self.p.map_frame if self.p.use_slam_map else self.p.odom_frame, "no pose for turn planning")
-
-        if self.state == MissionState.EXECUTE_TURN:
-            if self.active_turn_path is None:
-                self.transition(MissionState.PLAN_TURN, "missing active turn path")
-                return LocalPath([], False, self.p.map_frame if self.p.use_slam_map else self.p.odom_frame, "missing path")
-
-            # Adaptive Replanung waehrend des Wendens:
-            # Wenn der Turn nur geometrisch im map-Frame gestartet wurde, die SLAM-Map
-            # aber waehrend des Wendens eine Zielgasse sichtbar macht, wird der Rest
-            # des Turns ab der aktuellen map-Pose neu zur erkannten Zielgasse geplant.
-            if (
-                self.p.turn_replan_enabled
-                and self.p.use_slam_map
-                and self.p.require_map_for_turns
-                and self.p.map_row_detection_enabled
-                and not self.active_turn_uses_map_lane
-                and self.active_turn_path.frame_id == self.p.map_frame
-                and pose_map is not None
-                and latest_map is not None
-                and map_detector is not None
-                and self.turn_replan_attempts < max(0, self.p.turn_replan_max_attempts)
-            ):
-                self.turn_replan_frame_counter += 1
-
-                if self.turn_replan_frame_counter >= max(1, self.p.turn_replan_period_frames):
-                    self.turn_replan_frame_counter = 0
-                    self.turn_replan_attempts += 1
-
-                    self.map_lanes, self.map_row_bands, self.last_map_row_reason = map_detector.detect_lanes(
-                        latest_map,
-                        pose_map,
-                    )
-                    replanning_target_lane = map_detector.select_target_lane(
-                        self.map_lanes,
-                        self.map_row_bands,
-                        self.p.row_shift_direction,
-                        self.p.row_shift_count,
-                    )
-                    self.last_target_lane_reason = map_detector.last_target_reason
-                    self.expected_target_offset = map_detector.last_expected_target_offset
-                    self.detected_target_offset = map_detector.last_detected_target_offset
-                    self.target_offset_error = map_detector.last_target_offset_error
-                    self.reference_row_v = map_detector.last_reference_row_v
-                    self.target_row_v = map_detector.last_target_row_v
-                    self.candidate_rows_text = map_detector.last_candidate_rows_text
-
-                    if (
-                        replanning_target_lane is not None
-                        and replanning_target_lane.source.startswith("detected")
-                    ):
-                        replanned_path = planner.plan_turn_path_to_map_lane(
-                            pose_map,
-                            replanning_target_lane,
-                        )
-
-                        if replanned_path.valid and len(replanned_path.points) > 0:
-                            self.active_turn_path = replanned_path
-                            self.target_map_lane = replanning_target_lane
-                            self.active_turn_uses_map_lane = True
-
-                            self.node.get_logger().warn(
-                                "EXECUTE_TURN replan: SLAM target lane became available. "
-                                f"Replanned map turn from current pose. "
-                                f"target_v={replanning_target_lane.center_v:.3f}, "
-                                f"width={replanning_target_lane.width:.3f}, "
-                                f"source={replanning_target_lane.source}, "
-                                f"lanes={len(self.map_lanes)}, bands={len(self.map_row_bands)}, "
-                                f"attempt={self.turn_replan_attempts}"
-                            )
-                            return self.active_turn_path
-
-                        self.node.get_logger().warn(
-                            "EXECUTE_TURN replan candidate rejected: invalid replanned path. "
-                            f"reason='{replanned_path.reason}', "
-                            f"points={len(replanned_path.points)}, "
-                            f"target_v={replanning_target_lane.center_v:.3f}"
-                        )
-
-            active_pose = pose_map if self.active_turn_path.frame_id == self.p.map_frame else pose_odom
-
-            # Frueher Ausstieg aus dem globalen Turn:
-            # Wenn die Zielgasse lokal mit LiDAR stabil erkannt wird, wird der globale
-            # Turn-Pfad verlassen. Sonst kann der Roboter trotz richtiger lokaler
-            # Erkennung an der Zielgasse vorbei bis zu einer spaeteren Reihe fahren.
-            if self.p.turn_exit_on_local_row:
-                if row.valid and row.confidence >= self.p.turn_exit_min_confidence:
-                    self.turn_local_row_stable_frames += 1
-                else:
-                    self.turn_local_row_stable_frames = 0
-
-                if self.turn_local_row_stable_frames >= max(1, self.p.turn_exit_stable_frames):
-                    self.node.get_logger().warn(
-                        "EXECUTE_TURN early exit: target row detected locally. "
-                        f"row_conf={row.confidence:.3f}, stable_frames={self.turn_local_row_stable_frames}. "
-                        "Switching to ENTER_ROW before global turn path goal."
-                    )
-                    self.active_turn_path = None
-                    self.active_turn_uses_map_lane = False
-                    self.transition(MissionState.ENTER_ROW, "target row detected during turn")
-                    return planner.plan_enter_row(row)
-
-            if active_pose is not None and controller.path_goal_reached(self.active_turn_path, active_pose):
-                self.active_turn_path = None
-                self.active_turn_uses_map_lane = False
-                self.transition(MissionState.ACQUIRE_ROW, "turn path reached")
-                return planner.plan_acquire_row(row)
-
-            return self.active_turn_path
-
-        if self.state == MissionState.ACQUIRE_ROW:
-            acquire_shift_ok = True
-            acquire_yaw_ok = True
-            acquire_reference_ok = True
-            acquire_geometry_ok = True
-
-            if self.p.headland_maneuver_enabled and self.headland_required_shift != 0.0:
-                if pose_map is not None and self.headland_start_pose_map is not None:
-                    self._update_headland_measured_shift(pose_map)
-                acquire_shift_ok = self._entry_shift_window_ok()
-                acquire_yaw_ok = self._entry_yaw_or_local_row_ok(row, pose_map)
-                acquire_reference_ok = self._entry_reference_side_detected(row)
-                acquire_geometry_ok = self._entry_geometry_accept_ok(row, acquire_shift_ok, acquire_yaw_ok)
-
-                if self._neighbor_local_takeover_ok(row, pose_map):
-                    acquire_shift_ok = True
-                    acquire_yaw_ok = True
-                    acquire_reference_ok = True
-                    acquire_geometry_ok = True
-                    self.entry_shift_ok = True
-                    self.entry_reference_side_ok = True
-
-            acquire_row_ok = (
-                row.valid
-                and row.confidence >= self.p.min_enter_confidence
-                and acquire_shift_ok
-                and acquire_yaw_ok
-                and acquire_reference_ok
-                and acquire_geometry_ok
-            )
-
-            if acquire_row_ok:
-                self.enter_stable_frames += 1
-            else:
-                self.enter_stable_frames = 0
-
-            if self.enter_stable_frames >= self.p.enter_stable_frames_required:
-                self.transition(MissionState.ENTER_ROW, "target row acquired with shift/yaw/reference/geometry guards")
-                return planner.plan_enter_row(row)
-
-            if self.acquire_start_time is not None:
-                elapsed = (
-                    self.node.get_clock().now() - self.acquire_start_time
-                ).nanoseconds * 1e-9
-
-                if elapsed > self.p.acquire_timeout_sec:
-                    self.node.get_logger().warn(
-                        "ACQUIRE_ROW timeout: still searching. Check ROI, turn yaw, row_shift_direction and row markers."
-                    )
-                    self.acquire_start_time = self.node.get_clock().now()
-
-            # Critical safety guard: do not let ACQUIRE_ROW follow a single or
-            # geometrically invalid row too early. Bei 3R war der Sollversatz
-            # jedoch bereits erreicht/überschritten und die lokale Reihe stabil;
-            # weiteres Geradeausfahren ohne Reihenregelung ließ den Roboter aus
-            # der Gasse driften. Für Mehrreihensprünge wird dann langsam mit der
-            # lokalen Reihenhypothese nachgeführt, statt stur geradeaus weiter zu
-            # fahren.
-            if self.p.headland_maneuver_enabled and self.headland_required_shift != 0.0 and not acquire_row_ok:
-                if self._multirow_safe_acquire_steering_ok(row, acquire_shift_ok):
-                    return planner.plan_acquire_row(row)
-                return planner.plan_headland_shift_base_link(
-                    speed=min(self.p.enter_speed, self.p.slow_speed),
-                    reason="ACQUIRE_ROW_WAIT_FULL_LANE",
-                )
-
-            return planner.plan_acquire_row(row)
-
-        if self.state == MissionState.ENTER_ROW:
-            if pose_map is not None and self.headland_start_pose_map is not None:
-                self._update_headland_measured_shift(pose_map)
-
-            shift_ok_for_follow = True
-            yaw_ok_for_follow = True
-            reference_ok_for_follow = True
-
-            if self.p.headland_maneuver_enabled and self.headland_required_shift != 0.0:
-                shift_ok_for_follow = self._entry_shift_window_ok()
-                yaw_ok_for_follow = self._entry_yaw_or_local_row_ok(row, pose_map)
-                reference_ok_for_follow = self._entry_reference_side_detected(row)
-
-            geometry_ok_for_follow = (
-                self._entry_geometry_accept_ok(row, shift_ok_for_follow, yaw_ok_for_follow)
-                if self.p.headland_maneuver_enabled
-                else True
-            )
-
-            # Bei direktem Nachbargassenwechsel 1L/1R kann die lokale
-            # Zielgasse bereits eindeutig und stabil sein, obwohl der absolute
-            # map-basierte Shift noch knapp unter dem Sollfenster liegt. In
-            # ENTRY_CURVE und ACQUIRE_ROW wird dieser Fall bereits freigegeben;
-            # ENTER_ROW muss dieselbe Freigabe verwenden, sonst bleibt der
-            # Roboter trotz erkannter Gasse in ENTER_ROW_WAIT_FULL_LANE.
-            if self.p.headland_maneuver_enabled and self._neighbor_local_takeover_ok(row, pose_map):
-                shift_ok_for_follow = True
-                yaw_ok_for_follow = True
-                reference_ok_for_follow = True
-                geometry_ok_for_follow = True
-                self.entry_shift_ok = True
-                self.entry_reference_side_ok = True
-
-            enter_guards_ok = (
-                row.valid
-                and row.confidence >= self.p.min_follow_confidence
-                and shift_ok_for_follow
-                and yaw_ok_for_follow
-                and reference_ok_for_follow
-                and geometry_ok_for_follow
-            )
-
-            if enter_guards_ok:
-                self.enter_stable_frames += 1
-            else:
-                self.enter_stable_frames = 0
-
-            if self.enter_stable_frames >= self.p.enter_stable_frames_required:
-                if self.advance_pattern():
-                    self.transition(MissionState.FOLLOW_ROW, "stable row following")
-                    return planner.plan_follow_row(row)
-
-                # Alle Pattern-Wechsel wurden ausgefuehrt.
-                # Wichtig: Die zuletzt erreichte Gasse wird jetzt noch komplett durchfahren.
-                # Gestoppt wird erst am Ende dieser finalen Gasse.
-                self.pattern_completed = True
-                self.node.get_logger().info(
-                    "All pattern transitions executed. Driving final row; will stop at next row end."
-                )
-                self.transition(MissionState.FOLLOW_ROW, "stable final row following")
-                return planner.plan_follow_row(row)
-
-            # Same guard as ACQUIRE_ROW. Bei Mehrreihensprüngen darf eine stabile
-            # lokale Reihe nach erreichtem Sollversatz weiter als Lenkreferenz
-            # dienen, auch wenn die vollständige Gassengeometrie noch nicht
-            # bestätigt ist.
-            if self.p.headland_maneuver_enabled and self.headland_required_shift != 0.0 and not enter_guards_ok:
-                if self._multirow_safe_acquire_steering_ok(row, shift_ok_for_follow):
-                    return planner.plan_enter_row(row)
-                return planner.plan_headland_shift_base_link(
-                    speed=min(self.p.enter_speed, self.p.slow_speed),
-                    reason="ENTER_ROW_WAIT_FULL_LANE",
-                )
-
-            return planner.plan_enter_row(row)
-
-        if self.state == MissionState.FINISHED:
-            return LocalPath([], False, "base_link", "finished")
-
-        return LocalPath([], False, "base_link", "unknown state")
+        map_slope: Optional[float],
+        map_target_base: np.ndarray,
+    ) -> Tuple[List[np.ndarray], np.ndarray]:
+        slope = 0.0 if map_slope is None else float(map_slope)
+        angle = math.atan(slope)
+        direction = np.array([math.cos(angle), math.sin(angle)], dtype=float)
+        perp = np.array([-direction[1], direction[0]], dtype=float)
+        map_center_intercept = float(map_target_base[1] - slope * map_target_base[0])
+        center_offset = float(np.clip(
+            map_center_intercept,
+            -self.p.laser_roi_center_offset_limit,
+            self.p.laser_roi_center_offset_limit,
+        ))
+        along_center = self.p.laser_roi_x_min + 0.5 * self.p.laser_roi_length
+        lane_center = np.array([0.0, center_offset], dtype=float) + along_center * direction
+        half_lane = 0.5 * self.p.expected_row_width
+        return [lane_center + half_lane * perp, lane_center - half_lane * perp], direction
+
+    def points_in_oriented_roi(
+        self,
+        points: np.ndarray,
+        center: np.ndarray,
+        direction: np.ndarray,
+    ) -> np.ndarray:
+        if len(points) == 0:
+            return np.empty((0, 2), dtype=float)
+        perp = np.array([-direction[1], direction[0]], dtype=float)
+        rel = points - np.asarray(center, dtype=float)
+        mask = (
+            (np.abs(rel @ direction) <= 0.5 * self.p.laser_roi_length)
+            & (np.abs(rel @ perp) <= 0.5 * self.p.laser_roi_width)
+        )
+        return points[mask]
+
+    def fit_line_in_roi(
+        self,
+        points: np.ndarray,
+        center: np.ndarray,
+        direction: np.ndarray,
+    ) -> LaserLineFit:
+        roi_points = self.points_in_oriented_roi(points, center, direction)
+        perp = np.array([-direction[1], direction[0]], dtype=float)
+        rel = roi_points - np.asarray(center, dtype=float)
+        local_points = np.column_stack((rel @ direction, rel @ perp))
+        local_fit = self.fit_line_ransac(local_points)
+        if not local_fit.valid:
+            return local_fit
+        local_endpoints = np.array(
+            [
+                [-0.5 * self.p.laser_roi_length, local_fit.intercept - 0.5 * self.p.laser_roi_length * local_fit.slope],
+                [0.5 * self.p.laser_roi_length, local_fit.intercept + 0.5 * self.p.laser_roi_length * local_fit.slope],
+            ],
+            dtype=float,
+        )
+        base_endpoints = center + np.outer(local_endpoints[:, 0], direction) + np.outer(local_endpoints[:, 1], perp)
+        dx = float(base_endpoints[1, 0] - base_endpoints[0, 0])
+        if abs(dx) < 1e-6:
+            return LaserLineFit()
+        slope = float((base_endpoints[1, 1] - base_endpoints[0, 1]) / dx)
+        intercept = float(base_endpoints[0, 1] - slope * base_endpoints[0, 0])
+        return LaserLineFit(True, slope, intercept, local_fit.inliers, local_fit.visible_length)
+
+    def fit_line_ransac(self, points: np.ndarray) -> LaserLineFit:
+        if len(points) < self.p.laser_min_inliers:
+            return LaserLineFit()
+
+        best_inliers = np.zeros(len(points), dtype=bool)
+        rng = np.random.default_rng(42)
+        for _ in range(self.p.laser_ransac_iterations):
+            first, second = points[rng.choice(len(points), size=2, replace=False)]
+            dx = float(second[0] - first[0])
+            if abs(dx) < 1e-6:
+                continue
+            slope = float((second[1] - first[1]) / dx)
+            if abs(slope) > self.p.laser_max_abs_line_slope:
+                continue
+            intercept = float(first[1] - slope * first[0])
+            distances = np.abs(slope * points[:, 0] - points[:, 1] + intercept) / math.sqrt(slope * slope + 1.0)
+            inliers = distances <= self.p.laser_ransac_distance
+            if int(np.sum(inliers)) > int(np.sum(best_inliers)):
+                best_inliers = inliers
+
+        if int(np.sum(best_inliers)) < self.p.laser_min_inliers:
+            return LaserLineFit()
+        inlier_points = points[best_inliers]
+        slope, intercept = np.polyfit(inlier_points[:, 0], inlier_points[:, 1], 1)
+        visible_length = float(np.max(inlier_points[:, 0]) - np.min(inlier_points[:, 0]))
+        valid = visible_length >= self.p.laser_min_visible_length and abs(slope) <= self.p.laser_max_abs_line_slope
+        return LaserLineFit(valid, float(slope), float(intercept), int(np.sum(best_inliers)), visible_length)
 
 
 class MaizeNavigator(Node):
-    def __init__(self):
+    def __init__(self) -> None:
         super().__init__("maize_navigator")
-
         self.p = self.load_params()
+        self.validate_params()
 
-        self.perception = RowPerception(self.p)
-        self.tracker = RowTracker(self.p)
-        self.planner = LocalPlanner(self.p)
-        self.map_row_detector = MapRowDetector(self.p)
-        self.controller = PathFollower(self.p)
-        self.safety = SafetySupervisor(self.p)
-        self.mission = MissionManager(self, self.p)
-
-        self.latest_scan: Optional[LaserScan] = None
+        self.state = MissionState.IDLE
+        self.paused_state: Optional[MissionState] = None
         self.latest_map: Optional[OccupancyGrid] = None
-        self.latest_path: Optional[LocalPath] = None
-        self.latest_row: RowModel = self.tracker.model
+        self.latest_scan: Optional[LaserScan] = None
+        self.latest_scan_received_ns: Optional[int] = None
+        self.robot_pose: Optional[Pose2D] = None
+        self.laser_follower = LaserRowFollower(self.p)
+        self.laser_follow_result = LaserFollowResult(reason="not initialized")
+        self.fused_target_point: Optional[np.ndarray] = None
+        self.driving_profiles = self.build_driving_profiles()
+        self.current_carefulness = "high"
 
-        self.tf_buffer = tf2_ros.Buffer(cache_time=Duration(seconds=10.0))
+        self.left_row: Optional[RowMarchModel] = None
+        self.right_row: Optional[RowMarchModel] = None
+        self.midline: np.ndarray = np.empty((0, 2), dtype=float)
+        self.plant_row_end_point: Optional[np.ndarray] = None
+        self.row_exit_goal: Optional[np.ndarray] = None
+        self.row_exit_heading_goal: Optional[np.ndarray] = None
+        self.row_end_direction: Optional[np.ndarray] = None
+        self.last_cmd_angular_z: float = 0.0
+        self.last_target_point: Optional[np.ndarray] = None
+        self.current_lookahead_distance: float = self.p.lookahead_distance
+        self.current_lookahead_curvature: float = 0.0
+        self.current_maneuver_lookahead_distance: float = self.p.maneuver_lookahead_distance
+        self.current_maneuver_lookahead_curvature: float = 0.0
+        self.initial_forward_direction: Optional[np.ndarray] = None
+        self.row_number_increase_direction: Optional[np.ndarray] = None
+        self.pattern_steps: List[PatternStep] = self.parse_pattern(self.p.pattern)
+        self.pattern_index: int = 0
+        self.finish_after_current_row: bool = False
+        self.entrance_hist_center: Optional[np.ndarray] = None
+        self.entrance_hist_direction: Optional[np.ndarray] = None
+        self.entrance_hist_peaks: List[EntrancePeak] = []
+        self.entrance_target: Optional[np.ndarray] = None
+        self.entrance_target_direction: Optional[np.ndarray] = None
+        self.entrance_waypoints: List[np.ndarray] = []
+        self.entrance_heading_goal: Optional[np.ndarray] = None
+        self.entrance_follow_path: np.ndarray = np.empty((0, 2), dtype=float)
+        self.entrance_route_support: np.ndarray = np.empty((0, 2), dtype=float)
+        self.entrance_route: np.ndarray = np.empty((0, 2), dtype=float)
+        self.entrance_route_progress_index: int = 0
+        self.entrance_route_projection: Optional[np.ndarray] = None
+        self.entrance_route_target: Optional[np.ndarray] = None
+        self.entrance_route_remaining_distance: float = 0.0
+        self.entrance_route_provisional: bool = False
+        self.entrance_active_step: Optional[PatternStep] = None
+        self.entrance_traverse_outward: Optional[float] = None
+        self.pending_target_peaks: Optional[Tuple[EntrancePeak, EntrancePeak]] = None
+        self.stored_rows: Dict[int, np.ndarray] = {}
+        self.row_end_directions_by_side: Dict[str, List[np.ndarray]] = {"forward": [], "backward": []}
+        self.row_map_exported: bool = False
+
+        self.tf_buffer = tf2_ros.Buffer()
         self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
 
-        self.scan_sub = self.create_subscription(
-            LaserScan,
-            self.p.scan_topic,
-            self.scan_callback,
-            10,
-        )
-        self.map_sub = self.create_subscription(
-            OccupancyGrid,
-            self.p.map_topic,
-            self.map_callback,
-            10,
-        )
-
+        self.map_sub = self.create_subscription(OccupancyGrid, self.p.map_topic, self.map_callback, 10)
+        self.scan_sub = self.create_subscription(LaserScan, self.p.scan_topic, self.scan_callback, 10)
         self.cmd_pub = self.create_publisher(Twist, self.p.cmd_vel_topic, 10)
-
-        self.state_pub = self.create_publisher(String, "/debug/state", 10)
-        self.conf_pub = self.create_publisher(Float32, "/debug/row_confidence", 10)
-        self.end_pub = self.create_publisher(Float32, "/debug/end_probability", 10)
-        self.path_pub = self.create_publisher(Path, "/debug/local_path", 10)
-        self.marker_pub = self.create_publisher(MarkerArray, "/debug/row_markers", 10)
-
-        self.diag_pub = self.create_publisher(
-            String,
-            "/debug/navigation_diagnostics",
-            10,
+        self.marker_pub = self.create_publisher(MarkerArray, "navigation_markers", 10)
+        self.slam_reset_client = (
+            self.create_client(SlamToolboxReset, self.p.slam_reset_service)
+            if SlamToolboxReset is not None
+            else None
         )
-        self.last_diag_text = ""
-        self.last_diag_log_time = self.get_clock().now()
 
-        self.set_pattern_srv = self.create_service(
-            SetNavigationPattern,
-            "/set_navigation_pattern",
-            self.set_navigation_pattern_cb,
-        )
-        self.get_status_srv = self.create_service(
-            GetNavigationStatus,
-            "/get_navigation_status",
-            self.get_navigation_status_cb,
-        )
-        self.start_srv = self.create_service(Trigger, "/start_navigation", self.start_cb)
-        self.stop_srv = self.create_service(Trigger, "/stop_navigation", self.stop_cb)
-        self.pause_srv = self.create_service(Trigger, "/pause_navigation", self.pause_cb)
-        self.resume_srv = self.create_service(Trigger, "/resume_navigation", self.resume_cb)
+        self.start_srv = self.create_service(StartNavigation, "start_navigation", self.start_cb)
+        self.stop_srv = self.create_service(Trigger, "stop_navigation", self.stop_cb)
+        self.pause_srv = self.create_service(Trigger, "pause_navigation", self.pause_cb)
+        self.resume_srv = self.create_service(Trigger, "resume_navigation", self.resume_cb)
+        self.reset_srv = self.create_service(Trigger, "reset_navigation", self.reset_cb)
+        self.timer = self.create_timer(1.0 / self.p.control_frequency, self.control_loop)
 
-        period = 1.0 / max(self.p.control_frequency, 1.0)
-        self.timer = self.create_timer(period, self.control_loop)
-
-        self.get_logger().info("maize_navigator started")
-        self.get_logger().info(
-            f"scan_topic={self.p.scan_topic}, cmd_vel_topic={self.p.cmd_vel_topic}, "
-            f"map_topic={self.p.map_topic}, map_frame={self.p.map_frame}"
-        )
+        self.get_logger().info("Maize Navigator initialized with rectangle marching row detection")
 
     def load_params(self) -> NavigatorParams:
         p = NavigatorParams()
 
-        def declare(name: str, default):
+        def get_param(name: str, default):
             self.declare_parameter(name, default)
             return self.get_parameter(name).value
 
-        p.scan_topic = declare("scan_topic", p.scan_topic)
-        p.cmd_vel_topic = declare("cmd_vel_topic", p.cmd_vel_topic)
-        p.base_frame = declare("base_frame", p.base_frame)
-        p.odom_frame = declare("odom_frame", p.odom_frame)
-        p.map_topic = declare("map_topic", p.map_topic)
-        p.map_frame = declare("map_frame", p.map_frame)
-        p.use_slam_map = bool(declare("use_slam_map", p.use_slam_map))
-        p.require_map_for_turns = bool(declare("require_map_for_turns", p.require_map_for_turns))
+        p.cmd_vel_topic = str(get_param("cmd_vel_topic", p.cmd_vel_topic))
+        p.base_frame = str(get_param("base_frame", p.base_frame))
+        p.map_frame = str(get_param("map_frame", p.map_frame))
+        p.map_topic = str(get_param("map_topic", p.map_topic))
+        p.scan_topic = str(get_param("scan_topic", p.scan_topic))
+        p.control_frequency = float(get_param("control_frequency", p.control_frequency))
 
-        p.control_frequency = float(declare("control_frequency", p.control_frequency))
+        p.expected_row_width = float(get_param("expected_row_width", p.expected_row_width))
+        p.min_lane_width = float(get_param("min_lane_width", p.min_lane_width))
+        p.max_lane_width = float(get_param("max_lane_width", p.max_lane_width))
 
-        p.expected_row_width = float(declare("expected_row_width", p.expected_row_width))
-        p.min_lane_width = float(declare("min_lane_width", p.min_lane_width))
-        p.max_lane_width = float(declare("max_lane_width", p.max_lane_width))
+        p.hist_roi_size = float(get_param("hist_roi_size", p.hist_roi_size))
+        p.hist_roi_depth = float(get_param("hist_roi_depth", p.hist_roi_size))
+        p.hist_roi_width = float(get_param("hist_roi_width", p.hist_roi_size))
+        p.hist_bin_size = float(get_param("hist_bin_size", p.hist_bin_size))
+        p.hist_peak_min_points = int(get_param("hist_peak_min_points", p.hist_peak_min_points))
+        p.occ_threshold = int(get_param("map_row_occupancy_threshold", p.occ_threshold))
 
-        p.roi_x_min = float(declare("roi_x_min", p.roi_x_min))
-        p.roi_x_max = float(declare("roi_x_max", p.roi_x_max))
-        p.roi_y_abs_min = float(declare("roi_y_abs_min", p.roi_y_abs_min))
-        p.roi_y_abs_max = float(declare("roi_y_abs_max", p.roi_y_abs_max))
+        p.row_segment_point_count = int(get_param("row_segment_point_count", p.row_segment_point_count))
+        p.row_segment_point_spacing = float(get_param("row_segment_point_spacing", p.row_segment_point_spacing))
+        p.row_rectangle_width = float(get_param("row_rectangle_width", p.row_rectangle_width))
+        p.row_point_window_length = float(get_param("row_point_window_length", p.row_point_window_length))
+        p.row_end_min_points_fields_3_to_5 = int(
+            get_param("row_end_min_points_fields_3_to_5", p.row_end_min_points_fields_3_to_5)
+        )
+        p.row_max_march_steps = int(get_param("row_max_march_steps", p.row_max_march_steps))
+        p.row_min_fit_points = int(get_param("row_min_fit_points", p.row_min_fit_points))
+        p.row_freeze_behind_distance = float(get_param("row_freeze_behind_distance", p.row_freeze_behind_distance))
 
-        p.acquire_roi_x_min = float(declare("acquire_roi_x_min", p.acquire_roi_x_min))
-        p.acquire_roi_x_max = float(declare("acquire_roi_x_max", p.acquire_roi_x_max))
-        p.acquire_roi_y_abs_min = float(declare("acquire_roi_y_abs_min", p.acquire_roi_y_abs_min))
-        p.acquire_roi_y_abs_max = float(declare("acquire_roi_y_abs_max", p.acquire_roi_y_abs_max))
+        p.laser_follow_enabled = bool(get_param("laser_follow_enabled", p.laser_follow_enabled))
+        p.laser_scan_timeout = float(get_param("laser_scan_timeout", p.laser_scan_timeout))
+        p.laser_roi_x_min = float(get_param("laser_roi_x_min", p.laser_roi_x_min))
+        p.laser_roi_x_max = float(get_param("laser_roi_x_max", p.laser_roi_x_max))
+        p.laser_roi_length = float(get_param("laser_roi_length", p.laser_roi_length))
+        p.laser_roi_width = float(get_param("laser_roi_width", p.laser_roi_width))
+        p.laser_roi_center_offset_limit = float(
+            get_param("laser_roi_center_offset_limit", p.laser_roi_center_offset_limit)
+        )
+        p.laser_ransac_iterations = int(get_param("laser_ransac_iterations", p.laser_ransac_iterations))
+        p.laser_ransac_distance = float(get_param("laser_ransac_distance", p.laser_ransac_distance))
+        p.laser_min_inliers = int(get_param("laser_min_inliers", p.laser_min_inliers))
+        p.laser_min_visible_length = float(get_param("laser_min_visible_length", p.laser_min_visible_length))
+        p.laser_max_abs_line_slope = float(get_param("laser_max_abs_line_slope", p.laser_max_abs_line_slope))
+        p.laser_max_angle_to_map = float(get_param("laser_max_angle_to_map", p.laser_max_angle_to_map))
+        p.laser_max_center_offset = float(get_param("laser_max_center_offset", p.laser_max_center_offset))
+        p.laser_min_confidence = float(get_param("laser_min_confidence", p.laser_min_confidence))
+        p.laser_full_confidence = float(get_param("laser_full_confidence", p.laser_full_confidence))
+        p.laser_max_weight_both_sides = float(
+            get_param("laser_max_weight_both_sides", p.laser_max_weight_both_sides)
+        )
+        p.laser_max_weight_one_side = float(
+            get_param("laser_max_weight_one_side", p.laser_max_weight_one_side)
+        )
+        p.laser_tracker_alpha = float(get_param("laser_tracker_alpha", p.laser_tracker_alpha))
 
-        p.ransac_iterations = int(declare("ransac_iterations", p.ransac_iterations))
-        p.ransac_distance = float(declare("ransac_distance", p.ransac_distance))
-        p.min_inliers = int(declare("min_inliers", p.min_inliers))
-        p.min_visible_length = float(declare("min_visible_length", p.min_visible_length))
-        p.max_abs_line_slope = float(declare("max_abs_line_slope", p.max_abs_line_slope))
-        p.centerline_max_abs_slope = float(declare("centerline_max_abs_slope", p.centerline_max_abs_slope))
+        p.follow_speed = float(get_param("follow_speed", p.follow_speed))
+        p.slow_speed = float(get_param("slow_speed", p.slow_speed))
+        p.lookahead_distance = float(get_param("lookahead_distance", p.lookahead_distance))
+        p.turn_lookahead_distance = float(get_param("turn_lookahead_distance", p.turn_lookahead_distance))
+        p.lookahead_curvature_gain = float(get_param("lookahead_curvature_gain", p.lookahead_curvature_gain))
+        p.lookahead_curvature_sample_count = int(
+            get_param("lookahead_curvature_sample_count", p.lookahead_curvature_sample_count)
+        )
+        p.lookahead_curvature_back_distance = float(
+            get_param("lookahead_curvature_back_distance", p.lookahead_curvature_back_distance)
+        )
+        p.lookahead_lateral_error_gain = float(
+            get_param("lookahead_lateral_error_gain", p.lookahead_lateral_error_gain)
+        )
+        p.lookahead_filter_alpha = float(get_param("lookahead_filter_alpha", p.lookahead_filter_alpha))
+        p.lookahead_speed_reduction_gain = float(
+            get_param("lookahead_speed_reduction_gain", p.lookahead_speed_reduction_gain)
+        )
+        p.pure_pursuit_gain = float(get_param("pure_pursuit_gain", p.pure_pursuit_gain))
+        p.curve_speed_reduction_gain = float(get_param("curve_speed_reduction_gain", p.curve_speed_reduction_gain))
+        p.follow_max_angular_speed = float(get_param("follow_max_angular_speed", p.follow_max_angular_speed))
+        p.min_follow_turn_radius = float(get_param("min_follow_turn_radius", p.min_follow_turn_radius))
+        p.angular_rate_limit = float(get_param("angular_rate_limit", p.angular_rate_limit))
+        p.target_filter_alpha = float(get_param("target_filter_alpha", p.target_filter_alpha))
+        p.row_exit_extension_distance = float(get_param("row_exit_extension_distance", p.row_exit_extension_distance))
+        p.row_end_goal_outward_distance = float(
+            get_param("row_end_goal_outward_distance", p.row_end_goal_outward_distance)
+        )
+        p.path_goal_xy_tolerance = float(get_param("path_goal_xy_tolerance", p.path_goal_xy_tolerance))
+        p.maneuver_goal_xy_tolerance = float(get_param("maneuver_goal_xy_tolerance", p.maneuver_goal_xy_tolerance))
+        p.maneuver_goal_yaw_tolerance = float(get_param("maneuver_goal_yaw_tolerance", p.maneuver_goal_yaw_tolerance))
+        p.maneuver_heading_lookahead_distance = float(
+            get_param("maneuver_heading_lookahead_distance", p.maneuver_heading_lookahead_distance)
+        )
+        p.maneuver_speed = float(get_param("maneuver_speed", p.maneuver_speed))
+        p.maneuver_slow_speed = float(get_param("maneuver_slow_speed", p.maneuver_slow_speed))
+        p.maneuver_lookahead_distance = float(get_param("maneuver_lookahead_distance", p.maneuver_lookahead_distance))
+        p.maneuver_turn_lookahead_distance = float(
+            get_param("maneuver_turn_lookahead_distance", p.maneuver_turn_lookahead_distance)
+        )
+        p.maneuver_lookahead_curvature_gain = float(
+            get_param("maneuver_lookahead_curvature_gain", p.maneuver_lookahead_curvature_gain)
+        )
+        p.maneuver_lookahead_lateral_error_gain = float(
+            get_param("maneuver_lookahead_lateral_error_gain", p.maneuver_lookahead_lateral_error_gain)
+        )
+        p.maneuver_lookahead_filter_alpha = float(
+            get_param("maneuver_lookahead_filter_alpha", p.maneuver_lookahead_filter_alpha)
+        )
+        p.maneuver_lookahead_speed_reduction_gain = float(
+            get_param("maneuver_lookahead_speed_reduction_gain", p.maneuver_lookahead_speed_reduction_gain)
+        )
+        p.maneuver_route_spacing = float(get_param("maneuver_route_spacing", p.maneuver_route_spacing))
+        p.maneuver_corner_radius = float(get_param("maneuver_corner_radius", p.maneuver_corner_radius))
+        p.maneuver_entry_extension_distance = float(
+            get_param("maneuver_entry_extension_distance", p.maneuver_entry_extension_distance)
+        )
+        p.maneuver_max_route_deviation = float(
+            get_param("maneuver_max_route_deviation", p.maneuver_max_route_deviation)
+        )
+        p.maneuver_entry_lateral_tolerance = float(
+            get_param("maneuver_entry_lateral_tolerance", p.maneuver_entry_lateral_tolerance)
+        )
+        p.maneuver_entry_yaw_tolerance = float(
+            get_param("maneuver_entry_yaw_tolerance", p.maneuver_entry_yaw_tolerance)
+        )
+        p.row_map_output_directory = str(get_param("row_map_output_directory", p.row_map_output_directory))
+        p.slam_reset_service = str(get_param("slam_reset_service", p.slam_reset_service))
 
-        p.tracker_alpha = float(declare("tracker_alpha", p.tracker_alpha))
-        p.confidence_decay = float(declare("confidence_decay", p.confidence_decay))
-
-        p.front_density_x_min = float(declare("front_density_x_min", p.front_density_x_min))
-        p.front_density_x_max = float(declare("front_density_x_max", p.front_density_x_max))
-        p.front_density_y_abs = float(declare("front_density_y_abs", p.front_density_y_abs))
-        p.front_density_threshold = int(declare("front_density_threshold", p.front_density_threshold))
-        p.end_probability_threshold = float(declare("end_probability_threshold", p.end_probability_threshold))
-        p.end_stable_frames_required = int(declare("end_stable_frames_required", p.end_stable_frames_required))
-
-        p.min_follow_confidence = float(declare("min_follow_confidence", p.min_follow_confidence))
-        p.min_enter_confidence = float(declare("min_enter_confidence", p.min_enter_confidence))
-        p.enter_stable_frames_required = int(declare("enter_stable_frames_required", p.enter_stable_frames_required))
-        p.acquire_timeout_sec = float(declare("acquire_timeout_sec", p.acquire_timeout_sec))
-
-        p.follow_speed = float(declare("follow_speed", p.follow_speed))
-        p.slow_speed = float(declare("slow_speed", p.slow_speed))
-        p.enter_speed = float(declare("enter_speed", p.enter_speed))
-        p.turn_speed = float(declare("turn_speed", p.turn_speed))
-        p.max_linear_speed = float(declare("max_linear_speed", p.max_linear_speed))
-        p.max_angular_speed = float(declare("max_angular_speed", p.max_angular_speed))
-        p.follow_max_angular_speed = float(declare("follow_max_angular_speed", p.follow_max_angular_speed))
-        p.turn_max_angular_speed = float(declare("turn_max_angular_speed", p.turn_max_angular_speed))
-        p.angular_rate_limit = float(declare("angular_rate_limit", p.angular_rate_limit))
-
-        p.lookahead_distance = float(declare("lookahead_distance", p.lookahead_distance))
-        p.turn_lookahead_distance = float(declare("turn_lookahead_distance", p.turn_lookahead_distance))
-        p.turn_min_angular_speed = float(declare("turn_min_angular_speed", p.turn_min_angular_speed))
-        p.path_goal_xy_tolerance = float(declare("path_goal_xy_tolerance", p.path_goal_xy_tolerance))
-        p.path_goal_yaw_tolerance = float(declare("path_goal_yaw_tolerance", p.path_goal_yaw_tolerance))
-
-        p.exit_distance = float(declare("exit_distance", p.exit_distance))
-        p.turn_forward_distance = float(declare("turn_forward_distance", p.turn_forward_distance))
-        p.min_turn_radius = float(declare("min_turn_radius", p.min_turn_radius))
-        p.enter_distance = float(declare("enter_distance", p.enter_distance))
-        p.turn_180 = bool(declare("turn_180", p.turn_180))
-
-        p.headland_maneuver_enabled = bool(declare("headland_maneuver_enabled", p.headland_maneuver_enabled))
-        p.headland_exit_straight_distance = float(declare("headland_exit_straight_distance", p.headland_exit_straight_distance))
-        p.headland_exit_straight_speed = float(declare("headland_exit_straight_speed", p.headland_exit_straight_speed))
-        p.exit_curve_speed = float(declare("exit_curve_speed", p.exit_curve_speed))
-        p.exit_curve_angular_speed = float(declare("exit_curve_angular_speed", p.exit_curve_angular_speed))
-        p.exit_curve_yaw_change = float(declare("exit_curve_yaw_change", p.exit_curve_yaw_change))
-        p.headland_shift_speed = float(declare("headland_shift_speed", p.headland_shift_speed))
-        p.headland_shift_tolerance = float(declare("headland_shift_tolerance", p.headland_shift_tolerance))
-        p.headland_shift_overshoot_tolerance = float(declare("headland_shift_overshoot_tolerance", p.headland_shift_overshoot_tolerance))
-        p.headland_yaw_tolerance = float(declare("headland_yaw_tolerance", p.headland_yaw_tolerance))
-        p.headland_use_map_row_heading = bool(declare("headland_use_map_row_heading", p.headland_use_map_row_heading))
-        p.headland_heading_kp = float(declare("headland_heading_kp", p.headland_heading_kp))
-        p.headland_heading_max_yaw_error = float(declare("headland_heading_max_yaw_error", p.headland_heading_max_yaw_error))
-        p.headland_map_heading_min_confidence = float(declare("headland_map_heading_min_confidence", p.headland_map_heading_min_confidence))
-        p.entry_curve_speed = float(declare("entry_curve_speed", p.entry_curve_speed))
-        p.entry_curve_angular_speed = float(declare("entry_curve_angular_speed", p.entry_curve_angular_speed))
-        p.headland_total_yaw_change = float(declare("headland_total_yaw_change", p.headland_total_yaw_change))
-        p.entry_curve_yaw_change = float(declare("entry_curve_yaw_change", p.entry_curve_yaw_change))
-        p.entry_yaw_accept_tolerance = float(declare("entry_yaw_accept_tolerance", p.entry_yaw_accept_tolerance))
-        p.entry_shift_accept_tolerance = float(declare("entry_shift_accept_tolerance", p.entry_shift_accept_tolerance))
-        p.entry_row_min_confidence = float(declare("entry_row_min_confidence", p.entry_row_min_confidence))
-        p.entry_row_stable_frames = int(declare("entry_row_stable_frames", p.entry_row_stable_frames))
-        p.entry_require_full_lane = bool(declare("entry_require_full_lane", p.entry_require_full_lane))
-        p.entry_center_b_tolerance = float(declare("entry_center_b_tolerance", p.entry_center_b_tolerance))
-        p.entry_lane_width_tolerance = float(declare("entry_lane_width_tolerance", p.entry_lane_width_tolerance))
-        p.entry_row_yaw_tolerance = float(declare("entry_row_yaw_tolerance", p.entry_row_yaw_tolerance))
-        p.entry_relaxed_geometry_after_yaw_shift = bool(declare("entry_relaxed_geometry_after_yaw_shift", p.entry_relaxed_geometry_after_yaw_shift))
-        p.entry_relaxed_center_b_tolerance = float(declare("entry_relaxed_center_b_tolerance", p.entry_relaxed_center_b_tolerance))
-        p.entry_relaxed_row_yaw_tolerance = float(declare("entry_relaxed_row_yaw_tolerance", p.entry_relaxed_row_yaw_tolerance))
-        p.multirow_entry_extra_shift = float(declare("multirow_entry_extra_shift", p.multirow_entry_extra_shift))
-        p.multirow_straight_trim = float(declare("multirow_straight_trim", p.multirow_straight_trim))
-        p.multirow_entry_shift_overshoot_rows = float(declare("multirow_entry_shift_overshoot_rows", p.multirow_entry_shift_overshoot_rows))
-        p.multirow_local_takeover_min_yaw_progress = float(declare("multirow_local_takeover_min_yaw_progress", p.multirow_local_takeover_min_yaw_progress))
-        p.multirow_local_takeover_min_confidence = float(declare("multirow_local_takeover_min_confidence", p.multirow_local_takeover_min_confidence))
-        p.map_counted_lane_inward_bias_tolerance = float(declare("map_counted_lane_inward_bias_tolerance", p.map_counted_lane_inward_bias_tolerance))
-        p.map_multirow_require_counted_rows = bool(declare("map_multirow_require_counted_rows", p.map_multirow_require_counted_rows))
-        p.map_counted_row_min_width_ratio = float(declare("map_counted_row_min_width_ratio", p.map_counted_row_min_width_ratio))
-        p.map_multirow_counted_target_tolerance = float(declare("map_multirow_counted_target_tolerance", p.map_multirow_counted_target_tolerance))
-        p.map_multirow_reference_row_min_ratio = float(declare("map_multirow_reference_row_min_ratio", p.map_multirow_reference_row_min_ratio))
-        p.neighbor_reference_turn_enabled = bool(declare("neighbor_reference_turn_enabled", p.neighbor_reference_turn_enabled))
-        p.neighbor_reference_entry_requires_shift = bool(declare("neighbor_reference_entry_requires_shift", p.neighbor_reference_entry_requires_shift))
-        p.neighbor_reference_requires_same_side_row = bool(declare("neighbor_reference_requires_same_side_row", p.neighbor_reference_requires_same_side_row))
-        p.neighbor_local_takeover_enabled = bool(declare("neighbor_local_takeover_enabled", p.neighbor_local_takeover_enabled))
-        p.neighbor_local_takeover_min_confidence = float(declare("neighbor_local_takeover_min_confidence", p.neighbor_local_takeover_min_confidence))
-        p.neighbor_local_takeover_target_tolerance = float(declare("neighbor_local_takeover_target_tolerance", p.neighbor_local_takeover_target_tolerance))
-        p.neighbor_local_takeover_center_tolerance = float(declare("neighbor_local_takeover_center_tolerance", p.neighbor_local_takeover_center_tolerance))
-        p.neighbor_local_takeover_row_yaw_tolerance = float(declare("neighbor_local_takeover_row_yaw_tolerance", p.neighbor_local_takeover_row_yaw_tolerance))
-        p.neighbor_local_takeover_min_yaw_progress = float(declare("neighbor_local_takeover_min_yaw_progress", p.neighbor_local_takeover_min_yaw_progress))
-
-        p.map_row_detection_enabled = bool(declare("map_row_detection_enabled", p.map_row_detection_enabled))
-        p.map_row_occupancy_threshold = int(declare("map_row_occupancy_threshold", p.map_row_occupancy_threshold))
-        p.map_row_search_x_forward = float(declare("map_row_search_x_forward", p.map_row_search_x_forward))
-        p.map_row_search_x_backward = float(declare("map_row_search_x_backward", p.map_row_search_x_backward))
-        p.map_row_search_y_side = float(declare("map_row_search_y_side", p.map_row_search_y_side))
-        p.map_row_use_pca_orientation = bool(declare("map_row_use_pca_orientation", p.map_row_use_pca_orientation))
-        p.map_row_pca_radius = float(declare("map_row_pca_radius", p.map_row_pca_radius))
-        p.map_row_pca_min_points = int(declare("map_row_pca_min_points", p.map_row_pca_min_points))
-        p.map_field_orientation_enabled = bool(declare("map_field_orientation_enabled", p.map_field_orientation_enabled))
-        p.map_field_orientation_radius = float(declare("map_field_orientation_radius", p.map_field_orientation_radius))
-        p.map_field_orientation_min_points = int(declare("map_field_orientation_min_points", p.map_field_orientation_min_points))
-        p.map_field_orientation_min_confidence = float(declare("map_field_orientation_min_confidence", p.map_field_orientation_min_confidence))
-        p.map_field_orientation_alpha = float(declare("map_field_orientation_alpha", p.map_field_orientation_alpha))
-        p.map_field_orientation_max_local_deviation = float(declare("map_field_orientation_max_local_deviation", p.map_field_orientation_max_local_deviation))
-        p.map_row_lateral_bin = float(declare("map_row_lateral_bin", p.map_row_lateral_bin))
-        p.map_row_min_band_points = int(declare("map_row_min_band_points", p.map_row_min_band_points))
-        p.map_row_min_band_length = float(declare("map_row_min_band_length", p.map_row_min_band_length))
-        p.map_row_max_extrapolated_lanes = int(declare("map_row_max_extrapolated_lanes", p.map_row_max_extrapolated_lanes))
-        p.map_row_line_ransac_iterations = int(declare("map_row_line_ransac_iterations", p.map_row_line_ransac_iterations))
-        p.map_row_line_distance = float(declare("map_row_line_distance", p.map_row_line_distance))
-        p.map_row_min_line_inliers = int(declare("map_row_min_line_inliers", p.map_row_min_line_inliers))
-        p.map_row_min_line_length = float(declare("map_row_min_line_length", p.map_row_min_line_length))
-        p.map_row_max_abs_line_slope = float(declare("map_row_max_abs_line_slope", p.map_row_max_abs_line_slope))
-        p.map_row_max_lines = int(declare("map_row_max_lines", p.map_row_max_lines))
-        p.map_row_line_merge_distance = float(declare("map_row_line_merge_distance", p.map_row_line_merge_distance))
-        p.map_lane_accept_tolerance = float(declare("map_lane_accept_tolerance", p.map_lane_accept_tolerance))
-
-        p.turn_replan_enabled = bool(declare("turn_replan_enabled", p.turn_replan_enabled))
-        p.turn_replan_period_frames = int(declare("turn_replan_period_frames", p.turn_replan_period_frames))
-        p.turn_replan_max_attempts = int(declare("turn_replan_max_attempts", p.turn_replan_max_attempts))
-        p.turn_exit_on_local_row = bool(declare("turn_exit_on_local_row", p.turn_exit_on_local_row))
-        p.turn_exit_min_confidence = float(declare("turn_exit_min_confidence", p.turn_exit_min_confidence))
-        p.turn_exit_stable_frames = int(declare("turn_exit_stable_frames", p.turn_exit_stable_frames))
-
-        p.enable_safety = bool(declare("enable_safety", p.enable_safety))
-        p.obstacle_stop_distance = float(declare("obstacle_stop_distance", p.obstacle_stop_distance))
-        p.obstacle_slow_distance = float(declare("obstacle_slow_distance", p.obstacle_slow_distance))
-
-        p.publish_debug = bool(declare("publish_debug", p.publish_debug))
-
+        p.pattern = str(get_param("pattern", p.pattern))
+        p.starting_lane_number = int(get_param("starting_lane_number", p.starting_lane_number))
+        p.row_numbers_increase_to = str(get_param("row_numbers_increase_to", p.row_numbers_increase_to))
+        p.publish_debug = bool(get_param("publish_debug", p.publish_debug))
         return p
 
-    def scan_callback(self, msg: LaserScan) -> None:
-        self.latest_scan = msg
+    def validate_params(self) -> None:
+        if self.p.row_segment_point_count < 5:
+            self.get_logger().warn("row_segment_point_count must be at least 5; using 5")
+            self.p.row_segment_point_count = 5
+        if self.p.row_segment_point_count % 2 == 0:
+            self.get_logger().warn("row_segment_point_count must be odd; adding one")
+            self.p.row_segment_point_count += 1
+        self.p.row_segment_point_spacing = max(0.05, self.p.row_segment_point_spacing)
+        self.p.hist_roi_depth = max(self.p.hist_bin_size, self.p.hist_roi_depth)
+        self.p.hist_roi_width = max(self.p.hist_bin_size, self.p.hist_roi_width)
+        self.p.row_rectangle_width = max(0.05, self.p.row_rectangle_width)
+        self.p.row_point_window_length = max(0.05, self.p.row_point_window_length)
+        self.p.row_max_march_steps = max(1, self.p.row_max_march_steps)
+        self.p.row_freeze_behind_distance = max(0.0, self.p.row_freeze_behind_distance)
+        self.p.laser_scan_timeout = max(0.05, self.p.laser_scan_timeout)
+        self.p.laser_roi_length = max(0.05, self.p.laser_roi_length)
+        self.p.laser_roi_x_max = self.p.laser_roi_x_min + self.p.laser_roi_length
+        self.p.laser_roi_width = max(0.05, self.p.laser_roi_width)
+        self.p.laser_roi_center_offset_limit = max(0.0, self.p.laser_roi_center_offset_limit)
+        self.p.laser_ransac_iterations = max(1, self.p.laser_ransac_iterations)
+        self.p.laser_ransac_distance = max(0.01, self.p.laser_ransac_distance)
+        self.p.laser_min_inliers = max(2, self.p.laser_min_inliers)
+        self.p.laser_min_visible_length = max(0.05, self.p.laser_min_visible_length)
+        self.p.laser_max_abs_line_slope = max(0.05, self.p.laser_max_abs_line_slope)
+        self.p.laser_max_angle_to_map = max(0.05, self.p.laser_max_angle_to_map)
+        self.p.laser_max_center_offset = max(0.05, self.p.laser_max_center_offset)
+        self.p.laser_min_confidence = float(np.clip(self.p.laser_min_confidence, 0.0, 0.99))
+        self.p.laser_full_confidence = float(np.clip(self.p.laser_full_confidence, self.p.laser_min_confidence + 0.01, 1.0))
+        self.p.laser_max_weight_both_sides = float(np.clip(self.p.laser_max_weight_both_sides, 0.0, 1.0))
+        self.p.laser_max_weight_one_side = float(np.clip(self.p.laser_max_weight_one_side, 0.0, 1.0))
+        self.p.laser_tracker_alpha = float(np.clip(self.p.laser_tracker_alpha, 0.01, 1.0))
+        self.p.min_follow_turn_radius = max(0.1, self.p.min_follow_turn_radius)
+        self.p.angular_rate_limit = max(0.01, self.p.angular_rate_limit)
+        self.p.target_filter_alpha = float(np.clip(self.p.target_filter_alpha, 0.01, 1.0))
+        self.p.row_exit_extension_distance = max(0.0, self.p.row_exit_extension_distance)
+        self.p.row_end_goal_outward_distance = max(0.0, self.p.row_end_goal_outward_distance)
+        self.p.pure_pursuit_gain = max(0.05, self.p.pure_pursuit_gain)
+        self.p.lookahead_distance = max(0.05, self.p.lookahead_distance)
+        self.p.turn_lookahead_distance = float(
+            np.clip(self.p.turn_lookahead_distance, 0.05, self.p.lookahead_distance)
+        )
+        self.p.lookahead_curvature_gain = max(0.0, self.p.lookahead_curvature_gain)
+        self.p.lookahead_curvature_sample_count = max(3, self.p.lookahead_curvature_sample_count)
+        self.p.lookahead_curvature_back_distance = max(0.0, self.p.lookahead_curvature_back_distance)
+        self.p.lookahead_lateral_error_gain = max(0.0, self.p.lookahead_lateral_error_gain)
+        self.p.lookahead_filter_alpha = float(np.clip(self.p.lookahead_filter_alpha, 0.01, 1.0))
+        self.p.lookahead_speed_reduction_gain = max(0.0, self.p.lookahead_speed_reduction_gain)
+        self.p.slow_speed = float(np.clip(self.p.slow_speed, 0.0, self.p.follow_speed))
+        self.p.curve_speed_reduction_gain = max(0.0, self.p.curve_speed_reduction_gain)
+        self.p.maneuver_goal_xy_tolerance = max(0.05, self.p.maneuver_goal_xy_tolerance)
+        self.p.maneuver_goal_yaw_tolerance = max(0.05, self.p.maneuver_goal_yaw_tolerance)
+        self.p.maneuver_heading_lookahead_distance = max(0.05, self.p.maneuver_heading_lookahead_distance)
+        self.p.maneuver_speed = max(0.01, self.p.maneuver_speed)
+        self.p.maneuver_slow_speed = float(np.clip(self.p.maneuver_slow_speed, 0.01, self.p.maneuver_speed))
+        self.p.maneuver_lookahead_distance = max(0.05, self.p.maneuver_lookahead_distance)
+        self.p.maneuver_turn_lookahead_distance = float(
+            np.clip(self.p.maneuver_turn_lookahead_distance, 0.05, self.p.maneuver_lookahead_distance)
+        )
+        self.p.maneuver_lookahead_curvature_gain = max(0.0, self.p.maneuver_lookahead_curvature_gain)
+        self.p.maneuver_lookahead_lateral_error_gain = max(0.0, self.p.maneuver_lookahead_lateral_error_gain)
+        self.p.maneuver_lookahead_filter_alpha = float(
+            np.clip(self.p.maneuver_lookahead_filter_alpha, 0.01, 1.0)
+        )
+        self.p.maneuver_lookahead_speed_reduction_gain = max(
+            0.0,
+            self.p.maneuver_lookahead_speed_reduction_gain,
+        )
+        self.p.maneuver_route_spacing = max(0.02, self.p.maneuver_route_spacing)
+        self.p.maneuver_corner_radius = max(0.0, self.p.maneuver_corner_radius)
+        self.p.maneuver_entry_extension_distance = max(0.10, self.p.maneuver_entry_extension_distance)
+        self.p.maneuver_max_route_deviation = max(0.10, self.p.maneuver_max_route_deviation)
+        self.p.maneuver_entry_lateral_tolerance = max(0.05, self.p.maneuver_entry_lateral_tolerance)
+        self.p.maneuver_entry_yaw_tolerance = max(0.05, self.p.maneuver_entry_yaw_tolerance)
+        self.p.starting_lane_number = max(1, self.p.starting_lane_number)
+        self.p.row_numbers_increase_to = self.p.row_numbers_increase_to.lower()
+        if self.p.row_numbers_increase_to not in ("left", "right"):
+            self.get_logger().warn("row_numbers_increase_to must be 'left' or 'right'; using 'left'")
+            self.p.row_numbers_increase_to = "left"
 
     def map_callback(self, msg: OccupancyGrid) -> None:
         self.latest_map = msg
 
-    def fill_navigation_status(self, response):
-        pattern_loaded = self.mission.has_loaded_pattern()
-        can_set_pattern = self.mission.state == MissionState.IDLE
-        can_start = self.mission.state == MissionState.IDLE and pattern_loaded
-        can_abort = self.mission.state not in (MissionState.IDLE, MissionState.FINISHED)
+    def scan_callback(self, msg: LaserScan) -> None:
+        self.latest_scan = msg
+        self.latest_scan_received_ns = self.get_clock().now().nanoseconds
 
-        response.mission_state = self.mission.state.name
-        response.pattern_loaded = pattern_loaded
-        response.active_pattern = self.mission.loaded_pattern
-        response.active_step_index = self.mission.pattern_index + 1 if pattern_loaded else 0
-        response.total_steps = len(self.mission.pattern_steps)
-        response.active_step = self.mission.active_pattern_step_text()
-        response.can_set_pattern = can_set_pattern
-        response.can_start = can_start
-        response.can_pause = self.mission.state not in (
-            MissionState.IDLE,
-            MissionState.FINISHED,
-            MissionState.PAUSED,
+    def start_cb(self, req, res):
+        pattern = req.pattern.strip()
+        invalid_tokens = [token for token in pattern.split() if re.fullmatch(r"([1-9][0-9]*)([LlRr])", token) is None]
+        if not pattern or invalid_tokens:
+            res.success = False
+            res.message = "Invalid pattern. Use space-separated steps such as '1L 2R'."
+            return res
+        carefulness = getattr(req, "carefulness", "").strip().lower() or "high"
+        if carefulness not in self.driving_profiles:
+            res.success = False
+            res.message = "Invalid carefulness. Use one of: low, medium, high."
+            return res
+
+        self.p.pattern = pattern
+        self.apply_driving_profile(carefulness)
+        self.pattern_steps = self.parse_pattern(pattern)
+        self.reset_navigation_state(clear_sensor_cache=False)
+        self.state = MissionState.INITIALIZING
+        res.success = True
+        res.message = f"Navigation started with pattern: {pattern}; carefulness: {carefulness}"
+        return res
+
+    def build_driving_profiles(self) -> Dict[str, DrivingProfile]:
+        high = DrivingProfile(
+            laser_max_weight_both_sides=self.p.laser_max_weight_both_sides,
+            laser_max_weight_one_side=self.p.laser_max_weight_one_side,
+            follow_speed=self.p.follow_speed,
+            slow_speed=self.p.slow_speed,
+            pure_pursuit_gain=self.p.pure_pursuit_gain,
+            curve_speed_reduction_gain=self.p.curve_speed_reduction_gain,
+            follow_max_angular_speed=self.p.follow_max_angular_speed,
+            min_follow_turn_radius=self.p.min_follow_turn_radius,
+            angular_rate_limit=self.p.angular_rate_limit,
+            target_filter_alpha=self.p.target_filter_alpha,
+            lookahead_distance=self.p.lookahead_distance,
+            turn_lookahead_distance=self.p.turn_lookahead_distance,
+            lookahead_curvature_gain=self.p.lookahead_curvature_gain,
+            lookahead_lateral_error_gain=self.p.lookahead_lateral_error_gain,
+            lookahead_filter_alpha=self.p.lookahead_filter_alpha,
+            lookahead_speed_reduction_gain=self.p.lookahead_speed_reduction_gain,
+            maneuver_speed=self.p.maneuver_speed,
+            maneuver_slow_speed=self.p.maneuver_slow_speed,
+            maneuver_lookahead_distance=self.p.maneuver_lookahead_distance,
+            maneuver_turn_lookahead_distance=self.p.maneuver_turn_lookahead_distance,
+            maneuver_lookahead_curvature_gain=self.p.maneuver_lookahead_curvature_gain,
+            maneuver_lookahead_lateral_error_gain=self.p.maneuver_lookahead_lateral_error_gain,
+            maneuver_lookahead_filter_alpha=self.p.maneuver_lookahead_filter_alpha,
+            maneuver_lookahead_speed_reduction_gain=self.p.maneuver_lookahead_speed_reduction_gain,
+            maneuver_corner_radius=self.p.maneuver_corner_radius,
         )
-        response.can_resume = self.mission.state == MissionState.PAUSED
-        response.can_abort = can_abort
-        return response
+        return {
+            "high": high,
+            "medium": DrivingProfile(
+                laser_max_weight_both_sides=0.55,
+                laser_max_weight_one_side=0.275,
+                follow_speed=high.follow_speed * 1.30,
+                slow_speed=high.slow_speed * 1.25,
+                pure_pursuit_gain=high.pure_pursuit_gain * 0.9,
+                curve_speed_reduction_gain=high.curve_speed_reduction_gain * 0.60,
+                follow_max_angular_speed=high.follow_max_angular_speed * 1.10,
+                min_follow_turn_radius=high.min_follow_turn_radius,
+                angular_rate_limit=high.angular_rate_limit * 1.15,
+                target_filter_alpha=min(1.0, high.target_filter_alpha * 1.15),
+                lookahead_distance=high.lookahead_distance * 1.10,
+                turn_lookahead_distance=high.turn_lookahead_distance * 1.40,
+                lookahead_curvature_gain=high.lookahead_curvature_gain * 0.9,
+                lookahead_lateral_error_gain=high.lookahead_lateral_error_gain * 0.9,
+                lookahead_filter_alpha=min(1.0, high.lookahead_filter_alpha * 1.15),
+                lookahead_speed_reduction_gain=high.lookahead_speed_reduction_gain * 0.9,
+                maneuver_speed=high.maneuver_speed * 1.20,
+                maneuver_slow_speed=high.maneuver_slow_speed * 1.20,
+                maneuver_lookahead_distance=high.maneuver_lookahead_distance * 1.20,
+                maneuver_turn_lookahead_distance=high.maneuver_turn_lookahead_distance * 1.10,
+                maneuver_lookahead_curvature_gain=high.maneuver_lookahead_curvature_gain,
+                maneuver_lookahead_lateral_error_gain=high.maneuver_lookahead_lateral_error_gain * 0.9,
+                maneuver_lookahead_filter_alpha=min(1.0, high.maneuver_lookahead_filter_alpha * 1.10),
+                maneuver_lookahead_speed_reduction_gain=high.maneuver_lookahead_speed_reduction_gain,
+                maneuver_corner_radius=high.maneuver_corner_radius * 1.25,
+            ),
+            "low": DrivingProfile(
+                laser_max_weight_both_sides=0.80,
+                laser_max_weight_one_side=0.40,
+                follow_speed=high.follow_speed * 1.60,
+                slow_speed=high.slow_speed * 1.50,
+                pure_pursuit_gain=high.pure_pursuit_gain * 0.8,
+                curve_speed_reduction_gain=high.curve_speed_reduction_gain * 0.35,
+                follow_max_angular_speed=high.follow_max_angular_speed * 1.20,
+                min_follow_turn_radius=high.min_follow_turn_radius,
+                angular_rate_limit=high.angular_rate_limit * 1.30,
+                target_filter_alpha=min(1.0, high.target_filter_alpha * 1.30),
+                lookahead_distance=high.lookahead_distance * 1.20,
+                turn_lookahead_distance=high.turn_lookahead_distance * 2.00,
+                lookahead_curvature_gain=high.lookahead_curvature_gain * 0.8,
+                lookahead_lateral_error_gain=high.lookahead_lateral_error_gain * 0.8,
+                lookahead_filter_alpha=min(1.0, high.lookahead_filter_alpha * 1.30),
+                lookahead_speed_reduction_gain=high.lookahead_speed_reduction_gain * 0.8,
+                maneuver_speed=high.maneuver_speed * 1.40,
+                maneuver_slow_speed=high.maneuver_slow_speed * 1.5,
+                maneuver_lookahead_distance=high.maneuver_lookahead_distance * 1.38,
+                maneuver_turn_lookahead_distance=high.maneuver_turn_lookahead_distance * 1.20,
+                maneuver_lookahead_curvature_gain=high.maneuver_lookahead_curvature_gain,
+                maneuver_lookahead_lateral_error_gain=high.maneuver_lookahead_lateral_error_gain * 0.8,
+                maneuver_lookahead_filter_alpha=min(1.0, high.maneuver_lookahead_filter_alpha * 1.20),
+                maneuver_lookahead_speed_reduction_gain=high.maneuver_lookahead_speed_reduction_gain,
+                maneuver_corner_radius=high.maneuver_corner_radius * 1.50,
+            ),
+        }
 
-    def set_navigation_pattern_cb(self, request, response):
+    def apply_driving_profile(self, carefulness: str) -> None:
+        profile = self.driving_profiles[carefulness]
+        for name, value in profile.__dict__.items():
+            setattr(self.p, name, value)
+        self.current_carefulness = carefulness
+
+    def stop_cb(self, req, res):
+        self.store_current_rows()
+        export_path = self.export_row_map()
+        self.state = MissionState.IDLE
+        self.paused_state = None
+        self.reset_entrance_state()
+        self.reset_controller_state()
+        self.cmd_pub.publish(Twist())
+        res.success = True
+        res.message = "Navigation stopped"
+        if export_path is not None:
+            res.message += f"; row map saved to {export_path}"
+        return res
+
+    def pause_cb(self, req, res):
+        if self.state == MissionState.PAUSED:
+            res.success = True
+            res.message = "Navigation already paused"
+            return res
+        if self.state in (MissionState.IDLE, MissionState.FINISHED):
+            res.success = False
+            res.message = f"Cannot pause navigation while state is {self.state.name}"
+            return res
+        self.paused_state = self.state
+        self.state = MissionState.PAUSED
+        self.reset_controller_state()
+        self.cmd_pub.publish(Twist())
+        res.success = True
+        res.message = f"Navigation paused from state {self.paused_state.name}"
+        return res
+
+    def resume_cb(self, req, res):
+        if self.state != MissionState.PAUSED or self.paused_state is None:
+            res.success = False
+            res.message = "Navigation is not paused"
+            return res
+        resume_state = self.paused_state
+        self.paused_state = None
+        self.state = resume_state
+        self.reset_controller_state()
+        res.success = True
+        res.message = f"Navigation resumed in state {self.state.name}"
+        return res
+
+    def reset_cb(self, req, res):
+        self.state = MissionState.IDLE
+        self.paused_state = None
+        self.reset_navigation_state(clear_sensor_cache=True)
+        self.cmd_pub.publish(Twist())
+        slam_requested, slam_message = self.request_slam_reset()
+        res.success = True
+        res.message = f"Navigation reset; {slam_message}"
+        if not slam_requested:
+            self.get_logger().warn(slam_message)
+        return res
+
+    def request_slam_reset(self) -> Tuple[bool, str]:
+        if SlamToolboxReset is None or self.slam_reset_client is None:
+            return False, "slam_toolbox reset service type is not available"
+        if not self.slam_reset_client.wait_for_service(timeout_sec=0.2):
+            return False, f"SLAM reset service unavailable: {self.p.slam_reset_service}"
+        request = SlamToolboxReset.Request()
+        request.pause_new_measurements = False
+        future = self.slam_reset_client.call_async(request)
+        future.add_done_callback(self.handle_slam_reset_response)
+        return True, f"SLAM reset requested via {self.p.slam_reset_service}"
+
+    def handle_slam_reset_response(self, future) -> None:
         try:
-            response.accepted_pattern = self.mission.set_pattern(request.pattern)
-            response.success = True
-            response.message = "Pattern erfolgreich geladen."
-        except ValueError as exc:
-            response.success = False
-            response.message = str(exc)
-            response.accepted_pattern = self.mission.loaded_pattern
-
-        response.mission_state = self.mission.state.name
-        response.can_start = (
-            self.mission.state == MissionState.IDLE
-            and self.mission.has_loaded_pattern()
-        )
-        response.can_resume = self.mission.state == MissionState.PAUSED
-        return response
-
-    def get_navigation_status_cb(self, request, response):
-        response.success = True
-        if self.mission.state == MissionState.IDLE:
-            response.message = (
-                "Bereit. Pattern geladen."
-                if self.mission.has_loaded_pattern()
-                else "Bereit. Kein Pattern geladen."
-            )
-        elif self.mission.state == MissionState.FINISHED:
-            response.message = "Mission beendet."
-        elif self.mission.state == MissionState.PAUSED:
-            response.message = "Mission pausiert."
-        else:
-            response.message = "Mission aktiv."
-        return self.fill_navigation_status(response)
-
-    def start_cb(self, request, response):
-        try:
-            self.mission.start()
-            response.success = True
-            response.message = (
-                f"Navigation gestartet mit Pattern: {self.mission.loaded_pattern}"
-            )
-        except ValueError as exc:
-            response.success = False
-            response.message = str(exc)
-        return response
-
-    def stop_cb(self, request, response):
-        self.mission.stop()
-        self.publish_stop()
-        response.success = True
-        response.message = "Navigation abgebrochen. Geladenes Pattern wurde verworfen."
-        return response
-
-    def pause_cb(self, request, response):
-        try:
-            self.mission.pause()
-            self.publish_stop()
-            response.success = True
-            response.message = "Navigation pausiert."
-        except ValueError as exc:
-            response.success = False
-            response.message = str(exc)
-        return response
-
-    def resume_cb(self, request, response):
-        try:
-            self.mission.resume()
-            response.success = True
-            response.message = "Navigation fortgesetzt."
-        except ValueError as exc:
-            response.success = False
-            response.message = str(exc)
-        return response
-
-    def control_loop(self) -> None:
-        pose_odom = self.lookup_pose(self.p.odom_frame)
-        pose_map = self.lookup_pose(self.p.map_frame) if self.p.use_slam_map else None
-
-        if self.latest_scan is None:
-            stop_cmd = Twist()
-            self.publish_navigation_diagnostics(
-                row=self.latest_row,
-                path=LocalPath([], False, "base_link", "no LaserScan received"),
-                cmd=stop_cmd,
-                safe_cmd=stop_cmd,
-                pose_odom=pose_odom,
-                pose_map=pose_map,
-                active_pose=None,
-            )
-            self.publish_stop()
+            response = future.result()
+        except Exception as exc:
+            self.get_logger().error(f"SLAM reset failed: {exc}")
             return
+        result = getattr(response, "result", None)
+        self.get_logger().info(f"SLAM reset response result={result}")
 
-        self.perception.set_mode(self.mission.state)
+    def reset_navigation_state(self, clear_sensor_cache: bool) -> None:
+        self.left_row = None
+        self.right_row = None
+        self.midline = np.empty((0, 2), dtype=float)
+        self.plant_row_end_point = None
+        self.row_exit_goal = None
+        self.row_exit_heading_goal = None
+        self.row_end_direction = None
+        self.initial_forward_direction = None
+        self.row_number_increase_direction = None
+        self.pattern_index = 0
+        self.finish_after_current_row = len(self.pattern_steps) == 0
+        self.stored_rows = {}
+        self.row_end_directions_by_side = {"forward": [], "backward": []}
+        self.row_map_exported = False
+        self.reset_entrance_state()
+        self.reset_controller_state()
+        self.laser_follower.reset()
+        self.laser_follow_result = LaserFollowResult(reason="navigation reset")
+        self.fused_target_point = None
+        if clear_sensor_cache:
+            self.latest_map = None
+            self.latest_scan = None
+            self.latest_scan_received_ns = None
+            self.robot_pose = None
 
-        det = self.perception.process_scan(self.latest_scan)
-        row = self.tracker.update(det)
+    def reset_controller_state(self) -> None:
+        self.last_cmd_angular_z = 0.0
+        self.last_target_point = None
+        self.fused_target_point = None
+        self.current_lookahead_distance = self.p.lookahead_distance
+        self.current_lookahead_curvature = 0.0
+        self.current_maneuver_lookahead_distance = self.p.maneuver_lookahead_distance
+        self.current_maneuver_lookahead_curvature = 0.0
 
-        self.latest_row = row
+    def reset_entrance_state(self) -> None:
+        self.entrance_hist_center = None
+        self.entrance_hist_direction = None
+        self.entrance_hist_peaks = []
+        self.entrance_target = None
+        self.entrance_target_direction = None
+        self.entrance_waypoints = []
+        self.entrance_heading_goal = None
+        self.entrance_follow_path = np.empty((0, 2), dtype=float)
+        self.entrance_route_support = np.empty((0, 2), dtype=float)
+        self.entrance_route = np.empty((0, 2), dtype=float)
+        self.entrance_route_progress_index = 0
+        self.entrance_route_projection = None
+        self.entrance_route_target = None
+        self.entrance_route_remaining_distance = 0.0
+        self.entrance_route_provisional = False
+        self.entrance_active_step = None
+        self.entrance_traverse_outward = None
+        self.pending_target_peaks = None
 
-        path = self.mission.update(
-            row,
-            pose_odom,
-            pose_map,
-            self.planner,
-            self.controller,
-            self.map_row_detector,
-            self.latest_map,
-        )
-        self.latest_path = path
+    def parse_pattern(self, pattern: str) -> List[PatternStep]:
+        steps: List[PatternStep] = []
+        for token in pattern.split():
+            match = re.fullmatch(r"([1-9][0-9]*)([LlRr])", token)
+            if match is None:
+                self.get_logger().warn(f"Ignoring invalid pattern token: {token!r}")
+                continue
+            steps.append(PatternStep(int(match.group(1)), match.group(2).upper()))
+        return steps
 
-        active_pose = pose_map if path.frame_id == self.p.map_frame else pose_odom
-        cmd = self.controller.compute_cmd(path, active_pose)
-        safe_cmd = self.safety.filter_cmd(
-            cmd,
-            self.latest_scan,
-            row,
-            self.mission.state,
-        )
-
-        if self.mission.state in (
-            MissionState.IDLE,
-            MissionState.FINISHED,
-            MissionState.PAUSED,
-        ):
-            safe_cmd = Twist()
-
-        self.publish_navigation_diagnostics(
-            row=row,
-            path=path,
-            cmd=cmd,
-            safe_cmd=safe_cmd,
-            pose_odom=pose_odom,
-            pose_map=pose_map,
-            active_pose=active_pose,
-        )
-
-        self.cmd_pub.publish(safe_cmd)
-
-        if self.p.publish_debug:
-            self.publish_debug(det, row, path)
-
-    def lookup_pose(self, target_frame: str) -> Optional[Pose2D]:
+    def get_robot_pose(self) -> Optional[Pose2D]:
         try:
-            tf = self.tf_buffer.lookup_transform(
-                target_frame,
-                self.p.base_frame,
-                rclpy.time.Time(),
-                timeout=Duration(seconds=0.02),
-            )
+            t = self.tf_buffer.lookup_transform(self.p.map_frame, self.p.base_frame, rclpy.time.Time())
+            q = t.transform.rotation
+            _, _, yaw = euler_from_quaternion([q.x, q.y, q.z, q.w])
+            return Pose2D(float(t.transform.translation.x), float(t.transform.translation.y), float(yaw))
         except Exception:
             return None
 
-        q = tf.transform.rotation
-        yaw = yaw_from_quaternion(q)
-
-        t = tf.transform.translation
-
-        return Pose2D(float(t.x), float(t.y), float(yaw))
-
-    def publish_stop(self) -> None:
-        self.cmd_pub.publish(Twist())
-
-    def publish_navigation_diagnostics(
-        self,
-        row: RowModel,
-        path: LocalPath,
-        cmd: Twist,
-        safe_cmd: Twist,
-        pose_odom: Optional[Pose2D],
-        pose_map: Optional[Pose2D],
-        active_pose: Optional[Pose2D],
-    ) -> None:
-        state = self.mission.state
-
-        pose_odom_text = "ok" if pose_odom is not None else "None"
-        pose_map_text = "ok" if pose_map is not None else "None"
-        active_pose_text = "ok" if active_pose is not None else "None"
-
-        path_points = len(path.points) if path.points is not None else 0
-
-        raw_cmd_zero = (
-            abs(cmd.linear.x) < 1e-4
-            and abs(cmd.angular.z) < 1e-4
-        )
-
-        final_cmd_zero = (
-            abs(safe_cmd.linear.x) < 1e-4
-            and abs(safe_cmd.angular.z) < 1e-4
-        )
-
-        command_changed = (
-            abs(cmd.linear.x - safe_cmd.linear.x) > 1e-4
-            or abs(cmd.angular.z - safe_cmd.angular.z) > 1e-4
-        )
-
-        reasons: List[str] = []
-
-        if self.latest_scan is None:
-            reasons.append("no LaserScan received")
-
-        if self.p.use_slam_map and self.p.require_map_for_turns:
-            if state in (
-                MissionState.EXIT_ROW,
-                MissionState.PLAN_TURN,
-                MissionState.EXECUTE_TURN,
-            ) and pose_map is None:
-                reasons.append("map pose missing while map turn is required")
-
-        if path.frame_id == self.p.map_frame and pose_map is None:
-            reasons.append("path is in map frame but pose_map is missing")
-
-        if path.frame_id == self.p.odom_frame and pose_odom is None:
-            reasons.append("path is in odom frame but pose_odom is missing")
-
-        if not path.valid:
-            if path.reason:
-                reasons.append(f"path invalid: {path.reason}")
-            else:
-                reasons.append("path invalid")
-
-        if path.valid and path_points == 0:
-            reasons.append("path valid but contains zero points")
-
-        if active_pose is None and path.valid and path.frame_id not in ("base_link", ""):
-            reasons.append(f"active pose missing for path frame '{path.frame_id}'")
-
-        if not row.valid and state in (
-            MissionState.FOLLOW_ROW,
-            MissionState.ACQUIRE_ROW,
-            MissionState.ENTER_ROW,
-        ):
-            reasons.append("row model invalid")
-
-        if row.confidence < self.p.min_follow_confidence and state == MissionState.FOLLOW_ROW:
-            reasons.append(
-                f"low row confidence: {row.confidence:.3f} < {self.p.min_follow_confidence:.3f}"
-            )
-
-        if state == MissionState.PLAN_TURN:
-            if pose_map is not None:
-                reasons.append("planning map turn")
-            else:
-                reasons.append("cannot plan map turn without map pose")
-
-        if state == MissionState.EXECUTE_TURN and self.mission.active_turn_path is None:
-            reasons.append("EXECUTE_TURN but active_turn_path is None")
-
-        if raw_cmd_zero and state not in (MissionState.IDLE, MissionState.FINISHED, MissionState.PAUSED):
-            reasons.append("controller output is zero")
-
-        if command_changed:
-            if self.p.enable_safety:
-                reasons.append("safety modified command")
-            else:
-                reasons.append("command changed although safety is disabled")
-
-        if final_cmd_zero and not raw_cmd_zero and state not in (
-            MissionState.IDLE,
-            MissionState.FINISHED,
-            MissionState.PAUSED,
-        ):
-            reasons.append("final command is zero although controller command was nonzero")
-
-        if self.p.map_row_detection_enabled:
-            if state in (MissionState.PLAN_TURN, MissionState.EXECUTE_TURN):
-                reasons.append(
-                    f"map_lanes={len(self.mission.map_lanes)}, "
-                    f"map_bands={len(self.mission.map_row_bands)}, "
-                    f"map_reason={self.mission.last_map_row_reason}"
-                )
-
-        if state == MissionState.EXECUTE_TURN:
-            if self.mission.active_turn_uses_map_lane:
-                reasons.append("turn_source=SLAM_map_lane")
-            else:
-                reasons.append("turn_source=geometric_map_fallback")
-
-        if state in (MissionState.PLAN_TURN, MissionState.EXECUTE_TURN):
-            reasons.append(
-                f"target_offset_expected={self.mission.expected_target_offset:.3f}, "
-                f"detected={self.mission.detected_target_offset:.3f}, "
-                f"error={self.mission.target_offset_error:.3f}, "
-                f"reason={self.mission.last_target_lane_reason}"
-            )
-
-        target_lane = self.mission.target_map_lane
-        if target_lane is not None:
-            target_lane_text = (
-                f"valid={target_lane.valid},"
-                f"v={target_lane.center_v:.3f},"
-                f"width={target_lane.width:.3f},"
-                f"conf={target_lane.confidence:.3f},"
-                f"source={target_lane.source}"
-            )
-        else:
-            target_lane_text = "None"
-
-        if len(reasons) == 0:
-            reasons.append("ok")
-
-        diag_text = (
-            f"STATE={state.name}"
-            f" | reasons={'; '.join(reasons)}"
-            f" | pose_map={pose_map_text}"
-            f" | pose_odom={pose_odom_text}"
-            f" | active_pose={active_pose_text}"
-            f" | path_valid={path.valid}"
-            f" | path_frame={path.frame_id}"
-            f" | path_points={path_points}"
-            f" | path_reason='{path.reason}'"
-            f" | row_valid={row.valid}"
-            f" | row_missing_frames={row.missing_frames}"
-            f" | row_conf={row.confidence:.3f}"
-            f" | row_end_prob={row.end_probability:.3f}"
-            f" | raw_cmd=({cmd.linear.x:.3f}, {cmd.angular.z:.3f})"
-            f" | final_cmd=({safe_cmd.linear.x:.3f}, {safe_cmd.angular.z:.3f})"
-            f" | safety_enabled={self.p.enable_safety}"
-            f" | map_rows_enabled={self.p.map_row_detection_enabled}"
-            f" | map_lanes={len(self.mission.map_lanes)}"
-            f" | map_bands={len(self.mission.map_row_bands)}"
-            f" | target_map_lane={target_lane_text}"
-            f" | active_turn_uses_map_lane={self.mission.active_turn_uses_map_lane}"
-            f" | pattern_index={self.mission.pattern_index}"
-            f" | pattern_completed={self.mission.pattern_completed}"
-            f" | headland_enabled={self.p.headland_maneuver_enabled}"
-            f" | headland_required_shift={self.mission.headland_required_shift:.3f}"
-            f" | headland_measured_shift={self.mission.headland_measured_shift:.3f}"
-            f" | headland_exit_forward={self.mission.headland_exit_forward_distance:.3f}"
-            f" | headland_shift_forward={self.mission.headland_shift_forward_distance:.3f}"
-            f" | headland_shift_forward_target={self.mission._multirow_deterministic_straight_target():.3f}"
-            f" | headland_pre_entry_target={self.mission._headland_pre_entry_shift_target():.3f}"
-            f" | headland_total_yaw_progress={self.mission._headland_total_yaw_progress(pose_map):.3f}"
-            f" | map_row_yaw={self.map_row_detector.last_row_yaw_map if self.map_row_detector.last_row_yaw_map is not None else 'None'}"
-            f" | map_row_yaw_conf={self.map_row_detector.last_row_yaw_confidence:.3f}"
-            f" | field_row_yaw={self.map_row_detector.last_field_row_yaw_map if self.map_row_detector.last_field_row_yaw_map is not None else 'None'}"
-            f" | field_row_yaw_conf={self.map_row_detector.last_field_row_yaw_confidence:.3f}"
-            f" | headland_reference_row_yaw={self.mission.headland_reference_row_yaw_map if self.mission.headland_reference_row_yaw_map is not None else 'None'}"
-            f" | entry_row_stable_frames={self.mission.entry_row_stable_frames}"
-            f" | expected_target_offset={self.mission.expected_target_offset:.3f}"
-            f" | detected_target_offset={self.mission.detected_target_offset:.3f}"
-            f" | target_offset_error={self.mission.target_offset_error:.3f}"
-            f" | multirow_counted_target_latched={self.mission.multirow_counted_target_latched}"
-            f" | multirow_latched_target_offset={self.mission.multirow_latched_target_offset:.3f}"
-            f" | multirow_corrected_shift={self.mission._multirow_corrected_headland_shift():.3f}"
-            f" | multirow_shift_sign_correction={self.mission.multirow_shift_sign_correction:.1f}"
-            f" | multirow_latched_preentry_v={self.mission.multirow_latched_preentry_global_v if self.mission.multirow_latched_preentry_global_v is not None else 'None'}"
-            f" | target_lane_reason='{self.mission.last_target_lane_reason}'"
-            f" | reference_row_v={self.mission.reference_row_v:.3f}"
-            f" | target_row_v={self.mission.target_row_v:.3f}"
-            f" | candidate_rows_side='{self.mission.candidate_rows_text}'"
-            f" | turn_local_row_stable_frames={self.mission.turn_local_row_stable_frames}"
-            f" | turn_replan_attempts={self.mission.turn_replan_attempts}"
-            f" | turn_replan_enabled={self.p.turn_replan_enabled}"
-            f" | turn_exit_on_local_row={self.p.turn_exit_on_local_row}"
-            f" | entry_shift_ok={self.mission.entry_shift_ok}"
-            f" | entry_reference_side_ok={self.mission.entry_reference_side_ok}"
-            f" | entry_geometry_ok={self.mission._entry_row_geometry_ok(row)}"
-            f" | neighbor_local_takeover_ok={self.mission._neighbor_local_takeover_ok(row, pose_map)}"
-            f" | neighbor_reference_enabled={self.p.neighbor_reference_turn_enabled}"
-        )
-
-        msg = String()
-        msg.data = diag_text
-        self.diag_pub.publish(msg)
-
-        self.log_diagnostic_throttled(diag_text)
-
-    def log_diagnostic_throttled(self, text: str) -> None:
-        now = self.get_clock().now()
-        dt = (now - self.last_diag_log_time).nanoseconds * 1e-9
-
-        should_log = text != self.last_diag_text or dt > 2.0
-
-        if not should_log:
+    def control_loop(self) -> None:
+        self.robot_pose = self.get_robot_pose()
+        if self.robot_pose is None or self.latest_map is None:
             return
 
-        self.last_diag_text = text
-        self.last_diag_log_time = now
+        if self.state == MissionState.INITIALIZING:
+            self.handle_initializing()
+        elif self.state == MissionState.FOLLOW_ROW:
+            self.handle_follow_row()
+        elif self.state == MissionState.FIND_NEXT_ROW_ENTRANCE:
+            self.handle_find_next_row_entrance()
+        elif self.state == MissionState.FINISHED:
+            self.cmd_pub.publish(Twist())
+        elif self.state == MissionState.PAUSED:
+            self.cmd_pub.publish(Twist())
 
-        if "reasons=ok" in text:
-            self.get_logger().info(text)
+        self.publish_visuals()
+
+    def handle_initializing(self) -> None:
+        points = self.get_map_points_in_hist_roi(self.robot_pose)
+        if len(points) < 5:
+            self.get_logger().info(f"Not enough occupied map points for histogram: {len(points)}", throttle_duration_sec=2.0)
+            return
+
+        peak_pair = self.find_start_peak_pair(points, self.robot_pose)
+        if peak_pair is None:
+            self.get_logger().info("No valid left/right histogram peak pair found", throttle_duration_sec=2.0)
+            return
+
+        left_peak, right_peak = peak_pair
+        forward = self.yaw_to_vector(self.robot_pose.yaw)
+
+        left_point1 = self.start_point1_from_peak(points, self.robot_pose, left_peak)
+        right_point1 = self.start_point1_from_peak(points, self.robot_pose, right_peak)
+        left_point2 = self.initial_point2_from_sector(points, self.robot_pose, left_point1, left_peak)
+        right_point2 = self.initial_point2_from_sector(points, self.robot_pose, right_point1, right_peak)
+
+        left_direction = self.initial_direction_from_points(left_point1, left_point2, forward)
+        right_direction = self.initial_direction_from_points(right_point1, right_point2, forward)
+        if self.initial_forward_direction is None:
+            self.initial_forward_direction = np.asarray(forward, dtype=float)
+            initial_left = np.array([-forward[1], forward[0]], dtype=float)
+            increase_sign = 1.0 if self.p.row_numbers_increase_to == "left" else -1.0
+            self.row_number_increase_direction = increase_sign * initial_left
+
+        lane_number = self.p.starting_lane_number
+        if self.p.row_numbers_increase_to == "left":
+            left_number, right_number = lane_number + 1, lane_number
         else:
-            self.get_logger().warn(text)
+            left_number, right_number = lane_number, lane_number + 1
+        self.left_row = RowMarchModel("left", left_point1, left_point2, left_direction, left_number)
+        self.right_row = RowMarchModel("right", right_point1, right_point2, right_direction, right_number)
 
-    def publish_debug(self, det: RowDetection, row: RowModel, path: LocalPath) -> None:
-        state_msg = String()
-        state_msg.data = self.mission.state.name
-        self.state_pub.publish(state_msg)
+        self.recompute_rows()
+        if len(self.midline) < 2:
+            self.get_logger().info("Initial peaks found, but rectangle marching produced no usable midline", throttle_duration_sec=2.0)
+            return
 
-        conf_msg = Float32()
-        conf_msg.data = float(row.confidence)
-        self.conf_pub.publish(conf_msg)
+        self.state = MissionState.FOLLOW_ROW
+        self.get_logger().info(
+            f"Initial rows locked once from histogram peaks: left={left_peak:.3f}, right={right_peak:.3f}, width={left_peak - right_peak:.3f}"
+        )
 
-        end_msg = Float32()
-        end_msg.data = float(row.end_probability)
-        self.end_pub.publish(end_msg)
+    def handle_follow_row(self) -> None:
+        self.recompute_rows()
+        if len(self.midline) < 2:
+            self.get_logger().warn("No usable midline from rectangle marching; stopping")
+            self.cmd_pub.publish(Twist())
+            return
 
-        self.publish_path(path)
-        self.publish_markers(det, row)
+        robot_xy = np.array([self.robot_pose.x, self.robot_pose.y], dtype=float)
+        if self.row_exit_goal is not None and self.row_end_direction is not None:
+            if self.pose_goal_reached(self.row_exit_goal, self.row_end_direction):
+                self.store_current_rows()
+                self.record_current_row_end_direction()
+                self.reset_controller_state()
+                self.cmd_pub.publish(Twist())
+                if self.finish_after_current_row:
+                    self.get_logger().info("Last pattern row completed. Mission finished.")
+                    self.export_row_map()
+                    self.state = MissionState.FINISHED
+                else:
+                    self.get_logger().info("Row exit reached. Finding the next row entrance.")
+                    self.reset_entrance_state()
+                    self.state = MissionState.FIND_NEXT_ROW_ENTRANCE
+                return
 
-    def publish_path(self, path: LocalPath) -> None:
-        msg = Path()
-        msg.header.stamp = self.get_clock().now().to_msg()
-        msg.header.frame_id = path.frame_id
+        lookahead_distance = self.dynamic_follow_lookahead(self.midline, robot_xy)
+        self.get_logger().info(
+            (
+                "Dynamic lookahead: "
+                f"distance={lookahead_distance:.3f} "
+                f"curvature={self.current_lookahead_curvature:.3f} "
+                f"min={self.p.turn_lookahead_distance:.3f} "
+                f"max={self.p.lookahead_distance:.3f}"
+            ),
+            throttle_duration_sec=0.5,
+        )
+        target = self.lookahead_point_from_polyline_projection(self.midline, robot_xy, lookahead_distance)
+        if target is None:
+            target = self.midline[-1]
+        target = np.asarray(target, dtype=float)
+        self.fused_target_point = self.fuse_follow_target_with_laser(target)
+        self.drive_to_point(self.fused_target_point)
 
-        for p in path.points:
-            pose = PoseStamped()
-            pose.header = msg.header
-            pose.pose.position.x = float(p.x)
-            pose.pose.position.y = float(p.y)
-            pose.pose.position.z = 0.0
+    def fuse_follow_target_with_laser(self, map_target: np.ndarray) -> np.ndarray:
+        self.laser_follow_result = LaserFollowResult(reason="laser following disabled")
+        if not self.p.laser_follow_enabled:
+            return np.asarray(map_target, dtype=float)
 
-            q = quaternion_from_yaw(p.yaw)
+        scan = self.latest_scan
+        if self.latest_scan_received_ns is None:
+            scan = None
+        else:
+            age = (self.get_clock().now().nanoseconds - self.latest_scan_received_ns) * 1e-9
+            if age > self.p.laser_scan_timeout:
+                scan = None
 
-            pose.pose.orientation.x = q[0]
-            pose.pose.orientation.y = q[1]
-            pose.pose.orientation.z = q[2]
-            pose.pose.orientation.w = q[3]
+        map_target_base = self.map_point_to_base(map_target)
+        tangent_map = self.polyline_tangent_at_point(self.midline, np.array([self.robot_pose.x, self.robot_pose.y]))
+        tangent_base = self.map_direction_to_base(tangent_map)
+        if abs(float(tangent_base[0])) < 1e-6:
+            map_slope = math.copysign(self.p.laser_max_abs_line_slope, float(tangent_base[1]))
+        else:
+            map_slope = float(tangent_base[1] / tangent_base[0])
 
-            msg.poses.append(pose)
+        self.laser_follow_result = self.laser_follower.process_scan(scan, map_slope, map_target_base)
+        result = self.laser_follow_result
+        if not result.valid or result.target_base is None or result.weight <= 0.0:
+            return np.asarray(map_target, dtype=float)
+        fused_base = (1.0 - result.weight) * map_target_base + result.weight * result.target_base
+        return self.base_point_to_map(fused_base)
 
-        self.path_pub.publish(msg)
+    def map_point_to_base(self, point: np.ndarray) -> np.ndarray:
+        rel = np.asarray(point, dtype=float) - np.array([self.robot_pose.x, self.robot_pose.y], dtype=float)
+        cosine = math.cos(self.robot_pose.yaw)
+        sine = math.sin(self.robot_pose.yaw)
+        return np.array([cosine * rel[0] + sine * rel[1], -sine * rel[0] + cosine * rel[1]], dtype=float)
 
-    def publish_markers(self, det: RowDetection, row: RowModel) -> None:
-        markers = MarkerArray()
+    def base_point_to_map(self, point: np.ndarray) -> np.ndarray:
+        point = np.asarray(point, dtype=float)
+        cosine = math.cos(self.robot_pose.yaw)
+        sine = math.sin(self.robot_pose.yaw)
+        return np.array(
+            [
+                self.robot_pose.x + cosine * point[0] - sine * point[1],
+                self.robot_pose.y + sine * point[0] + cosine * point[1],
+            ],
+            dtype=float,
+        )
 
-        def line_marker(
-            marker_id: int,
-            a: float,
-            b: float,
-            color: Tuple[float, float, float],
-            valid: bool,
+    def map_direction_to_base(self, direction: np.ndarray) -> np.ndarray:
+        direction = self.normalize(direction)
+        cosine = math.cos(self.robot_pose.yaw)
+        sine = math.sin(self.robot_pose.yaw)
+        return np.array([cosine * direction[0] + sine * direction[1], -sine * direction[0] + cosine * direction[1]])
+
+    def base_direction_to_map(self, direction: np.ndarray) -> np.ndarray:
+        direction = self.normalize(direction)
+        cosine = math.cos(self.robot_pose.yaw)
+        sine = math.sin(self.robot_pose.yaw)
+        return np.array([cosine * direction[0] - sine * direction[1], sine * direction[0] + cosine * direction[1]])
+
+    def polyline_tangent_at_point(self, polyline: np.ndarray, point: np.ndarray) -> np.ndarray:
+        if len(polyline) < 2:
+            return self.yaw_to_vector(self.robot_pose.yaw)
+        point = np.asarray(point, dtype=float)
+        best_direction = np.asarray(polyline[1] - polyline[0], dtype=float)
+        best_distance = float("inf")
+        for start, end in zip(polyline[:-1], polyline[1:]):
+            segment = end - start
+            length_sq = float(segment @ segment)
+            if length_sq < 1e-12:
+                continue
+            ratio = float(np.clip(((point - start) @ segment) / length_sq, 0.0, 1.0))
+            distance = float(np.linalg.norm(point - (start + ratio * segment)))
+            if distance < best_distance:
+                best_distance = distance
+                best_direction = segment
+        return self.normalize(best_direction)
+
+    def store_current_rows(self) -> None:
+        for model in (self.left_row, self.right_row):
+            if model is None or len(model.result.points) < 2:
+                continue
+            points = self.orient_row_points(model.result.points)
+            existing = self.stored_rows.get(model.row_number)
+            if existing is None or self.polyline_length(points) > self.polyline_length(existing):
+                self.stored_rows[model.row_number] = np.array(points, copy=True)
+
+    def orient_row_points(self, points: np.ndarray) -> np.ndarray:
+        points = np.asarray(points, dtype=float)
+        if len(points) < 2 or self.initial_forward_direction is None:
+            return np.array(points, copy=True)
+        if float((points[-1] - points[0]) @ self.initial_forward_direction) < 0.0:
+            return np.array(points[::-1], copy=True)
+        return np.array(points, copy=True)
+
+    def polyline_length(self, points: np.ndarray) -> float:
+        if len(points) < 2:
+            return 0.0
+        return float(np.sum(np.linalg.norm(np.diff(points, axis=0), axis=1)))
+
+    def build_rounded_route(self, support_points: np.ndarray) -> np.ndarray:
+        points = [np.asarray(point, dtype=float) for point in support_points]
+        if len(points) < 2:
+            return np.asarray(points, dtype=float)
+        route: List[np.ndarray] = [points[0]]
+        for idx in range(1, len(points) - 1):
+            previous = points[idx - 1]
+            corner = points[idx]
+            following = points[idx + 1]
+            incoming = corner - previous
+            outgoing = following - corner
+            incoming_length = float(np.linalg.norm(incoming))
+            outgoing_length = float(np.linalg.norm(outgoing))
+            if incoming_length < 1e-6 or outgoing_length < 1e-6:
+                continue
+            radius = min(
+                self.p.maneuver_corner_radius,
+                0.50 * incoming_length,
+                0.50 * outgoing_length,
+            )
+            before = corner - radius * incoming / incoming_length
+            after = corner + radius * outgoing / outgoing_length
+            self.append_sampled_line(route, route[-1], before)
+            sample_count = max(3, int(math.ceil((2.0 * radius) / self.p.maneuver_route_spacing)))
+            for ratio in np.linspace(0.0, 1.0, sample_count)[1:]:
+                one_minus = 1.0 - float(ratio)
+                route.append(one_minus * one_minus * before + 2.0 * one_minus * ratio * corner + ratio * ratio * after)
+        self.append_sampled_line(route, route[-1], points[-1])
+        return np.asarray(route, dtype=float)
+
+    def append_sampled_line(self, route: List[np.ndarray], start: np.ndarray, end: np.ndarray) -> None:
+        distance = float(np.linalg.norm(np.asarray(end, dtype=float) - np.asarray(start, dtype=float)))
+        sample_count = max(1, int(math.ceil(distance / self.p.maneuver_route_spacing)))
+        for ratio in np.linspace(0.0, 1.0, sample_count + 1)[1:]:
+            route.append((1.0 - ratio) * np.asarray(start, dtype=float) + ratio * np.asarray(end, dtype=float))
+
+    def project_onto_route_forward(
+        self,
+        route: np.ndarray,
+        point: np.ndarray,
+        start_idx: int,
+    ) -> Tuple[np.ndarray, int, float]:
+        point = np.asarray(point, dtype=float)
+        best_projection = np.asarray(route[-1], dtype=float)
+        best_idx = min(max(0, start_idx), max(0, len(route) - 2))
+        best_distance = float("inf")
+        for idx in range(best_idx, len(route) - 1):
+            segment = route[idx + 1] - route[idx]
+            length_sq = float(segment @ segment)
+            if length_sq < 1e-12:
+                continue
+            ratio = float(np.clip(((point - route[idx]) @ segment) / length_sq, 0.0, 1.0))
+            projection = route[idx] + ratio * segment
+            distance = float(np.linalg.norm(point - projection))
+            if distance < best_distance:
+                best_projection = projection
+                best_idx = idx
+                best_distance = distance
+        return np.asarray(best_projection, dtype=float), best_idx, best_distance
+
+    def polyline_distance_from_projection(self, route: np.ndarray, projection: np.ndarray, start_idx: int) -> float:
+        if len(route) < 2:
+            return 0.0
+        start_idx = int(np.clip(start_idx, 0, len(route) - 2))
+        return float(np.linalg.norm(route[start_idx + 1] - projection)) + self.polyline_length(route[start_idx + 1:])
+
+    def point_at_route_distance(
+        self,
+        route: np.ndarray,
+        projection: np.ndarray,
+        start_idx: int,
+        distance_ahead: float,
+    ) -> np.ndarray:
+        start_idx = int(np.clip(start_idx, 0, len(route) - 2))
+        travelled = 0.0
+        segment_start = np.asarray(projection, dtype=float)
+        for idx in range(start_idx, len(route) - 1):
+            segment_end = np.asarray(route[idx + 1], dtype=float)
+            segment = segment_end - segment_start
+            length = float(np.linalg.norm(segment))
+            if travelled + length >= distance_ahead and length > 1e-9:
+                return segment_start + ((distance_ahead - travelled) / length) * segment
+            travelled += length
+            segment_start = segment_end
+        return np.asarray(route[-1], dtype=float)
+
+    def export_row_map(self) -> Optional[str]:
+        if self.row_map_exported or len(self.stored_rows) == 0:
+            return None
+        output_directory = os.path.abspath(os.path.expanduser(self.p.row_map_output_directory))
+        filename = f"maize_row_map_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+        output_path = os.path.join(output_directory, filename)
+        try:
+            os.makedirs(output_directory, exist_ok=True)
+            with open(output_path, "w", newline="", encoding="utf-8") as csv_file:
+                writer = csv.writer(csv_file)
+                writer.writerow(("row_number", "point_index", "x", "y", "map_frame"))
+                for row_number in sorted(self.stored_rows):
+                    for point_index, point in enumerate(self.stored_rows[row_number]):
+                        writer.writerow(
+                            (
+                                row_number,
+                                point_index,
+                                f"{float(point[0]):.6f}",
+                                f"{float(point[1]):.6f}",
+                                self.p.map_frame,
+                            )
+                        )
+            self.row_map_exported = True
+            self.get_logger().info(f"Saved maize row map CSV: {output_path}")
+            return output_path
+        except OSError as exc:
+            self.get_logger().error(f"Could not save maize row map CSV to {output_path}: {exc}")
+            return None
+
+    def handle_find_next_row_entrance(self) -> None:
+        if not self.ensure_provisional_entrance_route():
+            self.cmd_pub.publish(Twist())
+            return
+        if not self.lock_next_row_entrance() and self.entrance_target is None:
+            self.rebuild_entrance_route(None)
+
+        if (
+            self.entrance_target_direction is not None
+            and self.entry_line_reached(self.entrance_target, self.entrance_target_direction)
         ):
-            marker = Marker()
-            marker.header.stamp = self.get_clock().now().to_msg()
-            marker.header.frame_id = self.p.base_frame
-            marker.ns = "rows"
-            marker.id = marker_id
-            marker.type = Marker.LINE_STRIP
-            marker.action = Marker.ADD if valid else Marker.DELETE
-            marker.scale.x = 0.035
+            self.initialize_selected_entrance_rows()
+            return
 
-            marker.color.r = color[0]
-            marker.color.g = color[1]
-            marker.color.b = color[2]
-            marker.color.a = 1.0
+        target = self.update_entrance_route_target()
+        if target is None:
+            self.cmd_pub.publish(Twist())
+            return
+        if (
+            self.entrance_route_provisional
+            and self.entrance_route_remaining_distance <= self.p.maneuver_goal_xy_tolerance
+        ):
+            self.cmd_pub.publish(Twist())
+            return
+        self.drive_to_point(target, self.p.maneuver_speed, self.p.maneuver_slow_speed)
 
-            for x in [0.2, 3.0]:
-                pt = Point()
-                pt.x = x
-                pt.y = a * x + b
-                pt.z = 0.05
-                marker.points.append(pt)
-
-            return marker
-
-        markers.markers.append(
-            line_marker(1, det.left_a, det.left_b, (0.0, 1.0, 0.0), det.left_valid)
+    def entry_line_reached(self, goal: np.ndarray, direction: np.ndarray) -> bool:
+        direction = self.normalize(direction)
+        lateral_direction = np.array([-direction[1], direction[0]], dtype=float)
+        robot_xy = np.array([self.robot_pose.x, self.robot_pose.y], dtype=float)
+        rel = robot_xy - np.asarray(goal, dtype=float)
+        along = float(rel @ direction)
+        lateral = abs(float(rel @ lateral_direction))
+        desired_yaw = math.atan2(float(direction[1]), float(direction[0]))
+        yaw_error = abs(wrap_to_pi(desired_yaw - self.robot_pose.yaw))
+        return (
+            along >= 0.0
+            and lateral <= self.p.maneuver_entry_lateral_tolerance
+            and yaw_error <= self.p.maneuver_entry_yaw_tolerance
         )
-        markers.markers.append(
-            line_marker(2, det.right_a, det.right_b, (0.0, 1.0, 0.0), det.right_valid)
+
+    def update_entrance_route_target(self) -> Optional[np.ndarray]:
+        if len(self.entrance_route) < 2:
+            self.get_logger().warn("Cannot follow headland maneuver without an entrance route")
+            return None
+        robot_xy = np.array([self.robot_pose.x, self.robot_pose.y], dtype=float)
+        projection, segment_idx, deviation = self.project_onto_route_forward(
+            self.entrance_route,
+            robot_xy,
+            self.entrance_route_progress_index,
         )
-        markers.markers.append(
-            line_marker(3, row.center_a, row.center_b, (1.0, 0.5, 0.0), row.valid)
+        self.entrance_route_projection = projection
+        self.entrance_route_progress_index = max(self.entrance_route_progress_index, segment_idx)
+        if deviation > self.p.maneuver_max_route_deviation:
+            self.get_logger().warn(
+                f"Headland route deviation too large: {deviation:.3f} m",
+                throttle_duration_sec=1.0,
+            )
+            self.entrance_route_target = None
+            return None
+        self.entrance_route_remaining_distance = self.polyline_distance_from_projection(
+            self.entrance_route,
+            projection,
+            self.entrance_route_progress_index,
         )
+        lookahead = self.dynamic_maneuver_lookahead(
+            self.entrance_route,
+            projection,
+            self.entrance_route_progress_index,
+            deviation,
+            self.entrance_route_remaining_distance,
+        )
+        self.get_logger().info(
+            (
+                "Maneuver lookahead: "
+                f"distance={lookahead:.3f} "
+                f"curvature={self.current_maneuver_lookahead_curvature:.3f} "
+                f"min={self.p.maneuver_turn_lookahead_distance:.3f} "
+                f"max={self.p.maneuver_lookahead_distance:.3f}"
+            ),
+            throttle_duration_sec=0.5,
+        )
+        self.entrance_route_target = self.point_at_route_distance(
+            self.entrance_route,
+            projection,
+            self.entrance_route_progress_index,
+            lookahead,
+        )
+        return self.entrance_route_target
+
+    def pose_goal_reached(self, goal: np.ndarray, direction: np.ndarray) -> bool:
+        direction = self.normalize(direction)
+        lateral_direction = np.array([-direction[1], direction[0]], dtype=float)
+        robot_xy = np.array([self.robot_pose.x, self.robot_pose.y], dtype=float)
+        rel = robot_xy - np.asarray(goal, dtype=float)
+        along = float(rel @ direction)
+        lateral = abs(float(rel @ lateral_direction))
+        distance = float(np.linalg.norm(rel))
+        desired_yaw = math.atan2(float(direction[1]), float(direction[0]))
+        yaw_error = abs(wrap_to_pi(desired_yaw - self.robot_pose.yaw))
+        position_reached = distance <= self.p.maneuver_goal_xy_tolerance or (
+            along >= 0.0 and lateral <= self.p.maneuver_goal_xy_tolerance
+        )
+        return position_reached and yaw_error <= self.p.maneuver_goal_yaw_tolerance
+
+    def lock_next_row_entrance(self) -> bool:
+        if (
+            self.plant_row_end_point is None
+            or self.row_end_direction is None
+            or self.left_row is None
+            or self.right_row is None
+            or self.entrance_active_step is None
+        ):
+            self.get_logger().warn("Cannot find next entrance without completed row end data and a pending pattern step")
+            return False
+
+        center = np.asarray(self.plant_row_end_point, dtype=float)
+        outgoing = self.average_row_end_direction_for_side(self.row_end_direction)
+        roi_points = self.points_in_oriented_rectangle(
+            self.get_all_map_points(),
+            center,
+            outgoing,
+            self.p.hist_roi_depth,
+            self.p.hist_roi_width,
+        )
+        self.entrance_hist_center = center
+        self.entrance_hist_direction = outgoing
+        self.entrance_hist_peaks = self.find_entrance_histogram_peaks(roi_points, center, outgoing)
+        if len(self.entrance_hist_peaks) < 2:
+            self.get_logger().info("Not enough headland histogram peaks for row entrance", throttle_duration_sec=2.0)
+            return False
+
+        current_indices = self.associate_known_rows_with_entrance_peaks(center, outgoing)
+        if current_indices is None:
+            self.get_logger().info("Could not associate known plant rows with headland peaks", throttle_duration_sec=2.0)
+            return False
+
+        step = self.entrance_active_step
+        shift = step.lane_shift if step.direction == "L" else -step.lane_shift
+        target_indices = (current_indices[0] + shift, current_indices[1] + shift)
+        if min(target_indices) < 0 or max(target_indices) >= len(self.entrance_hist_peaks):
+            self.get_logger().info(
+                f"Pattern step {step.lane_shift}{step.direction} needs peaks outside detected range",
+                throttle_duration_sec=2.0,
+            )
+            return False
+
+        first = self.entrance_hist_peaks[target_indices[0]]
+        second = self.entrance_hist_peaks[target_indices[1]]
+        first.selected = True
+        second.selected = True
+        target_row_end = 0.5 * (first.point + second.point)
+        new_target = target_row_end + self.p.row_end_goal_outward_distance * outgoing
+        first_lock = self.entrance_route_provisional
+        target_shift = (
+            float("inf")
+            if self.entrance_target is None
+            else float(np.linalg.norm(new_target - self.entrance_target))
+        )
+        new_target_lateral = float((new_target - center) @ np.array([-outgoing[1], outgoing[0]], dtype=float))
+        new_traverse_outward = self.compute_headland_traverse_outward(center, outgoing, new_target_lateral)
+        traverse_shift = (
+            float("inf")
+            if self.entrance_traverse_outward is None
+            else abs(new_traverse_outward - self.entrance_traverse_outward)
+        )
+        replan_threshold = max(0.15, 0.25 * self.p.expected_row_width)
+        should_replan = (
+            first_lock
+            or len(self.entrance_route) < 2
+            or target_shift >= replan_threshold
+            or traverse_shift >= replan_threshold
+        )
+        if should_replan:
+            self.pending_target_peaks = (first, second)
+            self.entrance_target = new_target
+            self.entrance_target_direction = -outgoing
+            self.entrance_heading_goal = (
+                self.entrance_target
+                + self.p.maneuver_entry_extension_distance * self.entrance_target_direction
+            )
+            self.entrance_follow_path = self.build_entrance_follow_path()
+            self.rebuild_entrance_route(self.entrance_target)
+        if first_lock:
+            self.pattern_index += 1
+            self.finish_after_current_row = self.pattern_index >= len(self.pattern_steps)
+            self.reset_controller_state()
+            self.get_logger().info(
+                f"Locked next entrance for pattern step {step.lane_shift}{step.direction}: "
+                f"rows {first.row_number}/{second.row_number}"
+            )
+        return True
+
+    def ensure_provisional_entrance_route(self) -> bool:
+        if self.entrance_active_step is not None and len(self.entrance_route) >= 2:
+            return True
+        if (
+            self.plant_row_end_point is None
+            or self.row_end_direction is None
+            or self.pattern_index >= len(self.pattern_steps)
+        ):
+            return False
+
+        self.entrance_active_step = self.pattern_steps[self.pattern_index]
+        self.rebuild_entrance_route(None)
+        self.reset_controller_state()
+        self.get_logger().info(
+            f"Headland peaks not ready; following provisional route for pattern step "
+            f"{self.entrance_active_step.lane_shift}{self.entrance_active_step.direction}",
+            throttle_duration_sec=2.0,
+        )
+        return True
+
+    def rebuild_entrance_route(self, target: Optional[np.ndarray]) -> None:
+        if self.plant_row_end_point is None or self.row_end_direction is None or self.entrance_active_step is None:
+            return
+        center = np.asarray(self.plant_row_end_point, dtype=float)
+        outgoing = self.average_row_end_direction_for_side(self.row_end_direction)
+        lateral_direction = np.array([-outgoing[1], outgoing[0]], dtype=float)
+        step = self.entrance_active_step
+        signed_shift = step.lane_shift if step.direction == "L" else -step.lane_shift
+        expected_lateral = signed_shift * self.p.expected_row_width
+        target_lateral = expected_lateral if target is None else float((np.asarray(target) - center) @ lateral_direction)
+        traverse_outward = self.compute_headland_traverse_outward(center, outgoing, target_lateral)
+
+        robot_xy = np.array([self.robot_pose.x, self.robot_pose.y], dtype=float)
+        incoming = -outgoing
+        target_lateral_error = (
+            float("inf")
+            if target is None
+            else abs(float((robot_xy - np.asarray(target, dtype=float)) @ lateral_direction))
+        )
+        entry_capture_lateral = max(self.p.maneuver_entry_lateral_tolerance, 0.5 * self.p.expected_row_width)
+        if (
+            target is not None
+            and float((robot_xy - np.asarray(target, dtype=float)) @ incoming) >= 0.0
+            and target_lateral_error <= entry_capture_lateral
+        ):
+            forward_path = [
+                point
+                for point in self.entrance_follow_path
+                if float((np.asarray(point, dtype=float) - robot_xy) @ incoming) > self.p.maneuver_route_spacing
+            ]
+            if not forward_path:
+                forward_path = [robot_xy + self.p.maneuver_entry_extension_distance * incoming]
+            self.entrance_waypoints = []
+            self.set_entrance_route(np.vstack((robot_xy, *forward_path)), False)
+            return
+
+        route_start = self.headland_route_anchor(center, outgoing)
+        route, support_points, waypoints = self.build_headland_route(
+            route_start,
+            center,
+            outgoing,
+            lateral_direction,
+            target_lateral,
+            traverse_outward,
+            target,
+        )
+        self.entrance_waypoints = waypoints
+        self.entrance_route_support = support_points
+        self.entrance_route = route
+        self.entrance_route_progress_index = 0
+        self.entrance_route_projection = None
+        self.entrance_route_target = None
+        self.entrance_route_remaining_distance = self.polyline_length(self.entrance_route)
+        self.entrance_route_provisional = target is None
+        self.entrance_traverse_outward = traverse_outward
+
+    def headland_route_anchor(self, center: np.ndarray, outgoing: np.ndarray) -> np.ndarray:
+        if self.row_exit_goal is not None:
+            return np.asarray(self.row_exit_goal, dtype=float)
+        return np.asarray(center, dtype=float) + self.p.row_end_goal_outward_distance * self.normalize(outgoing)
+
+    def compute_headland_traverse_outward(
+        self,
+        center: np.ndarray,
+        outgoing: np.ndarray,
+        target_lateral: float,
+    ) -> float:
+        lower_lateral, upper_lateral = sorted((0.0, target_lateral))
+        lateral_margin = self.p.expected_row_width
+        route_peaks = [
+            peak
+            for peak in self.entrance_hist_peaks
+            if lower_lateral - lateral_margin <= peak.lateral <= upper_lateral + lateral_margin
+        ]
+        outermost = max(
+            [0.0] + [float((np.asarray(peak.point) - center) @ outgoing) for peak in route_peaks]
+        )
+        clearance = max(self.p.row_exit_extension_distance, self.p.row_end_goal_outward_distance)
+        return outermost + clearance
+
+    def build_headland_route(
+        self,
+        start: np.ndarray,
+        center: np.ndarray,
+        outgoing: np.ndarray,
+        lateral_direction: np.ndarray,
+        target_lateral: float,
+        traverse_outward: float,
+        target: Optional[np.ndarray],
+    ) -> Tuple[np.ndarray, np.ndarray, List[np.ndarray]]:
+        start = np.asarray(start, dtype=float)
+        center = np.asarray(center, dtype=float)
+        outgoing = self.normalize(outgoing)
+        lateral_direction = self.normalize(lateral_direction)
+        start_lateral = float((start - center) @ lateral_direction)
+        start_outward = float((start - center) @ outgoing)
+        target_outward = start_outward if target is None else float((np.asarray(target) - center) @ outgoing)
+        delta_lateral = target_lateral - start_lateral
+        turn_sign = 1.0 if delta_lateral >= 0.0 else -1.0
+        abs_delta_lateral = abs(delta_lateral)
+        desired_radius = self.p.maneuver_corner_radius
+        if abs_delta_lateral < 1e-6:
+            desired_radius = 0.0
+        radius = min(desired_radius, 0.5 * abs_delta_lateral) if desired_radius > 0.0 else 0.0
+        traverse_outward = max(traverse_outward, start_outward + radius, target_outward + radius)
+
+        route: List[np.ndarray] = [start]
+        support: List[np.ndarray] = [start]
+        waypoints: List[np.ndarray] = []
+
+        if radius <= 1e-6:
+            straight_point = center + traverse_outward * outgoing + target_lateral * lateral_direction
+            self.append_sampled_line(route, start, straight_point)
+            support.append(straight_point)
+            waypoints.append(straight_point)
+        else:
+            first_arc_start = center + (traverse_outward - radius) * outgoing + start_lateral * lateral_direction
+            first_straight_start = (
+                center
+                + traverse_outward * outgoing
+                + (start_lateral + turn_sign * radius) * lateral_direction
+            )
+            second_straight_end = (
+                center
+                + traverse_outward * outgoing
+                + (target_lateral - turn_sign * radius) * lateral_direction
+            )
+            second_arc_end = center + (traverse_outward - radius) * outgoing + target_lateral * lateral_direction
+
+            self.append_sampled_line(route, route[-1], first_arc_start)
+            self.append_headland_arc(route, first_arc_start, outgoing, lateral_direction, turn_sign, radius, first=True)
+            if target is None:
+                provisional_end = center + traverse_outward * outgoing + target_lateral * lateral_direction
+                self.append_sampled_line(route, route[-1], provisional_end)
+                support.extend((first_arc_start, first_straight_start, provisional_end))
+                waypoints.extend((first_straight_start, provisional_end))
+            else:
+                self.append_sampled_line(route, route[-1], second_straight_end)
+                self.append_headland_arc(route, second_straight_end, outgoing, lateral_direction, turn_sign, radius, first=False)
+                support.extend((first_arc_start, first_straight_start, second_straight_end, second_arc_end))
+                waypoints.extend((first_straight_start, second_straight_end))
+
+        if target is not None:
+            target = np.asarray(target, dtype=float)
+            self.append_sampled_line(route, route[-1], target)
+            support.append(target)
+            for point in self.entrance_follow_path:
+                self.append_sampled_line(route, route[-1], np.asarray(point, dtype=float))
+                support.append(np.asarray(point, dtype=float))
+
+        return np.asarray(route, dtype=float), np.asarray(support, dtype=float), waypoints
+
+    def append_headland_arc(
+        self,
+        route: List[np.ndarray],
+        arc_start: np.ndarray,
+        outgoing: np.ndarray,
+        lateral_direction: np.ndarray,
+        turn_sign: float,
+        radius: float,
+        first: bool,
+    ) -> None:
+        sample_count = max(3, int(math.ceil((0.5 * math.pi * radius) / self.p.maneuver_route_spacing)))
+        for theta in np.linspace(0.0, 0.5 * math.pi, sample_count + 1)[1:]:
+            if first:
+                point = (
+                    arc_start
+                    + radius * math.sin(float(theta)) * outgoing
+                    + turn_sign * radius * (1.0 - math.cos(float(theta))) * lateral_direction
+                )
+            else:
+                point = (
+                    arc_start
+                    + turn_sign * radius * math.sin(float(theta)) * lateral_direction
+                    - radius * (1.0 - math.cos(float(theta))) * outgoing
+                )
+            route.append(np.asarray(point, dtype=float))
+
+    def set_entrance_route(
+        self,
+        support_points: np.ndarray,
+        provisional: bool,
+        marker_support_points: Optional[np.ndarray] = None,
+    ) -> None:
+        if marker_support_points is None:
+            marker_support_points = support_points
+        self.entrance_route_support = np.asarray(marker_support_points, dtype=float)
+        self.entrance_route = self.build_rounded_route(support_points)
+        self.entrance_route_progress_index = 0
+        self.entrance_route_projection = None
+        self.entrance_route_target = None
+        self.entrance_route_remaining_distance = self.polyline_length(self.entrance_route)
+        self.entrance_route_provisional = provisional
+
+    def build_entrance_follow_path(self) -> np.ndarray:
+        models = self.build_selected_entrance_models()
+        if models is None or self.entrance_target is None or self.entrance_target_direction is None:
+            return np.empty((0, 2), dtype=float)
+        incoming = self.normalize(self.entrance_target_direction)
+        fallback = self.entrance_target + self.p.maneuver_entry_extension_distance * incoming
+        left_model, right_model = models
+        map_points = self.get_all_map_points()
+        left_result = self.march_row(left_model, map_points)
+        right_result = self.march_row(right_model, map_points)
+        midline = self.build_midline(left_result.points, right_result.points)
+        path = [np.asarray(fallback, dtype=float)]
+        minimum_along = self.p.maneuver_entry_extension_distance + self.p.maneuver_route_spacing
+        for point in midline:
+            if float((np.asarray(point, dtype=float) - self.entrance_target) @ incoming) > minimum_along:
+                path.append(np.asarray(point, dtype=float))
+        return np.asarray(path, dtype=float)
+
+    def find_entrance_histogram_peaks(
+        self,
+        points: np.ndarray,
+        center: np.ndarray,
+        outgoing_direction: np.ndarray,
+    ) -> List[EntrancePeak]:
+        if len(points) == 0:
+            return []
+        lateral_direction = np.array([-outgoing_direction[1], outgoing_direction[0]], dtype=float)
+        local_y = (points - center) @ lateral_direction
+        half_roi = 0.5 * self.p.hist_roi_width
+        bins = np.arange(-half_roi, half_roi + self.p.hist_bin_size, self.p.hist_bin_size)
+        if len(bins) < 3:
+            return []
+        hist, bin_edges = np.histogram(local_y, bins=bins)
+        smoothed_hist = np.convolve(hist, np.array([1, 1, 1], dtype=int), mode="same")
+        candidates: List[Tuple[int, EntrancePeak]] = []
+        for idx in range(1, len(hist) - 1):
+            if (
+                smoothed_hist[idx] >= self.p.hist_peak_min_points
+                and smoothed_hist[idx] >= smoothed_hist[idx - 1]
+                and smoothed_hist[idx] >= smoothed_hist[idx + 1]
+                and hist[idx - 1] + hist[idx] + hist[idx + 1] > 0
+            ):
+                window_counts = hist[idx - 1 : idx + 2]
+                window_centers = 0.5 * (bin_edges[idx - 1 : idx + 2] + bin_edges[idx : idx + 3])
+                lateral = float(np.average(window_centers, weights=window_counts))
+                point = self.actual_row_end_from_peak(points, center, outgoing_direction, lateral)
+                candidates.append((int(smoothed_hist[idx]), EntrancePeak(lateral, point)))
+
+        # Broad occupied bands often form several adjacent local maxima. Count them
+        # as one plant row before applying pattern-relative peak offsets.
+        min_peak_spacing = max(2.0 * self.p.hist_bin_size, 0.5 * self.p.min_lane_width)
+        peaks: List[EntrancePeak] = []
+        for _, candidate in sorted(candidates, key=lambda item: item[0], reverse=True):
+            if all(abs(candidate.lateral - peak.lateral) >= min_peak_spacing for peak in peaks):
+                peaks.append(candidate)
+        peaks.sort(key=lambda peak: peak.lateral)
+        self.get_logger().info(
+            f"Headland histogram peaks: {[round(peak.lateral, 3) for peak in peaks]}",
+            throttle_duration_sec=2.0,
+        )
+        return peaks
+
+    def regularize_entrance_peak_spacing(self, peaks: List[EntrancePeak]) -> List[EntrancePeak]:
+        regularized: List[EntrancePeak] = []
+        for peak in sorted(peaks, key=lambda item: item.lateral):
+            if not regularized or abs(peak.lateral - regularized[-1].lateral) >= self.p.min_lane_width:
+                regularized.append(peak)
+        return regularized
+
+    def actual_row_end_from_peak(
+        self,
+        points: np.ndarray,
+        center: np.ndarray,
+        outgoing_direction: np.ndarray,
+        peak_lateral: float,
+    ) -> np.ndarray:
+        lateral_direction = np.array([-outgoing_direction[1], outgoing_direction[0]], dtype=float)
+        rel = points - np.asarray(center, dtype=float)
+        local_x = rel @ outgoing_direction
+        local_y = rel @ lateral_direction
+        half_width = max(self.p.hist_bin_size, 0.5 * self.p.row_rectangle_width)
+        band_mask = np.abs(local_y - peak_lateral) <= half_width
+        if not np.any(band_mask):
+            return np.asarray(center, dtype=float) + peak_lateral * lateral_direction
+        band_points = points[band_mask]
+        band_x = local_x[band_mask]
+        outermost_x = float(np.max(band_x))
+        end_points = band_points[band_x >= outermost_x - self.p.row_point_window_length]
+        return np.asarray(np.mean(end_points, axis=0), dtype=float)
+
+    def row_end_side(self, direction: np.ndarray) -> str:
+        if self.initial_forward_direction is None:
+            return "forward"
+        return "forward" if float(self.normalize(direction) @ self.initial_forward_direction) >= 0.0 else "backward"
+
+    def record_current_row_end_direction(self) -> None:
+        if self.row_end_direction is None:
+            return
+        direction = self.normalize(self.row_end_direction)
+        side = self.row_end_side(direction)
+        directions = self.row_end_directions_by_side[side]
+        if directions and float(direction @ directions[-1]) < 0.0:
+            direction = -direction
+        directions.append(direction)
+
+    def average_row_end_direction_for_side(self, current_direction: np.ndarray) -> np.ndarray:
+        current_direction = self.normalize(current_direction)
+        directions = self.row_end_directions_by_side[self.row_end_side(current_direction)]
+        if not directions:
+            return current_direction
+        aligned = [direction if float(direction @ current_direction) >= 0.0 else -direction for direction in directions]
+        return self.normalize(np.sum(aligned, axis=0))
+
+    def associate_known_rows_with_entrance_peaks(
+        self,
+        center: np.ndarray,
+        outgoing_direction: np.ndarray,
+    ) -> Optional[Tuple[int, int]]:
+        if self.left_row is None or self.right_row is None or self.row_number_increase_direction is None:
+            return None
+        left_end = self.left_row.result.end_point
+        right_end = self.right_row.result.end_point
+        if left_end is None or right_end is None:
+            return None
+
+        lateral_direction = np.array([-outgoing_direction[1], outgoing_direction[0]], dtype=float)
+        known_laterals = [
+            float((np.asarray(left_end, dtype=float) - center) @ lateral_direction),
+            float((np.asarray(right_end, dtype=float) - center) @ lateral_direction),
+        ]
+        matched_indices = [
+            int(np.argmin([abs(peak.lateral - known_laterals[0]) for peak in self.entrance_hist_peaks])),
+            int(np.argmin([abs(peak.lateral - known_laterals[1]) for peak in self.entrance_hist_peaks])),
+        ]
+        matched_distances = [
+            abs(self.entrance_hist_peaks[matched_indices[0]].lateral - known_laterals[0]),
+            abs(self.entrance_hist_peaks[matched_indices[1]].lateral - known_laterals[1]),
+        ]
+        if (
+            matched_indices[0] == matched_indices[1]
+            or abs(matched_indices[0] - matched_indices[1]) != 1
+            or max(matched_distances) > self.p.max_lane_width
+        ):
+            return None
+
+        left_idx, right_idx = matched_indices
+        self.entrance_hist_peaks[left_idx].row_number = self.left_row.row_number
+        self.entrance_hist_peaks[right_idx].row_number = self.right_row.row_number
+        number_step = 1 if float(lateral_direction @ self.row_number_increase_direction) >= 0.0 else -1
+        anchor_idx = left_idx
+        anchor_number = self.left_row.row_number
+        for idx, peak in enumerate(self.entrance_hist_peaks):
+            peak.row_number = anchor_number + (idx - anchor_idx) * number_step
+        if self.entrance_hist_peaks[right_idx].row_number != self.right_row.row_number:
+            return None
+        return tuple(sorted((left_idx, right_idx)))
+
+    def initialize_selected_entrance_rows(self) -> None:
+        models = self.build_selected_entrance_models()
+        if models is None:
+            self.cmd_pub.publish(Twist())
+            return
+
+        first, second = sorted(self.pending_target_peaks, key=lambda peak: peak.lateral)
+        self.left_row, self.right_row = models
+        self.midline = np.empty((0, 2), dtype=float)
+        self.plant_row_end_point = None
+        self.row_exit_goal = None
+        self.row_exit_heading_goal = None
+        self.row_end_direction = None
+        self.reset_controller_state()
+        self.laser_follower.reset()
+        self.reset_entrance_state()
+        self.state = MissionState.FOLLOW_ROW
+        self.get_logger().info(
+            f"Entered new lane between plant rows {first.row_number} and {second.row_number}; following row"
+        )
+
+    def build_selected_entrance_models(self) -> Optional[Tuple[RowMarchModel, RowMarchModel]]:
+        if (
+            self.pending_target_peaks is None
+            or self.entrance_hist_center is None
+            or self.entrance_hist_direction is None
+        ):
+            return None
+
+        outgoing = self.normalize(self.entrance_hist_direction)
+        incoming = -outgoing
+        roi_points = self.points_in_oriented_rectangle(
+            self.get_all_map_points(),
+            self.entrance_hist_center,
+            outgoing,
+            self.p.hist_roi_depth,
+            self.p.hist_roi_width,
+        )
+        first, second = sorted(self.pending_target_peaks, key=lambda peak: peak.lateral)
+        # Seen in the new incoming direction, the lower outgoing-lateral peak is the left row.
+        left_point1 = self.entrance_point1_from_peak(roi_points, self.entrance_hist_center, outgoing, first.lateral)
+        right_point1 = self.entrance_point1_from_peak(roi_points, self.entrance_hist_center, outgoing, second.lateral)
+        left_point2 = self.point2_from_sector(roi_points, left_point1, incoming, f"row {first.row_number}")
+        right_point2 = self.point2_from_sector(roi_points, right_point1, incoming, f"row {second.row_number}")
+        left_direction = self.initial_direction_from_points(left_point1, left_point2, incoming)
+        right_direction = self.initial_direction_from_points(right_point1, right_point2, incoming)
+        return (
+            RowMarchModel("left", left_point1, left_point2, left_direction, int(first.row_number)),
+            RowMarchModel("right", right_point1, right_point2, right_direction, int(second.row_number)),
+        )
+
+    def find_start_peak_pair(self, points: np.ndarray, pose: Pose2D) -> Optional[Tuple[float, float]]:
+        forward = self.yaw_to_vector(pose.yaw)
+        lateral = np.array([-forward[1], forward[0]], dtype=float)
+        robot_xy = np.array([pose.x, pose.y], dtype=float)
+        rel = points - robot_xy
+        local_y = rel @ lateral
+
+        half_roi = 0.5 * self.p.hist_roi_width
+        bins = np.arange(-half_roi, half_roi + self.p.hist_bin_size, self.p.hist_bin_size)
+        if len(bins) < 3:
+            return None
+        hist, bin_edges = np.histogram(local_y, bins=bins)
+
+        peaks: List[Tuple[float, int]] = []
+        for idx in range(1, len(hist) - 1):
+            if hist[idx] >= self.p.hist_peak_min_points and hist[idx] >= hist[idx - 1] and hist[idx] >= hist[idx + 1]:
+                center = 0.5 * (bin_edges[idx] + bin_edges[idx + 1])
+                peaks.append((float(center), int(hist[idx])))
+
+        if len(peaks) < 2:
+            self.get_logger().info(f"Histogram peaks: {[round(p[0], 3) for p in peaks]}", throttle_duration_sec=2.0)
+            return None
+
+        best_pair = None
+        best_score = float("inf")
+        sorted_peaks = sorted(peaks, key=lambda item: item[0])
+        for left_idx in range(len(sorted_peaks) - 1):
+            right_peak = sorted_peaks[left_idx][0]
+            left_peak = sorted_peaks[left_idx + 1][0]
+            sep = left_peak - right_peak
+            if sep < self.p.min_lane_width or sep > self.p.max_lane_width:
+                continue
+            count_bonus = 0.01 * (sorted_peaks[left_idx][1] + sorted_peaks[left_idx + 1][1])
+            score = abs(sep - self.p.expected_row_width) - count_bonus
+            if score < best_score:
+                best_score = score
+                best_pair = (left_peak, right_peak)
+
+        self.get_logger().info(
+            f"Histogram peaks: {[round(p[0], 3) for p in sorted_peaks]}, selected={best_pair}",
+            throttle_duration_sec=2.0,
+        )
+        return best_pair
+
+    def start_point1_from_peak(self, points: np.ndarray, pose: Pose2D, peak_y: float) -> np.ndarray:
+        forward = self.yaw_to_vector(pose.yaw)
+        lateral = np.array([-forward[1], forward[0]], dtype=float)
+        robot_xy = np.array([pose.x, pose.y], dtype=float)
+        fallback = robot_xy + peak_y * lateral
+
+        if len(points) == 0:
+            return fallback
+
+        rel = points - robot_xy
+        local_x = rel @ forward
+        local_y = rel @ lateral
+
+        peak_half_width = max(self.p.hist_bin_size, 0.5 * self.p.row_rectangle_width)
+        band_mask = (local_x >= 0.0) & (np.abs(local_y - peak_y) <= peak_half_width)
+        band_points = points[band_mask]
+        band_x = local_x[band_mask]
+
+        if len(band_points) == 0:
+            self.get_logger().info(
+                f"No occupied start points ahead for peak {peak_y:.3f}; using robot-height fallback",
+                throttle_duration_sec=2.0,
+            )
+            return fallback
+
+        first_x = float(np.min(band_x))
+        start_window = max(self.p.row_point_window_length, self.p.hist_bin_size)
+        start_mask = band_x <= first_x + start_window
+        start_points = band_points[start_mask]
+        if len(start_points) == 0:
+            return fallback
+
+        point1 = np.mean(start_points, axis=0)
+        self.get_logger().info(
+            f"Initial point 1 for peak {peak_y:.3f}: first_x={first_x:.2f}, n={len(start_points)}",
+            throttle_duration_sec=2.0,
+        )
+        return np.asarray(point1, dtype=float)
+
+    def initial_point2_from_sector(self, points: np.ndarray, pose: Pose2D, point1: np.ndarray, peak_y: float) -> np.ndarray:
+        forward = self.yaw_to_vector(pose.yaw)
+        return self.point2_from_sector(points, point1, forward, f"peak {peak_y:.3f}")
+
+    def point2_from_sector(
+        self,
+        points: np.ndarray,
+        point1: np.ndarray,
+        forward: np.ndarray,
+        label: str,
+    ) -> np.ndarray:
+        expected_point2 = np.asarray(point1, dtype=float) + self.p.row_segment_point_spacing * forward
+        sector_points = self.points_in_oriented_rectangle(
+            points,
+            expected_point2,
+            forward,
+            self.p.row_point_window_length,
+            self.p.row_rectangle_width,
+        )
+        if len(sector_points) == 0:
+            self.get_logger().info(
+                f"No occupied second-sector points for {label}; using expected point 2",
+                throttle_duration_sec=2.0,
+            )
+            return expected_point2
+
+        point2 = np.mean(sector_points, axis=0)
+        self.get_logger().info(
+            f"Initial point 2 for {label}: n={len(sector_points)}",
+            throttle_duration_sec=2.0,
+        )
+        return np.asarray(point2, dtype=float)
+
+    def entrance_point1_from_peak(
+        self,
+        points: np.ndarray,
+        center: np.ndarray,
+        outgoing_direction: np.ndarray,
+        peak_y: float,
+    ) -> np.ndarray:
+        outgoing_direction = self.normalize(outgoing_direction)
+        lateral_direction = np.array([-outgoing_direction[1], outgoing_direction[0]], dtype=float)
+        fallback = np.asarray(center, dtype=float) + peak_y * lateral_direction
+        if len(points) == 0:
+            return fallback
+
+        rel = points - np.asarray(center, dtype=float)
+        local_x = rel @ outgoing_direction
+        local_y = rel @ lateral_direction
+        peak_half_width = max(self.p.hist_bin_size, 0.5 * self.p.row_rectangle_width)
+        band_mask = np.abs(local_y - peak_y) <= peak_half_width
+        band_points = points[band_mask]
+        band_x = local_x[band_mask]
+        if len(band_points) == 0:
+            return fallback
+
+        outermost_x = float(np.max(band_x))
+        point1_points = band_points[band_x >= outermost_x - self.p.row_point_window_length]
+        if len(point1_points) == 0:
+            return fallback
+        return np.asarray(np.mean(point1_points, axis=0), dtype=float)
+
+    def initial_direction_from_points(self, point1: np.ndarray, point2: np.ndarray, fallback_direction: np.ndarray) -> np.ndarray:
+        direction = np.asarray(point2, dtype=float) - np.asarray(point1, dtype=float)
+        if float(np.linalg.norm(direction)) < 1e-6:
+            return self.normalize(fallback_direction)
+        fallback_direction = self.normalize(fallback_direction)
+        direction = self.normalize(direction)
+        if np.dot(direction, fallback_direction) < 0.0:
+            direction = -direction
+        return direction
+
+    def recompute_rows(self) -> None:
+        if self.left_row is None or self.right_row is None:
+            return
+        map_points = self.get_all_map_points()
+        if len(map_points) == 0:
+            self.midline = np.empty((0, 2), dtype=float)
+            self.plant_row_end_point = None
+            self.row_exit_goal = None
+            self.row_exit_heading_goal = None
+            self.row_end_direction = None
+            return
+
+        self.left_row.result = self.march_row(self.left_row, map_points)
+        self.right_row.result = self.march_row(self.right_row, map_points)
+        self.update_frozen_prefix(self.left_row)
+        self.update_frozen_prefix(self.right_row)
+        self.midline = self.build_midline(self.left_row.result.points, self.right_row.result.points)
+
+        if self.left_row.result.ended and self.right_row.result.ended:
+            left_end = self.left_row.result.end_point
+            right_end = self.right_row.result.end_point
+            left_direction = self.left_row.result.end_direction
+            right_direction = self.right_row.result.end_direction
+            if left_end is not None and right_end is not None and left_direction is not None and right_direction is not None and len(self.midline) > 0:
+                self.row_end_direction = self.mean_direction(left_direction, right_direction)
+                farther_end = left_end if float(left_end @ self.row_end_direction) >= float(right_end @ self.row_end_direction) else right_end
+                center_anchor = np.asarray(self.midline[-1], dtype=float)
+                self.plant_row_end_point = self.project_point_to_line(farther_end, center_anchor, self.row_end_direction)
+                self.row_exit_goal = self.plant_row_end_point + self.p.row_end_goal_outward_distance * self.row_end_direction
+                self.row_exit_heading_goal = (
+                    self.row_exit_goal
+                    + self.p.maneuver_heading_lookahead_distance * self.row_end_direction
+                )
+                self.midline = self.append_polyline_point(self.midline, self.plant_row_end_point)
+                self.midline = self.append_polyline_point(self.midline, self.row_exit_goal)
+                self.midline = self.append_polyline_point(self.midline, self.row_exit_heading_goal)
+            elif len(self.midline) > 0:
+                self.plant_row_end_point = np.asarray(self.midline[-1], dtype=float)
+                self.row_exit_goal = np.asarray(self.midline[-1], dtype=float)
+                self.row_exit_heading_goal = np.asarray(self.midline[-1], dtype=float)
+        else:
+            self.plant_row_end_point = None
+            self.row_exit_goal = None
+            self.row_exit_heading_goal = None
+            self.row_end_direction = None
+
+    def update_frozen_prefix(self, model: RowMarchModel) -> None:
+        if self.robot_pose is None or len(model.result.points) < 2:
+            return
+        robot_xy = np.array([self.robot_pose.x, self.robot_pose.y], dtype=float)
+        direction = self.normalize(model.initial_direction)
+        along = (model.result.points - robot_xy) @ direction
+        eligible = np.where(along <= -self.p.row_freeze_behind_distance)[0]
+        if len(eligible) == 0:
+            return
+        freeze_count = int(eligible[-1]) + 1
+        if freeze_count > len(model.frozen_points):
+            model.frozen_points = np.array(model.result.points[:freeze_count], copy=True)
+            if len(model.result.point_directions) >= freeze_count:
+                model.frozen_directions = np.array(model.result.point_directions[:freeze_count], copy=True)
+        model.result.frozen_count = len(model.frozen_points)
+
+    def march_row(self, model: RowMarchModel, map_points: np.ndarray) -> RowMarchResult:
+        result = RowMarchResult()
+        if len(model.frozen_points) >= 2:
+            exact_points = [np.asarray(point, dtype=float) for point in model.frozen_points]
+            point1 = exact_points[-2]
+            point2 = exact_points[-1]
+            if len(model.frozen_directions) == len(model.frozen_points):
+                exact_directions = [np.asarray(direction, dtype=float) for direction in model.frozen_directions]
+                direction = self.normalize(exact_directions[-1])
+            else:
+                direction = self.initial_direction_from_points(point1, point2, model.initial_direction)
+                exact_directions = [np.asarray(direction, dtype=float) for _ in exact_points]
+            line_points = self.build_next_line_from_old_point3(point2, direction)
+        else:
+            point1 = np.asarray(model.initial_point1, dtype=float)
+            point2 = np.asarray(model.initial_point2, dtype=float)
+            direction = self.normalize(model.initial_direction)
+            exact_points = [point1, point2]
+            exact_directions = [np.asarray(direction, dtype=float), np.asarray(direction, dtype=float)]
+            line_points = self.build_initial_line_from_point1_and_point2(point1, point2, direction)
+        result.frozen_count = len(model.frozen_points)
+        previous_valid_point: Optional[np.ndarray] = np.asarray(point2, dtype=float)
+        last_valid_direction = np.asarray(direction, dtype=float)
+
+        for _ in range(self.p.row_max_march_steps):
+            search_point3 = line_points[2]
+            big_rect_length = self.big_rectangle_length()
+            fit_points = self.points_in_oriented_rectangle(
+                map_points,
+                search_point3,
+                direction,
+                big_rect_length,
+                self.p.row_rectangle_width,
+            )
+
+            corrected_direction = direction
+            corrected_point3 = np.array(search_point3, copy=True)
+            if len(fit_points) >= self.p.row_min_fit_points:
+                fit_origin, fitted_direction = self.fit_line(fit_points, direction)
+                corrected_direction = fitted_direction
+                corrected_point3 = self.project_point_to_line(search_point3, fit_origin, fitted_direction)
+
+            corrected_line_points = self.build_initial_line_from_point3(corrected_point3, corrected_direction)
+            field_count = self.count_points_in_fields_3_to_5(map_points, corrected_line_points, corrected_direction)
+
+            local_point3_points = self.points_in_oriented_rectangle(
+                map_points,
+                corrected_point3,
+                corrected_direction,
+                self.p.row_point_window_length,
+                self.p.row_rectangle_width,
+            )
+
+            if len(exact_points) > 0 and field_count <= self.p.row_end_min_points_fields_3_to_5:
+                result.ended = True
+                result.end_point = previous_valid_point if previous_valid_point is not None else exact_points[-1]
+                result.end_direction = np.asarray(last_valid_direction, dtype=float)
+                break
+
+            if len(local_point3_points) > 0:
+                row_point = np.mean(local_point3_points, axis=0)
+                previous_valid_point = row_point
+            else:
+                row_point = np.array(corrected_point3, copy=True)
+
+            exact_points.append(row_point)
+            exact_directions.append(np.asarray(corrected_direction, dtype=float))
+            last_valid_direction = np.asarray(corrected_direction, dtype=float)
+            result.debug_segments.append(
+                SegmentDebug(
+                    line_points=np.array(corrected_line_points, copy=True),
+                    direction=np.array(corrected_direction, copy=True),
+                    big_rect_center=np.array(search_point3, copy=True),
+                    big_rect_length=big_rect_length,
+                    big_rect_width=self.p.row_rectangle_width,
+                    point3_rect_center=np.array(corrected_point3, copy=True),
+                    point3_rect_length=self.p.row_point_window_length,
+                    point3_rect_width=self.p.row_rectangle_width,
+                    support_count=len(fit_points),
+                    end_field_count=field_count,
+                )
+            )
+
+            direction = corrected_direction
+            line_points = self.build_next_line_from_old_point3(corrected_point3, direction)
+
+        result.points = np.asarray(exact_points, dtype=float) if exact_points else np.empty((0, 2), dtype=float)
+        result.point_directions = (
+            np.asarray(exact_directions, dtype=float) if exact_directions else np.empty((0, 2), dtype=float)
+        )
+        result.current_line_points = np.asarray(line_points, dtype=float)
+        if result.ended and result.end_point is None and len(result.points) > 0:
+            result.end_point = result.points[-1]
+        if result.end_direction is None:
+            result.end_direction = np.asarray(last_valid_direction, dtype=float)
+        return result
+
+    def build_initial_line_from_point3(self, point3: np.ndarray, direction: np.ndarray) -> np.ndarray:
+        spacing = self.p.row_segment_point_spacing
+        direction = self.normalize(direction)
+        return np.array([point3 + (idx - 2) * spacing * direction for idx in range(self.p.row_segment_point_count)], dtype=float)
+
+    def build_initial_line_from_point1_and_point2(self, point1: np.ndarray, point2: np.ndarray, direction: np.ndarray) -> np.ndarray:
+        spacing = self.p.row_segment_point_spacing
+        direction = self.initial_direction_from_points(point1, point2, direction)
+        point1 = np.asarray(point1, dtype=float)
+        point2 = np.asarray(point2, dtype=float)
+        points = [point1, point2]
+        while len(points) < self.p.row_segment_point_count:
+            points.append(points[-1] + spacing * direction)
+        return np.asarray(points, dtype=float)
+
+    def build_next_line_from_old_point3(self, old_point3: np.ndarray, direction: np.ndarray) -> np.ndarray:
+        spacing = self.p.row_segment_point_spacing
+        direction = self.normalize(direction)
+        point2 = np.asarray(old_point3, dtype=float)
+        return np.array([point2 + (idx - 1) * spacing * direction for idx in range(self.p.row_segment_point_count)], dtype=float)
+
+    def big_rectangle_length(self) -> float:
+        return float(self.p.row_segment_point_count) * self.p.row_segment_point_spacing
+
+    def count_points_in_fields_3_to_5(self, map_points: np.ndarray, line_points: np.ndarray, direction: np.ndarray) -> int:
+        total = 0
+        for idx in (2, 3, 4):
+            total += len(
+                self.points_in_oriented_rectangle(
+                    map_points,
+                    line_points[idx],
+                    direction,
+                    self.p.row_point_window_length,
+                    self.p.row_rectangle_width,
+                )
+            )
+        return total
+
+    def fit_line(self, points: np.ndarray, fallback_direction: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        fallback_direction = self.normalize(fallback_direction)
+        fallback_origin = np.mean(points, axis=0) if len(points) > 0 else np.array([0.0, 0.0], dtype=float)
+        if len(points) < 2:
+            return fallback_origin, fallback_direction
+
+        fit_points = points
+        if len(points) > 2:
+            best_inliers = np.ones(len(points), dtype=bool)
+            best_count = -1
+            threshold = max(0.05, 0.18 * self.p.row_rectangle_width)
+            rng = np.random.default_rng(42)
+            iterations = min(64, max(16, len(points) * 2))
+
+            for _ in range(iterations):
+                idx_a, idx_b = rng.choice(len(points), size=2, replace=False)
+                a = points[idx_a]
+                b = points[idx_b]
+                candidate = b - a
+                norm = float(np.linalg.norm(candidate))
+                if norm < 1e-9:
+                    continue
+                candidate = candidate / norm
+                if np.dot(candidate, fallback_direction) < 0.0:
+                    candidate = -candidate
+                perp = np.array([-candidate[1], candidate[0]], dtype=float)
+                distances = np.abs((points - a) @ perp)
+                inliers = distances <= threshold
+                count = int(np.sum(inliers))
+                if count > best_count:
+                    best_count = count
+                    best_inliers = inliers
+
+            if best_count >= self.p.row_min_fit_points:
+                fit_points = points[best_inliers]
+
+        centered = fit_points - np.mean(fit_points, axis=0)
+        cov = np.cov(centered.T)
+        if np.ndim(cov) != 2:
+            return np.mean(fit_points, axis=0), fallback_direction
+
+        eigenvalues, eigenvectors = np.linalg.eigh(cov)
+        direction = np.real(eigenvectors[:, int(np.argmax(eigenvalues))])
+        direction = self.normalize(direction)
+        if np.dot(direction, fallback_direction) < 0.0:
+            direction = -direction
+
+        # Light damping keeps the marching direction from swinging on sparse/noisy cells.
+        direction = self.normalize(0.75 * fallback_direction + 0.25 * direction)
+        origin = np.mean(fit_points, axis=0)
+        return np.asarray(origin, dtype=float), direction
+
+    def project_point_to_line(self, point: np.ndarray, line_origin: np.ndarray, line_direction: np.ndarray) -> np.ndarray:
+        line_direction = self.normalize(line_direction)
+        rel = np.asarray(point, dtype=float) - np.asarray(line_origin, dtype=float)
+        return np.asarray(line_origin, dtype=float) + float(rel @ line_direction) * line_direction
+
+    def mean_direction(self, first: np.ndarray, second: np.ndarray) -> np.ndarray:
+        first = self.normalize(first)
+        second = self.normalize(second)
+        if np.dot(first, second) < 0.0:
+            second = -second
+        return self.normalize(first + second)
+
+    def append_polyline_point(self, polyline: np.ndarray, point: np.ndarray) -> np.ndarray:
+        point = np.asarray(point, dtype=float)
+        if len(polyline) == 0:
+            return np.array([point], dtype=float)
+        if float(np.linalg.norm(np.asarray(polyline[-1], dtype=float) - point)) < 1e-6:
+            return polyline
+        return np.vstack((polyline, point))
+
+    def points_in_oriented_rectangle(
+        self,
+        points: np.ndarray,
+        center: np.ndarray,
+        direction: np.ndarray,
+        length: float,
+        width: float,
+    ) -> np.ndarray:
+        if len(points) == 0:
+            return np.empty((0, 2), dtype=float)
+        direction = self.normalize(direction)
+        perp = np.array([-direction[1], direction[0]], dtype=float)
+        rel = points - np.asarray(center, dtype=float)
+        along = rel @ direction
+        lateral = rel @ perp
+        mask = (np.abs(along) <= 0.5 * length) & (np.abs(lateral) <= 0.5 * width)
+        return points[mask]
+
+    def build_midline(self, left_points: np.ndarray, right_points: np.ndarray) -> np.ndarray:
+        if len(left_points) == 0 or len(right_points) == 0:
+            return np.empty((0, 2), dtype=float)
+        count = min(len(left_points), len(right_points))
+        return 0.5 * (left_points[:count] + right_points[:count])
+
+    def point_at_polyline_distance(self, polyline: np.ndarray, start_idx: int, distance_ahead: float) -> Optional[np.ndarray]:
+        if len(polyline) == 0:
+            return None
+        if len(polyline) == 1:
+            return polyline[0]
+        start_idx = int(np.clip(start_idx, 0, len(polyline) - 1))
+        travelled = 0.0
+        for idx in range(start_idx, len(polyline) - 1):
+            segment = polyline[idx + 1] - polyline[idx]
+            seg_len = float(np.linalg.norm(segment))
+            if seg_len < 1e-9:
+                continue
+            if travelled + seg_len >= distance_ahead:
+                ratio = (distance_ahead - travelled) / seg_len
+                return polyline[idx] + ratio * segment
+            travelled += seg_len
+        return polyline[-1]
+
+    def project_onto_polyline(self, polyline: np.ndarray, point: np.ndarray) -> Tuple[np.ndarray, int]:
+        point = np.asarray(point, dtype=float)
+        if len(polyline) < 2:
+            return point, 0
+
+        best_projection = np.asarray(polyline[0], dtype=float)
+        best_segment_idx = 0
+        best_distance = float("inf")
+        for idx in range(len(polyline) - 1):
+            segment = polyline[idx + 1] - polyline[idx]
+            seg_len_sq = float(segment @ segment)
+            if seg_len_sq < 1e-12:
+                continue
+            ratio = float(np.clip(((point - polyline[idx]) @ segment) / seg_len_sq, 0.0, 1.0))
+            projection = polyline[idx] + ratio * segment
+            distance = float(np.linalg.norm(point - projection))
+            if distance < best_distance:
+                best_distance = distance
+                best_projection = projection
+                best_segment_idx = idx
+        return np.asarray(best_projection, dtype=float), best_segment_idx
+
+    def point_at_polyline_distance_from_projection(
+        self,
+        polyline: np.ndarray,
+        projection: np.ndarray,
+        start_idx: int,
+        distance_ahead: float,
+    ) -> np.ndarray:
+        if len(polyline) < 2:
+            return np.asarray(projection, dtype=float)
+
+        start_idx = int(np.clip(start_idx, 0, len(polyline) - 2))
+        travelled = 0.0
+        segment_start = np.asarray(projection, dtype=float)
+        for idx in range(start_idx, len(polyline) - 1):
+            segment_end = np.asarray(polyline[idx + 1], dtype=float)
+            segment = segment_end - segment_start
+            seg_len = float(np.linalg.norm(segment))
+            if seg_len >= 1e-9:
+                if travelled + seg_len >= distance_ahead:
+                    ratio = (distance_ahead - travelled) / seg_len
+                    return segment_start + ratio * segment
+                travelled += seg_len
+            segment_start = segment_end
+        return np.asarray(polyline[-1], dtype=float)
+
+    def point_behind_polyline_projection(
+        self,
+        polyline: np.ndarray,
+        projection: np.ndarray,
+        start_idx: int,
+        distance_behind: float,
+    ) -> np.ndarray:
+        if len(polyline) < 2 or distance_behind <= 0.0:
+            return np.asarray(projection, dtype=float)
+
+        start_idx = int(np.clip(start_idx, 0, len(polyline) - 2))
+        travelled = 0.0
+        segment_end = np.asarray(projection, dtype=float)
+        for idx in range(start_idx, -1, -1):
+            segment_start = np.asarray(polyline[idx], dtype=float)
+            segment = segment_start - segment_end
+            seg_len = float(np.linalg.norm(segment))
+            if seg_len >= 1e-9:
+                if travelled + seg_len >= distance_behind:
+                    ratio = (distance_behind - travelled) / seg_len
+                    return segment_end + ratio * segment
+                travelled += seg_len
+            segment_end = segment_start
+        return np.asarray(polyline[0], dtype=float)
+
+    def estimate_polyline_curvature_ahead(
+        self,
+        polyline: np.ndarray,
+        point: np.ndarray,
+        lookahead_distance: Optional[float] = None,
+        sample_count: Optional[int] = None,
+        back_distance: Optional[float] = None,
+        projection: Optional[np.ndarray] = None,
+        segment_idx: Optional[int] = None,
+    ) -> float:
+        if len(polyline) < 3:
+            return 0.0
+
+        if projection is None or segment_idx is None:
+            projection, segment_idx = self.project_onto_polyline(polyline, point)
+        lookahead_distance = self.p.lookahead_distance if lookahead_distance is None else lookahead_distance
+        sample_count = self.p.lookahead_curvature_sample_count if sample_count is None else sample_count
+        back_distance = self.p.lookahead_curvature_back_distance if back_distance is None else back_distance
+        sample_count = max(3, sample_count)
+        samples = []
+        for distance in np.linspace(-back_distance, lookahead_distance, sample_count):
+            distance = float(distance)
+            if distance < 0.0:
+                samples.append(self.point_behind_polyline_projection(polyline, projection, segment_idx, abs(distance)))
+            else:
+                samples.append(
+                    self.point_at_polyline_distance_from_projection(
+                        polyline,
+                        projection,
+                        segment_idx,
+                        distance,
+                    )
+                )
+
+        directions: List[float] = []
+        arc_length = 0.0
+        for start, end in zip(samples[:-1], samples[1:]):
+            segment = end - start
+            segment_length = float(np.linalg.norm(segment))
+            if segment_length < 1e-9:
+                continue
+            arc_length += segment_length
+            directions.append(math.atan2(float(segment[1]), float(segment[0])))
+
+        if len(directions) < 2 or arc_length < 1e-9:
+            return 0.0
+
+        total_heading_change = 0.0
+        for previous, current in zip(directions[:-1], directions[1:]):
+            total_heading_change += abs(wrap_to_pi(current - previous))
+        return total_heading_change / arc_length
+
+    def dynamic_follow_lookahead(self, polyline: np.ndarray, point: np.ndarray) -> float:
+        curvature = self.estimate_polyline_curvature_ahead(polyline, point)
+        projection, _ = self.project_onto_polyline(polyline, point)
+        lateral_error = float(np.linalg.norm(np.asarray(point, dtype=float) - projection))
+        raw_lookahead = self.p.lookahead_distance / (
+            1.0
+            + self.p.lookahead_curvature_gain * abs(curvature)
+            + self.p.lookahead_lateral_error_gain * lateral_error
+        )
+        raw_lookahead = float(
+            np.clip(raw_lookahead, self.p.turn_lookahead_distance, self.p.lookahead_distance)
+        )
+        alpha = self.p.lookahead_filter_alpha
+        previous_lookahead = getattr(self, "current_lookahead_distance", self.p.lookahead_distance)
+        lookahead = (1.0 - alpha) * previous_lookahead + alpha * raw_lookahead
+        lookahead = float(np.clip(lookahead, self.p.turn_lookahead_distance, self.p.lookahead_distance))
+        self.current_lookahead_distance = lookahead
+        self.current_lookahead_curvature = curvature
+        return lookahead
+
+    def dynamic_maneuver_lookahead(
+        self,
+        route: np.ndarray,
+        projection: np.ndarray,
+        segment_idx: int,
+        lateral_error: float,
+        remaining_distance: float,
+    ) -> float:
+        curvature = self.estimate_polyline_curvature_ahead(
+            route,
+            projection,
+            self.p.maneuver_lookahead_distance,
+            self.p.lookahead_curvature_sample_count,
+            self.p.lookahead_curvature_back_distance,
+            projection,
+            segment_idx,
+        )
+        raw_lookahead = self.p.maneuver_lookahead_distance / (
+            1.0
+            + self.p.maneuver_lookahead_curvature_gain * abs(curvature)
+            + self.p.maneuver_lookahead_lateral_error_gain * lateral_error
+        )
+        raw_lookahead = float(
+            np.clip(
+                raw_lookahead,
+                self.p.maneuver_turn_lookahead_distance,
+                self.p.maneuver_lookahead_distance,
+            )
+        )
+        alpha = self.p.maneuver_lookahead_filter_alpha
+        previous_lookahead = getattr(
+            self,
+            "current_maneuver_lookahead_distance",
+            self.p.maneuver_lookahead_distance,
+        )
+        filtered_lookahead = (1.0 - alpha) * previous_lookahead + alpha * raw_lookahead
+        filtered_lookahead = float(
+            np.clip(
+                filtered_lookahead,
+                self.p.maneuver_turn_lookahead_distance,
+                self.p.maneuver_lookahead_distance,
+            )
+        )
+        distance_limited_lookahead = min(filtered_lookahead, max(0.10, 0.60 * remaining_distance))
+        self.current_maneuver_lookahead_distance = distance_limited_lookahead
+        self.current_maneuver_lookahead_curvature = curvature
+        return distance_limited_lookahead
+
+    def lookahead_point_from_polyline_projection(
+        self,
+        polyline: np.ndarray,
+        point: np.ndarray,
+        distance_ahead: float,
+    ) -> Optional[np.ndarray]:
+        if len(polyline) == 0:
+            return None
+        if len(polyline) == 1:
+            return np.asarray(polyline[0], dtype=float)
+
+        point = np.asarray(point, dtype=float)
+        best_projection: Optional[np.ndarray] = None
+        best_segment_idx = 0
+        best_distance = float("inf")
+        for idx in range(len(polyline) - 1):
+            segment = polyline[idx + 1] - polyline[idx]
+            seg_len_sq = float(segment @ segment)
+            if seg_len_sq < 1e-12:
+                continue
+            ratio = float(np.clip(((point - polyline[idx]) @ segment) / seg_len_sq, 0.0, 1.0))
+            projection = polyline[idx] + ratio * segment
+            distance = float(np.linalg.norm(point - projection))
+            if distance < best_distance:
+                best_distance = distance
+                best_projection = projection
+                best_segment_idx = idx
+
+        if best_projection is None:
+            return np.asarray(polyline[-1], dtype=float)
+
+        travelled = 0.0
+        segment_start = best_projection
+        for idx in range(best_segment_idx, len(polyline) - 1):
+            segment_end = polyline[idx + 1]
+            segment = segment_end - segment_start
+            seg_len = float(np.linalg.norm(segment))
+            if seg_len >= 1e-9:
+                if travelled + seg_len >= distance_ahead:
+                    ratio = (distance_ahead - travelled) / seg_len
+                    return segment_start + ratio * segment
+                travelled += seg_len
+            segment_start = segment_end
+        return np.asarray(polyline[-1], dtype=float)
+
+    def drive_to_point(
+        self,
+        target: np.ndarray,
+        max_speed: Optional[float] = None,
+        min_speed: Optional[float] = None,
+    ) -> None:
+        target = np.asarray(target, dtype=float)
+        if self.last_target_point is None:
+            filtered_target = target
+        else:
+            alpha = self.p.target_filter_alpha
+            filtered_target = (1.0 - alpha) * self.last_target_point + alpha * target
+        self.last_target_point = np.asarray(filtered_target, dtype=float)
+
+        dx = float(filtered_target[0] - self.robot_pose.x)
+        dy = float(filtered_target[1] - self.robot_pose.y)
+        target_distance = math.hypot(dx, dy)
+        target_yaw = math.atan2(dy, dx)
+        yaw_error = wrap_to_pi(target_yaw - self.robot_pose.yaw)
+
+        cmd = Twist()
+        is_follow_control = max_speed is None and min_speed is None
+        max_speed = self.p.follow_speed if max_speed is None else max_speed
+        min_speed = self.p.slow_speed if min_speed is None else min_speed
+        is_maneuver_control = (
+            not is_follow_control
+            and math.isclose(max_speed, self.p.maneuver_speed)
+            and math.isclose(min_speed, self.p.maneuver_slow_speed)
+        )
+        pursuit_distance = max(0.10, target_distance)
+        curvature = self.p.pure_pursuit_gain * 2.0 * math.sin(yaw_error) / pursuit_distance
+        lookahead_speed_penalty = 0.0
+        if is_follow_control and self.p.lookahead_distance > 1e-9:
+            lookahead_ratio = float(np.clip(self.current_lookahead_distance / self.p.lookahead_distance, 0.0, 1.0))
+            lookahead_speed_penalty = self.p.lookahead_speed_reduction_gain * (1.0 - lookahead_ratio)
+        elif is_maneuver_control and self.p.maneuver_lookahead_distance > 1e-9:
+            lookahead_ratio = float(
+                np.clip(
+                    self.current_maneuver_lookahead_distance / self.p.maneuver_lookahead_distance,
+                    0.0,
+                    1.0,
+                )
+            )
+            lookahead_speed_penalty = self.p.maneuver_lookahead_speed_reduction_gain * (1.0 - lookahead_ratio)
+        cmd.linear.x = float(np.clip(
+            max_speed / (
+                1.0
+                + self.p.curve_speed_reduction_gain * abs(curvature)
+                + lookahead_speed_penalty
+            ),
+            min_speed,
+            max_speed,
+        ))
+        radius_limited_angular = abs(cmd.linear.x) / self.p.min_follow_turn_radius
+        max_angular = min(self.p.follow_max_angular_speed, radius_limited_angular)
+        # Pure-pursuit curvature is calmer around the midline than a direct
+        # proportional yaw correction and still works for headland waypoints.
+        pursuit_angular = cmd.linear.x * curvature
+        angular_raw = float(np.clip(pursuit_angular, -max_angular, max_angular))
+
+        dt = 1.0 / max(1e-6, self.p.control_frequency)
+        max_delta = self.p.angular_rate_limit * dt
+        angular_limited = float(np.clip(
+            angular_raw,
+            self.last_cmd_angular_z - max_delta,
+            self.last_cmd_angular_z + max_delta,
+        ))
+        self.last_cmd_angular_z = angular_limited
+        cmd.angular.z = angular_limited
+        self.cmd_pub.publish(cmd)
+
+    def get_map_points_in_hist_roi(self, pose: Pose2D) -> np.ndarray:
+        points = self.get_all_map_points()
+        if len(points) == 0:
+            return points
+        center = np.array([pose.x, pose.y], dtype=float)
+        forward = self.yaw_to_vector(pose.yaw)
+        return self.points_in_oriented_rectangle(
+            points,
+            center,
+            forward,
+            self.p.hist_roi_depth,
+            self.p.hist_roi_width,
+        )
+
+    def get_all_map_points(self) -> np.ndarray:
+        if self.latest_map is None:
+            return np.empty((0, 2), dtype=float)
+
+        info = self.latest_map.info
+        grid = np.asarray(self.latest_map.data, dtype=np.int16).reshape((info.height, info.width))
+        occ_y, occ_x = np.where(grid >= self.p.occ_threshold)
+        if len(occ_x) == 0:
+            return np.empty((0, 2), dtype=float)
+
+        world_x = (occ_x.astype(float) + 0.5) * info.resolution + info.origin.position.x
+        world_y = (occ_y.astype(float) + 0.5) * info.resolution + info.origin.position.y
+        return np.column_stack((world_x, world_y))
+
+    def publish_visuals(self) -> None:
+        markers = MarkerArray()
+        stamp = self.get_clock().now().to_msg()
+        clear_marker = Marker(header=Header(frame_id=self.p.map_frame, stamp=stamp))
+        clear_marker.action = Marker.DELETEALL
+        markers.markers.append(clear_marker)
+
+        marker_id = 1
+        for row_number in sorted(self.stored_rows):
+            markers.markers.append(
+                self.create_line_marker(
+                    f"stored_row_{row_number}",
+                    marker_id,
+                    self.stored_rows[row_number],
+                    (0.65, 0.75, 0.82, 0.65),
+                    0.025,
+                    stamp,
+                )
+            )
+            marker_id += 1
+        if self.left_row is not None:
+            marker_id = self.add_row_markers(markers, marker_id, self.left_row, (0.1, 0.95, 0.2, 1.0), stamp)
+        if self.right_row is not None:
+            marker_id = self.add_row_markers(markers, marker_id, self.right_row, (1.0, 0.55, 0.05, 1.0), stamp)
+        if len(self.midline) > 0:
+            markers.markers.append(self.create_line_marker("march_midline", marker_id, self.midline, (0.15, 0.45, 1.0, 1.0), 0.055, stamp))
+            marker_id += 1
+        if self.robot_pose is not None and self.p.laser_follow_enabled:
+            marker_id = self.add_laser_follow_markers(markers, marker_id, stamp)
+        if self.fused_target_point is not None:
+            markers.markers.append(self.create_sphere_marker("fused_target_point", marker_id, self.fused_target_point, (0.95, 0.25, 0.95, 1.0), 0.14, stamp))
+            marker_id += 1
+        if self.last_target_point is not None:
+            markers.markers.append(self.create_sphere_marker("filtered_target_point", marker_id, self.last_target_point, (1.0, 0.05, 1.0, 1.0), 0.18, stamp))
+            marker_id += 1
+            if self.robot_pose is not None:
+                robot_point = np.array([self.robot_pose.x, self.robot_pose.y], dtype=float)
+                target_line = np.vstack((robot_point, self.last_target_point))
+                markers.markers.append(self.create_line_marker("robot_to_filtered_target", marker_id, target_line, (1.0, 0.05, 1.0, 0.75), 0.025, stamp))
+                marker_id += 1
+        if self.plant_row_end_point is not None:
+            markers.markers.append(self.create_sphere_marker("plant_row_end", marker_id, self.plant_row_end_point, (1.0, 0.0, 0.0, 1.0), 0.22, stamp))
+            marker_id += 1
+        if self.row_exit_goal is not None:
+            markers.markers.append(self.create_sphere_marker("row_exit_goal", marker_id, self.row_exit_goal, (0.7, 0.0, 1.0, 1.0), 0.24, stamp))
+            marker_id += 1
+        if self.row_exit_heading_goal is not None:
+            markers.markers.append(
+                self.create_sphere_marker("row_exit_heading_goal", marker_id, self.row_exit_heading_goal, (0.7, 0.0, 1.0, 0.55), 0.13, stamp)
+            )
+            marker_id += 1
+        if self.entrance_hist_center is not None and self.entrance_hist_direction is not None:
+            markers.markers.append(
+                self.create_rectangle_marker(
+                    "entrance_histogram_roi",
+                    marker_id,
+                    self.entrance_hist_center,
+                    self.entrance_hist_direction,
+                    self.p.hist_roi_depth,
+                    self.p.hist_roi_width,
+                    (0.1, 1.0, 0.9, 0.8),
+                    stamp,
+                )
+            )
+            marker_id += 1
+            markers.markers.append(
+                self.create_arrow_marker(
+                    "entrance_histogram_direction",
+                    marker_id,
+                    self.entrance_hist_center,
+                    self.entrance_hist_direction,
+                    (0.1, 1.0, 0.9, 1.0),
+                    stamp,
+                )
+            )
+            marker_id += 1
+        for peak in self.entrance_hist_peaks:
+            color = (0.0, 1.0, 0.25, 1.0) if peak.selected else (0.0, 0.85, 1.0, 0.9)
+            scale = 0.24 if peak.selected else 0.16
+            markers.markers.append(self.create_sphere_marker("entrance_histogram_peaks", marker_id, peak.point, color, scale, stamp))
+            marker_id += 1
+            label = "?" if peak.row_number is None else str(peak.row_number)
+            markers.markers.append(self.create_text_marker("entrance_histogram_row_numbers", marker_id, peak.point, label, color, stamp))
+            marker_id += 1
+        for waypoint in self.entrance_waypoints:
+            markers.markers.append(
+                self.create_sphere_marker("entrance_waypoints", marker_id, waypoint, (1.0, 0.9, 0.1, 1.0), 0.24, stamp)
+            )
+            marker_id += 1
+        if len(self.entrance_follow_path) > 0:
+            markers.markers.append(
+                self.create_line_marker("entrance_follow_path", marker_id, self.entrance_follow_path, (0.1, 1.0, 0.35, 0.9), 0.06, stamp)
+            )
+            marker_id += 1
+        if len(self.entrance_route_support) > 1:
+            markers.markers.append(
+                self.create_line_marker(
+                    "entrance_route_support",
+                    marker_id,
+                    self.entrance_route_support,
+                    (1.0, 0.95, 0.1, 0.55),
+                    0.035,
+                    stamp,
+                )
+            )
+            marker_id += 1
+        if len(self.entrance_route) > 0:
+            markers.markers.append(
+                self.create_line_marker("entrance_turn_route", marker_id, self.entrance_route, (1.0, 0.75, 0.0, 0.9), 0.055, stamp)
+            )
+            marker_id += 1
+        if self.entrance_route_projection is not None:
+            markers.markers.append(
+                self.create_sphere_marker("entrance_route_projection", marker_id, self.entrance_route_projection, (0.1, 1.0, 0.9, 1.0), 0.15, stamp)
+            )
+            marker_id += 1
+        if self.entrance_route_target is not None:
+            markers.markers.append(
+                self.create_sphere_marker("entrance_route_lookahead", marker_id, self.entrance_route_target, (1.0, 0.2, 0.8, 1.0), 0.17, stamp)
+            )
+            marker_id += 1
+            markers.markers.append(
+                self.create_text_marker(
+                    "entrance_route_status",
+                    marker_id,
+                    self.entrance_route_target,
+                    f"idx={self.entrance_route_progress_index} remaining={self.entrance_route_remaining_distance:.2f}",
+                    (1.0, 1.0, 1.0, 1.0),
+                    stamp,
+                )
+            )
+            marker_id += 1
+        if self.entrance_target is not None:
+            markers.markers.append(self.create_sphere_marker("entrance_target", marker_id, self.entrance_target, (0.9, 0.1, 1.0, 1.0), 0.26, stamp))
+            marker_id += 1
+            if self.entrance_heading_goal is not None:
+                markers.markers.append(
+                    self.create_sphere_marker("entrance_heading_goal", marker_id, self.entrance_heading_goal, (0.9, 0.1, 1.0, 0.55), 0.13, stamp)
+                )
+                marker_id += 1
+            if self.entrance_target_direction is not None:
+                markers.markers.append(
+                    self.create_arrow_marker(
+                        "entrance_target_direction",
+                        marker_id,
+                        self.entrance_target,
+                        self.entrance_target_direction,
+                        (0.9, 0.1, 1.0, 1.0),
+                        stamp,
+                    )
+                )
 
         self.marker_pub.publish(markers)
 
+    def add_laser_follow_markers(self, markers: MarkerArray, marker_id: int, stamp) -> int:
+        x_min = self.p.laser_roi_x_min
+        x_max = self.p.laser_roi_x_max
+        result = self.laser_follow_result
+        roi_centers = result.roi_centers
+        roi_direction = result.roi_direction
+        if len(roi_centers) != 2:
+            roi_centers, roi_direction = self.laser_follower.build_rois(None, np.array([x_max, 0.0], dtype=float))
+        for center_base, namespace in zip(roi_centers, ("laser_left_roi", "laser_right_roi")):
+            markers.markers.append(
+                self.create_rectangle_marker(
+                    namespace,
+                    marker_id,
+                    self.base_point_to_map(center_base),
+                    self.base_direction_to_map(roi_direction),
+                    self.p.laser_roi_length,
+                    self.p.laser_roi_width,
+                    (0.2, 0.95, 0.95, 0.65),
+                    stamp,
+                )
+            )
+            marker_id += 1
 
-def main(args=None):
+        for line, namespace, color in (
+            (result.left_line, "laser_left_line", (0.0, 1.0, 0.25, 1.0)),
+            (result.right_line, "laser_right_line", (1.0, 0.55, 0.0, 1.0)),
+        ):
+            if not line.valid:
+                continue
+            line_base = np.array(
+                [[x_min, line.slope * x_min + line.intercept], [x_max, line.slope * x_max + line.intercept]],
+                dtype=float,
+            )
+            markers.markers.append(self.create_line_marker(namespace, marker_id, self.base_points_to_map(line_base), color, 0.045, stamp))
+            marker_id += 1
+
+        if result.valid:
+            centerline_base = np.array(
+                [
+                    [x_min, result.center_slope * x_min + result.center_intercept],
+                    [x_max, result.center_slope * x_max + result.center_intercept],
+                ],
+                dtype=float,
+            )
+            markers.markers.append(
+                self.create_line_marker(
+                    "laser_centerline",
+                    marker_id,
+                    self.base_points_to_map(centerline_base),
+                    (0.95, 0.15, 0.95, 1.0),
+                    0.055,
+                    stamp,
+                )
+            )
+            marker_id += 1
+
+        status_point = self.base_point_to_map(np.array([0.35, 0.0], dtype=float))
+        status = f"laser conf={result.confidence:.2f} weight={result.weight:.2f} {result.reason}"
+        markers.markers.append(self.create_text_marker("laser_follow_status", marker_id, status_point, status, (1.0, 1.0, 1.0, 1.0), stamp))
+        return marker_id + 1
+
+    def base_points_to_map(self, points: np.ndarray) -> np.ndarray:
+        return np.asarray([self.base_point_to_map(point) for point in points], dtype=float)
+
+    def add_row_markers(
+        self,
+        markers: MarkerArray,
+        start_id: int,
+        model: RowMarchModel,
+        color: Tuple[float, float, float, float],
+        stamp,
+    ) -> int:
+        marker_id = start_id
+        result = model.result
+        if len(result.points) > 0:
+            if result.frozen_count > 0:
+                markers.markers.append(
+                    self.create_line_marker(
+                        f"{model.side}_row_frozen",
+                        marker_id,
+                        result.points[: result.frozen_count],
+                        (0.72, 0.72, 0.82, 0.95),
+                        0.065,
+                        stamp,
+                    )
+                )
+                marker_id += 1
+            markers.markers.append(self.create_line_marker(f"{model.side}_row_curve", marker_id, result.points, color, 0.045, stamp))
+            marker_id += 1
+            markers.markers.append(self.create_points_marker(f"{model.side}_row_points", marker_id, result.points, color, 0.11, stamp))
+            marker_id += 1
+
+        if len(result.current_line_points) > 0:
+            markers.markers.append(
+                self.create_points_marker(
+                    f"{model.side}_current_five_points",
+                    marker_id,
+                    result.current_line_points,
+                    (1.0, 1.0, 0.1, 0.95),
+                    0.08,
+                    stamp,
+                )
+            )
+            marker_id += 1
+            markers.markers.append(
+                self.create_line_marker(
+                    f"{model.side}_current_line",
+                    marker_id,
+                    result.current_line_points,
+                    (1.0, 1.0, 0.1, 0.85),
+                    0.025,
+                    stamp,
+                )
+            )
+            marker_id += 1
+            for idx, point in enumerate(result.current_line_points[: self.p.row_segment_point_count]):
+                markers.markers.append(
+                    self.create_text_marker(
+                        f"{model.side}_current_point_numbers",
+                        marker_id,
+                        point,
+                        str(idx + 1),
+                        (1.0, 1.0, 1.0, 0.95),
+                        stamp,
+                    )
+                )
+                marker_id += 1
+
+        if self.p.publish_debug:
+            for segment in result.debug_segments[-25:]:
+                markers.markers.append(
+                    self.create_rectangle_marker(
+                        f"{model.side}_fit_rectangles",
+                        marker_id,
+                        segment.big_rect_center,
+                        segment.direction,
+                        segment.big_rect_length,
+                        segment.big_rect_width,
+                        (0.05, 0.75, 1.0, 0.34),
+                        stamp,
+                    )
+                )
+                marker_id += 1
+                markers.markers.append(
+                    self.create_rectangle_marker(
+                        f"{model.side}_point3_rectangles",
+                        marker_id,
+                        segment.point3_rect_center,
+                        segment.direction,
+                        segment.point3_rect_length,
+                        segment.point3_rect_width,
+                        (1.0, 0.1, 0.8, 0.48),
+                        stamp,
+                    )
+                )
+                marker_id += 1
+
+        if result.end_point is not None:
+            markers.markers.append(self.create_sphere_marker(f"{model.side}_end_point", marker_id, result.end_point, (1.0, 0.0, 0.0, 1.0), 0.18, stamp))
+            marker_id += 1
+        return marker_id
+
+    def create_line_marker(
+        self,
+        namespace: str,
+        marker_id: int,
+        points: np.ndarray,
+        color: Tuple[float, float, float, float],
+        scale: float,
+        stamp,
+    ) -> Marker:
+        marker = Marker(header=Header(frame_id=self.p.map_frame, stamp=stamp))
+        marker.ns = namespace
+        marker.id = marker_id
+        marker.type = Marker.LINE_STRIP
+        marker.action = Marker.ADD
+        marker.scale.x = float(scale)
+        marker.color.r, marker.color.g, marker.color.b, marker.color.a = color
+        for point in points:
+            marker.points.append(Point(x=float(point[0]), y=float(point[1]), z=0.0))
+        return marker
+
+    def create_points_marker(
+        self,
+        namespace: str,
+        marker_id: int,
+        points: np.ndarray,
+        color: Tuple[float, float, float, float],
+        scale: float,
+        stamp,
+    ) -> Marker:
+        marker = Marker(header=Header(frame_id=self.p.map_frame, stamp=stamp))
+        marker.ns = namespace
+        marker.id = marker_id
+        marker.type = Marker.SPHERE_LIST
+        marker.action = Marker.ADD
+        marker.scale.x = float(scale)
+        marker.scale.y = float(scale)
+        marker.scale.z = float(scale)
+        marker.color.r, marker.color.g, marker.color.b, marker.color.a = color
+        for point in points:
+            marker.points.append(Point(x=float(point[0]), y=float(point[1]), z=0.0))
+        return marker
+
+    def create_text_marker(
+        self,
+        namespace: str,
+        marker_id: int,
+        point: np.ndarray,
+        text: str,
+        color: Tuple[float, float, float, float],
+        stamp,
+    ) -> Marker:
+        marker = Marker(header=Header(frame_id=self.p.map_frame, stamp=stamp))
+        marker.ns = namespace
+        marker.id = marker_id
+        marker.type = Marker.TEXT_VIEW_FACING
+        marker.action = Marker.ADD
+        marker.scale.z = 0.18
+        marker.color.r, marker.color.g, marker.color.b, marker.color.a = color
+        marker.pose.position.x = float(point[0])
+        marker.pose.position.y = float(point[1])
+        marker.pose.position.z = 0.25
+        marker.pose.orientation.w = 1.0
+        marker.text = text
+        return marker
+
+    def create_sphere_marker(
+        self,
+        namespace: str,
+        marker_id: int,
+        point: np.ndarray,
+        color: Tuple[float, float, float, float],
+        scale: float,
+        stamp,
+    ) -> Marker:
+        marker = Marker(header=Header(frame_id=self.p.map_frame, stamp=stamp))
+        marker.ns = namespace
+        marker.id = marker_id
+        marker.type = Marker.SPHERE
+        marker.action = Marker.ADD
+        marker.scale.x = float(scale)
+        marker.scale.y = float(scale)
+        marker.scale.z = float(scale)
+        marker.color.r, marker.color.g, marker.color.b, marker.color.a = color
+        marker.pose.position.x = float(point[0])
+        marker.pose.position.y = float(point[1])
+        marker.pose.position.z = 0.0
+        marker.pose.orientation.w = 1.0
+        return marker
+
+    def create_rectangle_marker(
+        self,
+        namespace: str,
+        marker_id: int,
+        center: np.ndarray,
+        direction: np.ndarray,
+        length: float,
+        width: float,
+        color: Tuple[float, float, float, float],
+        stamp,
+    ) -> Marker:
+        marker = Marker(header=Header(frame_id=self.p.map_frame, stamp=stamp))
+        marker.ns = namespace
+        marker.id = marker_id
+        marker.type = Marker.LINE_STRIP
+        marker.action = Marker.ADD
+        marker.scale.x = 0.025
+        marker.color.r, marker.color.g, marker.color.b, marker.color.a = color
+
+        direction = self.normalize(direction)
+        perp = np.array([-direction[1], direction[0]], dtype=float)
+        center = np.asarray(center, dtype=float)
+        half_length = 0.5 * float(length)
+        half_width = 0.5 * float(width)
+        corners = [
+            center - half_length * direction - half_width * perp,
+            center + half_length * direction - half_width * perp,
+            center + half_length * direction + half_width * perp,
+            center - half_length * direction + half_width * perp,
+            center - half_length * direction - half_width * perp,
+        ]
+        for corner in corners:
+            marker.points.append(Point(x=float(corner[0]), y=float(corner[1]), z=0.0))
+        return marker
+
+    def create_arrow_marker(
+        self,
+        namespace: str,
+        marker_id: int,
+        point: np.ndarray,
+        direction: np.ndarray,
+        color: Tuple[float, float, float, float],
+        stamp,
+    ) -> Marker:
+        marker = Marker(header=Header(frame_id=self.p.map_frame, stamp=stamp))
+        marker.ns = namespace
+        marker.id = marker_id
+        marker.type = Marker.ARROW
+        marker.action = Marker.ADD
+        marker.scale.x = 0.55
+        marker.scale.y = 0.10
+        marker.scale.z = 0.10
+        marker.color.r, marker.color.g, marker.color.b, marker.color.a = color
+        marker.pose.position.x = float(point[0])
+        marker.pose.position.y = float(point[1])
+        marker.pose.orientation.z = math.sin(0.5 * math.atan2(float(direction[1]), float(direction[0])))
+        marker.pose.orientation.w = math.cos(0.5 * math.atan2(float(direction[1]), float(direction[0])))
+        return marker
+
+    def yaw_to_vector(self, yaw: float) -> np.ndarray:
+        return np.array([math.cos(yaw), math.sin(yaw)], dtype=float)
+
+    def normalize(self, vector: np.ndarray) -> np.ndarray:
+        vector = np.asarray(vector, dtype=float)
+        norm = float(np.linalg.norm(vector))
+        if norm < 1e-9:
+            return np.array([1.0, 0.0], dtype=float)
+        return vector / norm
+
+
+def main(args=None) -> None:
     rclpy.init(args=args)
     node = MaizeNavigator()
-
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:
         pass
     finally:
-        node.publish_stop()
         node.destroy_node()
         rclpy.shutdown()
 

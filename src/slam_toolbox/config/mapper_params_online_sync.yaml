@@ -139,3 +139,4 @@ slam_toolbox:
 
     min_pass_through: 2
     occupancy_threshold: 0.1
+
