@@ -2418,7 +2418,7 @@ class MaizeNavigator(Node):
     ) -> None:
         is_maneuver_control = max_speed is not None or min_speed is not None
         target = np.asarray(target, dtype=float)
-        if self.last_target_point is None:
+        if self.last_target_point is None or reference_polyline is not None:
             filtered_target = target
         else:
             alpha = self.p.target_filter_alpha

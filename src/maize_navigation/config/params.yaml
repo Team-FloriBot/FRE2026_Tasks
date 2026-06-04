@@ -56,20 +56,20 @@ maize_navigator:
 
     # High-carefulness row-following profile.
     # StartNavigation.carefulness=medium/low derives faster runtime profiles from these values.
-    follow_speed: 0.45
+    follow_speed: 0.42
     slow_speed: 0.12
-    lookahead_distance: 0.85
+    lookahead_distance: 0.65
     yaw_kp: 0.6
     pure_pursuit_gain: 1.2
-    heading_kp: 0.30
-    lateral_kp: 0.35
-    lateral_kd: 0.40
+    heading_kp: 0.35
+    lateral_kp: 0.50
+    lateral_kd: 0.45
     lateral_error_limit: 0.35
     lateral_rate_limit: 0.45
-    curve_speed_reduction_gain: 2.5
-    lateral_speed_reduction_gain: 2.5
-    lateral_rate_speed_reduction_gain: 3.0
-    linear_accel_limit: 0.30
+    curve_speed_reduction_gain: 3.0
+    lateral_speed_reduction_gain: 4.0
+    lateral_rate_speed_reduction_gain: 3.5
+    linear_accel_limit: 0.25
     angular_control_speed: 0.35
     ackermann_wheelbase: 1.1
     max_steering_angle: 1.25
@@ -86,12 +86,12 @@ maize_navigator:
     maneuver_goal_xy_tolerance: 0.25
     maneuver_goal_yaw_tolerance: 0.75
     maneuver_heading_lookahead_distance: 0.10
-    maneuver_speed: 0.32
+    maneuver_speed: 0.26
     maneuver_slow_speed: 0.10
-    maneuver_lookahead_distance: 0.55
+    maneuver_lookahead_distance: 0.35
     maneuver_route_spacing: 0.08
-    maneuver_corner_radius: 0.45
-    maneuver_control_gain_scale: 0.85
+    maneuver_corner_radius: 0.37
+    maneuver_control_gain_scale: 1.00
     maneuver_max_angular_speed: 1.25
     maneuver_angular_rate_limit: 2.4
     maneuver_entry_extension_distance: 0.80

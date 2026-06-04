@@ -565,6 +565,24 @@ def test_maneuver_control_uses_maneuver_angular_limits():
     assert published[-1].angular.z <= navigator.p.maneuver_max_angular_speed
 
 
+def test_reference_polyline_target_is_not_filtered_off_the_route():
+    navigator = bare_navigator()
+    navigator.cmd_pub = types.SimpleNamespace(publish=lambda _cmd: None)
+    navigator.robot_pose = Pose2D(0.0, 0.0, 0.0)
+    navigator.last_target_point = np.array([0.0, 2.0])
+    navigator.last_lateral_error = None
+    navigator.last_cmd_linear_x = 0.0
+    navigator.last_cmd_angular_z = 0.0
+    navigator.p.target_filter_alpha = 0.10
+
+    target = np.array([1.0, 0.0])
+    route = np.array([[0.0, 0.0], [1.0, 0.0], [1.0, 1.0]])
+
+    navigator.drive_to_point(target, reference_polyline=route)
+
+    assert np.allclose(navigator.last_target_point, target)
+
+
 def test_lookahead_pose_controller_turns_toward_midline_side():
     navigator = bare_navigator()
     published = []
