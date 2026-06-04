@@ -63,7 +63,7 @@ maize_navigator:
     pure_pursuit_gain: 1.4
     heading_kp: 0.25
     lateral_kp: 0.45
-    lateral_kd: 0.22
+    lateral_kd: 0.3
     lateral_error_limit: 0.35
     lateral_rate_limit: 0.45
     curve_speed_reduction_gain: 3.0
