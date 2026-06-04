@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import random
 from dataclasses import dataclass, field
 from typing import Dict, Optional
 
@@ -50,6 +51,16 @@ class ObjectTracker(Node):
         self.declare_parameter("marker_z_offset", 0.15)
         self.declare_parameter("marker_sphere_scale", 0.18)
         self.declare_parameter("marker_text_scale", 0.28)
+        self.declare_parameter("simulation_enabled", False)
+        self.declare_parameter("simulation_publish_rate", 2.0)
+        self.declare_parameter("simulation_object_count", 5)
+        self.declare_parameter("simulation_seed", 0)
+        self.declare_parameter("simulation_label", "sim_object")
+        self.declare_parameter("simulation_x_min", 0.0)
+        self.declare_parameter("simulation_x_max", 5.0)
+        self.declare_parameter("simulation_y_min", -1.0)
+        self.declare_parameter("simulation_y_max", 1.0)
+        self.declare_parameter("simulation_z", 0.0)
 
         self.target_frame = str(self.get_parameter("target_frame").value)
         detector_results_topic = str(self.get_parameter("detector_results_topic").value)
@@ -66,6 +77,16 @@ class ObjectTracker(Node):
         self.marker_z_offset = float(self.get_parameter("marker_z_offset").value)
         self.marker_sphere_scale = float(self.get_parameter("marker_sphere_scale").value)
         self.marker_text_scale = float(self.get_parameter("marker_text_scale").value)
+        self.simulation_enabled = bool(self.get_parameter("simulation_enabled").value)
+        self.simulation_publish_rate = float(self.get_parameter("simulation_publish_rate").value)
+        self.simulation_object_count = int(self.get_parameter("simulation_object_count").value)
+        self.simulation_seed = int(self.get_parameter("simulation_seed").value)
+        self.simulation_label = str(self.get_parameter("simulation_label").value)
+        self.simulation_x_min = float(self.get_parameter("simulation_x_min").value)
+        self.simulation_x_max = float(self.get_parameter("simulation_x_max").value)
+        self.simulation_y_min = float(self.get_parameter("simulation_y_min").value)
+        self.simulation_y_max = float(self.get_parameter("simulation_y_max").value)
+        self.simulation_z = float(self.get_parameter("simulation_z").value)
 
         self.tf_buffer = Buffer()
         self.tf_listener = TransformListener(self.tf_buffer, self)
@@ -84,6 +105,15 @@ class ObjectTracker(Node):
         self.active = False
         self.next_id = 0
         self.objects: Dict[int, TrackedState] = {}
+        self.simulated_objects: Optional[TrackedObjectArray] = None
+        self.simulation_timer = None
+        if self.simulation_enabled:
+            self.simulated_objects = self.create_simulated_objects()
+            period_sec = 1.0 / max(0.1, self.simulation_publish_rate)
+            self.simulation_timer = self.create_timer(period_sec, self.publish_simulated_objects)
+            self.get_logger().info(
+                f"Object tracker simulation enabled with {self.simulation_object_count} objects"
+            )
 
         self.get_logger().info(
             f"Object tracker ready: {detector_results_topic} -> {tracked_objects_topic} in {self.target_frame}"
@@ -101,9 +131,14 @@ class ObjectTracker(Node):
     def reset_tracks(self) -> None:
         self.objects.clear()
         self.next_id = 0
+        self.simulated_objects = self.create_simulated_objects() if self.simulation_enabled else None
         self.publish_delete_all_markers()
+        if self.simulated_objects is not None:
+            self.publish_simulated_objects()
 
     def detection_results_callback(self, msg: DetectionArray) -> None:
+        if self.simulation_enabled:
+            return
         if not self.active:
             return
 
@@ -127,6 +162,30 @@ class ObjectTracker(Node):
             self.update_track(detection, point_out.point, msg.header.stamp)
 
         self.publish_tracks(msg.header.stamp)
+
+    def create_simulated_objects(self) -> TrackedObjectArray:
+        rng = random.Random(self.simulation_seed)
+        x_min, x_max = sorted((self.simulation_x_min, self.simulation_x_max))
+        y_min, y_max = sorted((self.simulation_y_min, self.simulation_y_max))
+
+        msg = TrackedObjectArray()
+        msg.header.frame_id = self.target_frame
+        for idx in range(max(0, self.simulation_object_count)):
+            tracked = TrackedObject()
+            tracked.id = idx
+            tracked.label = self.simulation_label
+            tracked.position.x = rng.uniform(x_min, x_max)
+            tracked.position.y = rng.uniform(y_min, y_max)
+            tracked.position.z = self.simulation_z
+            msg.objects.append(tracked)
+        return msg
+
+    def publish_simulated_objects(self) -> None:
+        if self.simulated_objects is None:
+            self.simulated_objects = self.create_simulated_objects()
+        self.simulated_objects.header.stamp = self.get_clock().now().to_msg()
+        self.tracked_objects_pub.publish(self.simulated_objects)
+        self.publish_markers(self.simulated_objects)
 
     def update_track(self, detection, position, stamp) -> None:
         matched_id = self.find_match(position)

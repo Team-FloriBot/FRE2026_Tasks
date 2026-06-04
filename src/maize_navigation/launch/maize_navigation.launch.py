@@ -2,6 +2,8 @@ from pathlib import Path
 
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
+from launch.actions import DeclareLaunchArgument
+from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
 
 
@@ -10,6 +12,11 @@ def generate_launch_description():
     params_file = pkg_share / "config" / "params.yaml"
 
     return LaunchDescription([
+        DeclareLaunchArgument(
+            "simulate_tracked_objects",
+            default_value="false",
+            description="Publish simulated tracked objects from the object tracker.",
+        ),
         Node(
             package="maize_navigation",
             executable="navigator",
@@ -22,5 +29,8 @@ def generate_launch_description():
             executable="object_tracker",
             name="object_tracker",
             output="screen",
+            parameters=[{
+                "simulation_enabled": LaunchConfiguration("simulate_tracked_objects"),
+            }],
         ),
     ])
