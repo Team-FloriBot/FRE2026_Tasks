@@ -2474,31 +2474,49 @@ class MaizeNavigator(Node):
         tracking_lateral_error = float(
             np.clip(lateral_error - desired_lateral_offset, -self.p.lateral_error_limit, self.p.lateral_error_limit)
         )
-        lateral_rate = 0.0
+        measured_lateral_rate = 0.0
         if self.last_lateral_error is not None:
-            lateral_rate = (raw_lateral_error - self.last_lateral_error) / dt
-            lateral_rate = float(np.clip(lateral_rate, -self.p.lateral_rate_limit, self.p.lateral_rate_limit))
+            measured_lateral_rate = (raw_lateral_error - self.last_lateral_error) / dt
+            measured_lateral_rate = float(
+                np.clip(measured_lateral_rate, -self.p.lateral_rate_limit, self.p.lateral_rate_limit)
+            )
         self.last_lateral_error = raw_lateral_error
 
         target_base = self.map_point_to_base(lookahead_point)
         tangent = self.polyline_tangent_at_point(reference_polyline, lookahead_point)
         path_yaw = math.atan2(float(tangent[1]), float(tangent[0]))
         heading_error = wrap_to_pi(path_yaw - self.robot_pose.yaw)
-        effective_lookahead = max(float(np.linalg.norm(target_base)), 0.05)
-
-        point_curvature = 2.0 * float(target_base[1]) / max(effective_lookahead * effective_lookahead, 1e-6)
-        heading_curvature = self.p.pose_heading_gain * math.sin(heading_error) / effective_lookahead
-        _, lookahead_idx, _ = self.project_onto_polyline(reference_polyline, lookahead_point)
-        feedforward_curvature = (
-            self.p.pose_curvature_feedforward_gain * self.polyline_curvature_at_index(reference_polyline, lookahead_idx)
+        lateral_rate_from_heading = -max(abs(self.last_cmd_linear_x), min_speed) * math.sin(heading_error)
+        if measured_lateral_rate * lateral_rate_from_heading > 0.0:
+            lateral_rate_estimate = 0.5 * (measured_lateral_rate + lateral_rate_from_heading)
+        else:
+            lateral_rate_estimate = lateral_rate_from_heading
+        lateral_rate = float(
+            np.clip(
+                lateral_rate_estimate,
+                -self.p.lateral_rate_limit,
+                self.p.lateral_rate_limit,
+            )
         )
-        lateral_curvature = -self.p.pose_lateral_gain * tracking_lateral_error / max(effective_lookahead, 1e-6)
-        damping_curvature = -self.p.pose_lateral_rate_gain * lateral_rate
-        curvature_raw = point_curvature + heading_curvature + feedforward_curvature + lateral_curvature + damping_curvature
+        effective_lookahead = max(float(np.linalg.norm(target_base)), 0.05)
 
         radius_limited_steering = math.atan2(self.p.ackermann_wheelbase, self.p.min_follow_turn_radius)
         max_steering = min(self.p.max_steering_angle, radius_limited_steering)
         max_curvature = min(1.0 / self.p.min_follow_turn_radius, math.tan(max_steering) / self.p.ackermann_wheelbase)
+
+        point_curvature = (
+            self.p.pose_lateral_gain * 2.0 * float(target_base[1]) / max(effective_lookahead * effective_lookahead, 1e-6)
+        )
+        heading_curvature = self.p.pose_heading_gain * math.sin(heading_error) / effective_lookahead
+        _, lookahead_idx, _ = self.project_onto_polyline(reference_polyline, lookahead_point)
+        path_curvature = float(np.clip(self.polyline_curvature_at_index(reference_polyline, lookahead_idx), -max_curvature, max_curvature))
+        feedforward_curvature = (
+            self.p.pose_curvature_feedforward_gain * path_curvature
+        )
+        lateral_curvature = -0.5 * self.p.pose_lateral_gain * tracking_lateral_error / max(effective_lookahead, 1e-6)
+        damping_curvature = -self.p.pose_lateral_rate_gain * lateral_rate
+        curvature_raw = point_curvature + heading_curvature + feedforward_curvature + lateral_curvature + damping_curvature
+
         curvature = float(np.clip(curvature_raw, -max_curvature, max_curvature))
         steering_angle = math.atan(self.p.ackermann_wheelbase * curvature)
         steering_angle = float(np.clip(steering_angle, -max_steering, max_steering))

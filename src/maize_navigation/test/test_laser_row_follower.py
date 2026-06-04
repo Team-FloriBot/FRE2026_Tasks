@@ -595,6 +595,64 @@ def test_pose_curvature_controller_corrects_heading_on_straight_midline():
     assert published[-1].angular.z < 0.0
 
 
+def test_pose_lateral_rate_uses_heading_to_countersteer_before_crossing_midline():
+    navigator = bare_navigator()
+    published = []
+    navigator.cmd_pub = types.SimpleNamespace(publish=published.append)
+    navigator.robot_pose = Pose2D(0.0, -0.05, 0.30)
+    navigator.last_target_point = None
+    navigator.last_lateral_error = None
+    navigator.last_cmd_linear_x = 0.0
+    navigator.last_cmd_angular_z = 0.0
+    navigator.p.follow_speed = 0.40
+    navigator.p.slow_speed = 0.10
+    navigator.p.pose_lateral_gain = 0.0
+    navigator.p.pose_heading_gain = 0.0
+    navigator.p.pose_curvature_feedforward_gain = 0.0
+    navigator.p.pose_lateral_rate_gain = 1.0
+    navigator.p.curve_speed_reduction_gain = 0.0
+    navigator.p.lateral_speed_reduction_gain = 0.0
+    navigator.p.lateral_rate_speed_reduction_gain = 0.0
+    navigator.p.linear_accel_limit = 0.0
+    navigator.p.angular_control_speed = 0.0
+    navigator.p.max_angular_speed = 10.0
+    navigator.p.min_follow_turn_radius = 0.37
+    navigator.p.angular_rate_limit = 100.0
+
+    navigator.drive_to_point(np.array([0.8, 0.0]), reference_polyline=np.array([[0.0, 0.0], [1.0, 0.0]]))
+
+    assert published[-1].angular.z < 0.0
+
+
+def test_pose_lateral_rate_prefers_heading_when_measured_rate_disagrees_after_curve():
+    navigator = bare_navigator()
+    published = []
+    navigator.cmd_pub = types.SimpleNamespace(publish=published.append)
+    navigator.robot_pose = Pose2D(0.0, -0.05, 0.30)
+    navigator.last_target_point = None
+    navigator.last_lateral_error = -0.20
+    navigator.last_cmd_linear_x = 0.20
+    navigator.last_cmd_angular_z = 0.0
+    navigator.p.follow_speed = 0.40
+    navigator.p.slow_speed = 0.10
+    navigator.p.pose_lateral_gain = 0.0
+    navigator.p.pose_heading_gain = 0.0
+    navigator.p.pose_curvature_feedforward_gain = 0.0
+    navigator.p.pose_lateral_rate_gain = 1.0
+    navigator.p.curve_speed_reduction_gain = 0.0
+    navigator.p.lateral_speed_reduction_gain = 0.0
+    navigator.p.lateral_rate_speed_reduction_gain = 0.0
+    navigator.p.linear_accel_limit = 0.0
+    navigator.p.angular_control_speed = 0.0
+    navigator.p.max_angular_speed = 10.0
+    navigator.p.min_follow_turn_radius = 0.37
+    navigator.p.angular_rate_limit = 100.0
+
+    navigator.drive_to_point(np.array([0.8, 0.0]), reference_polyline=np.array([[0.0, 0.0], [1.0, 0.0]]))
+
+    assert published[-1].angular.z < 0.0
+
+
 def test_pose_curvature_controller_anticipates_ninety_degree_curve():
     navigator = bare_navigator()
     published = []
