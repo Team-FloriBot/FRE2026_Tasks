@@ -19,11 +19,12 @@ def install_ros_import_stubs():
 
     for package, names in (
         ("geometry_msgs", ("Point", "Twist")),
+        ("fre2026_detection_interfaces", ("TrackedObject", "TrackedObjectArray")),
         ("fre2026_tasks_interfaces", ("SetNavigationPattern", "GetNavigationStatus")),
         ("maize_navigation_interfaces", ("StartNavigation",)),
         ("nav_msgs", ("OccupancyGrid",)),
         ("sensor_msgs", ("LaserScan",)),
-        ("std_msgs", ("Header",)),
+        ("std_msgs", ("Bool", "Header")),
         ("std_srvs", ("Trigger",)),
         ("visualization_msgs", ("Marker", "MarkerArray")),
     ):
@@ -43,6 +44,27 @@ def install_ros_import_stubs():
                     self.angular = types.SimpleNamespace(x=0.0, y=0.0, z=0.0)
 
             message_module.Twist = Twist
+        if package == "std_msgs":
+            class Bool:
+                def __init__(self):
+                    self.data = False
+
+            message_module.Bool = Bool
+        if package == "std_srvs":
+            message_module.Trigger.Request = type("Request", (), {})
+        if package == "fre2026_detection_interfaces":
+            class TrackedObject:
+                def __init__(self):
+                    self.id = 0
+                    self.label = ""
+                    self.position = types.SimpleNamespace(x=0.0, y=0.0, z=0.0)
+
+            class TrackedObjectArray:
+                def __init__(self):
+                    self.objects = []
+
+            message_module.TrackedObject = TrackedObject
+            message_module.TrackedObjectArray = TrackedObjectArray
         if package in ("fre2026_tasks_interfaces", "maize_navigation_interfaces", "std_srvs"):
             package_module.srv = message_module
         else:
@@ -72,11 +94,13 @@ from maize_navigation.maize_navigation import (  # noqa: E402
     MaizeNavigator,
     MissionState,
     NavigatorParams,
+    ObjectStop,
     PatternStep,
     Pose2D,
     RowMarchModel,
     RowMarchResult,
 )
+from fre2026_detection_interfaces.msg import TrackedObjectArray  # noqa: E402
 from sensor_msgs.msg import LaserScan  # noqa: E402
 
 
@@ -121,12 +145,87 @@ def make_navigator_for_start_callback():
     navigator.paused_state = None
     navigator.published_cmds = []
     navigator.cmd_pub = types.SimpleNamespace(publish=lambda msg: navigator.published_cmds.append(msg))
+    navigator.published_tracker_active = []
+    navigator.tracker_active_pub = types.SimpleNamespace(
+        publish=lambda msg: navigator.published_tracker_active.append(msg.data)
+    )
     navigator.slam_reset_client = None
+    navigator.tracker_reset_calls = 0
+    navigator.tracker_reset_client = types.SimpleNamespace(
+        service_is_ready=lambda: True,
+        wait_for_service=lambda timeout_sec=0.0: True,
+        call_async=lambda request: (
+            setattr(navigator, "tracker_reset_calls", navigator.tracker_reset_calls + 1)
+            or ImmediateFuture(success=True)
+        ),
+    )
+    navigator.object_detection_enabled = False
+    navigator.object_detection_model_path = ""
+    navigator.object_detection_initialized = False
+    navigator.object_detection_started = False
+    navigator.latest_tracked_objects = None
+    navigator.handled_tracked_object_ids = set()
+    navigator.active_object_stop = None
+    navigator.object_stop_hold_until_ns = None
+    navigator.now_ns = 0
+    navigator.get_clock = lambda: types.SimpleNamespace(
+        now=lambda: types.SimpleNamespace(nanoseconds=navigator.now_ns)
+    )
     navigator.get_logger = lambda: types.SimpleNamespace(
         warn=lambda *args, **kwargs: None,
         info=lambda *args, **kwargs: None,
         error=lambda *args, **kwargs: None,
     )
+    return navigator
+
+
+class ImmediateFuture:
+    def __init__(self, success=True, message=""):
+        self.response = types.SimpleNamespace(success=success, message=message)
+
+    def result(self):
+        return self.response
+
+    def add_done_callback(self, callback):
+        callback(self)
+
+
+def make_tracked_object(object_id, x, y, label="obj"):
+    return types.SimpleNamespace(
+        id=object_id,
+        label=label,
+        position=types.SimpleNamespace(x=x, y=y, z=0.0),
+    )
+
+
+def make_tracked_array(*objects):
+    msg = TrackedObjectArray()
+    msg.objects.extend(objects)
+    return msg
+
+
+def make_object_stop_navigator():
+    navigator = make_navigator_for_start_callback()
+    navigator.midline = np.array([[0.0, 0.0], [5.0, 0.0]], dtype=float)
+    left = RowMarchModel(
+        "left",
+        np.zeros(2),
+        np.zeros(2),
+        np.array([1.0, 0.0]),
+        2,
+    )
+    left.result.points = np.array([[0.0, 0.75], [5.0, 0.75]], dtype=float)
+    right = RowMarchModel(
+        "right",
+        np.zeros(2),
+        np.zeros(2),
+        np.array([1.0, 0.0]),
+        1,
+    )
+    right.result.points = np.array([[0.0, -0.75], [5.0, -0.75]], dtype=float)
+    navigator.left_row = left
+    navigator.right_row = right
+    navigator.state = MissionState.FOLLOW_ROW
     return navigator
 
 
@@ -144,6 +243,20 @@ def test_start_callback_sets_requested_pattern():
     assert navigator.pattern_steps == [PatternStep(3, "L"), PatternStep(2, "R")]
     assert navigator.state == MissionState.INITIALIZING
     assert navigator.current_carefulness == "high"
+
+
+def test_start_callback_clears_handled_tracked_object_ids():
+    navigator = make_navigator_for_start_callback()
+    navigator.handled_tracked_object_ids = {7}
+
+    response = navigator.start_cb(
+        types.SimpleNamespace(pattern="3L", carefulness="high", model_path=""),
+        types.SimpleNamespace(),
+    )
+
+    assert response.success
+    assert navigator.handled_tracked_object_ids == set()
+    assert navigator.tracker_reset_calls == 1
 
 
 def test_start_callback_defaults_to_high_carefulness_for_empty_value():
@@ -202,6 +315,7 @@ def test_pause_and_resume_keep_mission_state_and_profile():
     navigator.current_carefulness = "medium"
     navigator.p.follow_speed = navigator.driving_profiles["medium"].follow_speed
     navigator.midline = np.array([[0.0, 0.0], [1.0, 0.0]])
+    navigator.handled_tracked_object_ids = {11}
 
     pause_response = navigator.pause_cb(types.SimpleNamespace(), types.SimpleNamespace())
 
@@ -218,6 +332,7 @@ def test_pause_and_resume_keep_mission_state_and_profile():
     assert navigator.state == MissionState.FOLLOW_ROW
     assert navigator.paused_state is None
     assert navigator.current_carefulness == "medium"
+    assert navigator.handled_tracked_object_ids == {11}
 
 
 def test_pause_rejects_idle_navigation():
@@ -250,6 +365,7 @@ def test_reset_clears_navigation_and_sensor_state():
     navigator.robot_pose = Pose2D(1.0, 2.0, 0.5)
     navigator.midline = np.array([[0.0, 0.0], [1.0, 0.0]])
     navigator.stored_rows = {1: np.array([[0.0, 0.0]])}
+    navigator.handled_tracked_object_ids = {3}
 
     response = navigator.reset_cb(types.SimpleNamespace(), types.SimpleNamespace())
 
@@ -262,7 +378,113 @@ def test_reset_clears_navigation_and_sensor_state():
     assert navigator.robot_pose is None
     assert len(navigator.midline) == 0
     assert navigator.stored_rows == {}
+    assert navigator.handled_tracked_object_ids == set()
     assert len(navigator.published_cmds) == 1
+    assert navigator.tracker_reset_calls == 1
+
+
+def test_tracked_object_near_left_row_creates_midline_stop():
+    navigator = make_object_stop_navigator()
+    navigator.latest_tracked_objects = make_tracked_array(make_tracked_object(1, 1.2, 0.75))
+
+    stop = navigator.find_next_object_stop(np.array([0.0, 0.0]), navigator.midline)
+
+    assert stop is not None
+    assert stop.object_id == 1
+    assert stop.row_side == "left"
+    assert np.allclose(stop.stop_point, np.array([1.2, 0.0]))
+
+
+def test_tracked_object_near_right_row_creates_midline_stop():
+    navigator = make_object_stop_navigator()
+    navigator.latest_tracked_objects = make_tracked_array(make_tracked_object(2, 1.5, -0.75))
+
+    stop = navigator.find_next_object_stop(np.array([0.0, 0.0]), navigator.midline)
+
+    assert stop is not None
+    assert stop.object_id == 2
+    assert stop.row_side == "right"
+    assert np.allclose(stop.stop_point, np.array([1.5, 0.0]))
+
+
+def test_tracked_object_outside_current_rows_does_not_create_stop():
+    navigator = make_object_stop_navigator()
+    navigator.latest_tracked_objects = make_tracked_array(make_tracked_object(3, 1.5, 2.0))
+
+    stop = navigator.find_next_object_stop(np.array([0.0, 0.0]), navigator.midline)
+
+    assert stop is None
+
+
+def test_handled_tracked_object_id_does_not_create_second_stop():
+    navigator = make_object_stop_navigator()
+    navigator.handled_tracked_object_ids = {4}
+    navigator.latest_tracked_objects = make_tracked_array(make_tracked_object(4, 1.0, 0.75))
+
+    stop = navigator.find_next_object_stop(np.array([0.0, 0.0]), navigator.midline)
+
+    assert stop is None
+
+
+def test_active_object_stop_holds_for_two_seconds_then_marks_handled():
+    navigator = make_object_stop_navigator()
+    navigator.p.object_stop_duration_sec = 2.0
+    navigator.active_object_stop = ObjectStop(
+        object_id=5,
+        label="plant",
+        row_side="left",
+        object_point=np.array([0.0, 0.75]),
+        stop_point=np.array([0.0, 0.0]),
+        distance_ahead=0.0,
+    )
+    robot_xy = np.array([0.05, 0.0])
+
+    assert navigator.handle_active_object_stop(robot_xy)
+    assert navigator.active_object_stop is not None
+    assert navigator.active_object_stop.holding
+    assert navigator.handled_tracked_object_ids == set()
+    assert len(navigator.published_cmds) == 1
+    assert navigator.published_cmds[-1].linear.x == 0.0
+
+    navigator.now_ns = int(2.1e9)
+    assert navigator.handle_active_object_stop(robot_xy)
+
+    assert navigator.active_object_stop is None
+    assert navigator.object_stop_hold_until_ns is None
+    assert navigator.handled_tracked_object_ids == {5}
+    assert len(navigator.published_cmds) == 2
+    assert navigator.published_cmds[-1].linear.x == 0.0
+
+
+def test_tracker_active_is_published_on_detector_start_and_stop():
+    navigator = make_navigator_for_start_callback()
+    navigator.object_detection_enabled = True
+    navigator.state = MissionState.FOLLOW_ROW
+
+    navigator.handle_detector_start_response(ImmediateFuture(success=True), "test")
+
+    assert navigator.object_detection_started
+    assert navigator.published_tracker_active[-1] is True
+
+    navigator.detector = types.SimpleNamespace(stop=lambda: ImmediateFuture(success=True))
+    navigator.stop_object_detection("test")
+
+    assert not navigator.object_detection_started
+    assert navigator.published_tracker_active[-1] is False
+
+
+def test_tracker_active_is_published_false_on_release():
+    navigator = make_navigator_for_start_callback()
+    navigator.object_detection_enabled = True
+    navigator.object_detection_started = False
+    navigator.detector = types.SimpleNamespace(
+        clear_results=lambda: None,
+        release=lambda: ImmediateFuture(success=True),
+    )
+
+    navigator.release_object_detection("test")
+
+    assert navigator.published_tracker_active[-1] is False
 
 
 def test_driving_profiles_are_derived_from_high_profile():

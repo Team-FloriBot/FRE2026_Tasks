@@ -16,5 +16,11 @@ def generate_launch_description():
             name="maize_navigator",
             output="screen",
             parameters=[str(params_file)],
-        )
+        ),
+        Node(
+            package="fre2026_detection_client",
+            executable="object_tracker",
+            name="object_tracker",
+            output="screen",
+        ),
     ])

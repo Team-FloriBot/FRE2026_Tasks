@@ -10,8 +10,14 @@
   <buildtool_depend>ament_python</buildtool_depend>
 
   <depend>rclpy</depend>
-  <depend>std_msgs</depend>
+  <depend>fre2026_detection_interfaces</depend>
+  <depend>geometry_msgs</depend>
   <depend>ros2_detection_interfaces</depend>
+  <depend>std_msgs</depend>
+  <depend>std_srvs</depend>
+  <depend>tf2_geometry_msgs</depend>
+  <depend>tf2_ros</depend>
+  <depend>visualization_msgs</depend>
 
   <test_depend>ament_lint_auto</test_depend>
   <test_depend>ament_lint_common</test_depend>

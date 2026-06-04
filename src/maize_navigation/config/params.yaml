@@ -80,6 +80,14 @@ maize_navigator:
     lookahead_filter_alpha: 0.25
     lookahead_speed_reduction_gain: 2.5
 
+    # Stopps an getrackten Objekten in den aktuell benachbarten Pflanzenreihen.
+    object_stop_enabled: true
+    object_row_match_tolerance: 0.35
+    object_stop_duration_sec: 2.0
+    object_stop_xy_tolerance: 0.20
+    object_stop_max_ahead_distance: 4.0
+    object_stop_past_tolerance: 0.20
+
     path_goal_xy_tolerance: 0.25
     # Fuer Reihenende, Wendepunkt und neue Einfahrt: groessere Pose-Toleranz.
     maneuver_goal_xy_tolerance: 0.25

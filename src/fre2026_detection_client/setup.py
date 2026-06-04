@@ -17,4 +17,9 @@ setup(
     description="Shared ROS 2 client adapter for the FRE2026 detector service API.",
     license="MIT",
     tests_require=["pytest"],
+    entry_points={
+        "console_scripts": [
+            "object_tracker = fre2026_detection_client.object_tracker:main",
+        ],
+    },
 )

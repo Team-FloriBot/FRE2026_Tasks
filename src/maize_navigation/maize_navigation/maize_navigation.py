@@ -9,7 +9,7 @@ import re
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 
 import numpy as np
 
@@ -17,11 +17,12 @@ import rclpy
 from rclpy.node import Node
 
 from fre2026_detection_client import DetectorClient
+from fre2026_detection_interfaces.msg import TrackedObjectArray
 from geometry_msgs.msg import Point, Twist
 from maize_navigation_interfaces.srv import StartNavigation
 from nav_msgs.msg import OccupancyGrid
 from sensor_msgs.msg import LaserScan
-from std_msgs.msg import Header
+from std_msgs.msg import Bool, Header
 from std_srvs.srv import Trigger
 from fre2026_tasks_interfaces.srv import SetNavigationPattern, GetNavigationStatus
 from visualization_msgs.msg import Marker, MarkerArray
@@ -88,6 +89,17 @@ class RowMarchModel:
 class PatternStep:
     lane_shift: int
     direction: str
+
+
+@dataclass
+class ObjectStop:
+    object_id: int
+    label: str
+    row_side: str
+    object_point: np.ndarray
+    stop_point: np.ndarray
+    distance_ahead: float
+    holding: bool = False
 
 
 @dataclass
@@ -247,6 +259,13 @@ class NavigatorParams:
     maneuver_entry_yaw_tolerance: float = 0.45
     row_map_output_directory: str = "~/.ros/maize_navigation"
     slam_reset_service: str = "/slam_toolbox/reset"
+
+    object_stop_enabled: bool = True
+    object_row_match_tolerance: float = 0.35
+    object_stop_duration_sec: float = 2.0
+    object_stop_xy_tolerance: float = 0.20
+    object_stop_max_ahead_distance: float = 4.0
+    object_stop_past_tolerance: float = 0.20
 
     pattern: str = "1L 2R"
     starting_lane_number: int = 1
@@ -457,6 +476,10 @@ class MaizeNavigator(Node):
         self.object_detection_model_path = ""
         self.object_detection_initialized = False
         self.object_detection_started = False
+        self.latest_tracked_objects: Optional[TrackedObjectArray] = None
+        self.handled_tracked_object_ids: Set[int] = set()
+        self.active_object_stop: Optional[ObjectStop] = None
+        self.object_stop_hold_until_ns: Optional[int] = None
 
         self.left_row: Optional[RowMarchModel] = None
         self.right_row: Optional[RowMarchModel] = None
@@ -503,8 +526,16 @@ class MaizeNavigator(Node):
 
         self.map_sub = self.create_subscription(OccupancyGrid, self.p.map_topic, self.map_callback, 10)
         self.scan_sub = self.create_subscription(LaserScan, self.p.scan_topic, self.scan_callback, 10)
+        self.tracked_objects_sub = self.create_subscription(
+            TrackedObjectArray,
+            "/tracker/tracked_objects",
+            self.tracked_objects_callback,
+            10,
+        )
         self.cmd_pub = self.create_publisher(Twist, self.p.cmd_vel_topic, 10)
         self.marker_pub = self.create_publisher(MarkerArray, "navigation_markers", 10)
+        self.tracker_active_pub = self.create_publisher(Bool, "/tracker/active", 10)
+        self.tracker_reset_client = self.create_client(Trigger, "/tracker/reset")
         self.slam_reset_client = (
             self.create_client(SlamToolboxReset, self.p.slam_reset_service)
             if SlamToolboxReset is not None
@@ -652,6 +683,19 @@ class MaizeNavigator(Node):
         p.row_map_output_directory = str(get_param("row_map_output_directory", p.row_map_output_directory))
         p.slam_reset_service = str(get_param("slam_reset_service", p.slam_reset_service))
 
+        p.object_stop_enabled = bool(get_param("object_stop_enabled", p.object_stop_enabled))
+        p.object_row_match_tolerance = float(
+            get_param("object_row_match_tolerance", p.object_row_match_tolerance)
+        )
+        p.object_stop_duration_sec = float(get_param("object_stop_duration_sec", p.object_stop_duration_sec))
+        p.object_stop_xy_tolerance = float(get_param("object_stop_xy_tolerance", p.object_stop_xy_tolerance))
+        p.object_stop_max_ahead_distance = float(
+            get_param("object_stop_max_ahead_distance", p.object_stop_max_ahead_distance)
+        )
+        p.object_stop_past_tolerance = float(
+            get_param("object_stop_past_tolerance", p.object_stop_past_tolerance)
+        )
+
         p.pattern = str(get_param("pattern", p.pattern))
         p.starting_lane_number = int(get_param("starting_lane_number", p.starting_lane_number))
         p.row_numbers_increase_to = str(get_param("row_numbers_increase_to", p.row_numbers_increase_to))
@@ -705,6 +749,11 @@ class MaizeNavigator(Node):
         self.p.lookahead_lateral_error_gain = max(0.0, self.p.lookahead_lateral_error_gain)
         self.p.lookahead_filter_alpha = float(np.clip(self.p.lookahead_filter_alpha, 0.01, 1.0))
         self.p.lookahead_speed_reduction_gain = max(0.0, self.p.lookahead_speed_reduction_gain)
+        self.p.object_row_match_tolerance = max(0.01, self.p.object_row_match_tolerance)
+        self.p.object_stop_duration_sec = max(0.0, self.p.object_stop_duration_sec)
+        self.p.object_stop_xy_tolerance = max(0.01, self.p.object_stop_xy_tolerance)
+        self.p.object_stop_max_ahead_distance = max(0.01, self.p.object_stop_max_ahead_distance)
+        self.p.object_stop_past_tolerance = max(0.0, self.p.object_stop_past_tolerance)
         self.p.slow_speed = float(np.clip(self.p.slow_speed, 0.0, self.p.follow_speed))
         self.p.curve_speed_reduction_gain = max(0.0, self.p.curve_speed_reduction_gain)
         self.p.maneuver_goal_xy_tolerance = max(0.05, self.p.maneuver_goal_xy_tolerance)
@@ -744,6 +793,9 @@ class MaizeNavigator(Node):
         self.latest_scan = msg
         self.latest_scan_received_ns = self.get_clock().now().nanoseconds
 
+    def tracked_objects_callback(self, msg: TrackedObjectArray) -> None:
+        self.latest_tracked_objects = msg
+
     def start_cb(self, req, res):
         pattern = req.pattern.strip()
         invalid_tokens = [token for token in pattern.split() if re.fullmatch(r"([1-9][0-9]*)([LlRr])", token) is None]
@@ -767,6 +819,8 @@ class MaizeNavigator(Node):
         self.apply_driving_profile(carefulness)
         self.pattern_steps = self.parse_pattern(pattern)
         self.reset_navigation_state(clear_sensor_cache=False)
+        self.handled_tracked_object_ids = set()
+        self.request_tracker_reset()
         self.state = MissionState.INITIALIZING
         res.success = True
         res.message = (
@@ -919,6 +973,8 @@ class MaizeNavigator(Node):
         self.state = MissionState.IDLE
         self.paused_state = None
         self.reset_navigation_state(clear_sensor_cache=True)
+        self.handled_tracked_object_ids = set()
+        self.request_tracker_reset()
         self.cmd_pub.publish(Twist())
         slam_requested, slam_message = self.request_slam_reset()
         res.success = True
@@ -938,6 +994,20 @@ class MaizeNavigator(Node):
         future.add_done_callback(self.handle_slam_reset_response)
         return True, f"SLAM reset requested via {self.p.slam_reset_service}"
 
+    def request_tracker_reset(self) -> None:
+        if not hasattr(self, "tracker_reset_client"):
+            return
+        if not self.tracker_reset_client.service_is_ready():
+            self.tracker_reset_client.wait_for_service(timeout_sec=0.1)
+        if not self.tracker_reset_client.service_is_ready():
+            self.get_logger().warn("Tracker reset service unavailable: /tracker/reset")
+            return
+        future = self.tracker_reset_client.call_async(Trigger.Request())
+        future.add_done_callback(self.handle_tracker_reset_response)
+
+    def handle_tracker_reset_response(self, future) -> None:
+        self.service_response_success(future, "tracker reset")
+
     def handle_slam_reset_response(self, future) -> None:
         try:
             response = future.result()
@@ -950,6 +1020,7 @@ class MaizeNavigator(Node):
     def prepare_object_detection(self, model_path: str) -> Tuple[bool, str]:
         if not model_path:
             self.release_object_detection("object detection disabled for new navigation start")
+            self.set_tracker_active(False)
             self.object_detection_enabled = False
             self.object_detection_model_path = ""
             self.object_detection_initialized = False
@@ -998,19 +1069,20 @@ class MaizeNavigator(Node):
         self.object_detection_started = success
         if success:
             self.get_logger().info(f"Object detection started ({reason})")
+            self.set_tracker_active(True)
             if self.state == MissionState.PAUSED:
                 self.stop_object_detection("navigation paused")
         else:
             self.release_object_detection("detector start failed")
 
     def stop_object_detection(self, reason: str) -> None:
-        if not getattr(self, "object_detection_enabled", False) or not getattr(
-            self,
-            "object_detection_started",
-            False,
-        ):
+        if not getattr(self, "object_detection_enabled", False):
+            return
+        if not getattr(self, "object_detection_started", False):
+            self.set_tracker_active(False)
             return
         self.object_detection_started = False
+        self.set_tracker_active(False)
         future = self.detector.stop()
         future.add_done_callback(lambda done: self.service_response_success(done, f"detector stop ({reason})"))
 
@@ -1026,6 +1098,7 @@ class MaizeNavigator(Node):
 
     def release_object_detection(self, reason: str) -> None:
         if not getattr(self, "object_detection_enabled", False):
+            self.set_tracker_active(False)
             return
         if not hasattr(self, "detector"):
             return
@@ -1034,6 +1107,7 @@ class MaizeNavigator(Node):
         self.object_detection_initialized = False
         self.object_detection_started = False
         self.object_detection_model_path = ""
+        self.set_tracker_active(False)
         self.detector.clear_results()
         if was_started:
             future = self.detector.stop()
@@ -1064,6 +1138,13 @@ class MaizeNavigator(Node):
             self.get_logger().error(f"{action_name} failed: {message}")
         return success
 
+    def set_tracker_active(self, active: bool) -> None:
+        if not hasattr(self, "tracker_active_pub"):
+            return
+        msg = Bool()
+        msg.data = bool(active)
+        self.tracker_active_pub.publish(msg)
+
     def reset_navigation_state(self, clear_sensor_cache: bool) -> None:
         self.p.expected_row_width = getattr(self, "configured_expected_row_width", self.p.expected_row_width)
         self.left_row = None
@@ -1080,6 +1161,8 @@ class MaizeNavigator(Node):
         self.stored_rows = {}
         self.row_end_directions_by_side = {"forward": [], "backward": []}
         self.row_map_exported = False
+        self.active_object_stop = None
+        self.object_stop_hold_until_ns = None
         self.reset_entrance_state()
         self.reset_controller_state()
         self.laser_follower.reset()
@@ -1221,6 +1304,38 @@ class MaizeNavigator(Node):
                 f"(configured {previous_width:.3f} m)"
             )
 
+    def handle_active_object_stop(self, robot_xy: np.ndarray) -> bool:
+        stop = self.active_object_stop
+        if stop is None:
+            return False
+        if stop.object_id in self.handled_tracked_object_ids:
+            self.active_object_stop = None
+            self.object_stop_hold_until_ns = None
+            return False
+
+        now_ns = self.get_clock().now().nanoseconds
+        if stop.holding:
+            self.cmd_pub.publish(Twist())
+            if self.object_stop_hold_until_ns is not None and now_ns >= self.object_stop_hold_until_ns:
+                self.handled_tracked_object_ids.add(stop.object_id)
+                self.active_object_stop = None
+                self.object_stop_hold_until_ns = None
+                self.reset_controller_state()
+                self.get_logger().info(f"Tracked object {stop.object_id} handled; continuing navigation")
+            return True
+
+        distance_to_stop = float(np.linalg.norm(np.asarray(robot_xy, dtype=float) - stop.stop_point))
+        if distance_to_stop <= self.p.object_stop_xy_tolerance:
+            stop.holding = True
+            self.object_stop_hold_until_ns = now_ns + int(self.p.object_stop_duration_sec * 1e9)
+            self.reset_controller_state()
+            self.cmd_pub.publish(Twist())
+            self.get_logger().info(
+                f"Stopping for tracked object {stop.object_id} ({stop.label}) on {stop.row_side} row"
+            )
+            return True
+        return False
+
     def handle_follow_row(self) -> None:
         self.recompute_rows()
         if len(self.midline) < 2:
@@ -1246,6 +1361,12 @@ class MaizeNavigator(Node):
                     self.state = MissionState.FIND_NEXT_ROW_ENTRANCE
                 return
 
+        if self.handle_active_object_stop(robot_xy):
+            return
+
+        if self.active_object_stop is None:
+            self.active_object_stop = self.find_next_object_stop(robot_xy, self.midline)
+
         lookahead_distance = self.dynamic_follow_lookahead(self.midline, robot_xy)
         self.get_logger().info(
             (
@@ -1261,8 +1382,128 @@ class MaizeNavigator(Node):
         if target is None:
             target = self.midline[-1]
         target = np.asarray(target, dtype=float)
+        if self.active_object_stop is not None:
+            stop_distance = self.object_stop_distance_ahead(self.active_object_stop, robot_xy, self.midline)
+            if stop_distance < -self.p.object_stop_past_tolerance:
+                self.handled_tracked_object_ids.add(self.active_object_stop.object_id)
+                self.active_object_stop = None
+                self.object_stop_hold_until_ns = None
+            elif stop_distance <= lookahead_distance + 1e-6:
+                target = self.active_object_stop.stop_point
+                self.current_lookahead_distance = max(0.05, min(self.current_lookahead_distance, max(0.0, stop_distance)))
+                self.last_target_point = None
         self.fused_target_point = self.fuse_follow_target_with_laser(target)
         self.drive_to_point(self.fused_target_point)
+
+    def find_next_object_stop(self, robot_xy: np.ndarray, midline: np.ndarray) -> Optional[ObjectStop]:
+        if not self.p.object_stop_enabled or self.latest_tracked_objects is None:
+            return None
+        if len(midline) < 2:
+            return None
+
+        robot_projection, robot_segment_idx = self.project_onto_polyline(midline, robot_xy)
+        best_stop: Optional[ObjectStop] = None
+        best_distance = float("inf")
+        for tracked in self.latest_tracked_objects.objects:
+            object_id = int(tracked.id)
+            if object_id in self.handled_tracked_object_ids:
+                continue
+            object_xy = np.array([float(tracked.position.x), float(tracked.position.y)], dtype=float)
+            row_side, row_distance = self.match_tracked_object_to_current_row(object_xy)
+            if row_side is None or row_distance > self.p.object_row_match_tolerance:
+                continue
+
+            object_projection, object_segment_idx = self.project_onto_polyline(midline, object_xy)
+            distance_ahead = self.midline_distance_ahead(
+                midline,
+                robot_projection,
+                robot_segment_idx,
+                object_projection,
+                object_segment_idx,
+            )
+            if distance_ahead < -self.p.object_stop_past_tolerance:
+                continue
+            distance_ahead = max(0.0, distance_ahead)
+            if distance_ahead > self.p.object_stop_max_ahead_distance:
+                continue
+            if distance_ahead < best_distance:
+                best_distance = distance_ahead
+                best_stop = ObjectStop(
+                    object_id=object_id,
+                    label=str(getattr(tracked, "label", "")),
+                    row_side=row_side,
+                    object_point=object_xy,
+                    stop_point=object_projection,
+                    distance_ahead=distance_ahead,
+                )
+
+        if best_stop is not None:
+            self.get_logger().info(
+                f"Next tracked object stop: id={best_stop.object_id} "
+                f"row={best_stop.row_side} distance={best_stop.distance_ahead:.2f} m"
+            )
+        return best_stop
+
+    def match_tracked_object_to_current_row(self, object_xy: np.ndarray) -> Tuple[Optional[str], float]:
+        candidates: List[Tuple[str, float]] = []
+        if self.left_row is not None:
+            candidates.append(("left", self.row_distance_to_object(self.left_row.result.points, object_xy)))
+        if self.right_row is not None:
+            candidates.append(("right", self.row_distance_to_object(self.right_row.result.points, object_xy)))
+        if not candidates:
+            return None, float("inf")
+        side, distance = min(candidates, key=lambda item: item[1])
+        return side, distance
+
+    def row_distance_to_object(self, row_points: np.ndarray, object_xy: np.ndarray) -> float:
+        if len(row_points) < 2:
+            return float("inf")
+        projection, _ = self.project_onto_polyline(row_points, object_xy)
+        return float(np.linalg.norm(np.asarray(object_xy, dtype=float) - projection))
+
+    def object_stop_distance_ahead(self, stop: ObjectStop, robot_xy: np.ndarray, midline: np.ndarray) -> float:
+        if len(midline) < 2:
+            return 0.0
+        robot_projection, robot_segment_idx = self.project_onto_polyline(midline, robot_xy)
+        stop_projection, stop_segment_idx = self.project_onto_polyline(midline, stop.stop_point)
+        return self.midline_distance_ahead(
+            midline,
+            robot_projection,
+            robot_segment_idx,
+            stop_projection,
+            stop_segment_idx,
+        )
+
+    def midline_distance_ahead(
+        self,
+        midline: np.ndarray,
+        robot_projection: np.ndarray,
+        robot_segment_idx: int,
+        object_projection: np.ndarray,
+        object_segment_idx: int,
+    ) -> float:
+        if len(midline) < 2:
+            return 0.0
+
+        robot_segment_idx = int(np.clip(robot_segment_idx, 0, len(midline) - 2))
+        object_segment_idx = int(np.clip(object_segment_idx, 0, len(midline) - 2))
+
+        if object_segment_idx < robot_segment_idx:
+            return -float(np.linalg.norm(np.asarray(robot_projection, dtype=float) - object_projection))
+
+        if object_segment_idx == robot_segment_idx:
+            segment = midline[robot_segment_idx + 1] - midline[robot_segment_idx]
+            segment_length = float(np.linalg.norm(segment))
+            if segment_length < 1e-9:
+                return 0.0
+            direction = segment / segment_length
+            return float((np.asarray(object_projection, dtype=float) - robot_projection) @ direction)
+
+        distance = float(np.linalg.norm(midline[robot_segment_idx + 1] - robot_projection))
+        for idx in range(robot_segment_idx + 1, object_segment_idx):
+            distance += float(np.linalg.norm(midline[idx + 1] - midline[idx]))
+        distance += float(np.linalg.norm(np.asarray(object_projection, dtype=float) - midline[object_segment_idx]))
+        return distance
 
     def fuse_follow_target_with_laser(self, map_target: np.ndarray) -> np.ndarray:
         self.laser_follow_result = LaserFollowResult(reason="laser following disabled")
