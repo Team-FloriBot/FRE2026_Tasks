@@ -6,49 +6,41 @@ pure_pursuit_node:
 
     base_link_frame: "base_link"
 
-    # Reale Roboter brauchen meist mehr Vorschau als die Simulation.
-    # Zu kleiner Lookahead erzeugt starke Krümmung und damit Schlingern um den Pfad.
-    lookahead_min: 0.45
-    lookahead_max: 0.90
-    lookahead_gain: 0.20
+    # Mehr Vorschau für stabilere reale Fahrt.
+    # Zu kleiner Lookahead erzeugt hohe Krümmungen und Schlingern.
+    lookahead_min: 0.50
+    lookahead_max: 1.00
+    lookahead_gain: 0.25
 
-    # Für Ersttests auf dem realen Roboter bewusst reduziert.
-    # Erst stabil bekommen, danach max_speed schrittweise erhöhen.
+    # Konservativ für Ersttests auf dem realen Roboter.
     max_speed: 0.22
     min_speed: 0.10
 
-    # Höherer Wert reduziert die Geschwindigkeit stärker in engen Kurven.
+    # Reduziert Geschwindigkeit in gekrümmten Bereichen.
     curvature_gain: 4.0
 
-    # Reduzierte Lenkverstärkung gegen Überschwingen.
+    # Reduzierte Querregelverstärkung gegen Überschwingen.
     pure_pursuit_gain: 0.65
 
-    # 3.0 rad/s ist für den realen Roboter sehr aggressiv.
-    max_angular_velocity: 0.85
+    # Begrenzung der realen Drehdynamik.
+    max_angular_velocity: 0.65
+    angular_acceleration_limit: 0.60
 
-    # Nicht kleiner als die mechanisch realistisch fahrbare Kurve wählen.
+    # Mechanisch realistischer Mindest-Kurvenradius.
     min_follow_turn_radius: 0.45
-
-    # Starke Begrenzung gegen schnelle Richtungswechsel von angular.z.
-    angular_acceleration_limit: 0.80
 
     goal_tolerance: 0.15
     slowdown_distance: 0.90
 
-    # Sanftere Längsdynamik, damit die Querregelung nicht durch Geschwindigkeitssprünge angeregt wird.
+    # Sanfte Längsdynamik.
     acceleration_limit: 0.30
     deceleration_limit: 0.40
 
     control_rate: 20.0
 
-    # Etwas größeres Suchfenster, da der Lookahead nun größer ist.
-    projection_search_distance: 2.0
-
-    # Kleiner Rückblick gegen Odometrie-/TF-Rauschen, aber nicht zu groß.
+    # Suchfenster passend zum größeren Lookahead.
+    projection_search_distance: 2.20
     projection_backtrack_distance: 0.15
 
     heading_filter_enabled: true
-
-    # Etwas enger als vorher, aber noch tolerant genug für Kurven.
-    # 1.75 rad war sehr großzügig und kann bei Pfadnähe falsche Segmente zulassen.
     heading_tolerance: 1.35
