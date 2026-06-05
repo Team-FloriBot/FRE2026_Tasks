@@ -836,6 +836,15 @@ def test_driving_profiles_are_derived_from_high_profile():
     high = navigator.driving_profiles["high"]
     medium = navigator.driving_profiles["medium"]
     low = navigator.driving_profiles["low"]
+    high_laser = navigator.driving_profiles["high_laser"]
+    high_mix = navigator.driving_profiles["high_mix"]
+    high_map = navigator.driving_profiles["high_map"]
+    medium_laser = navigator.driving_profiles["medium_laser"]
+    medium_mix = navigator.driving_profiles["medium_mix"]
+    medium_map = navigator.driving_profiles["medium_map"]
+    low_laser = navigator.driving_profiles["low_laser"]
+    low_mix = navigator.driving_profiles["low_mix"]
+    low_map = navigator.driving_profiles["low_map"]
 
     assert isinstance(high, DrivingProfile)
     assert math.isclose(high.laser_max_weight_both_sides, 0.30)
@@ -850,6 +859,24 @@ def test_driving_profiles_are_derived_from_high_profile():
     assert low.laser_max_weight_both_sides > medium.laser_max_weight_both_sides
     assert medium.lookahead_speed_reduction_gain < high.lookahead_speed_reduction_gain
     assert low.lookahead_speed_reduction_gain < medium.lookahead_speed_reduction_gain
+    assert math.isclose(high_laser.follow_speed, high.follow_speed)
+    assert math.isclose(high_mix.follow_speed, high.follow_speed)
+    assert math.isclose(high_map.follow_speed, high.follow_speed)
+    assert math.isclose(medium_laser.follow_speed, medium.follow_speed)
+    assert math.isclose(medium_mix.follow_speed, medium.follow_speed)
+    assert math.isclose(medium_map.follow_speed, medium.follow_speed)
+    assert math.isclose(low_laser.follow_speed, low.follow_speed)
+    assert math.isclose(low_mix.follow_speed, low.follow_speed)
+    assert math.isclose(low_map.follow_speed, low.follow_speed)
+    assert math.isclose(high_laser.laser_max_weight_both_sides, 0.80)
+    assert math.isclose(high_mix.laser_max_weight_both_sides, 0.55)
+    assert math.isclose(high_map.laser_max_weight_both_sides, 0.30)
+    assert math.isclose(medium_laser.laser_max_weight_both_sides, 0.80)
+    assert math.isclose(medium_mix.laser_max_weight_both_sides, 0.55)
+    assert math.isclose(medium_map.laser_max_weight_both_sides, 0.30)
+    assert math.isclose(low_laser.laser_max_weight_both_sides, 0.80)
+    assert math.isclose(low_mix.laser_max_weight_both_sides, 0.55)
+    assert math.isclose(low_map.laser_max_weight_both_sides, 0.30)
 
 
 def test_both_rows_produce_centered_high_weight_target():

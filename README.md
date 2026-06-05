@@ -53,7 +53,37 @@ Mit Object Detection:
 ```
 ros2 service call /start_navigation maize_navigation_interfaces/srv/StartNavigation "{pattern: '3L 6R 5R', carefulness: 'high', model_path: '/path/to/model.pt'}"
 ```
-`carefulness` kann `high`, `medium` oder `low` sein. `high` ist vorsichtig, `low` ist am schnellsten.
+`carefulness` waehlt das Fahrprofil. Der erste Teil bestimmt die generellen Fahrparameter:
+
+| Wert | Bedeutung |
+| --- | --- |
+| `high` | vorsichtigstes Profil |
+| `medium` | mittleres Profil |
+| `low` | schnellstes Profil |
+
+Der zweite Teil bestimmt, wie stark Laser- und Karten-Zielpunkt gemischt werden:
+
+| Wert | Bedeutung |
+| --- | --- |
+| `laser` | faehrt hauptsaechlich nach Laser |
+| `mix` | mischt Laser und Karte |
+| `map` | faehrt hauptsaechlich nach Karte |
+
+Damit gibt es fuer den Startservice diese eindeutigen Optionen:
+
+| `carefulness` | Fahrparameter | Zielgewichtung |
+| --- | --- | --- |
+| `high_laser` | high | laser |
+| `high_mix` | high | mix |
+| `high_map` | high | map |
+| `medium_laser` | medium | laser |
+| `medium_mix` | medium | mix |
+| `medium_map` | medium | map |
+| `low_laser` | low | laser |
+| `low_mix` | low | mix |
+| `low_map` | low | map |
+
+Die alten Werte funktionieren weiterhin als Kurzformen: `high` entspricht `high_map`, `medium` entspricht `medium_mix` und `low` entspricht `low_laser`.
 
 Weitere Navigationsservices:
 ```

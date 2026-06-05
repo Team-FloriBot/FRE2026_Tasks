@@ -6,7 +6,7 @@ import csv
 import math
 import os
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 from enum import Enum
 from typing import Dict, List, Optional, Set, Tuple
@@ -886,7 +886,7 @@ class MaizeNavigator(Node):
         carefulness = getattr(req, "carefulness", "").strip().lower() or "high"
         if carefulness not in self.driving_profiles:
             res.success = False
-            res.message = "Invalid carefulness. Use one of: low, medium, high."
+            res.message = f"Invalid carefulness. Use one of: {', '.join(sorted(self.driving_profiles))}."
             self.publish_audio_text("navigation error")
             return res
         model_path = getattr(req, "model_path", "").strip()
@@ -966,63 +966,86 @@ class MaizeNavigator(Node):
             maneuver_lookahead_speed_reduction_gain=self.p.maneuver_lookahead_speed_reduction_gain,
             maneuver_corner_radius=self.p.maneuver_corner_radius,
         )
-        return {
-            "high": high,
-            "medium": DrivingProfile(
-                laser_max_weight_both_sides=0.55,
-                laser_max_weight_one_side=0.275,
-                follow_speed=high.follow_speed * 1.30,
-                slow_speed=high.slow_speed * 1.25,
-                pure_pursuit_gain=high.pure_pursuit_gain * 0.9,
-                curve_speed_reduction_gain=high.curve_speed_reduction_gain * 0.60,
-                follow_max_angular_speed=high.follow_max_angular_speed * 1.10,
-                min_follow_turn_radius=high.min_follow_turn_radius,
-                angular_rate_limit=high.angular_rate_limit * 1.15,
-                target_filter_alpha=min(1.0, high.target_filter_alpha * 1.15),
-                lookahead_distance=high.lookahead_distance * 1.10,
-                turn_lookahead_distance=high.turn_lookahead_distance * 1.40,
-                lookahead_curvature_gain=high.lookahead_curvature_gain * 0.9,
-                lookahead_lateral_error_gain=high.lookahead_lateral_error_gain * 0.9,
-                lookahead_filter_alpha=min(1.0, high.lookahead_filter_alpha * 1.15),
-                lookahead_speed_reduction_gain=high.lookahead_speed_reduction_gain * 0.9,
-                maneuver_speed=high.maneuver_speed * 1.20,
-                maneuver_slow_speed=high.maneuver_slow_speed * 1.20,
-                maneuver_lookahead_distance=high.maneuver_lookahead_distance * 1.20,
-                maneuver_turn_lookahead_distance=high.maneuver_turn_lookahead_distance * 1.10,
-                maneuver_lookahead_curvature_gain=high.maneuver_lookahead_curvature_gain,
-                maneuver_lookahead_lateral_error_gain=high.maneuver_lookahead_lateral_error_gain * 0.9,
-                maneuver_lookahead_filter_alpha=min(1.0, high.maneuver_lookahead_filter_alpha * 1.10),
-                maneuver_lookahead_speed_reduction_gain=high.maneuver_lookahead_speed_reduction_gain,
-                maneuver_corner_radius=high.maneuver_corner_radius * 1.25,
-            ),
-            "low": DrivingProfile(
-                laser_max_weight_both_sides=0.80,
-                laser_max_weight_one_side=0.40,
-                follow_speed=high.follow_speed * 1.60,
-                slow_speed=high.slow_speed * 1.50,
-                pure_pursuit_gain=high.pure_pursuit_gain * 0.8,
-                curve_speed_reduction_gain=high.curve_speed_reduction_gain * 0.35,
-                follow_max_angular_speed=high.follow_max_angular_speed * 1.20,
-                min_follow_turn_radius=high.min_follow_turn_radius,
-                angular_rate_limit=high.angular_rate_limit * 1.30,
-                target_filter_alpha=min(1.0, high.target_filter_alpha * 1.30),
-                lookahead_distance=high.lookahead_distance * 1.20,
-                turn_lookahead_distance=high.turn_lookahead_distance * 2.00,
-                lookahead_curvature_gain=high.lookahead_curvature_gain * 0.8,
-                lookahead_lateral_error_gain=high.lookahead_lateral_error_gain * 0.8,
-                lookahead_filter_alpha=min(1.0, high.lookahead_filter_alpha * 1.30),
-                lookahead_speed_reduction_gain=high.lookahead_speed_reduction_gain * 0.8,
-                maneuver_speed=high.maneuver_speed * 1.40,
-                maneuver_slow_speed=high.maneuver_slow_speed * 1.5,
-                maneuver_lookahead_distance=high.maneuver_lookahead_distance * 1.38,
-                maneuver_turn_lookahead_distance=high.maneuver_turn_lookahead_distance * 1.20,
-                maneuver_lookahead_curvature_gain=high.maneuver_lookahead_curvature_gain,
-                maneuver_lookahead_lateral_error_gain=high.maneuver_lookahead_lateral_error_gain * 0.8,
-                maneuver_lookahead_filter_alpha=min(1.0, high.maneuver_lookahead_filter_alpha * 1.20),
-                maneuver_lookahead_speed_reduction_gain=high.maneuver_lookahead_speed_reduction_gain,
-                maneuver_corner_radius=high.maneuver_corner_radius * 1.50,
-            ),
+        medium = DrivingProfile(
+            laser_max_weight_both_sides=0.55,
+            laser_max_weight_one_side=0.275,
+            follow_speed=high.follow_speed * 1.30,
+            slow_speed=high.slow_speed * 1.25,
+            pure_pursuit_gain=high.pure_pursuit_gain * 0.9,
+            curve_speed_reduction_gain=high.curve_speed_reduction_gain * 0.60,
+            follow_max_angular_speed=high.follow_max_angular_speed * 1.10,
+            min_follow_turn_radius=high.min_follow_turn_radius,
+            angular_rate_limit=high.angular_rate_limit * 1.15,
+            target_filter_alpha=min(1.0, high.target_filter_alpha * 1.15),
+            lookahead_distance=high.lookahead_distance * 1.10,
+            turn_lookahead_distance=high.turn_lookahead_distance * 1.40,
+            lookahead_curvature_gain=high.lookahead_curvature_gain * 0.9,
+            lookahead_lateral_error_gain=high.lookahead_lateral_error_gain * 0.9,
+            lookahead_filter_alpha=min(1.0, high.lookahead_filter_alpha * 1.15),
+            lookahead_speed_reduction_gain=high.lookahead_speed_reduction_gain * 0.9,
+            maneuver_speed=high.maneuver_speed * 1.20,
+            maneuver_slow_speed=high.maneuver_slow_speed * 1.20,
+            maneuver_lookahead_distance=high.maneuver_lookahead_distance * 1.20,
+            maneuver_turn_lookahead_distance=high.maneuver_turn_lookahead_distance * 1.10,
+            maneuver_lookahead_curvature_gain=high.maneuver_lookahead_curvature_gain,
+            maneuver_lookahead_lateral_error_gain=high.maneuver_lookahead_lateral_error_gain * 0.9,
+            maneuver_lookahead_filter_alpha=min(1.0, high.maneuver_lookahead_filter_alpha * 1.10),
+            maneuver_lookahead_speed_reduction_gain=high.maneuver_lookahead_speed_reduction_gain,
+            maneuver_corner_radius=high.maneuver_corner_radius * 1.25,
+        )
+        low = DrivingProfile(
+            laser_max_weight_both_sides=0.80,
+            laser_max_weight_one_side=0.40,
+            follow_speed=high.follow_speed * 1.60,
+            slow_speed=high.slow_speed * 1.50,
+            pure_pursuit_gain=high.pure_pursuit_gain * 0.8,
+            curve_speed_reduction_gain=high.curve_speed_reduction_gain * 0.35,
+            follow_max_angular_speed=high.follow_max_angular_speed * 1.20,
+            min_follow_turn_radius=high.min_follow_turn_radius,
+            angular_rate_limit=high.angular_rate_limit * 1.30,
+            target_filter_alpha=min(1.0, high.target_filter_alpha * 1.30),
+            lookahead_distance=high.lookahead_distance * 1.20,
+            turn_lookahead_distance=high.turn_lookahead_distance * 2.00,
+            lookahead_curvature_gain=high.lookahead_curvature_gain * 0.8,
+            lookahead_lateral_error_gain=high.lookahead_lateral_error_gain * 0.8,
+            lookahead_filter_alpha=min(1.0, high.lookahead_filter_alpha * 1.30),
+            lookahead_speed_reduction_gain=high.lookahead_speed_reduction_gain * 0.8,
+            maneuver_speed=high.maneuver_speed * 1.40,
+            maneuver_slow_speed=high.maneuver_slow_speed * 1.5,
+            maneuver_lookahead_distance=high.maneuver_lookahead_distance * 1.38,
+            maneuver_turn_lookahead_distance=high.maneuver_turn_lookahead_distance * 1.20,
+            maneuver_lookahead_curvature_gain=high.maneuver_lookahead_curvature_gain,
+            maneuver_lookahead_lateral_error_gain=high.maneuver_lookahead_lateral_error_gain * 0.8,
+            maneuver_lookahead_filter_alpha=min(1.0, high.maneuver_lookahead_filter_alpha * 1.20),
+            maneuver_lookahead_speed_reduction_gain=high.maneuver_lookahead_speed_reduction_gain,
+            maneuver_corner_radius=high.maneuver_corner_radius * 1.50,
+        )
+
+        weight_profiles = {
+            "map": (high.laser_max_weight_both_sides, high.laser_max_weight_one_side),
+            "mix": (medium.laser_max_weight_both_sides, medium.laser_max_weight_one_side),
+            "laser": (low.laser_max_weight_both_sides, low.laser_max_weight_one_side),
         }
+        speed_profiles = {
+            "high": high,
+            "medium": medium,
+            "low": low,
+        }
+        profiles = {}
+        for speed_name, base_profile in speed_profiles.items():
+            for weight_name, (both_sides, one_side) in weight_profiles.items():
+                profiles[f"{speed_name}_{weight_name}"] = replace(
+                    base_profile,
+                    laser_max_weight_both_sides=both_sides,
+                    laser_max_weight_one_side=one_side,
+                )
+
+        profiles.update({
+            "high": profiles["high_map"],
+            "medium": profiles["medium_mix"],
+            "low": profiles["low_laser"],
+        })
+        return profiles
 
     def apply_driving_profile(self, carefulness: str) -> None:
         profile = self.driving_profiles[carefulness]
