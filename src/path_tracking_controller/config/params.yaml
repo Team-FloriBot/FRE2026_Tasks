@@ -6,30 +6,49 @@ pure_pursuit_node:
 
     base_link_frame: "base_link"
 
-    # Wenn der Roboter auf Geraden pendelt oder nervös lenkt:lookahead_min leicht erhöhen
-    # Wenn er Kurven schneidet oder in engen Turns zu spät einlenkt: lookahead_min senken oder lookahead_max kleiner halten.
-    # Wenn er bei Kreuzungen zu weit voraus “in den falschen Ast” schaut: lookahead_max reduzieren
-    lookahead_min: 0.25 # minimale Vorschauweite
-    lookahead_max: 0.60 # maximale Vorschauweite
-    lookahead_gain: 0.15 # Skaliert die Vorschauweite mit der Geschwindigkeit
+    # Reale Roboter brauchen meist mehr Vorschau als die Simulation.
+    # Zu kleiner Lookahead erzeugt starke Krümmung und damit Schlingern um den Pfad.
+    lookahead_min: 0.45
+    lookahead_max: 0.90
+    lookahead_gain: 0.20
 
-    max_speed: 0.3
-    min_speed: 0.2
+    # Für Ersttests auf dem realen Roboter bewusst reduziert.
+    # Erst stabil bekommen, danach max_speed schrittweise erhöhen.
+    max_speed: 0.22
+    min_speed: 0.10
 
-    curvature_gain: 3.0 # reduziert Geschwindigkeit bei hoher Krümmung. Höher = langsamer in Kurven.
-    pure_pursuit_gain: 1.0 # multipliziert die Krümmung, höher lenkt stärker, niedriger ruhiger
-    max_angular_velocity: 3.0
-    min_follow_turn_radius: 0.37 # minimal erlaubter Fahrradius
-    angular_acceleration_limit: 3.0
+    # Höherer Wert reduziert die Geschwindigkeit stärker in engen Kurven.
+    curvature_gain: 4.0
+
+    # Reduzierte Lenkverstärkung gegen Überschwingen.
+    pure_pursuit_gain: 0.65
+
+    # 3.0 rad/s ist für den realen Roboter sehr aggressiv.
+    max_angular_velocity: 0.85
+
+    # Nicht kleiner als die mechanisch realistisch fahrbare Kurve wählen.
+    min_follow_turn_radius: 0.45
+
+    # Starke Begrenzung gegen schnelle Richtungswechsel von angular.z.
+    angular_acceleration_limit: 0.80
 
     goal_tolerance: 0.15
-    slowdown_distance: 0.75
-    acceleration_limit: 0.5
-    deceleration_limit: 0.5
+    slowdown_distance: 0.90
+
+    # Sanftere Längsdynamik, damit die Querregelung nicht durch Geschwindigkeitssprünge angeregt wird.
+    acceleration_limit: 0.30
+    deceleration_limit: 0.40
 
     control_rate: 20.0
 
-    projection_search_distance: 1.5 # lokales Suchfenster nach vorne entlang des Pfads
-    projection_backtrack_distance: 0.20 # kleiner Rückblick gegen Messrauschen
-    heading_filter_enabled: true # aktiviert Richtungsprüfung
-    heading_tolerance: 1.75 # erlaubte Abweichung zwischen Roboter-Yaw und Segmentrichtung in rad; kleiner genauer, aber Risiko für enge Turns
+    # Etwas größeres Suchfenster, da der Lookahead nun größer ist.
+    projection_search_distance: 2.0
+
+    # Kleiner Rückblick gegen Odometrie-/TF-Rauschen, aber nicht zu groß.
+    projection_backtrack_distance: 0.15
+
+    heading_filter_enabled: true
+
+    # Etwas enger als vorher, aber noch tolerant genug für Kurven.
+    # 1.75 rad war sehr großzügig und kann bei Pfadnähe falsche Segmente zulassen.
+    heading_tolerance: 1.35
