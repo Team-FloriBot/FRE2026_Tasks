@@ -24,7 +24,7 @@ def install_ros_import_stubs():
         ("maize_navigation_interfaces", ("StartNavigation",)),
         ("nav_msgs", ("OccupancyGrid",)),
         ("sensor_msgs", ("LaserScan",)),
-        ("std_msgs", ("Bool", "Header")),
+        ("std_msgs", ("Bool", "Header", "String")),
         ("std_srvs", ("Trigger",)),
         ("visualization_msgs", ("Marker", "MarkerArray")),
     ):
@@ -50,6 +50,12 @@ def install_ros_import_stubs():
                     self.data = False
 
             message_module.Bool = Bool
+
+            class String:
+                def __init__(self):
+                    self.data = ""
+
+            message_module.String = String
         if package == "std_srvs":
             message_module.Trigger.Request = type("Request", (), {})
         if package == "fre2026_detection_interfaces":
@@ -145,6 +151,8 @@ def make_navigator_for_start_callback():
     navigator.paused_state = None
     navigator.published_cmds = []
     navigator.cmd_pub = types.SimpleNamespace(publish=lambda msg: navigator.published_cmds.append(msg))
+    navigator.published_audio = []
+    navigator.audio_pub = types.SimpleNamespace(publish=lambda msg: navigator.published_audio.append(msg.data))
     navigator.published_tracker_active = []
     navigator.tracker_active_pub = types.SimpleNamespace(
         publish=lambda msg: navigator.published_tracker_active.append(msg.data)
@@ -243,6 +251,7 @@ def test_start_callback_sets_requested_pattern():
     assert navigator.pattern_steps == [PatternStep(3, "L"), PatternStep(2, "R")]
     assert navigator.state == MissionState.INITIALIZING
     assert navigator.current_carefulness == "high"
+    assert navigator.published_audio[-1] == "navigation started"
 
 
 def test_start_callback_clears_handled_tracked_object_ids():
@@ -295,6 +304,7 @@ def test_start_callback_rejects_invalid_pattern_without_changing_mission():
     assert not response.success
     assert navigator.p.pattern == "1L 2R"
     assert navigator.pattern_steps == [PatternStep(1, "L")]
+    assert navigator.published_audio[-1] == "navigation error"
 
 
 def test_start_callback_rejects_invalid_carefulness_without_changing_mission():
@@ -333,6 +343,7 @@ def test_pause_and_resume_keep_mission_state_and_profile():
     assert navigator.paused_state is None
     assert navigator.current_carefulness == "medium"
     assert navigator.handled_tracked_object_ids == {11}
+    assert navigator.published_audio == ["navigation stopped", "navigation continuing"]
 
 
 def test_pause_rejects_idle_navigation():
@@ -343,6 +354,7 @@ def test_pause_rejects_idle_navigation():
 
     assert not response.success
     assert navigator.state == MissionState.IDLE
+    assert navigator.published_audio[-1] == "navigation error"
 
 
 def test_resume_rejects_when_not_paused():
@@ -353,6 +365,7 @@ def test_resume_rejects_when_not_paused():
 
     assert not response.success
     assert navigator.state == MissionState.FOLLOW_ROW
+    assert navigator.published_audio[-1] == "navigation error"
 
 
 def test_reset_clears_navigation_and_sensor_state():
@@ -383,6 +396,21 @@ def test_reset_clears_navigation_and_sensor_state():
     assert navigator.tracker_reset_calls == 1
 
 
+def test_stop_callback_publishes_navigation_stopped_audio():
+    navigator = make_navigator_for_start_callback()
+    navigator.state = MissionState.FOLLOW_ROW
+    navigator.store_current_rows = lambda: None
+    navigator.export_row_map = lambda: None
+    navigator.release_object_detection = lambda reason: None
+    navigator.reset_entrance_state = lambda: None
+
+    response = navigator.stop_cb(types.SimpleNamespace(), types.SimpleNamespace())
+
+    assert response.success
+    assert navigator.state == MissionState.IDLE
+    assert navigator.published_audio[-1] == "navigation stopped"
+
+
 def test_tracked_object_near_left_row_creates_midline_stop():
     navigator = make_object_stop_navigator()
     navigator.latest_tracked_objects = make_tracked_array(make_tracked_object(1, 1.2, 0.75))
@@ -392,6 +420,8 @@ def test_tracked_object_near_left_row_creates_midline_stop():
     assert stop is not None
     assert stop.object_id == 1
     assert stop.row_side == "left"
+    assert stop.plant_row_number == 2
+    assert stop.plant_row_offset == 1
     assert np.allclose(stop.stop_point, np.array([1.2, 0.0]))
 
 
@@ -404,6 +434,8 @@ def test_tracked_object_near_right_row_creates_midline_stop():
     assert stop is not None
     assert stop.object_id == 2
     assert stop.row_side == "right"
+    assert stop.plant_row_number == 1
+    assert stop.plant_row_offset == -1
     assert np.allclose(stop.stop_point, np.array([1.5, 0.0]))
 
 
@@ -445,6 +477,7 @@ def test_active_object_stop_holds_for_two_seconds_then_marks_handled():
     assert navigator.handled_tracked_object_ids == set()
     assert len(navigator.published_cmds) == 1
     assert navigator.published_cmds[-1].linear.x == 0.0
+    assert navigator.published_audio == ["plant detected on the left"]
 
     navigator.now_ns = int(2.1e9)
     assert navigator.handle_active_object_stop(robot_xy)
@@ -454,6 +487,85 @@ def test_active_object_stop_holds_for_two_seconds_then_marks_handled():
     assert navigator.handled_tracked_object_ids == {5}
     assert len(navigator.published_cmds) == 2
     assert navigator.published_cmds[-1].linear.x == 0.0
+    assert navigator.published_audio == ["plant detected on the left", "navigation continuing"]
+
+
+def test_active_object_stop_uses_object_fallback_label():
+    navigator = make_object_stop_navigator()
+    navigator.active_object_stop = ObjectStop(
+        object_id=6,
+        label="",
+        row_side="right",
+        object_point=np.array([0.0, -0.75]),
+        stop_point=np.array([0.0, 0.0]),
+        distance_ahead=0.0,
+    )
+
+    assert navigator.handle_active_object_stop(np.array([0.0, 0.0]))
+
+    assert navigator.published_audio == ["object detected on the right"]
+
+
+def test_row_aware_object_audio_helpers_format_future_messages():
+    navigator = make_object_stop_navigator()
+    exact_stop = ObjectStop(
+        object_id=7,
+        label="weed",
+        row_side="left",
+        object_point=np.array([0.0, 0.75]),
+        stop_point=np.array([0.0, 0.0]),
+        distance_ahead=0.0,
+        plant_row_number=4,
+    )
+    offset_stop = ObjectStop(
+        object_id=8,
+        label="weed",
+        row_side="left",
+        object_point=np.array([0.0, 2.25]),
+        stop_point=np.array([0.0, 0.0]),
+        distance_ahead=0.0,
+        plant_row_offset=2,
+    )
+    far_right_stop = ObjectStop(
+        object_id=9,
+        label="weed",
+        row_side="right",
+        object_point=np.array([0.0, -3.0]),
+        stop_point=np.array([0.0, 0.0]),
+        distance_ahead=0.0,
+        plant_row_offset=-4,
+    )
+
+    assert navigator.build_object_row_number_audio(exact_stop) == "weed detected in plant row 4 on the left"
+    assert navigator.build_object_row_offset_audio(offset_stop) == "weed detected two plant rows left"
+    assert navigator.build_object_row_offset_audio(far_right_stop) == "weed detected 4 plant rows right"
+
+
+def test_follow_row_publishes_navigation_finished_audio():
+    navigator = make_object_stop_navigator()
+    navigator.robot_pose = Pose2D(0.0, 0.0, 0.0)
+    navigator.row_exit_goal = np.array([0.0, 0.0])
+    navigator.row_end_direction = np.array([1.0, 0.0])
+    navigator.finish_after_current_row = True
+    navigator.recompute_rows = lambda: None
+    navigator.pose_goal_reached = lambda goal, direction: True
+    navigator.store_current_rows = lambda: None
+    navigator.record_current_row_end_direction = lambda: None
+    navigator.export_row_map = lambda: None
+    navigator.release_object_detection = lambda reason: None
+
+    navigator.handle_follow_row()
+
+    assert navigator.state == MissionState.FINISHED
+    assert navigator.published_audio[-1] == "navigation finished"
+
+
+def test_service_response_failure_publishes_navigation_error_audio():
+    navigator = make_navigator_for_start_callback()
+
+    assert not navigator.service_response_success(ImmediateFuture(success=False, message="nope"), "detector start")
+
+    assert navigator.published_audio[-1] == "navigation error"
 
 
 def test_tracker_active_is_published_on_detector_start_and_stop():

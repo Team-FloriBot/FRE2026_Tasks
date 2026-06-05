@@ -22,7 +22,7 @@ from geometry_msgs.msg import Point, Twist
 from maize_navigation_interfaces.srv import StartNavigation
 from nav_msgs.msg import OccupancyGrid
 from sensor_msgs.msg import LaserScan
-from std_msgs.msg import Bool, Header
+from std_msgs.msg import Bool, Header, String
 from std_srvs.srv import Trigger
 from fre2026_tasks_interfaces.srv import SetNavigationPattern, GetNavigationStatus
 from visualization_msgs.msg import Marker, MarkerArray
@@ -99,6 +99,8 @@ class ObjectStop:
     object_point: np.ndarray
     stop_point: np.ndarray
     distance_ahead: float
+    plant_row_number: Optional[int] = None
+    plant_row_offset: Optional[int] = None
     holding: bool = False
 
 
@@ -535,6 +537,7 @@ class MaizeNavigator(Node):
         self.cmd_pub = self.create_publisher(Twist, self.p.cmd_vel_topic, 10)
         self.marker_pub = self.create_publisher(MarkerArray, "navigation_markers", 10)
         self.tracker_active_pub = self.create_publisher(Bool, "/tracker/active", 10)
+        self.audio_pub = self.create_publisher(String, "/classification_result", 10)
         self.tracker_reset_client = self.create_client(Trigger, "/tracker/reset")
         self.slam_reset_client = (
             self.create_client(SlamToolboxReset, self.p.slam_reset_service)
@@ -796,23 +799,62 @@ class MaizeNavigator(Node):
     def tracked_objects_callback(self, msg: TrackedObjectArray) -> None:
         self.latest_tracked_objects = msg
 
+    def publish_audio_text(self, text: str) -> None:
+        if not hasattr(self, "audio_pub"):
+            return
+        phrase = str(text).strip()
+        if not phrase:
+            return
+        msg = String()
+        msg.data = phrase
+        self.audio_pub.publish(msg)
+
+    def object_audio_label(self, label: str) -> str:
+        label = str(label).strip()
+        return label if label else "object"
+
+    def build_object_detection_audio(self, stop: ObjectStop) -> str:
+        label = self.object_audio_label(stop.label)
+        side = "left" if stop.row_side == "left" else "right"
+        return f"{label} detected on the {side}"
+
+    def build_object_row_number_audio(self, stop: ObjectStop) -> str:
+        label = self.object_audio_label(stop.label)
+        side = "left" if stop.row_side == "left" else "right"
+        if stop.plant_row_number is None:
+            return self.build_object_detection_audio(stop)
+        return f"{label} detected in plant row {stop.plant_row_number} on the {side}"
+
+    def build_object_row_offset_audio(self, stop: ObjectStop) -> str:
+        label = self.object_audio_label(stop.label)
+        offset = stop.plant_row_offset
+        if offset is None or offset == 0:
+            return self.build_object_detection_audio(stop)
+        count = abs(int(offset))
+        words = {1: "one", 2: "two", 3: "three"}.get(count, str(count))
+        side = "left" if offset > 0 else "right"
+        return f"{label} detected {words} plant rows {side}"
+
     def start_cb(self, req, res):
         pattern = req.pattern.strip()
         invalid_tokens = [token for token in pattern.split() if re.fullmatch(r"([1-9][0-9]*)([LlRr])", token) is None]
         if not pattern or invalid_tokens:
             res.success = False
             res.message = "Invalid pattern. Use space-separated steps such as '1L 2R'."
+            self.publish_audio_text("navigation error")
             return res
         carefulness = getattr(req, "carefulness", "").strip().lower() or "high"
         if carefulness not in self.driving_profiles:
             res.success = False
             res.message = "Invalid carefulness. Use one of: low, medium, high."
+            self.publish_audio_text("navigation error")
             return res
         model_path = getattr(req, "model_path", "").strip()
         detection_ok, detection_message = self.prepare_object_detection(model_path)
         if not detection_ok:
             res.success = False
             res.message = detection_message
+            self.publish_audio_text("navigation error")
             return res
 
         self.p.pattern = pattern
@@ -827,6 +869,7 @@ class MaizeNavigator(Node):
             f"Navigation started with pattern: {pattern}; carefulness: {carefulness}; "
             f"{detection_message}"
         )
+        self.publish_audio_text("navigation started")
         return res
 
     def build_driving_profiles(self) -> Dict[str, DrivingProfile]:
@@ -934,6 +977,7 @@ class MaizeNavigator(Node):
         res.message = "Navigation stopped"
         if export_path is not None:
             res.message += f"; row map saved to {export_path}"
+        self.publish_audio_text("navigation stopped")
         return res
 
     def pause_cb(self, req, res):
@@ -944,6 +988,7 @@ class MaizeNavigator(Node):
         if self.state in (MissionState.IDLE, MissionState.FINISHED):
             res.success = False
             res.message = f"Cannot pause navigation while state is {self.state.name}"
+            self.publish_audio_text("navigation error")
             return res
         self.paused_state = self.state
         self.state = MissionState.PAUSED
@@ -952,12 +997,14 @@ class MaizeNavigator(Node):
         self.stop_object_detection("navigation paused")
         res.success = True
         res.message = f"Navigation paused from state {self.paused_state.name}"
+        self.publish_audio_text("navigation stopped")
         return res
 
     def resume_cb(self, req, res):
         if self.state != MissionState.PAUSED or self.paused_state is None:
             res.success = False
             res.message = "Navigation is not paused"
+            self.publish_audio_text("navigation error")
             return res
         resume_state = self.paused_state
         self.paused_state = None
@@ -966,6 +1013,7 @@ class MaizeNavigator(Node):
         self.resume_object_detection()
         res.success = True
         res.message = f"Navigation resumed in state {self.state.name}"
+        self.publish_audio_text("navigation continuing")
         return res
 
     def reset_cb(self, req, res):
@@ -981,6 +1029,7 @@ class MaizeNavigator(Node):
         res.message = f"Navigation reset; {slam_message}"
         if not slam_requested:
             self.get_logger().warn(slam_message)
+            self.publish_audio_text("navigation error")
         return res
 
     def request_slam_reset(self) -> Tuple[bool, str]:
@@ -1128,14 +1177,17 @@ class MaizeNavigator(Node):
             response = future.result()
         except Exception as exc:
             self.get_logger().error(f"{action_name} failed: {exc}")
+            self.publish_audio_text("navigation error")
             return False
         if response is None:
             self.get_logger().error(f"{action_name} returned no response")
+            self.publish_audio_text("navigation error")
             return False
         success = bool(getattr(response, "success", False))
         if not success:
             message = getattr(response, "message", "")
             self.get_logger().error(f"{action_name} failed: {message}")
+            self.publish_audio_text("navigation error")
         return success
 
     def set_tracker_active(self, active: bool) -> None:
@@ -1322,6 +1374,7 @@ class MaizeNavigator(Node):
                 self.object_stop_hold_until_ns = None
                 self.reset_controller_state()
                 self.get_logger().info(f"Tracked object {stop.object_id} handled; continuing navigation")
+                self.publish_audio_text("navigation continuing")
             return True
 
         distance_to_stop = float(np.linalg.norm(np.asarray(robot_xy, dtype=float) - stop.stop_point))
@@ -1333,6 +1386,7 @@ class MaizeNavigator(Node):
             self.get_logger().info(
                 f"Stopping for tracked object {stop.object_id} ({stop.label}) on {stop.row_side} row"
             )
+            self.publish_audio_text(self.build_object_detection_audio(stop))
             return True
         return False
 
@@ -1340,6 +1394,7 @@ class MaizeNavigator(Node):
         self.recompute_rows()
         if len(self.midline) < 2:
             self.get_logger().warn("No usable midline from rectangle marching; stopping")
+            self.publish_audio_text("navigation error")
             self.cmd_pub.publish(Twist())
             return
 
@@ -1355,6 +1410,7 @@ class MaizeNavigator(Node):
                     self.export_row_map()
                     self.release_object_detection("mission finished")
                     self.state = MissionState.FINISHED
+                    self.publish_audio_text("navigation finished")
                 else:
                     self.get_logger().info("Row exit reached. Finding the next row entrance.")
                     self.reset_entrance_state()
@@ -1428,6 +1484,7 @@ class MaizeNavigator(Node):
                 continue
             if distance_ahead < best_distance:
                 best_distance = distance_ahead
+                plant_row_number = self.plant_row_number_for_side(row_side)
                 best_stop = ObjectStop(
                     object_id=object_id,
                     label=str(getattr(tracked, "label", "")),
@@ -1435,6 +1492,8 @@ class MaizeNavigator(Node):
                     object_point=object_xy,
                     stop_point=object_projection,
                     distance_ahead=distance_ahead,
+                    plant_row_number=plant_row_number,
+                    plant_row_offset=self.plant_row_offset_for_side(row_side),
                 )
 
         if best_stop is not None:
@@ -1443,6 +1502,20 @@ class MaizeNavigator(Node):
                 f"row={best_stop.row_side} distance={best_stop.distance_ahead:.2f} m"
             )
         return best_stop
+
+    def plant_row_number_for_side(self, row_side: str) -> Optional[int]:
+        if row_side == "left" and self.left_row is not None:
+            return int(self.left_row.row_number)
+        if row_side == "right" and self.right_row is not None:
+            return int(self.right_row.row_number)
+        return None
+
+    def plant_row_offset_for_side(self, row_side: str) -> Optional[int]:
+        if row_side == "left":
+            return 1
+        if row_side == "right":
+            return -1
+        return None
 
     def match_tracked_object_to_current_row(self, object_xy: np.ndarray) -> Tuple[Optional[str], float]:
         candidates: List[Tuple[str, float]] = []
