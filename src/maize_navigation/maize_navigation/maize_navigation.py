@@ -102,6 +102,8 @@ class ObjectStop:
     plant_row_number: Optional[int] = None
     plant_row_offset: Optional[int] = None
     holding: bool = False
+    final_aligning: bool = False
+    final_started_ns: Optional[int] = None
 
 
 @dataclass
@@ -268,6 +270,11 @@ class NavigatorParams:
     object_stop_xy_tolerance: float = 0.20
     object_stop_max_ahead_distance: float = 4.0
     object_stop_past_tolerance: float = 0.20
+    object_stop_final_distance: float = 0.45
+    object_stop_final_speed: float = 0.06
+    object_stop_final_lateral_tolerance: float = 0.12
+    object_stop_final_yaw_tolerance: float = 0.18
+    object_stop_final_timeout_sec: float = 2.0
 
     pattern: str = "1L 2R"
     starting_lane_number: int = 1
@@ -702,6 +709,17 @@ class MaizeNavigator(Node):
         p.object_stop_past_tolerance = float(
             get_param("object_stop_past_tolerance", p.object_stop_past_tolerance)
         )
+        p.object_stop_final_distance = float(get_param("object_stop_final_distance", p.object_stop_final_distance))
+        p.object_stop_final_speed = float(get_param("object_stop_final_speed", p.object_stop_final_speed))
+        p.object_stop_final_lateral_tolerance = float(
+            get_param("object_stop_final_lateral_tolerance", p.object_stop_final_lateral_tolerance)
+        )
+        p.object_stop_final_yaw_tolerance = float(
+            get_param("object_stop_final_yaw_tolerance", p.object_stop_final_yaw_tolerance)
+        )
+        p.object_stop_final_timeout_sec = float(
+            get_param("object_stop_final_timeout_sec", p.object_stop_final_timeout_sec)
+        )
 
         p.pattern = str(get_param("pattern", p.pattern))
         p.starting_lane_number = int(get_param("starting_lane_number", p.starting_lane_number))
@@ -761,6 +779,11 @@ class MaizeNavigator(Node):
         self.p.object_stop_xy_tolerance = max(0.01, self.p.object_stop_xy_tolerance)
         self.p.object_stop_max_ahead_distance = max(0.01, self.p.object_stop_max_ahead_distance)
         self.p.object_stop_past_tolerance = max(0.0, self.p.object_stop_past_tolerance)
+        self.p.object_stop_final_distance = max(self.p.object_stop_xy_tolerance, self.p.object_stop_final_distance)
+        self.p.object_stop_final_speed = max(0.0, self.p.object_stop_final_speed)
+        self.p.object_stop_final_lateral_tolerance = max(0.01, self.p.object_stop_final_lateral_tolerance)
+        self.p.object_stop_final_yaw_tolerance = max(0.01, self.p.object_stop_final_yaw_tolerance)
+        self.p.object_stop_final_timeout_sec = max(0.0, self.p.object_stop_final_timeout_sec)
         self.p.slow_speed = float(np.clip(self.p.slow_speed, 0.0, self.p.follow_speed))
         self.p.curve_speed_reduction_gain = max(0.0, self.p.curve_speed_reduction_gain)
         self.p.maneuver_goal_xy_tolerance = max(0.05, self.p.maneuver_goal_xy_tolerance)
@@ -1445,16 +1468,95 @@ class MaizeNavigator(Node):
 
         distance_to_stop = float(np.linalg.norm(np.asarray(robot_xy, dtype=float) - stop.stop_point))
         if distance_to_stop <= self.p.object_stop_xy_tolerance:
-            stop.holding = True
-            self.object_stop_hold_until_ns = now_ns + int(self.p.object_stop_duration_sec * 1e9)
-            self.reset_controller_state()
-            self.cmd_pub.publish(Twist())
-            self.get_logger().info(
-                f"Stopping for tracked object {stop.object_id} ({stop.label}) on {stop.row_side} row"
-            )
-            self.publish_audio_text(self.build_object_detection_audio(stop))
+            if stop.final_aligning and len(self.midline) >= 2 and self.robot_pose is not None:
+                tangent = self.polyline_tangent_at_point(self.midline, stop.stop_point)
+                desired_yaw = math.atan2(float(tangent[1]), float(tangent[0]))
+                yaw_error = abs(wrap_to_pi(desired_yaw - self.robot_pose.yaw))
+                if yaw_error > self.p.object_stop_final_yaw_tolerance:
+                    return False
+            self.begin_object_stop_holding(stop, now_ns, "stop point reached")
             return True
         return False
+
+    def begin_object_stop_holding(self, stop: ObjectStop, now_ns: int, reason: str) -> None:
+        if not stop.holding:
+            self.get_logger().info(
+                f"Stopping for tracked object {stop.object_id} ({stop.label}) on {stop.row_side} row: {reason}"
+            )
+            self.publish_audio_text(self.build_object_detection_audio(stop))
+        stop.holding = True
+        stop.final_aligning = False
+        stop.final_started_ns = None
+        self.object_stop_hold_until_ns = now_ns + int(self.p.object_stop_duration_sec * 1e9)
+        self.reset_controller_state()
+        self.cmd_pub.publish(Twist())
+
+    def handle_object_stop_final_alignment(
+        self,
+        stop: ObjectStop,
+        robot_xy: np.ndarray,
+        midline: np.ndarray,
+        stop_distance: float,
+    ) -> bool:
+        if len(midline) < 2 or self.robot_pose is None:
+            self.begin_object_stop_holding(stop, self.get_clock().now().nanoseconds, "unsafe final alignment geometry")
+            return True
+
+        now_ns = self.get_clock().now().nanoseconds
+        if not stop.final_aligning:
+            stop.final_aligning = True
+            stop.final_started_ns = now_ns
+            self.reset_controller_state()
+
+        robot_projection, _ = self.project_onto_polyline(midline, robot_xy)
+        tangent = self.polyline_tangent_at_point(midline, robot_projection)
+        left_normal = np.array([-tangent[1], tangent[0]], dtype=float)
+        lateral_error = float((np.asarray(robot_xy, dtype=float) - robot_projection) @ left_normal)
+        desired_yaw = math.atan2(float(tangent[1]), float(tangent[0]))
+        yaw_error = wrap_to_pi(desired_yaw - self.robot_pose.yaw)
+        timeout_reached = (
+            stop.final_started_ns is not None
+            and now_ns - stop.final_started_ns >= int(self.p.object_stop_final_timeout_sec * 1e9)
+        )
+
+        if abs(lateral_error) > self.p.object_stop_final_lateral_tolerance:
+            self.begin_object_stop_holding(stop, now_ns, "final lateral error too large")
+            return True
+        if timeout_reached:
+            self.begin_object_stop_holding(stop, now_ns, "final alignment timeout")
+            return True
+        if (
+            stop_distance <= self.p.object_stop_xy_tolerance
+            and abs(yaw_error) <= self.p.object_stop_final_yaw_tolerance
+        ):
+            self.begin_object_stop_holding(stop, now_ns, "aligned at stop point")
+            return True
+
+        cmd = Twist()
+        cmd.linear.x = min(self.p.object_stop_final_speed, self.p.follow_speed)
+        if stop_distance <= self.p.object_stop_xy_tolerance:
+            cmd.linear.x = 0.0
+        lateral_correction = -float(lateral_error)
+        angular_raw = self.p.pure_pursuit_gain * yaw_error + lateral_correction
+        radius_limited_angular = (
+            abs(cmd.linear.x) / self.p.min_follow_turn_radius
+            if cmd.linear.x > 0.0
+            else self.p.follow_max_angular_speed
+        )
+        max_angular = min(self.p.follow_max_angular_speed, max(0.05, radius_limited_angular))
+        angular_raw = float(np.clip(angular_raw, -max_angular, max_angular))
+        dt = 1.0 / max(1e-6, self.p.control_frequency)
+        max_delta = self.p.angular_rate_limit * dt
+        angular_limited = float(np.clip(
+            angular_raw,
+            self.last_cmd_angular_z - max_delta,
+            self.last_cmd_angular_z + max_delta,
+        ))
+        self.last_cmd_angular_z = angular_limited
+        cmd.angular.z = angular_limited
+        self.cmd_pub.publish(cmd)
+        self.fused_target_point = robot_projection
+        return True
 
     def handle_follow_row(self) -> None:
         self.recompute_rows()
@@ -1507,6 +1609,14 @@ class MaizeNavigator(Node):
                 self.handled_tracked_object_ids.add(self.active_object_stop.object_id)
                 self.active_object_stop = None
                 self.object_stop_hold_until_ns = None
+            elif stop_distance <= self.p.object_stop_final_distance:
+                if self.handle_object_stop_final_alignment(
+                    self.active_object_stop,
+                    robot_xy,
+                    self.midline,
+                    stop_distance,
+                ):
+                    return
             elif stop_distance <= lookahead_distance + 1e-6:
                 target = self.active_object_stop.stop_point
                 self.current_lookahead_distance = max(0.05, min(self.current_lookahead_distance, max(0.0, stop_distance)))

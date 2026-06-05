@@ -87,6 +87,11 @@ maize_navigator:
     object_stop_xy_tolerance: 0.20
     object_stop_max_ahead_distance: 4.0
     object_stop_past_tolerance: 0.20
+    object_stop_final_distance: 0.45
+    object_stop_final_speed: 0.06
+    object_stop_final_lateral_tolerance: 0.12
+    object_stop_final_yaw_tolerance: 0.18
+    object_stop_final_timeout_sec: 2.0
 
     path_goal_xy_tolerance: 0.25
     # Fuer Reihenende, Wendepunkt und neue Einfahrt: groessere Pose-Toleranz.

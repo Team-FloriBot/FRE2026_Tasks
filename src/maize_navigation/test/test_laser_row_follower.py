@@ -238,6 +238,8 @@ def make_object_stop_navigator():
     right.result.points = np.array([[0.0, -0.75], [5.0, -0.75]], dtype=float)
     navigator.left_row = left
     navigator.right_row = right
+    navigator.row_exit_goal = None
+    navigator.row_end_direction = None
     navigator.state = MissionState.FOLLOW_ROW
     return navigator
 
@@ -602,6 +604,116 @@ def test_active_object_stop_uses_object_fallback_label():
     assert navigator.handle_active_object_stop(np.array([0.0, 0.0]))
 
     assert navigator.published_audio == ["object detected on the right"]
+
+
+def test_object_stop_final_alignment_starts_near_stop_point():
+    navigator = make_object_stop_navigator()
+    navigator.recompute_rows = lambda: None
+    navigator.robot_pose = Pose2D(1.10, 0.0, 0.0)
+    navigator.active_object_stop = ObjectStop(
+        object_id=15,
+        label="weed",
+        row_side="left",
+        object_point=np.array([1.40, 0.75]),
+        stop_point=np.array([1.40, 0.0]),
+        distance_ahead=0.30,
+    )
+
+    navigator.handle_follow_row()
+
+    assert navigator.active_object_stop.final_aligning
+    assert navigator.active_object_stop.final_started_ns == 0
+    assert navigator.published_cmds[-1].linear.x == navigator.p.object_stop_final_speed
+    assert navigator.published_audio == []
+
+
+def test_object_stop_final_alignment_drives_slowly_with_small_lateral_error():
+    navigator = make_object_stop_navigator()
+    navigator.recompute_rows = lambda: None
+    navigator.robot_pose = Pose2D(1.10, 0.05, 0.0)
+    navigator.active_object_stop = ObjectStop(
+        object_id=16,
+        label="weed",
+        row_side="left",
+        object_point=np.array([1.40, 0.75]),
+        stop_point=np.array([1.40, 0.0]),
+        distance_ahead=0.30,
+    )
+
+    navigator.handle_follow_row()
+
+    cmd = navigator.published_cmds[-1]
+    assert cmd.linear.x == navigator.p.object_stop_final_speed
+    assert cmd.angular.z < 0.0
+    assert navigator.active_object_stop.holding is False
+
+
+def test_object_stop_final_alignment_stops_on_large_lateral_error():
+    navigator = make_object_stop_navigator()
+    navigator.recompute_rows = lambda: None
+    navigator.robot_pose = Pose2D(1.10, 0.20, 0.0)
+    navigator.active_object_stop = ObjectStop(
+        object_id=17,
+        label="weed",
+        row_side="left",
+        object_point=np.array([1.40, 0.75]),
+        stop_point=np.array([1.40, 0.0]),
+        distance_ahead=0.30,
+    )
+
+    navigator.handle_follow_row()
+
+    assert navigator.active_object_stop.holding
+    assert navigator.published_cmds[-1].linear.x == 0.0
+    assert navigator.published_audio == ["weed detected on the left"]
+
+
+def test_final_aligning_stop_waits_for_yaw_at_stop_point():
+    navigator = make_object_stop_navigator()
+    navigator.robot_pose = Pose2D(1.40, 0.0, 0.5)
+    navigator.active_object_stop = ObjectStop(
+        object_id=18,
+        label="weed",
+        row_side="left",
+        object_point=np.array([1.40, 0.75]),
+        stop_point=np.array([1.40, 0.0]),
+        distance_ahead=0.0,
+        final_aligning=True,
+        final_started_ns=0,
+    )
+
+    assert not navigator.handle_active_object_stop(np.array([1.40, 0.0]))
+    assert navigator.active_object_stop.holding is False
+
+    navigator.robot_pose = Pose2D(1.40, 0.0, 0.0)
+    assert navigator.handle_active_object_stop(np.array([1.40, 0.0]))
+
+    assert navigator.active_object_stop.holding
+    assert navigator.published_audio == ["weed detected on the left"]
+
+
+def test_object_stop_final_alignment_timeout_stops_safely():
+    navigator = make_object_stop_navigator()
+    navigator.recompute_rows = lambda: None
+    navigator.p.object_stop_final_timeout_sec = 2.0
+    navigator.now_ns = int(2.1e9)
+    navigator.robot_pose = Pose2D(1.35, 0.0, 0.7)
+    navigator.active_object_stop = ObjectStop(
+        object_id=19,
+        label="weed",
+        row_side="left",
+        object_point=np.array([1.40, 0.75]),
+        stop_point=np.array([1.40, 0.0]),
+        distance_ahead=0.05,
+        final_aligning=True,
+        final_started_ns=0,
+    )
+
+    navigator.handle_follow_row()
+
+    assert navigator.active_object_stop.holding
+    assert navigator.published_cmds[-1].linear.x == 0.0
+    assert navigator.published_audio == ["weed detected on the left"]
 
 
 def test_row_aware_object_audio_helpers_format_future_messages():
