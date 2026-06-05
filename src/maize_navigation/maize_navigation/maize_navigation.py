@@ -477,6 +477,8 @@ class MaizeNavigator(Node):
         self.p = self.load_params()
         self.validate_params()
         self.configured_expected_row_width = self.p.expected_row_width
+        self.configured_starting_lane_number = self.p.starting_lane_number
+        self.configured_row_numbers_increase_to = self.p.row_numbers_increase_to
 
         self.state = MissionState.IDLE
         self.paused_state: Optional[MissionState] = None
@@ -516,6 +518,8 @@ class MaizeNavigator(Node):
         self.current_maneuver_lookahead_distance: float = self.p.maneuver_lookahead_distance
         self.current_maneuver_lookahead_curvature: float = 0.0
         self.initial_forward_direction: Optional[np.ndarray] = None
+        self.field_start_reference_point: Optional[np.ndarray] = None
+        self.field_start_reference_direction: Optional[np.ndarray] = None
         self.row_number_increase_direction: Optional[np.ndarray] = None
         self.pattern_steps: List[PatternStep] = self.parse_pattern(self.p.pattern)
         self.pattern_index: int = 0
@@ -892,6 +896,8 @@ class MaizeNavigator(Node):
         model_path = getattr(req, "model_path", "").strip()
         object_row_range = int(getattr(req, "object_row_range", 1))
         plant_row_count = int(getattr(req, "plant_row_count", 0))
+        starting_lane_number = int(getattr(req, "starting_lane_number", 0))
+        row_numbers_increase_to = str(getattr(req, "row_numbers_increase_to", "")).strip().lower()
         max_navigation_duration_sec = float(getattr(req, "max_navigation_duration_sec", 0.0))
         if object_row_range < 0:
             res.success = False
@@ -901,6 +907,16 @@ class MaizeNavigator(Node):
         if plant_row_count < 0:
             res.success = False
             res.message = "Invalid plant_row_count. Use 0 if the total plant-row count is unknown."
+            self.publish_audio_text("navigation error")
+            return res
+        if starting_lane_number < 0:
+            res.success = False
+            res.message = "Invalid starting_lane_number. Use 0 for the configured default or a positive lane number."
+            self.publish_audio_text("navigation error")
+            return res
+        if row_numbers_increase_to and row_numbers_increase_to not in ("left", "right"):
+            res.success = False
+            res.message = "Invalid row_numbers_increase_to. Use '', 'left', or 'right'."
             self.publish_audio_text("navigation error")
             return res
         if max_navigation_duration_sec < 0.0:
@@ -916,6 +932,16 @@ class MaizeNavigator(Node):
             return res
 
         self.p.pattern = pattern
+        self.p.starting_lane_number = (
+            starting_lane_number
+            if starting_lane_number > 0
+            else int(getattr(self, "configured_starting_lane_number", self.p.starting_lane_number))
+        )
+        self.p.row_numbers_increase_to = (
+            row_numbers_increase_to
+            if row_numbers_increase_to
+            else str(getattr(self, "configured_row_numbers_increase_to", self.p.row_numbers_increase_to))
+        )
         self.apply_driving_profile(carefulness)
         self.pattern_steps = self.parse_pattern(pattern)
         self.reset_navigation_state(clear_sensor_cache=False)
@@ -933,6 +959,8 @@ class MaizeNavigator(Node):
             f"Navigation started with pattern: {pattern}; carefulness: {carefulness}; "
             f"{detection_message}; object row range: {self.active_object_row_range}; "
             f"plant row count: {self.active_plant_row_count or 0}; "
+            f"starting lane: {self.p.starting_lane_number}; "
+            f"row numbers increase to: {self.p.row_numbers_increase_to}; "
             f"duration limit: {self.max_navigation_duration_sec or 0.0:.1f} s"
         )
         self.publish_audio_text("navigation started")
@@ -1303,6 +1331,8 @@ class MaizeNavigator(Node):
         self.row_exit_heading_goal = None
         self.row_end_direction = None
         self.initial_forward_direction = None
+        self.field_start_reference_point = None
+        self.field_start_reference_direction = None
         self.row_number_increase_direction = None
         self.pattern_index = 0
         self.finish_after_current_row = len(self.pattern_steps) == 0
@@ -1448,6 +1478,8 @@ class MaizeNavigator(Node):
         right_direction = self.initial_direction_from_points(right_point1, right_point2, forward)
         if self.initial_forward_direction is None:
             self.initial_forward_direction = np.asarray(forward, dtype=float)
+            self.field_start_reference_point = 0.5 * (left_point1 + right_point1)
+            self.field_start_reference_direction = self.normalize(forward)
             initial_left = np.array([-forward[1], forward[0]], dtype=float)
             increase_sign = 1.0 if self.p.row_numbers_increase_to == "left" else -1.0
             self.row_number_increase_direction = increase_sign * initial_left
@@ -1829,7 +1861,7 @@ class MaizeNavigator(Node):
             return
 
         projection, segment_idx = self.project_onto_polyline(row_points, stop.object_point)
-        distance_from_start = self.polyline_distance_to_projection(row_points, projection, segment_idx)
+        distance_from_start = self.object_distance_from_original_start(row_points, projection, segment_idx)
         distance_from_start = round(float(np.clip(distance_from_start, 0.0, 20.0)) * 10.0) / 10.0
         self.object_row_positions[stop.object_id] = ObjectRowPosition(
             object_id=stop.object_id,
@@ -1868,6 +1900,26 @@ class MaizeNavigator(Node):
         distance = self.polyline_length(polyline[: segment_idx + 1])
         distance += float(np.linalg.norm(np.asarray(projection, dtype=float) - polyline[segment_idx]))
         return distance
+
+    def object_distance_from_original_start(
+        self,
+        row_points: np.ndarray,
+        projection: np.ndarray,
+        segment_idx: int,
+    ) -> float:
+        known_distance = self.polyline_distance_to_projection(row_points, projection, segment_idx)
+        start_point = getattr(self, "field_start_reference_point", None)
+        start_direction = getattr(self, "field_start_reference_direction", None)
+        if start_point is None or start_direction is None or len(row_points) == 0:
+            return known_distance
+
+        # If a row was entered from the far side, the known polyline can start meters
+        # after the field start side. Estimate that missing prefix in the original
+        # field-forward direction and add the measured row distance from there.
+        start_direction = self.normalize(np.asarray(start_direction, dtype=float))
+        first_known_point = np.asarray(row_points[0], dtype=float)
+        missing_prefix = float((first_known_point - np.asarray(start_point, dtype=float)) @ start_direction)
+        return max(0.0, missing_prefix) + known_distance
 
     def object_stop_distance_ahead(self, stop: ObjectStop, robot_xy: np.ndarray, midline: np.ndarray) -> float:
         if len(midline) < 2:

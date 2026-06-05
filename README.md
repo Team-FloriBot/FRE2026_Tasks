@@ -51,7 +51,7 @@ ros2 service call /start_navigation maize_navigation_interfaces/srv/StartNavigat
 ```
 Mit Object Detection:
 ```
-ros2 service call /start_navigation maize_navigation_interfaces/srv/StartNavigation "{pattern: '3L 6R 5R', carefulness: 'high_map', model_path: '/path/to/model.pt', object_row_range: 1, plant_row_count: 0, max_navigation_duration_sec: 0.0}"
+ros2 service call /start_navigation maize_navigation_interfaces/srv/StartNavigation "{pattern: '3L 6R 5R', carefulness: 'high_map', model_path: '/path/to/model.pt', object_row_range: 1, plant_row_count: 5, starting_lane_number: 1, row_numbers_increase_to: 'left', max_navigation_duration_sec: 0.0}"
 ```
 
 Alle Felder des Startservices:
@@ -63,7 +63,11 @@ Alle Felder des Startservices:
 | `model_path` | `string` | Pfad zum Object-Detection-Modell. | leer = Object Detection aus |
 | `object_row_range` | `int32` | Anzahl Pflanzenreihen, in denen erkannte Objekte für Stopps berücksichtigt werden. Wirkt nur mit gesetztem `model_path`. | `0` = Objektstopps aus; ohne `model_path` immer aus |
 | `plant_row_count` | `int32` | Gesamtzahl der Pflanzenreihen, falls bekannt. Wird für die Zuordnung von Objekten zu Reihen verwendet. | `0` = unbekannt |
+| `starting_lane_number` | `int32` | Nummer der Startgasse. Startgasse `1` liegt zwischen Pflanzenreihe 1 und 2. | `0` = Wert aus `params.yaml` |
+| `row_numbers_increase_to` | `string` | Feldfeste Richtung, in der die Pflanzenreihennummern vom Roboterstart aus groesser werden: `left` oder `right`. | leer = Wert aus `params.yaml` |
 | `max_navigation_duration_sec` | `float64` | Maximale Navigationsdauer in Sekunden. | `0.0` = kein Zeitlimit |
+
+Fuer die Objekt-CSV sollten `starting_lane_number`, `row_numbers_increase_to` und `plant_row_count` passend zum Feldaufbau gesetzt werden. Die CSV verwendet damit eine einheitliche Feldreferenz: `row_number` und `distance_from_start_m`, wobei die Distanz immer von der urspruenglichen Startseite des Feldes in die Reihe hinein gemessen wird.
 
 `carefulness` wählt das Fahrprofil. Der erste Teil bestimmt die generellen Fahrparameter:
 
@@ -99,7 +103,7 @@ Die alten Werte funktionieren weiterhin als Kurzformen: `high` entspricht `high_
 
 Beispiel mit Zeitlimit und bekannter Pflanzenreihenzahl:
 ```
-ros2 service call /start_navigation maize_navigation_interfaces/srv/StartNavigation "{pattern: '3L 6R 5R', carefulness: 'medium_mix', model_path: '/path/to/model.pt', object_row_range: 2, plant_row_count: 12, max_navigation_duration_sec: 45.0}"
+ros2 service call /start_navigation maize_navigation_interfaces/srv/StartNavigation "{pattern: '3L 6R 5R', carefulness: 'medium_mix', model_path: '/path/to/model.pt', object_row_range: 2, plant_row_count: 5, starting_lane_number: 1, row_numbers_increase_to: 'left', max_navigation_duration_sec: 45.0}"
 ```
 
 Weitere Navigationsservices:

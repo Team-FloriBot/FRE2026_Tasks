@@ -144,6 +144,9 @@ def process_repeatedly(follower, scan, count=12, map_slope=0.0, map_target=(1.4,
 def make_navigator_for_start_callback():
     navigator = MaizeNavigator.__new__(MaizeNavigator)
     navigator.p = NavigatorParams()
+    navigator.configured_expected_row_width = navigator.p.expected_row_width
+    navigator.configured_starting_lane_number = navigator.p.starting_lane_number
+    navigator.configured_row_numbers_increase_to = navigator.p.row_numbers_increase_to
     navigator.state = MissionState.IDLE
     navigator.pattern_steps = [PatternStep(1, "L")]
     navigator.laser_follower = types.SimpleNamespace(reset=lambda: None)
@@ -253,7 +256,8 @@ def test_start_callback_sets_requested_pattern():
     assert response.success
     assert response.message == (
         "Navigation started with pattern: 3L  2r; carefulness: high; object detection disabled; "
-        "object row range: 0; plant row count: 0; duration limit: 0.0 s"
+        "object row range: 0; plant row count: 0; starting lane: 1; "
+        "row numbers increase to: left; duration limit: 0.0 s"
     )
     assert navigator.p.pattern == "3L  2r"
     assert navigator.pattern_steps == [PatternStep(3, "L"), PatternStep(2, "R")]
@@ -311,6 +315,48 @@ def test_start_callback_applies_object_range_row_count_and_duration_when_model_i
     assert "duration limit: 45.0 s" in response.message
 
 
+def test_start_callback_applies_row_numbering_inputs():
+    navigator = make_navigator_for_start_callback()
+
+    response = navigator.start_cb(
+        types.SimpleNamespace(
+            pattern="3L",
+            carefulness="high",
+            model_path="",
+            starting_lane_number=3,
+            row_numbers_increase_to="right",
+        ),
+        types.SimpleNamespace(),
+    )
+
+    assert response.success
+    assert navigator.p.starting_lane_number == 3
+    assert navigator.p.row_numbers_increase_to == "right"
+    assert "starting lane: 3" in response.message
+    assert "row numbers increase to: right" in response.message
+
+
+def test_start_callback_uses_configured_row_numbering_defaults():
+    navigator = make_navigator_for_start_callback()
+    navigator.configured_starting_lane_number = 4
+    navigator.configured_row_numbers_increase_to = "right"
+
+    response = navigator.start_cb(
+        types.SimpleNamespace(
+            pattern="3L",
+            carefulness="high",
+            model_path="",
+            starting_lane_number=0,
+            row_numbers_increase_to="",
+        ),
+        types.SimpleNamespace(),
+    )
+
+    assert response.success
+    assert navigator.p.starting_lane_number == 4
+    assert navigator.p.row_numbers_increase_to == "right"
+
+
 def test_start_callback_ignores_object_range_without_model():
     navigator = make_navigator_for_start_callback()
 
@@ -341,6 +387,29 @@ def test_start_callback_rejects_negative_new_inputs():
 
     assert not response.success
     assert response.message.startswith("Invalid object_row_range")
+    assert navigator.published_audio[-1] == "navigation error"
+
+    navigator = make_navigator_for_start_callback()
+    response = navigator.start_cb(
+        types.SimpleNamespace(pattern="3L", carefulness="high", model_path="", starting_lane_number=-1),
+        types.SimpleNamespace(),
+    )
+
+    assert not response.success
+    assert response.message.startswith("Invalid starting_lane_number")
+    assert navigator.published_audio[-1] == "navigation error"
+
+
+def test_start_callback_rejects_invalid_row_numbers_increase_to():
+    navigator = make_navigator_for_start_callback()
+
+    response = navigator.start_cb(
+        types.SimpleNamespace(pattern="3L", carefulness="high", model_path="", row_numbers_increase_to="up"),
+        types.SimpleNamespace(),
+    )
+
+    assert not response.success
+    assert response.message.startswith("Invalid row_numbers_increase_to")
     assert navigator.published_audio[-1] == "navigation error"
 
 
@@ -546,6 +615,50 @@ def test_object_row_range_zero_disables_object_stops():
     stop = navigator.find_next_object_stop(np.array([0.0, 0.0]), navigator.midline)
 
     assert stop is None
+
+
+def test_object_csv_distance_uses_original_start_side_reference():
+    navigator = make_object_stop_navigator()
+    navigator.initial_forward_direction = np.array([1.0, 0.0])
+    navigator.field_start_reference_point = np.array([0.0, 0.0])
+    navigator.field_start_reference_direction = np.array([1.0, 0.0])
+    stop = ObjectStop(
+        object_id=21,
+        label="weed",
+        row_side="left",
+        object_point=np.array([1.24, 0.75]),
+        stop_point=np.array([1.24, 0.0]),
+        distance_ahead=1.24,
+        plant_row_number=2,
+        plant_row_offset=1,
+    )
+
+    navigator.record_object_row_position(stop)
+
+    assert navigator.object_row_positions[21].row_number == 2
+    assert navigator.object_row_positions[21].distance_from_start_m == 1.2
+
+
+def test_object_csv_distance_estimates_missing_prefix_for_partial_far_side_row():
+    navigator = make_object_stop_navigator()
+    navigator.left_row.result.points = np.array([[15.0, 0.75], [10.0, 0.75]], dtype=float)
+    navigator.initial_forward_direction = np.array([1.0, 0.0])
+    navigator.field_start_reference_point = np.array([0.0, 0.0])
+    navigator.field_start_reference_direction = np.array([1.0, 0.0])
+    stop = ObjectStop(
+        object_id=22,
+        label="weed",
+        row_side="left",
+        object_point=np.array([12.34, 0.75]),
+        stop_point=np.array([12.34, 0.0]),
+        distance_ahead=0.2,
+        plant_row_number=2,
+        plant_row_offset=1,
+    )
+
+    navigator.record_object_row_position(stop)
+
+    assert navigator.object_row_positions[22].distance_from_start_m == 12.3
 
 
 def test_handled_tracked_object_id_does_not_create_second_stop():

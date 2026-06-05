@@ -3,6 +3,8 @@ string carefulness
 string model_path
 int32 object_row_range
 int32 plant_row_count
+int32 starting_lane_number
+string row_numbers_increase_to
 float64 max_navigation_duration_sec
 ---
 bool success
