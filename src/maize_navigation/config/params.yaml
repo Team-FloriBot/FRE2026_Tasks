@@ -121,6 +121,7 @@ maize_navigator:
     starting_lane_number: 1
     row_numbers_increase_to: "left"
     row_map_output_directory: "~/.ros/maize_navigation"
+    object_positions_output_directory: "~/.ros/maize_navigation"
     slam_reset_service: "/slam_toolbox/reset"
 
     publish_debug: true

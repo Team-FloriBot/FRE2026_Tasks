@@ -107,6 +107,13 @@ class ObjectStop:
 
 
 @dataclass
+class ObjectRowPosition:
+    object_id: int
+    row_number: int
+    distance_from_start_m: float
+
+
+@dataclass
 class DrivingProfile:
     laser_max_weight_both_sides: float
     laser_max_weight_one_side: float
@@ -262,6 +269,7 @@ class NavigatorParams:
     maneuver_entry_lateral_tolerance: float = 0.25
     maneuver_entry_yaw_tolerance: float = 0.45
     row_map_output_directory: str = "~/.ros/maize_navigation"
+    object_positions_output_directory: str = "~/.ros/maize_navigation"
     slam_reset_service: str = "/slam_toolbox/reset"
 
     object_stop_enabled: bool = True
@@ -533,6 +541,8 @@ class MaizeNavigator(Node):
         self.stored_rows: Dict[int, np.ndarray] = {}
         self.row_end_directions_by_side: Dict[str, List[np.ndarray]] = {"forward": [], "backward": []}
         self.row_map_exported: bool = False
+        self.object_row_positions: Dict[int, ObjectRowPosition] = {}
+        self.object_positions_exported: bool = False
 
         self.tf_buffer = tf2_ros.Buffer()
         self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
@@ -695,6 +705,9 @@ class MaizeNavigator(Node):
             get_param("maneuver_entry_yaw_tolerance", p.maneuver_entry_yaw_tolerance)
         )
         p.row_map_output_directory = str(get_param("row_map_output_directory", p.row_map_output_directory))
+        p.object_positions_output_directory = str(
+            get_param("object_positions_output_directory", p.object_positions_output_directory)
+        )
         p.slam_reset_service = str(get_param("slam_reset_service", p.slam_reset_service))
 
         p.object_stop_enabled = bool(get_param("object_stop_enabled", p.object_stop_enabled))
@@ -1019,7 +1032,8 @@ class MaizeNavigator(Node):
 
     def stop_cb(self, req, res):
         self.store_current_rows()
-        export_path = self.export_row_map()
+        row_export_path = self.export_row_map()
+        object_export_path = self.export_object_positions()
         self.release_object_detection("navigation stopped")
         self.state = MissionState.IDLE
         self.paused_state = None
@@ -1030,8 +1044,10 @@ class MaizeNavigator(Node):
         self.cmd_pub.publish(Twist())
         res.success = True
         res.message = "Navigation stopped"
-        if export_path is not None:
-            res.message += f"; row map saved to {export_path}"
+        if row_export_path is not None:
+            res.message += f"; row map saved to {row_export_path}"
+        if object_export_path is not None:
+            res.message += f"; object positions saved to {object_export_path}"
         self.publish_audio_text("navigation stopped")
         return res
 
@@ -1270,6 +1286,8 @@ class MaizeNavigator(Node):
         self.stored_rows = {}
         self.row_end_directions_by_side = {"forward": [], "backward": []}
         self.row_map_exported = False
+        self.object_row_positions = {}
+        self.object_positions_exported = False
         self.active_object_stop = None
         self.object_stop_hold_until_ns = None
         if clear_sensor_cache:
@@ -1375,6 +1393,7 @@ class MaizeNavigator(Node):
         self.cmd_pub.publish(Twist())
         self.get_logger().info(f"Mission finished: {reason}")
         self.export_row_map()
+        self.export_object_positions()
         self.release_object_detection(reason)
         self.state = MissionState.FINISHED
         self.navigation_start_time_ns = None
@@ -1483,6 +1502,7 @@ class MaizeNavigator(Node):
             self.get_logger().info(
                 f"Stopping for tracked object {stop.object_id} ({stop.label}) on {stop.row_side} row: {reason}"
             )
+            self.record_object_row_position(stop)
             self.publish_audio_text(self.build_object_detection_audio(stop))
         stop.holding = True
         stop.final_aligning = False
@@ -1774,6 +1794,58 @@ class MaizeNavigator(Node):
         projection, _ = self.project_onto_polyline(row_points, object_xy)
         return float(np.linalg.norm(np.asarray(object_xy, dtype=float) - projection))
 
+    def record_object_row_position(self, stop: ObjectStop) -> None:
+        self.ensure_object_position_storage()
+        if stop.object_id in self.object_row_positions:
+            return
+        if stop.plant_row_number is None:
+            return
+
+        row_points = self.row_points_for_object_stop(stop)
+        if len(row_points) < 2:
+            return
+
+        projection, segment_idx = self.project_onto_polyline(row_points, stop.object_point)
+        distance_from_start = self.polyline_distance_to_projection(row_points, projection, segment_idx)
+        distance_from_start = round(float(np.clip(distance_from_start, 0.0, 20.0)) * 10.0) / 10.0
+        self.object_row_positions[stop.object_id] = ObjectRowPosition(
+            object_id=stop.object_id,
+            row_number=int(stop.plant_row_number),
+            distance_from_start_m=distance_from_start,
+        )
+        self.get_logger().info(
+            f"Recorded object {stop.object_id} at row {stop.plant_row_number}, "
+            f"distance_from_start={distance_from_start:.1f} m"
+        )
+
+    def ensure_object_position_storage(self) -> None:
+        if not hasattr(self, "object_row_positions"):
+            self.object_row_positions = {}
+        if not hasattr(self, "object_positions_exported"):
+            self.object_positions_exported = False
+
+    def row_points_for_object_stop(self, stop: ObjectStop) -> np.ndarray:
+        if stop.row_side == "left":
+            model = self.left_row
+        elif stop.row_side == "right":
+            model = self.right_row
+        else:
+            model = None
+        if model is None or len(model.result.points) < 2:
+            return np.empty((0, 2), dtype=float)
+
+        distance_rows = abs(int(stop.plant_row_offset)) if stop.plant_row_offset is not None else 1
+        row_points = self.offset_row_points(model.result.points, stop.row_side, max(0, distance_rows - 1))
+        return self.orient_row_points(row_points)
+
+    def polyline_distance_to_projection(self, polyline: np.ndarray, projection: np.ndarray, segment_idx: int) -> float:
+        if len(polyline) < 2:
+            return 0.0
+        segment_idx = int(np.clip(segment_idx, 0, len(polyline) - 2))
+        distance = self.polyline_length(polyline[: segment_idx + 1])
+        distance += float(np.linalg.norm(np.asarray(projection, dtype=float) - polyline[segment_idx]))
+        return distance
+
     def object_stop_distance_ahead(self, stop: ObjectStop, robot_xy: np.ndarray, midline: np.ndarray) -> float:
         if len(midline) < 2:
             return 0.0
@@ -2029,6 +2101,36 @@ class MaizeNavigator(Node):
             return output_path
         except OSError as exc:
             self.get_logger().error(f"Could not save maize row map CSV to {output_path}: {exc}")
+            return None
+
+    def export_object_positions(self) -> Optional[str]:
+        self.ensure_object_position_storage()
+        if self.object_positions_exported or len(self.object_row_positions) == 0:
+            return None
+        output_directory_param = getattr(
+            self.p,
+            "object_positions_output_directory",
+            self.p.row_map_output_directory,
+        )
+        output_directory = os.path.abspath(os.path.expanduser(output_directory_param))
+        filename = f"detected_object_positions_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+        output_path = os.path.join(output_directory, filename)
+        try:
+            os.makedirs(output_directory, exist_ok=True)
+            records = sorted(
+                self.object_row_positions.values(),
+                key=lambda item: (item.row_number, item.distance_from_start_m, item.object_id),
+            )
+            with open(output_path, "w", newline="", encoding="utf-8") as csv_file:
+                writer = csv.writer(csv_file)
+                writer.writerow(("row_number", "distance_from_start_m"))
+                for record in records:
+                    writer.writerow((record.row_number, f"{record.distance_from_start_m:.1f}"))
+            self.object_positions_exported = True
+            self.get_logger().info(f"Saved detected object positions CSV: {output_path}")
+            return output_path
+        except OSError as exc:
+            self.get_logger().error(f"Could not save detected object positions CSV to {output_path}: {exc}")
             return None
 
     def handle_find_next_row_entrance(self) -> None:
