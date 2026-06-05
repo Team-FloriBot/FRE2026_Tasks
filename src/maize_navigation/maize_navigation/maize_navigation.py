@@ -478,10 +478,14 @@ class MaizeNavigator(Node):
         self.object_detection_model_path = ""
         self.object_detection_initialized = False
         self.object_detection_started = False
+        self.active_object_row_range = 1
+        self.active_plant_row_count: Optional[int] = None
         self.latest_tracked_objects: Optional[TrackedObjectArray] = None
         self.handled_tracked_object_ids: Set[int] = set()
         self.active_object_stop: Optional[ObjectStop] = None
         self.object_stop_hold_until_ns: Optional[int] = None
+        self.navigation_start_time_ns: Optional[int] = None
+        self.max_navigation_duration_sec: Optional[float] = None
 
         self.left_row: Optional[RowMarchModel] = None
         self.right_row: Optional[RowMarchModel] = None
@@ -850,6 +854,24 @@ class MaizeNavigator(Node):
             self.publish_audio_text("navigation error")
             return res
         model_path = getattr(req, "model_path", "").strip()
+        object_row_range = int(getattr(req, "object_row_range", 1))
+        plant_row_count = int(getattr(req, "plant_row_count", 0))
+        max_navigation_duration_sec = float(getattr(req, "max_navigation_duration_sec", 0.0))
+        if object_row_range < 0:
+            res.success = False
+            res.message = "Invalid object_row_range. Use 0 to disable object stops or a positive plant-row range."
+            self.publish_audio_text("navigation error")
+            return res
+        if plant_row_count < 0:
+            res.success = False
+            res.message = "Invalid plant_row_count. Use 0 if the total plant-row count is unknown."
+            self.publish_audio_text("navigation error")
+            return res
+        if max_navigation_duration_sec < 0.0:
+            res.success = False
+            res.message = "Invalid max_navigation_duration_sec. Use 0 for no time limit."
+            self.publish_audio_text("navigation error")
+            return res
         detection_ok, detection_message = self.prepare_object_detection(model_path)
         if not detection_ok:
             res.success = False
@@ -861,13 +883,21 @@ class MaizeNavigator(Node):
         self.apply_driving_profile(carefulness)
         self.pattern_steps = self.parse_pattern(pattern)
         self.reset_navigation_state(clear_sensor_cache=False)
+        self.active_object_row_range = object_row_range if model_path else 0
+        self.active_plant_row_count = plant_row_count if plant_row_count > 0 else None
+        self.max_navigation_duration_sec = (
+            max_navigation_duration_sec if max_navigation_duration_sec > 0.0 else None
+        )
+        self.navigation_start_time_ns = self.get_clock().now().nanoseconds
         self.handled_tracked_object_ids = set()
         self.request_tracker_reset()
         self.state = MissionState.INITIALIZING
         res.success = True
         res.message = (
             f"Navigation started with pattern: {pattern}; carefulness: {carefulness}; "
-            f"{detection_message}"
+            f"{detection_message}; object row range: {self.active_object_row_range}; "
+            f"plant row count: {self.active_plant_row_count or 0}; "
+            f"duration limit: {self.max_navigation_duration_sec or 0.0:.1f} s"
         )
         self.publish_audio_text("navigation started")
         return res
@@ -970,6 +1000,8 @@ class MaizeNavigator(Node):
         self.release_object_detection("navigation stopped")
         self.state = MissionState.IDLE
         self.paused_state = None
+        self.navigation_start_time_ns = None
+        self.max_navigation_duration_sec = None
         self.reset_entrance_state()
         self.reset_controller_state()
         self.cmd_pub.publish(Twist())
@@ -1021,6 +1053,8 @@ class MaizeNavigator(Node):
         self.state = MissionState.IDLE
         self.paused_state = None
         self.reset_navigation_state(clear_sensor_cache=True)
+        self.navigation_start_time_ns = None
+        self.max_navigation_duration_sec = None
         self.handled_tracked_object_ids = set()
         self.request_tracker_reset()
         self.cmd_pub.publish(Twist())
@@ -1215,6 +1249,11 @@ class MaizeNavigator(Node):
         self.row_map_exported = False
         self.active_object_stop = None
         self.object_stop_hold_until_ns = None
+        if clear_sensor_cache:
+            self.active_object_row_range = 1
+            self.active_plant_row_count = None
+            self.navigation_start_time_ns = None
+            self.max_navigation_duration_sec = None
         self.reset_entrance_state()
         self.reset_controller_state()
         self.laser_follower.reset()
@@ -1279,6 +1318,11 @@ class MaizeNavigator(Node):
         if self.robot_pose is None or self.latest_map is None:
             return
 
+        if self.navigation_duration_reached():
+            self.complete_mission("navigation duration reached")
+            self.publish_visuals()
+            return
+
         if self.state == MissionState.INITIALIZING:
             self.handle_initializing()
         elif self.state == MissionState.FOLLOW_ROW:
@@ -1291,6 +1335,28 @@ class MaizeNavigator(Node):
             self.cmd_pub.publish(Twist())
 
         self.publish_visuals()
+
+    def navigation_duration_reached(self) -> bool:
+        if self.max_navigation_duration_sec is None or self.navigation_start_time_ns is None:
+            return False
+        if self.state in (MissionState.IDLE, MissionState.FINISHED):
+            return False
+        elapsed_sec = (self.get_clock().now().nanoseconds - self.navigation_start_time_ns) * 1e-9
+        return elapsed_sec >= self.max_navigation_duration_sec
+
+    def complete_mission(self, reason: str) -> None:
+        if self.state == MissionState.FINISHED:
+            return
+        self.store_current_rows()
+        self.reset_controller_state()
+        self.cmd_pub.publish(Twist())
+        self.get_logger().info(f"Mission finished: {reason}")
+        self.export_row_map()
+        self.release_object_detection(reason)
+        self.state = MissionState.FINISHED
+        self.navigation_start_time_ns = None
+        self.max_navigation_duration_sec = None
+        self.publish_audio_text("navigation finished")
 
     def handle_initializing(self) -> None:
         points = self.get_map_points_in_hist_roi(self.robot_pose)
@@ -1401,20 +1467,17 @@ class MaizeNavigator(Node):
         robot_xy = np.array([self.robot_pose.x, self.robot_pose.y], dtype=float)
         if self.row_exit_goal is not None and self.row_end_direction is not None:
             if self.pose_goal_reached(self.row_exit_goal, self.row_end_direction):
+                if self.finish_after_current_row:
+                    self.record_current_row_end_direction()
+                    self.complete_mission("pattern finished")
+                    return
                 self.store_current_rows()
                 self.record_current_row_end_direction()
                 self.reset_controller_state()
                 self.cmd_pub.publish(Twist())
-                if self.finish_after_current_row:
-                    self.get_logger().info("Last pattern row completed. Mission finished.")
-                    self.export_row_map()
-                    self.release_object_detection("mission finished")
-                    self.state = MissionState.FINISHED
-                    self.publish_audio_text("navigation finished")
-                else:
-                    self.get_logger().info("Row exit reached. Finding the next row entrance.")
-                    self.reset_entrance_state()
-                    self.state = MissionState.FIND_NEXT_ROW_ENTRANCE
+                self.get_logger().info("Row exit reached. Finding the next row entrance.")
+                self.reset_entrance_state()
+                self.state = MissionState.FIND_NEXT_ROW_ENTRANCE
                 return
 
         if self.handle_active_object_stop(robot_xy):
@@ -1465,7 +1528,9 @@ class MaizeNavigator(Node):
             if object_id in self.handled_tracked_object_ids:
                 continue
             object_xy = np.array([float(tracked.position.x), float(tracked.position.y)], dtype=float)
-            row_side, row_distance = self.match_tracked_object_to_current_row(object_xy)
+            row_side, row_distance, plant_row_number, plant_row_offset = self.match_tracked_object_to_active_rows(
+                object_xy
+            )
             if row_side is None or row_distance > self.p.object_row_match_tolerance:
                 continue
 
@@ -1484,7 +1549,6 @@ class MaizeNavigator(Node):
                 continue
             if distance_ahead < best_distance:
                 best_distance = distance_ahead
-                plant_row_number = self.plant_row_number_for_side(row_side)
                 best_stop = ObjectStop(
                     object_id=object_id,
                     label=str(getattr(tracked, "label", "")),
@@ -1493,7 +1557,7 @@ class MaizeNavigator(Node):
                     stop_point=object_projection,
                     distance_ahead=distance_ahead,
                     plant_row_number=plant_row_number,
-                    plant_row_offset=self.plant_row_offset_for_side(row_side),
+                    plant_row_offset=plant_row_offset,
                 )
 
         if best_stop is not None:
@@ -1502,6 +1566,72 @@ class MaizeNavigator(Node):
                 f"row={best_stop.row_side} distance={best_stop.distance_ahead:.2f} m"
             )
         return best_stop
+
+    def match_tracked_object_to_active_rows(
+        self,
+        object_xy: np.ndarray,
+    ) -> Tuple[Optional[str], float, Optional[int], Optional[int]]:
+        row_range = int(max(0, getattr(self, "active_object_row_range", 1)))
+        if row_range <= 0:
+            return None, float("inf"), None, None
+
+        candidates: List[Tuple[str, float, Optional[int], int]] = []
+        for side, model in (("left", self.left_row), ("right", self.right_row)):
+            if model is None or len(model.result.points) < 2:
+                continue
+            base_offset = self.plant_row_offset_for_side(side)
+            if base_offset is None:
+                continue
+            for distance_rows in range(1, row_range + 1):
+                offset = distance_rows if side == "left" else -distance_rows
+                row_points = self.offset_row_points(model.result.points, side, distance_rows - 1)
+                distance = self.row_distance_to_object(row_points, object_xy)
+                row_number = self.plant_row_number_for_offset(offset)
+                candidates.append((side, distance, row_number, offset))
+
+        if not candidates:
+            return None, float("inf"), None, None
+        side, distance, row_number, offset = min(candidates, key=lambda item: item[1])
+        return side, distance, row_number, offset
+
+    def offset_row_points(self, row_points: np.ndarray, side: str, extra_rows_outward: int) -> np.ndarray:
+        points = np.asarray(row_points, dtype=float)
+        if extra_rows_outward <= 0:
+            return points
+        outward = self.row_outward_direction(side)
+        return points + outward * (float(extra_rows_outward) * self.p.expected_row_width)
+
+    def row_outward_direction(self, side: str) -> np.ndarray:
+        if self.left_row is not None and self.right_row is not None:
+            left_points = self.left_row.result.points
+            right_points = self.right_row.result.points
+            if len(left_points) > 0 and len(right_points) > 0:
+                lane_left = self.normalize(np.asarray(left_points[0], dtype=float) - np.asarray(right_points[0], dtype=float))
+                return lane_left if side == "left" else -lane_left
+        if self.robot_pose is not None:
+            forward = self.yaw_to_vector(self.robot_pose.yaw)
+        elif self.initial_forward_direction is not None:
+            forward = self.initial_forward_direction
+        else:
+            forward = np.array([1.0, 0.0], dtype=float)
+        lane_left = np.array([-forward[1], forward[0]], dtype=float)
+        return self.normalize(lane_left if side == "left" else -lane_left)
+
+    def plant_row_number_for_offset(self, plant_row_offset: int) -> Optional[int]:
+        if plant_row_offset == 0:
+            return None
+        if plant_row_offset > 0:
+            base = self.plant_row_number_for_side("left")
+            row_number = None if base is None else base + plant_row_offset - 1
+        else:
+            base = self.plant_row_number_for_side("right")
+            row_number = None if base is None else base + plant_row_offset + 1
+        if row_number is None:
+            return None
+        row_count = getattr(self, "active_plant_row_count", None)
+        if row_count is not None and not 1 <= row_number <= row_count:
+            return None
+        return int(row_number)
 
     def plant_row_number_for_side(self, row_side: str) -> Optional[int]:
         if row_side == "left" and self.left_row is not None:

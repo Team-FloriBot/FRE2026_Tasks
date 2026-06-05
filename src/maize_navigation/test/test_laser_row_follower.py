@@ -144,6 +144,7 @@ def process_repeatedly(follower, scan, count=12, map_slope=0.0, map_target=(1.4,
 def make_navigator_for_start_callback():
     navigator = MaizeNavigator.__new__(MaizeNavigator)
     navigator.p = NavigatorParams()
+    navigator.state = MissionState.IDLE
     navigator.pattern_steps = [PatternStep(1, "L")]
     navigator.laser_follower = types.SimpleNamespace(reset=lambda: None)
     navigator.driving_profiles = navigator.build_driving_profiles()
@@ -171,10 +172,14 @@ def make_navigator_for_start_callback():
     navigator.object_detection_model_path = ""
     navigator.object_detection_initialized = False
     navigator.object_detection_started = False
+    navigator.active_object_row_range = 1
+    navigator.active_plant_row_count = None
     navigator.latest_tracked_objects = None
     navigator.handled_tracked_object_ids = set()
     navigator.active_object_stop = None
     navigator.object_stop_hold_until_ns = None
+    navigator.navigation_start_time_ns = None
+    navigator.max_navigation_duration_sec = None
     navigator.now_ns = 0
     navigator.get_clock = lambda: types.SimpleNamespace(
         now=lambda: types.SimpleNamespace(nanoseconds=navigator.now_ns)
@@ -245,12 +250,16 @@ def test_start_callback_sets_requested_pattern():
 
     assert response.success
     assert response.message == (
-        "Navigation started with pattern: 3L  2r; carefulness: high; object detection disabled"
+        "Navigation started with pattern: 3L  2r; carefulness: high; object detection disabled; "
+        "object row range: 0; plant row count: 0; duration limit: 0.0 s"
     )
     assert navigator.p.pattern == "3L  2r"
     assert navigator.pattern_steps == [PatternStep(3, "L"), PatternStep(2, "R")]
     assert navigator.state == MissionState.INITIALIZING
     assert navigator.current_carefulness == "high"
+    assert navigator.active_object_row_range == 0
+    assert navigator.active_plant_row_count is None
+    assert navigator.max_navigation_duration_sec is None
     assert navigator.published_audio[-1] == "navigation started"
 
 
@@ -266,6 +275,71 @@ def test_start_callback_clears_handled_tracked_object_ids():
     assert response.success
     assert navigator.handled_tracked_object_ids == set()
     assert navigator.tracker_reset_calls == 1
+
+
+def test_start_callback_applies_object_range_row_count_and_duration_when_model_is_set():
+    navigator = make_navigator_for_start_callback()
+    navigator.detector = types.SimpleNamespace(
+        wait_for_services=lambda timeout_sec=0.0: True,
+        clear_results=lambda: None,
+        init=lambda model_path: ImmediateFuture(success=True),
+        start=lambda: ImmediateFuture(success=True),
+        release=lambda: ImmediateFuture(success=True),
+    )
+
+    response = navigator.start_cb(
+        types.SimpleNamespace(
+            pattern="3L",
+            carefulness="high",
+            model_path="/tmp/model.pt",
+            object_row_range=3,
+            plant_row_count=12,
+            max_navigation_duration_sec=45.0,
+        ),
+        types.SimpleNamespace(),
+    )
+
+    assert response.success
+    assert navigator.active_object_row_range == 3
+    assert navigator.active_plant_row_count == 12
+    assert navigator.max_navigation_duration_sec == 45.0
+    assert navigator.navigation_start_time_ns == 0
+    assert "object row range: 3" in response.message
+    assert "plant row count: 12" in response.message
+    assert "duration limit: 45.0 s" in response.message
+
+
+def test_start_callback_ignores_object_range_without_model():
+    navigator = make_navigator_for_start_callback()
+
+    response = navigator.start_cb(
+        types.SimpleNamespace(
+            pattern="3L",
+            carefulness="high",
+            model_path="",
+            object_row_range=4,
+            plant_row_count=8,
+            max_navigation_duration_sec=0.0,
+        ),
+        types.SimpleNamespace(),
+    )
+
+    assert response.success
+    assert navigator.active_object_row_range == 0
+    assert navigator.active_plant_row_count == 8
+
+
+def test_start_callback_rejects_negative_new_inputs():
+    navigator = make_navigator_for_start_callback()
+
+    response = navigator.start_cb(
+        types.SimpleNamespace(pattern="3L", carefulness="high", model_path="", object_row_range=-1),
+        types.SimpleNamespace(),
+    )
+
+    assert not response.success
+    assert response.message.startswith("Invalid object_row_range")
+    assert navigator.published_audio[-1] == "navigation error"
 
 
 def test_start_callback_defaults_to_high_carefulness_for_empty_value():
@@ -448,6 +522,30 @@ def test_tracked_object_outside_current_rows_does_not_create_stop():
     assert stop is None
 
 
+def test_object_row_range_finds_second_plant_row_left():
+    navigator = make_object_stop_navigator()
+    navigator.active_object_row_range = 2
+    navigator.latest_tracked_objects = make_tracked_array(make_tracked_object(13, 1.5, 1.50, "weed"))
+
+    stop = navigator.find_next_object_stop(np.array([0.0, 0.0]), navigator.midline)
+
+    assert stop is not None
+    assert stop.object_id == 13
+    assert stop.row_side == "left"
+    assert stop.plant_row_offset == 2
+    assert stop.plant_row_number == 3
+
+
+def test_object_row_range_zero_disables_object_stops():
+    navigator = make_object_stop_navigator()
+    navigator.active_object_row_range = 0
+    navigator.latest_tracked_objects = make_tracked_array(make_tracked_object(14, 1.2, 0.75))
+
+    stop = navigator.find_next_object_stop(np.array([0.0, 0.0]), navigator.midline)
+
+    assert stop is None
+
+
 def test_handled_tracked_object_id_does_not_create_second_stop():
     navigator = make_object_stop_navigator()
     navigator.handled_tracked_object_ids = {4}
@@ -557,6 +655,28 @@ def test_follow_row_publishes_navigation_finished_audio():
     navigator.handle_follow_row()
 
     assert navigator.state == MissionState.FINISHED
+    assert navigator.published_audio[-1] == "navigation finished"
+
+
+def test_control_loop_finishes_when_navigation_duration_is_reached():
+    navigator = make_object_stop_navigator()
+    navigator.state = MissionState.FOLLOW_ROW
+    navigator.latest_map = object()
+    navigator.robot_pose = Pose2D(0.0, 0.0, 0.0)
+    navigator.get_robot_pose = lambda: navigator.robot_pose
+    navigator.publish_visuals = lambda: None
+    navigator.store_current_rows = lambda: None
+    navigator.export_row_map = lambda: None
+    navigator.release_object_detection = lambda reason: None
+    navigator.navigation_start_time_ns = 0
+    navigator.max_navigation_duration_sec = 3.0
+    navigator.now_ns = int(3.1e9)
+
+    navigator.control_loop()
+
+    assert navigator.state == MissionState.FINISHED
+    assert navigator.navigation_start_time_ns is None
+    assert navigator.max_navigation_duration_sec is None
     assert navigator.published_audio[-1] == "navigation finished"
 
 
