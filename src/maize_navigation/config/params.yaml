@@ -120,8 +120,8 @@ maize_navigator:
     # Die Richtung gilt feldfest relativ zur Blickrichtung beim Missionsstart.
     starting_lane_number: 1
     row_numbers_increase_to: "left"
-    row_map_output_directory: "~/.ros/maize_navigation"
-    object_positions_output_directory: "~/.ros/maize_navigation"
+    row_map_output_directory: "/data/csv"
+    object_positions_output_directory: "/data/csv"
     slam_reset_service: "/slam_toolbox/reset"
 
     publish_debug: true
