@@ -47,13 +47,25 @@ Die Konfiguration erfolgt über die config/params.yaml. Hier können das Fahrmus
 Zum Starten der Maisnavigation folgenden Service in der Kommandozeile aufrufen:
 Ohne Object Detection kann `model_path` leer bleiben:
 ```
-ros2 service call /start_navigation maize_navigation_interfaces/srv/StartNavigation "{pattern: '3L 6R 5R', carefulness: 'high', model_path: ''}"
+ros2 service call /start_navigation maize_navigation_interfaces/srv/StartNavigation "{pattern: '3L 6R 5R', carefulness: 'high_map', model_path: '', object_row_range: 0, plant_row_count: 0, max_navigation_duration_sec: 0.0}"
 ```
 Mit Object Detection:
 ```
-ros2 service call /start_navigation maize_navigation_interfaces/srv/StartNavigation "{pattern: '3L 6R 5R', carefulness: 'high', model_path: '/path/to/model.pt'}"
+ros2 service call /start_navigation maize_navigation_interfaces/srv/StartNavigation "{pattern: '3L 6R 5R', carefulness: 'high_map', model_path: '/path/to/model.pt', object_row_range: 1, plant_row_count: 0, max_navigation_duration_sec: 0.0}"
 ```
-`carefulness` waehlt das Fahrprofil. Der erste Teil bestimmt die generellen Fahrparameter:
+
+Alle Felder des Startservices:
+
+| Feld | Typ | Bedeutung | Standard / Deaktivieren |
+| --- | --- | --- | --- |
+| `pattern` | `string` | Fahrmuster als Schritte aus Anzahl und Richtung, z. B. `3L 6R 5R`. | Pflichtfeld |
+| `carefulness` | `string` | Fahrprofil aus Fahrparametern und Zielgewichtung. | leer oder weggelassen = `high` |
+| `model_path` | `string` | Pfad zum Object-Detection-Modell. | leer = Object Detection aus |
+| `object_row_range` | `int32` | Anzahl Pflanzenreihen, in denen erkannte Objekte für Stopps berücksichtigt werden. Wirkt nur mit gesetztem `model_path`. | `0` = Objektstopps aus; ohne `model_path` immer aus |
+| `plant_row_count` | `int32` | Gesamtzahl der Pflanzenreihen, falls bekannt. Wird für die Zuordnung von Objekten zu Reihen verwendet. | `0` = unbekannt |
+| `max_navigation_duration_sec` | `float64` | Maximale Navigationsdauer in Sekunden. | `0.0` = kein Zeitlimit |
+
+`carefulness` wählt das Fahrprofil. Der erste Teil bestimmt die generellen Fahrparameter:
 
 | Wert | Bedeutung |
 | --- | --- |
@@ -65,11 +77,11 @@ Der zweite Teil bestimmt, wie stark Laser- und Karten-Zielpunkt gemischt werden:
 
 | Wert | Bedeutung |
 | --- | --- |
-| `laser` | faehrt hauptsaechlich nach Laser |
+| `laser` | fährt hauptsächlich nach Laser |
 | `mix` | mischt Laser und Karte |
-| `map` | faehrt hauptsaechlich nach Karte |
+| `map` | fährt hauptsächlich nach Karte |
 
-Damit gibt es fuer den Startservice diese eindeutigen Optionen:
+Damit gibt es für den Startservice diese eindeutigen Optionen:
 
 | `carefulness` | Fahrparameter | Zielgewichtung |
 | --- | --- | --- |
@@ -84,6 +96,11 @@ Damit gibt es fuer den Startservice diese eindeutigen Optionen:
 | `low_map` | low | map |
 
 Die alten Werte funktionieren weiterhin als Kurzformen: `high` entspricht `high_map`, `medium` entspricht `medium_mix` und `low` entspricht `low_laser`.
+
+Beispiel mit Zeitlimit und bekannter Pflanzenreihenzahl:
+```
+ros2 service call /start_navigation maize_navigation_interfaces/srv/StartNavigation "{pattern: '3L 6R 5R', carefulness: 'medium_mix', model_path: '/path/to/model.pt', object_row_range: 2, plant_row_count: 12, max_navigation_duration_sec: 45.0}"
+```
 
 Weitere Navigationsservices:
 ```
