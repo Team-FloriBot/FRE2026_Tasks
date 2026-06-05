@@ -6,39 +6,29 @@ pure_pursuit_node:
 
     base_link_frame: "base_link"
 
-    # Mehr Vorschau für stabilere reale Fahrt.
-    # Zu kleiner Lookahead erzeugt hohe Krümmungen und Schlingern.
     lookahead_min: 0.50
     lookahead_max: 1.00
     lookahead_gain: 0.25
 
-    # Konservativ für Ersttests auf dem realen Roboter.
     max_speed: 0.22
-    min_speed: 0.10
+    min_speed: 0.08
 
-    # Reduziert Geschwindigkeit in gekrümmten Bereichen.
     curvature_gain: 4.0
-
-    # Reduzierte Querregelverstärkung gegen Überschwingen.
     pure_pursuit_gain: 0.65
 
-    # Begrenzung der realen Drehdynamik.
     max_angular_velocity: 0.65
-    angular_acceleration_limit: 0.60
-
-    # Mechanisch realistischer Mindest-Kurvenradius.
     min_follow_turn_radius: 0.45
+    angular_acceleration_limit: 0.60
+    angular_command_filter_alpha: 0.35
 
     goal_tolerance: 0.15
     slowdown_distance: 0.90
 
-    # Sanfte Längsdynamik.
     acceleration_limit: 0.30
     deceleration_limit: 0.40
 
     control_rate: 20.0
 
-    # Suchfenster passend zum größeren Lookahead.
     projection_search_distance: 2.20
     projection_backtrack_distance: 0.15
 
