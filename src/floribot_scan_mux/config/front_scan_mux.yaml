@@ -10,8 +10,8 @@ front_scan_mux:
 
     profiles:
       rs_crop_scan:
-        topic: "/crop2d_topic"
+        topic: "/crop_points_2d"
       rs_nonground_scan:
-        topic: "/nonground2d_topic"
+        topic: "/nonground_points_2d"
       sick_front:
         topic: "/sensors/scan_front"
