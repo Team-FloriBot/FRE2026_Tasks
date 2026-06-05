@@ -57,7 +57,7 @@ slam_toolbox:
     # Für die Kartenerzeugung verwendeter Laserbereich.
     # Falls euer LiDAR im Feld nur bis z. B. 8-12 m zuverlässig misst,
     # kann max_laser_range später entsprechend reduziert werden.
-    min_laser_range: 0.0
+    min_laser_range: 0.25
     max_laser_range: 20.0
 
     # Geändert: Scans zeitlich häufiger für SLAM zulassen.
@@ -82,51 +82,51 @@ slam_toolbox:
     # Geändert: Neue Scans bereits nach kleinerer Translation aufnehmen.
     # Vorher: 0.5 m
     # Neu:   0.05 m
-    minimum_travel_distance: 0.05
+    minimum_travel_distance: 0.15
 
     # Geändert: Neue Scans bereits nach kleinerer Rotation aufnehmen.
     # Vorher: 0.5 rad  ~= 28.6°
     # Neu:   0.05 rad ~= 2.9°
-    minimum_travel_heading: 0.05
+    minimum_travel_heading: 0.15
 
     # Zunächst unverändert lassen.
     # Bei Problemen während langsamer Wendemanöver kann dieser Wert
     # separat getestet werden.
     check_min_dist_and_heading_precisely: false
 
-    scan_buffer_size: 10
+    scan_buffer_size: 30
     scan_buffer_maximum_scan_distance: 10.0
 
-    link_match_minimum_response_fine: 0.1
+    link_match_minimum_response_fine: 0.25
     link_scan_maximum_distance: 1.5
 
-    loop_search_maximum_distance: 3.0
+    loop_search_maximum_distance: 2.0
     do_loop_closing: true
 
-    loop_match_minimum_chain_size: 10
-    loop_match_maximum_variance_coarse: 3.0
-    loop_match_minimum_response_coarse: 0.35
-    loop_match_minimum_response_fine: 0.45
+    loop_match_minimum_chain_size: 15
+    loop_match_maximum_variance_coarse: 1.5
+    loop_match_minimum_response_coarse: 0.55
+    loop_match_minimum_response_fine: 0.65
 
     # ============================================================
     # Korrelationsparameter für lokales Scan Matching
     # ============================================================
-    correlation_search_space_dimension: 0.5
+    correlation_search_space_dimension: 0.4
     correlation_search_space_resolution: 0.01
     correlation_search_space_smear_deviation: 0.1
 
     # ============================================================
     # Korrelationsparameter für Loop Closure
     # ============================================================
-    loop_search_space_dimension: 8.0
+    loop_search_space_dimension: 4.0
     loop_search_space_resolution: 0.05
     loop_search_space_smear_deviation: 0.03
 
     # ============================================================
     # Scan-Matcher-Parameter
     # ============================================================
-    distance_variance_penalty: 0.5
-    angle_variance_penalty: 1.0
+    distance_variance_penalty: 0.8
+    angle_variance_penalty: 1.2
 
     fine_search_angle_offset: 0.00349
     coarse_search_angle_offset: 0.349
