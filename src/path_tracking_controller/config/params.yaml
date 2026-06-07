@@ -3,6 +3,7 @@ pure_pursuit_node:
 
     path_topic: "/plan"
     cmd_vel_topic: "/cmd_vel/tasks"
+    status_topic: "/pure_pursuit_node/status"
 
     base_link_frame: "base_link"
 
@@ -34,3 +35,10 @@ pure_pursuit_node:
 
     heading_filter_enabled: true
     heading_tolerance: 1.35
+
+    final_heading_alignment_enabled: true
+    final_heading_tolerance: 0.08
+    final_heading_gain: 1.2
+    final_heading_min_angular_velocity: 0.08
+    final_heading_max_angular_velocity: 0.45
+    final_heading_timeout: 8.0

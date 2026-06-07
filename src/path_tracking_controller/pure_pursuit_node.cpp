@@ -3,6 +3,7 @@
 #include <geometry_msgs/msg/pose_stamped.hpp>
 #include <geometry_msgs/msg/twist.hpp>
 #include <nav_msgs/msg/path.hpp>
+#include <std_msgs/msg/string.hpp>
 #include <std_srvs/srv/set_bool.hpp>
 #include <tf2_ros/transform_listener.h>
 #include <tf2_ros/buffer.h>
@@ -53,10 +54,17 @@ public:
         this->declare_parameter<double>("heading_tolerance", 1.35);
 
         this->declare_parameter<double>("min_follow_turn_radius", 0.45);
+        this->declare_parameter<bool>("final_heading_alignment_enabled", true);
+        this->declare_parameter<double>("final_heading_tolerance", 0.08);
+        this->declare_parameter<double>("final_heading_gain", 1.2);
+        this->declare_parameter<double>("final_heading_min_angular_velocity", 0.08);
+        this->declare_parameter<double>("final_heading_max_angular_velocity", 0.45);
+        this->declare_parameter<double>("final_heading_timeout", 8.0);
 
         this->declare_parameter<std::string>("path_topic", "/plan");
         this->declare_parameter<std::string>("cmd_vel_topic", "/cmd_vel");
         this->declare_parameter<std::string>("base_link_frame", "base_link");
+        this->declare_parameter<std::string>("status_topic", "~/status");
 
         lookahead_min_ = get_parameter("lookahead_min").as_double();
         lookahead_max_ = get_parameter("lookahead_max").as_double();
@@ -88,13 +96,25 @@ public:
         heading_tolerance_ = get_parameter("heading_tolerance").as_double();
 
         min_follow_turn_radius_ = get_parameter("min_follow_turn_radius").as_double();
+        final_heading_alignment_enabled_ = get_parameter("final_heading_alignment_enabled").as_bool();
+        final_heading_tolerance_ = get_parameter("final_heading_tolerance").as_double();
+        final_heading_gain_ = get_parameter("final_heading_gain").as_double();
+        final_heading_min_angular_velocity_ =
+            get_parameter("final_heading_min_angular_velocity").as_double();
+        final_heading_max_angular_velocity_ =
+            get_parameter("final_heading_max_angular_velocity").as_double();
+        final_heading_timeout_ = get_parameter("final_heading_timeout").as_double();
 
         path_topic_ = get_parameter("path_topic").as_string();
         cmd_vel_topic_ = get_parameter("cmd_vel_topic").as_string();
         base_link_frame_ = get_parameter("base_link_frame").as_string();
+        status_topic_ = get_parameter("status_topic").as_string();
 
         cmd_vel_pub_ = create_publisher<geometry_msgs::msg::Twist>(cmd_vel_topic_, 10);
         debug_pub_ = create_publisher<visualization_msgs::msg::MarkerArray>("/pure_pursuit/debug", 10);
+        status_pub_ = create_publisher<std_msgs::msg::String>(
+            status_topic_,
+            rclcpp::QoS(1).transient_local());
 
         path_sub_ = create_subscription<nav_msgs::msg::Path>(
             path_topic_, 10,
@@ -121,11 +141,14 @@ public:
             path_topic_.c_str(),
             cmd_vel_topic_.c_str(),
             (std::string(get_fully_qualified_name()) + "/set_active").c_str());
+
+        publish_status("idle", true);
     }
 
 private:
     rclcpp::Publisher<geometry_msgs::msg::Twist>::SharedPtr cmd_vel_pub_;
     rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr debug_pub_;
+    rclcpp::Publisher<std_msgs::msg::String>::SharedPtr status_pub_;
     rclcpp::Subscription<nav_msgs::msg::Path>::SharedPtr path_sub_;
     rclcpp::Service<std_srvs::srv::SetBool>::SharedPtr set_active_srv_;
     rclcpp::TimerBase::SharedPtr timer_;
@@ -138,6 +161,8 @@ private:
     bool path_received_ = false;
     bool tracking_enabled_ = false;
     bool path_completed_ = false;
+    bool heading_only_path_ = false;
+    bool final_heading_aligning_ = false;
 
     double lookahead_min_;
     double lookahead_max_;
@@ -165,8 +190,14 @@ private:
 
     double heading_tolerance_;
     double min_follow_turn_radius_;
+    double final_heading_tolerance_;
+    double final_heading_gain_;
+    double final_heading_min_angular_velocity_;
+    double final_heading_max_angular_velocity_;
+    double final_heading_timeout_;
 
     bool heading_filter_enabled_;
+    bool final_heading_alignment_enabled_;
 
     double commanded_linear_speed_ = 0.0;
     double commanded_angular_velocity_ = 0.0;
@@ -177,10 +208,13 @@ private:
     std::string path_topic_;
     std::string cmd_vel_topic_;
     std::string base_link_frame_;
+    std::string status_topic_;
+    std::string last_status_;
 
     std::vector<double> path_s_;
     double path_length_ = 0.0;
     double progress_s_ = 0.0;
+    rclcpp::Time final_heading_start_time_;
 
     bool progress_initialized_ = false;
     size_t current_segment_idx_ = 0;
@@ -207,6 +241,17 @@ private:
             angle += 2.0 * pi;
 
         return angle;
+    }
+
+    void publish_status(const std::string & status, bool force = false)
+    {
+        if (!force && status == last_status_)
+            return;
+
+        std_msgs::msg::String msg;
+        msg.data = status;
+        status_pub_->publish(msg);
+        last_status_ = status;
     }
 
     bool build_path_metrics()
@@ -410,32 +455,46 @@ private:
 
     void path_callback(const nav_msgs::msg::Path::SharedPtr msg)
     {
-        if (msg->poses.size() < 2)
+        if (msg->poses.empty())
         {
             path_received_ = false;
             tracking_enabled_ = false;
             path_completed_ = true;
+            heading_only_path_ = false;
+            final_heading_aligning_ = false;
 
             RCLCPP_WARN(
                 get_logger(),
-                "Empfangener Pfad hat weniger als zwei Posen. Stoppe Path Tracking.");
+                "Empfangener Pfad hat keine Posen. Stoppe Path Tracking.");
 
+            publish_status("completed");
             return;
         }
 
         path_ = *msg;
+        heading_only_path_ = false;
+        final_heading_aligning_ = false;
 
-        if (!build_path_metrics())
+        bool usable_path_length = build_path_metrics();
+        if (!usable_path_length)
         {
-            path_received_ = false;
-            tracking_enabled_ = false;
-            path_completed_ = true;
+            if (!final_heading_alignment_enabled_)
+            {
+                path_received_ = false;
+                tracking_enabled_ = false;
+                path_completed_ = true;
 
-            RCLCPP_WARN(
-                get_logger(),
-                "Empfangener Pfad hat keine nutzbare Laenge. Stoppe Path Tracking.");
+                RCLCPP_WARN(
+                    get_logger(),
+                    "Empfangener Pfad hat keine nutzbare Laenge. Stoppe Path Tracking.");
 
-            return;
+                publish_status("completed");
+                return;
+            }
+
+            heading_only_path_ = true;
+            path_length_ = 0.0;
+            path_s_.assign(path_.poses.size(), 0.0);
         }
 
         path_received_ = true;
@@ -455,6 +514,7 @@ private:
             "Path received: %zu poses, Laenge %.2f m. Path Tracking bereit. Start mit /pure_pursuit_node/set_active.",
             msg->poses.size(),
             path_length_);
+        publish_status("ready");
     }
 
     void set_active_callback(
@@ -472,20 +532,24 @@ private:
 
             tracking_enabled_ = true;
             path_completed_ = false;
+            final_heading_aligning_ = false;
 
             response->success = true;
             response->message = "Path Tracking gestartet.";
 
             RCLCPP_INFO(get_logger(), "%s", response->message.c_str());
+            publish_status(heading_only_path_ ? "aligning" : "tracking");
             return;
         }
 
         tracking_enabled_ = false;
+        final_heading_aligning_ = false;
 
         response->success = true;
         response->message = "Path Tracking wird sanft gestoppt.";
 
         RCLCPP_INFO(get_logger(), "%s", response->message.c_str());
+        publish_status("stopped");
     }
 
     bool get_robot_pose(geometry_msgs::msg::PoseStamped & pose)
@@ -780,6 +844,83 @@ private:
         debug_pub_->publish(arr);
     }
 
+    void complete_path(
+        const geometry_msgs::msg::PoseStamped & robot,
+        const geometry_msgs::msg::Point & projection,
+        const geometry_msgs::msg::Point & lookahead,
+        size_t segment_idx,
+        double dt)
+    {
+        path_completed_ = true;
+        tracking_enabled_ = false;
+        final_heading_aligning_ = false;
+
+        RCLCPP_INFO(
+            get_logger(),
+            "Pfadende erreicht. Bremse mit Geschwindigkeitsrampe auf 0.");
+
+        publish_status("completed");
+        publish_ramped_stop(dt);
+        publish_debug(robot, projection, lookahead, segment_idx);
+    }
+
+    bool handle_final_heading_alignment(
+        const geometry_msgs::msg::PoseStamped & robot,
+        const geometry_msgs::msg::Point & projection,
+        const geometry_msgs::msg::Point & lookahead,
+        size_t segment_idx,
+        double dt)
+    {
+        if (!final_heading_alignment_enabled_ || path_.poses.empty())
+            return false;
+
+        double target_yaw = tf2::getYaw(path_.poses.back().pose.orientation);
+        double robot_yaw = tf2::getYaw(robot.pose.orientation);
+        double yaw_error = normalize_angle(target_yaw - robot_yaw);
+
+        if (std::abs(yaw_error) <= std::max(0.0, final_heading_tolerance_))
+        {
+            complete_path(robot, projection, lookahead, segment_idx, dt);
+            return true;
+        }
+
+        if (!final_heading_aligning_)
+        {
+            final_heading_aligning_ = true;
+            final_heading_start_time_ = get_clock()->now();
+            publish_status("aligning");
+
+            RCLCPP_INFO(
+                get_logger(),
+                "Pfadende erreicht. Richte finalen Heading-Winkel aus.");
+        }
+
+        if (final_heading_timeout_ > 0.0 &&
+            (get_clock()->now() - final_heading_start_time_).seconds() > final_heading_timeout_)
+        {
+            RCLCPP_WARN(
+                get_logger(),
+                "Finale Heading-Ausrichtung hat Timeout erreicht. Markiere Pfad als abgeschlossen.");
+
+            complete_path(robot, projection, lookahead, segment_idx, dt);
+            return true;
+        }
+
+        double max_omega = std::max(1e-6, final_heading_max_angular_velocity_);
+        double omega = std::clamp(
+            final_heading_gain_ * yaw_error,
+            -max_omega,
+            max_omega);
+
+        double min_omega = std::max(0.0, final_heading_min_angular_velocity_);
+        if (std::abs(omega) < min_omega)
+            omega = std::copysign(min_omega, yaw_error);
+
+        publish_ramped_command(0.0, omega, dt);
+        publish_debug(robot, projection, lookahead, segment_idx);
+        return true;
+    }
+
     void control_loop()
     {
         double dt = control_dt();
@@ -801,6 +942,14 @@ private:
                 "Keine TF-Pose verfuegbar. Bremse mit Rampe auf 0.");
 
             publish_ramped_stop(dt);
+            return;
+        }
+
+        if (heading_only_path_)
+        {
+            geometry_msgs::msg::Point projection = robot.pose.position;
+            geometry_msgs::msg::Point lookahead = path_.poses.back().pose.position;
+            handle_final_heading_alignment(robot, projection, lookahead, 0, dt);
             return;
         }
 
@@ -835,15 +984,22 @@ private:
 
         if (remaining <= goal_tolerance_)
         {
-            path_completed_ = true;
-            tracking_enabled_ = false;
+            if (handle_final_heading_alignment(
+                    robot,
+                    projection.point,
+                    path_.poses.back().pose.position,
+                    current_segment_idx_,
+                    dt))
+            {
+                return;
+            }
 
-            RCLCPP_INFO(
-                get_logger(),
-                "Pfadende erreicht. Bremse mit Geschwindigkeitsrampe auf 0.");
-
-            publish_ramped_stop(dt);
-            publish_debug(robot, projection.point, path_.poses.back().pose.position, current_segment_idx_);
+            complete_path(
+                robot,
+                projection.point,
+                path_.poses.back().pose.position,
+                current_segment_idx_,
+                dt);
 
             return;
         }

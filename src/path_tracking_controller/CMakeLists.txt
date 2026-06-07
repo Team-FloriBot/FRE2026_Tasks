@@ -10,6 +10,7 @@ find_package(ament_cmake REQUIRED)
 find_package(rclcpp REQUIRED)
 find_package(geometry_msgs REQUIRED)
 find_package(nav_msgs REQUIRED)
+find_package(std_msgs REQUIRED)
 find_package(std_srvs REQUIRED)
 find_package(tf2 REQUIRED)
 find_package(tf2_ros REQUIRED)
@@ -22,6 +23,7 @@ ament_target_dependencies(pure_pursuit_node
   rclcpp
   geometry_msgs
   nav_msgs
+  std_msgs
   std_srvs
   tf2
   tf2_ros

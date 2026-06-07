@@ -23,7 +23,8 @@ setup(
     tests_require=["pytest"],
     entry_points={
         "console_scripts": [
-            "coverage_planner = task4.coverage_planner:main",
+            "task4_brain = task4.task4_brain:main",
+            "coverage_planner = task4.task4_brain:main",
         ],
     },
 )

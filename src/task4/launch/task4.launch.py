@@ -11,14 +11,14 @@ def generate_launch_description():
         'coverage_planner.yaml'
     )
 
-    coverage_planner_node = Node(
+    task4_brain_node = Node(
         package='task4',
-        executable='coverage_planner',
-        name='coverage_planner',
+        executable='task4_brain',
+        name='task4_brain',
         output='screen',
         parameters=[config_dir],
     )
 
     return LaunchDescription([
-        coverage_planner_node
+        task4_brain_node
     ])

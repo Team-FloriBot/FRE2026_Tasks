@@ -1,4 +1,4 @@
-coverage_planner:
+task4_brain:
   ros__parameters:
     # Feld startet beim Roboter (0,0) und geht 10 Meter nach vorne (X) 
     # und spannt sich 5 Meter nach links und rechts auf (Y)
@@ -6,10 +6,37 @@ coverage_planner:
     
     # Frames für die Transformation
     input_frame: "base_link"
-    target_frame: "odom"
+    target_frame: "map"
     
     # Roboter & Feldkonfiguration
     operating_width: 1.0
     robot_width: 0.42
     turn_radius: 0.37
     headland_width: 0.5
+
+    # Rueckkehrpunkt von Fields2Cover entfernen, wenn er nahe am Startpunkt liegt.
+    return_start_tolerance_m: 0.15
+
+    # Schussplanung: Winkel relativ zu base_link, 0 deg = +x nach vorne,
+    # positive Winkel gegen den Uhrzeigersinn Richtung +y.
+    shooting_range_m: 2.0
+    shoot_angle_min_deg: -60.0
+    shoot_angle_max_deg: 60.0
+    candidate_grid_spacing_m: 0.5
+    yaw_sample_step_deg: 10.0
+    path_candidate_stride_m: 0.5
+    object_ring_distance_ratio: 0.75
+    object_ring_angle_step_deg: 20.0
+    min_navigation_segment_m: 0.05
+
+    # ROS-Schnittstellen
+    tracked_objects_topic: "/tracker/tracked_objects"
+    tracker_active_topic: "/tracker/active"
+    tracker_reset_service: "/tracker/reset"
+    plan_topic: "/plan"
+    polygon_marker_topic: "/task4/coverage_polygon_marker"
+    shooting_marker_topic: "/task4/shooting_markers"
+    pure_pursuit_set_active_service: "/pure_pursuit_node/set_active"
+    pure_pursuit_status_topic: "/pure_pursuit_node/status"
+    aim_and_fire_action: "/aim_and_fire_targets"
+    tf_timeout_sec: 0.5
