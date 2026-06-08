@@ -3,19 +3,19 @@
 from __future__ import annotations
 
 import math
+import time
 from threading import Event
 from typing import Dict, List, Sequence, Tuple
 
 import rclpy
 from rcl_interfaces.msg import SetParametersResult
-from rclpy.action import ActionClient
 from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.duration import Duration
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
 from rclpy.time import Time
 
-from aim_and_fire_interfaces.action import AimAndFireTargets
+from fre2026_detection_client import DetectorClient, DetectorInitConfig
 from fre2026_detection_interfaces.msg import TrackedObjectArray
 from geometry_msgs.msg import Point, PointStamped, PoseStamped
 from nav_msgs.msg import Path
@@ -83,12 +83,33 @@ class Task4Brain(Node):
         self.declare_parameter("tracked_objects_topic", "/tracker/tracked_objects")
         self.declare_parameter("tracker_active_topic", "/tracker/active")
         self.declare_parameter("tracker_reset_service", "/tracker/reset")
+        self.declare_parameter("detector_enabled", True)
+        self.declare_parameter("detector_required", False)
+        self.declare_parameter("detector_namespace", "/detector")
+        self.declare_parameter("detector_model_path", "")
+        self.declare_parameter("detector_classes", [])
+        self.declare_parameter("detector_confidence", 0.5)
+        self.declare_parameter("detector_model_type", "yolo")
+        self.declare_parameter("detector_use_realsense_ros_wrapper", False)
+        self.declare_parameter("detector_use_decimation", False)
+        self.declare_parameter("detector_use_spatial", False)
+        self.declare_parameter("detector_use_temporal", True)
+        self.declare_parameter("detector_use_hole_filling", True)
+        self.declare_parameter("detector_use_mask_filter", True)
+        self.declare_parameter("detector_color_resolution_width", 640)
+        self.declare_parameter("detector_color_resolution_height", 480)
+        self.declare_parameter("detector_fps", 30)
+        self.declare_parameter("detector_rcnn_class_names", [])
+        self.declare_parameter("detector_service_timeout_sec", 10.0)
+        self.declare_parameter("detector_release_after_coverage", False)
         self.declare_parameter("plan_topic", "/plan")
         self.declare_parameter("polygon_marker_topic", "/task4/coverage_polygon_marker")
         self.declare_parameter("shooting_marker_topic", "/task4/shooting_markers")
         self.declare_parameter("pure_pursuit_set_active_service", "/pure_pursuit_node/set_active")
         self.declare_parameter("pure_pursuit_status_topic", "/pure_pursuit_node/status")
-        self.declare_parameter("aim_and_fire_action", "/aim_and_fire_targets")
+        self.declare_parameter("aim_target_topic", "/target_point")
+        self.declare_parameter("aim_target_frame", "base_link")
+        self.declare_parameter("aim_target_interval_sec", 5.0)
         self.declare_parameter("tf_timeout_sec", 0.5)
 
         self.callback_group = ReentrantCallbackGroup()
@@ -109,6 +130,11 @@ class Task4Brain(Node):
         self.tracker_active_pub = self.create_publisher(
             Bool,
             str(self.get_parameter("tracker_active_topic").value),
+            10,
+        )
+        self.aim_target_pub = self.create_publisher(
+            Point,
+            str(self.get_parameter("aim_target_topic").value),
             10,
         )
 
@@ -137,10 +163,9 @@ class Task4Brain(Node):
             str(self.get_parameter("tracker_reset_service").value),
             callback_group=self.callback_group,
         )
-        self.aim_client = ActionClient(
+        self.detector = DetectorClient(
             self,
-            AimAndFireTargets,
-            str(self.get_parameter("aim_and_fire_action").value),
+            namespace=str(self.get_parameter("detector_namespace").value),
             callback_group=self.callback_group,
         )
 
@@ -169,8 +194,11 @@ class Task4Brain(Node):
         self.shooting_poses: List[ShootingPose] = []
         self.uncovered_targets: List[ShotTarget] = []
         self.current_shot_index = 0
-        self.aim_goal_handle = None
-        self.aim_goal_active = False
+        self.current_aim_targets: List[ShotTarget] = []
+        self.current_aim_target_index = 0
+        self.next_aim_target_time = 0.0
+        self.detector_initialized = False
+        self.detector_started = False
         self.service_coords_set = False
 
         self.create_timer(0.2, self.control_loop, callback_group=self.callback_group)
@@ -240,6 +268,7 @@ class Task4Brain(Node):
                 raise RuntimeError("Coverage-Pfad enthaelt weniger als zwei Wegpunkte.")
 
             self.coverage_path = coverage_path
+            self.start_detector_for_coverage()
             self.reset_tracker()
             self.set_tracker_active(True)
             self.publish_path(coverage_path, self.target_frame())
@@ -269,9 +298,14 @@ class Task4Brain(Node):
                 self.begin_aim_and_fire()
             return
 
+        if self.state == MissionState.AIM_AND_FIRE:
+            self.publish_next_aim_target_if_due()
+            return
+
     def finish_coverage_drive(self):
         self.set_path_tracking_active(False)
         self.set_tracker_active(False)
+        self.stop_detector_for_coverage("Coverage-Fahrt beendet.")
         self.set_state(MissionState.PLAN_SHOOTING)
 
     def plan_shooting_phase(self):
@@ -345,9 +379,6 @@ class Task4Brain(Node):
             self.fail_mission(f"Schusspunkt konnte nicht angefahren werden: {exc}")
 
     def begin_aim_and_fire(self):
-        if self.aim_goal_active:
-            return
-
         pose = self.shooting_poses[self.current_shot_index]
         targets = [self.object_map[target_id] for target_id in pose.target_ids if target_id in self.object_map]
         if not targets:
@@ -355,62 +386,46 @@ class Task4Brain(Node):
             self.start_next_shot_navigation()
             return
 
-        if not self.aim_client.server_is_ready():
-            self.aim_client.wait_for_server(timeout_sec=0.5)
-
-        if not self.aim_client.server_is_ready():
-            self.fail_mission("Aim-and-fire Action-Server ist nicht erreichbar.")
-            return
-
-        goal = AimAndFireTargets.Goal()
-        goal.header.frame_id = self.target_frame()
-        goal.header.stamp = self.get_clock().now().to_msg()
-        goal.target_ids = [int(target.target_id) for target in targets]
-        goal.targets = [self.point_from_target(target) for target in targets]
-
-        self.aim_goal_active = True
+        self.current_aim_targets = targets
+        self.current_aim_target_index = 0
+        self.next_aim_target_time = 0.0
         self.set_state(MissionState.AIM_AND_FIRE)
-        send_future = self.aim_client.send_goal_async(goal, feedback_callback=self.aim_feedback_callback)
-        send_future.add_done_callback(self.aim_goal_response_callback)
-
-    def aim_feedback_callback(self, feedback_msg):
-        feedback = feedback_msg.feedback
-        self.get_logger().debug(
-            f"Aim-and-fire: Ziel {feedback.current_target_id}, Zustand {feedback.state}"
+        self.get_logger().info(
+            f"Schusspunkt {self.current_shot_index + 1}: "
+            f"{len(self.current_aim_targets)} Zielpunkte werden auf "
+            f"{self.get_parameter('aim_target_topic').value} publiziert."
         )
 
-    def aim_goal_response_callback(self, future):
+    def publish_next_aim_target_if_due(self):
+        if self.current_aim_target_index >= len(self.current_aim_targets):
+            self.current_aim_targets = []
+            self.current_aim_target_index = 0
+            self.current_shot_index += 1
+            self.start_next_shot_navigation()
+            return
+
+        now = time.monotonic()
+        if self.next_aim_target_time > 0.0 and now < self.next_aim_target_time:
+            return
+
+        target = self.current_aim_targets[self.current_aim_target_index]
         try:
-            goal_handle = future.result()
+            point = self.target_to_aim_point(target)
         except Exception as exc:
-            self.aim_goal_active = False
-            self.fail_mission(f"Aim-and-fire Ziel konnte nicht gesendet werden: {exc}")
+            self.fail_mission(f"Ziel {target.target_id} konnte nicht nach aim_target_frame transformiert werden: {exc}")
             return
 
-        if not goal_handle.accepted:
-            self.aim_goal_active = False
-            self.fail_mission("Aim-and-fire Ziel wurde abgelehnt.")
-            return
+        self.aim_target_pub.publish(point)
+        self.current_aim_target_index += 1
+        self.next_aim_target_time = now + max(
+            0.0,
+            float(self.get_parameter("aim_target_interval_sec").value),
+        )
 
-        self.aim_goal_handle = goal_handle
-        result_future = goal_handle.get_result_async()
-        result_future.add_done_callback(self.aim_result_callback)
-
-    def aim_result_callback(self, future):
-        self.aim_goal_active = False
-        try:
-            result = future.result().result
-        except Exception as exc:
-            self.fail_mission(f"Aim-and-fire Ergebnis fehlgeschlagen: {exc}")
-            return
-
-        if not result.success:
-            self.fail_mission(result.message or "Aim-and-fire meldet Fehler.")
-            return
-
-        self.get_logger().info(result.message)
-        self.current_shot_index += 1
-        self.start_next_shot_navigation()
+        self.get_logger().info(
+            f"Ziel {target.target_id} auf /target_point publiziert "
+            f"({self.current_aim_target_index}/{len(self.current_aim_targets)})."
+        )
 
     def tracked_objects_callback(self, msg: TrackedObjectArray):
         if self.state != MissionState.DRIVE_COVERAGE:
@@ -495,6 +510,26 @@ class Task4Brain(Node):
         transform = self.tf_buffer.lookup_transform(
             self.target_frame(),
             source_frame,
+            Time(),
+            timeout=Duration(seconds=self.tf_timeout_sec()),
+        )
+        return do_transform_point(point_in, transform).point
+
+    def target_to_aim_point(self, target: ShotTarget) -> Point:
+        aim_frame = str(self.get_parameter("aim_target_frame").value)
+        if not aim_frame:
+            aim_frame = str(self.get_parameter("input_frame").value)
+
+        point = self.point_from_target(target)
+        if aim_frame == self.target_frame():
+            return point
+
+        point_in = PointStamped()
+        point_in.header.frame_id = self.target_frame()
+        point_in.point = point
+        transform = self.tf_buffer.lookup_transform(
+            aim_frame,
+            self.target_frame(),
             Time(),
             timeout=Duration(seconds=self.tf_timeout_sec()),
         )
@@ -642,6 +677,119 @@ class Task4Brain(Node):
         future.add_done_callback(lambda _: completed.set())
         completed.wait(timeout=1.0)
 
+    def start_detector_for_coverage(self):
+        if not bool(self.get_parameter("detector_enabled").value):
+            self.get_logger().info("Detector ist per Parameter deaktiviert.")
+            return
+
+        model_path = str(self.get_parameter("detector_model_path").value)
+        if not model_path:
+            message = "detector_model_path ist leer; Detector wird nicht gestartet."
+            if bool(self.get_parameter("detector_required").value):
+                raise RuntimeError(message)
+            self.get_logger().warn(message)
+            return
+
+        timeout_sec = float(self.get_parameter("detector_service_timeout_sec").value)
+        if not self.detector.wait_for_services(timeout_sec=timeout_sec):
+            message = "Detector-Services sind nicht erreichbar."
+            if bool(self.get_parameter("detector_required").value):
+                raise RuntimeError(message)
+            self.get_logger().warn(message)
+            return
+
+        config = self.detector_config()
+        self.call_detector_service_sync(
+            self.detector.init_from_config(config),
+            "init",
+            timeout_sec,
+        )
+        self.detector_initialized = True
+
+        self.call_detector_service_sync(
+            self.detector.start(),
+            "start",
+            timeout_sec,
+        )
+        self.detector_started = True
+        self.detector.clear_results()
+        self.get_logger().info(
+            f"Detector gestartet: model='{config.model_path}', classes={list(config.classes)}"
+        )
+
+    def stop_detector_for_coverage(self, reason: str):
+        if not bool(self.get_parameter("detector_enabled").value):
+            return
+
+        timeout_sec = float(self.get_parameter("detector_service_timeout_sec").value)
+
+        if self.detector_started:
+            try:
+                self.call_detector_service_sync(
+                    self.detector.stop(),
+                    "stop",
+                    timeout_sec,
+                    raise_on_failure=False,
+                )
+            finally:
+                self.detector_started = False
+
+        if self.detector_initialized and bool(self.get_parameter("detector_release_after_coverage").value):
+            try:
+                self.call_detector_service_sync(
+                    self.detector.release(),
+                    "release",
+                    timeout_sec,
+                    raise_on_failure=False,
+                )
+            finally:
+                self.detector_initialized = False
+
+        self.get_logger().info(f"Detector fuer Coverage gestoppt: {reason}")
+
+    def call_detector_service_sync(
+        self,
+        future,
+        action_name: str,
+        timeout_sec: float,
+        raise_on_failure: bool = True,
+    ):
+        completed = Event()
+        future.add_done_callback(lambda _: completed.set())
+
+        if not completed.wait(timeout=max(0.1, timeout_sec)):
+            message = f"Timeout beim Detector-Service '{action_name}'."
+            if raise_on_failure:
+                raise RuntimeError(message)
+            self.get_logger().warn(message)
+            return None
+
+        try:
+            response = future.result()
+        except Exception as exc:
+            message = f"Detector-Service '{action_name}' fehlgeschlagen: {exc}"
+            if raise_on_failure:
+                raise RuntimeError(message)
+            self.get_logger().warn(message)
+            return None
+
+        if response is None:
+            message = f"Detector-Service '{action_name}' lieferte keine Antwort."
+            if raise_on_failure:
+                raise RuntimeError(message)
+            self.get_logger().warn(message)
+            return None
+
+        success = bool(getattr(response, "success", False))
+        message = str(getattr(response, "message", ""))
+        if not success:
+            full_message = f"Detector-Service '{action_name}' meldet Fehler: {message}"
+            if raise_on_failure:
+                raise RuntimeError(full_message)
+            self.get_logger().warn(full_message)
+
+        return response
+
     def set_path_tracking_active(self, active: bool) -> Tuple[bool, str]:
         if not self.path_tracking_active_client.service_is_ready():
             self.path_tracking_active_client.wait_for_service(timeout_sec=0.5)
@@ -668,20 +816,19 @@ class Task4Brain(Node):
     def abort_mission(self, reason: str):
         self.set_path_tracking_active(False)
         self.set_tracker_active(False)
-        if self.aim_goal_handle is not None:
-            try:
-                self.aim_goal_handle.cancel_goal_async()
-            except Exception:
-                pass
+        self.stop_detector_for_coverage(reason)
+        self.current_aim_targets = []
+        self.current_aim_target_index = 0
         self.last_error = reason
-        self.aim_goal_active = False
         self.set_state(MissionState.ABORTED)
 
     def fail_mission(self, reason: str):
         self.set_path_tracking_active(False)
         self.set_tracker_active(False)
+        self.stop_detector_for_coverage(reason)
+        self.current_aim_targets = []
+        self.current_aim_target_index = 0
         self.last_error = reason
-        self.aim_goal_active = False
         self.set_state(MissionState.FAILED)
         self.get_logger().error(reason)
 
@@ -708,6 +855,30 @@ class Task4Brain(Node):
             path_candidate_stride_m=float(self.get_parameter("path_candidate_stride_m").value),
             object_ring_distance_ratio=float(self.get_parameter("object_ring_distance_ratio").value),
             object_ring_angle_step_deg=float(self.get_parameter("object_ring_angle_step_deg").value),
+        )
+
+    def detector_config(self) -> DetectorInitConfig:
+        return DetectorInitConfig(
+            model_path=str(self.get_parameter("detector_model_path").value),
+            classes=list(self.get_parameter("detector_classes").value),
+            confidence=float(self.get_parameter("detector_confidence").value),
+            use_realsense_ros_wrapper=bool(
+                self.get_parameter("detector_use_realsense_ros_wrapper").value
+            ),
+            model_type=str(self.get_parameter("detector_model_type").value),
+            use_decimation=bool(self.get_parameter("detector_use_decimation").value),
+            use_spatial=bool(self.get_parameter("detector_use_spatial").value),
+            use_temporal=bool(self.get_parameter("detector_use_temporal").value),
+            use_hole_filling=bool(self.get_parameter("detector_use_hole_filling").value),
+            use_mask_filter=bool(self.get_parameter("detector_use_mask_filter").value),
+            color_resolution_width=int(
+                self.get_parameter("detector_color_resolution_width").value
+            ),
+            color_resolution_height=int(
+                self.get_parameter("detector_color_resolution_height").value
+            ),
+            fps=int(self.get_parameter("detector_fps").value),
+            rcnn_class_names=list(self.get_parameter("detector_rcnn_class_names").value),
         )
 
     def point_from_target(self, target: ShotTarget) -> Point:
