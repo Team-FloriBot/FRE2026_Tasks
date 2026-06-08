@@ -526,7 +526,7 @@ private:
             if (!path_received_)
             {
                 response->success = false;
-                response->message = "Kein Pfad vorhanden. Erst /trigger_coverage_planning aufrufen.";
+                response->message = "Kein Pfad vorhanden. Erst /task4/plan_coverage aufrufen.";
                 return;
             }
 

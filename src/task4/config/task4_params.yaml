@@ -29,7 +29,7 @@ task4_brain:
     object_ring_angle_step_deg: 20.0
     min_navigation_segment_m: 0.05
 
-    # ROS-Schnittstellen
+    # Tracker und Detector Konfiguration
     tracked_objects_topic: "/tracker/tracked_objects"
     tracker_active_topic: "/tracker/active"
     tracker_reset_service: "/tracker/reset"
@@ -52,6 +52,8 @@ task4_brain:
     detector_rcnn_class_names: []
     detector_service_timeout_sec: 10.0
     detector_release_after_coverage: false
+
+    # ROS-Schnittstellen
     plan_topic: "/plan"
     polygon_marker_topic: "/task4/coverage_polygon_marker"
     shooting_marker_topic: "/task4/shooting_markers"

@@ -47,10 +47,12 @@ from task4.shooting_planner import (
 class MissionState:
     IDLE = "idle"
     PREPARE_COVERAGE = "prepare_coverage"
+    COVERAGE_READY = "coverage_ready"
     DRIVE_COVERAGE = "drive_coverage"
     PLAN_SHOOTING = "plan_shooting"
     DRIVE_TO_SHOOT_POSE = "drive_to_shoot_pose"
     AIM_AND_FIRE = "aim_and_fire"
+    PAUSED = "paused"
     DONE = "done"
     FAILED = "failed"
     ABORTED = "aborted"
@@ -170,8 +172,12 @@ class Task4Brain(Node):
         )
 
         self.add_on_set_parameters_callback(self.on_parameter_change)
-        self.create_service(Trigger, "/trigger_coverage_planning", self.start_mission_callback)
-        self.create_service(Trigger, "/task4/start", self.start_mission_callback)
+        self.create_service(
+            Trigger,
+            "/task4/plan_coverage",
+            self.plan_coverage_callback,
+            callback_group=self.callback_group,
+        )
         self.create_service(
             Trigger,
             "/task4/start_navigation",
@@ -184,8 +190,15 @@ class Task4Brain(Node):
             self.stop_navigation_callback,
             callback_group=self.callback_group,
         )
+        self.create_service(
+            Trigger,
+            "/task4/reset",
+            self.reset_callback,
+            callback_group=self.callback_group,
+        )
 
         self.state = MissionState.IDLE
+        self.paused_state = MissionState.IDLE
         self.last_error = ""
         self.last_pp_status = ""
         self.object_map: Dict[int, ShotTarget] = {}
@@ -204,7 +217,7 @@ class Task4Brain(Node):
         self.create_timer(0.2, self.control_loop, callback_group=self.callback_group)
 
         self.get_logger().info(
-            "Task4 brain bereit. Start: /trigger_coverage_planning oder /task4/start"
+            "Task4 brain bereit. Planen: /task4/plan_coverage, Start: /task4/start_navigation"
         )
 
     def on_parameter_change(self, params):
@@ -216,39 +229,43 @@ class Task4Brain(Node):
                 self.service_coords_set = True
         return SetParametersResult(successful=True)
 
-    def start_mission_callback(self, request, response):
-        success, message = self.start_mission()
+    def plan_coverage_callback(self, request, response):
+        success, message = self.plan_coverage()
         response.success = success
         response.message = message
         return response
 
     def start_navigation_callback(self, request, response):
-        if self.state in (MissionState.IDLE, MissionState.DONE, MissionState.FAILED, MissionState.ABORTED):
-            success, message = self.start_mission()
-        else:
-            success, message = self.set_path_tracking_active(True)
+        success, message = self.start_navigation()
         response.success = success
         response.message = message
         return response
 
     def stop_navigation_callback(self, request, response):
-        self.abort_mission("Task4 wurde gestoppt.")
-        response.success = True
-        response.message = "Task4 gestoppt."
+        success, message = self.pause_navigation("Task4 wurde unterbrochen.")
+        response.success = success
+        response.message = message
         return response
 
-    def start_mission(self) -> Tuple[bool, str]:
-        if self.state not in (MissionState.IDLE, MissionState.DONE, MissionState.FAILED, MissionState.ABORTED):
-            return False, f"Task4 laeuft bereits im Zustand '{self.state}'."
+    def reset_callback(self, request, response):
+        self.reset_mission()
+        response.success = True
+        response.message = "Task4 zurueckgesetzt."
+        return response
+
+    def plan_coverage(self) -> Tuple[bool, str]:
+        if self.state in (
+            MissionState.DRIVE_COVERAGE,
+            MissionState.PLAN_SHOOTING,
+            MissionState.DRIVE_TO_SHOOT_POSE,
+            MissionState.AIM_AND_FIRE,
+        ):
+            return False, f"Task4 kann im Zustand '{self.state}' nicht neu planen."
 
         self.set_state(MissionState.PREPARE_COVERAGE)
         self.last_error = ""
         self.last_pp_status = ""
-        self.object_map.clear()
-        self.coverage_path = []
-        self.shooting_poses = []
-        self.uncovered_targets = []
-        self.current_shot_index = 0
+        self.clear_planned_mission()
 
         try:
             polygon_points, start_waypoint = self.load_polygon_and_start_pose()
@@ -268,10 +285,29 @@ class Task4Brain(Node):
                 raise RuntimeError("Coverage-Pfad enthaelt weniger als zwei Wegpunkte.")
 
             self.coverage_path = coverage_path
+            self.publish_path(coverage_path, self.target_frame())
+            self.set_state(MissionState.COVERAGE_READY)
+            return True, "Coverage geplant. Navigation noch nicht gestartet."
+        except Exception as exc:
+            self.fail_mission(f"Coverage-Planung fehlgeschlagen: {exc}")
+            return False, self.last_error
+
+    def start_navigation(self) -> Tuple[bool, str]:
+        if self.state == MissionState.PAUSED:
+            return self.resume_navigation()
+
+        if self.state != MissionState.COVERAGE_READY:
+            return False, "Erst /task4/plan_coverage aufrufen."
+
+        if len(self.coverage_path) < 2:
+            return False, "Kein gueltiger Coverage-Pfad vorhanden. Erst /task4/plan_coverage aufrufen."
+
+        try:
+            self.last_pp_status = ""
             self.start_detector_for_coverage()
             self.reset_tracker()
             self.set_tracker_active(True)
-            self.publish_path(coverage_path, self.target_frame())
+            self.publish_path(self.coverage_path, self.target_frame())
 
             success, message = self.set_path_tracking_active(True)
             if not success:
@@ -821,6 +857,74 @@ class Task4Brain(Node):
         self.current_aim_target_index = 0
         self.last_error = reason
         self.set_state(MissionState.ABORTED)
+
+    def pause_navigation(self, reason: str) -> Tuple[bool, str]:
+        if self.state not in (
+            MissionState.DRIVE_COVERAGE,
+            MissionState.DRIVE_TO_SHOOT_POSE,
+            MissionState.AIM_AND_FIRE,
+            MissionState.PLAN_SHOOTING,
+        ):
+            self.set_path_tracking_active(False)
+            return True, "Keine laufende Task4-Navigation aktiv."
+
+        self.paused_state = self.state
+        self.set_path_tracking_active(False)
+        self.set_tracker_active(False)
+        self.stop_detector_for_coverage(reason)
+        self.last_error = reason
+        self.set_state(MissionState.PAUSED)
+        return True, "Task4 Navigation unterbrochen."
+
+    def resume_navigation(self) -> Tuple[bool, str]:
+        if self.paused_state == MissionState.DRIVE_COVERAGE:
+            if len(self.coverage_path) < 2:
+                return False, "Unterbrochene Coverage-Fahrt kann nicht fortgesetzt werden: kein Coverage-Pfad vorhanden."
+            self.start_detector_for_coverage()
+            self.set_tracker_active(True)
+            success, message = self.set_path_tracking_active(True)
+            if success:
+                self.set_state(MissionState.DRIVE_COVERAGE)
+            return success, message
+
+        if self.paused_state == MissionState.DRIVE_TO_SHOOT_POSE:
+            success, message = self.set_path_tracking_active(True)
+            if success:
+                self.set_state(MissionState.DRIVE_TO_SHOOT_POSE)
+            return success, message
+
+        if self.paused_state == MissionState.AIM_AND_FIRE:
+            self.set_state(MissionState.AIM_AND_FIRE)
+            return True, "Aim-and-fire fortgesetzt."
+
+        if self.paused_state == MissionState.PLAN_SHOOTING:
+            self.set_state(MissionState.PLAN_SHOOTING)
+            return True, "Schussplanung fortgesetzt."
+
+        return False, "Task4 ist unterbrochen, hat aber keinen fortsetzbaren Navigationszustand."
+
+    def reset_mission(self):
+        self.set_path_tracking_active(False)
+        self.set_tracker_active(False)
+        self.stop_detector_for_coverage("Task4 Reset.")
+        self.clear_planned_mission()
+        self.last_error = ""
+        self.last_pp_status = ""
+        self.detector_initialized = False
+        self.detector_started = False
+        self.paused_state = MissionState.IDLE
+        self.set_state(MissionState.IDLE)
+
+    def clear_planned_mission(self):
+        self.object_map.clear()
+        self.coverage_polygon = []
+        self.coverage_path = []
+        self.shooting_poses = []
+        self.uncovered_targets = []
+        self.current_shot_index = 0
+        self.current_aim_targets = []
+        self.current_aim_target_index = 0
+        self.next_aim_target_time = 0.0
 
     def fail_mission(self, reason: str):
         self.set_path_tracking_active(False)
