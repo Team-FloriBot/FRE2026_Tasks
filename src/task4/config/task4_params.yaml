@@ -12,7 +12,7 @@ task4_brain:
     operating_width: 1.0
     robot_width: 0.42
     turn_radius: 0.37
-    headland_width: 0.5
+    headland_width: 1.0
 
     # Rueckkehrpunkt von Fields2Cover entfernen, wenn er nahe am Startpunkt liegt.
     return_start_tolerance_m: 0.15
