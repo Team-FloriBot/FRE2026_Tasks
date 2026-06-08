@@ -117,6 +117,11 @@ ros2 service call /reset_navigation std_srvs/srv/Trigger {}
 
 ## Task 4
 
+Eckkoordinaten setzen gemessen vom Startpunkt des Roboters:
+```
+ros2 param set /task4_brain polygon_coords '[0.0, 0.0, 5.0, 0.0, 5.0, 5.0, 0.0, 5.0]'
+```
+
 Zum Planen der Task4 an den Startpunkt am Feldrand fahren und folgenden Service in der Kommandozeile aufrufen:
 ```
 ros2 service call /task4/plan_coverage std_srvs/srv/Trigger "{}"
@@ -127,25 +132,17 @@ Zum Starten der geplanten Navigation:
 ros2 service call /task4/start_navigation std_srvs/srv/Trigger "{}"
 ```
 
-Eckkoordinaten setzen gemessen vom Startpunkt des Roboters:
-```
-ros2 param set /task4_brain polygon_coords '[0.0, 0.0, 5.0, 0.0, 5.0, 5.0, 0.0, 5.0]'
-```
 
 Unterbrechung (Stop)
 ```
 ros2 service call /task4/stop_navigation std_srvs/srv/Trigger "{}"
 ```
 
-Komplett zuruecksetzen:
+Reset:
 ```
 ros2 service call /task4/reset std_srvs/srv/Trigger "{}"
 ```
 
-Starten (nach Stop)
-```
-ros2 service call /pure_pursuit_node/set_active std_srvs/srv/SetBool "{data: true}"
-```
 
 ## Laser Mux
 Da wir mehrere Laser am Roboter verbaut haben, müssen wir zum Testen zwischen den Lasern umschalten können. Aktuell kann man zwischen 3 Laserscantopics für den front_laser umschalten:
