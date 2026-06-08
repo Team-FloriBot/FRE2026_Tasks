@@ -8,7 +8,7 @@ def generate_launch_description():
     config_dir = os.path.join(
         get_package_share_directory('task4'),
         'config',
-        'coverage_planner.yaml'
+        'task4_params.yaml'
     )
 
     task4_brain_node = Node(
