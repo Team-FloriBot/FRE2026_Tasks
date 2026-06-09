@@ -13,5 +13,7 @@ front_scan_mux:
         topic: "/crop_points_2d"
       rs_nonground_scan:
         topic: "/nonground_points_2d"
+      rs_nonground_scan_torsten:
+        topic: "/scan"
       sick_front:
         topic: "/sensors/scan_front"
