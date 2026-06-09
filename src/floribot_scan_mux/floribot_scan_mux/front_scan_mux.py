@@ -11,7 +11,12 @@ from rclpy.qos import QoSProfile, ReliabilityPolicy
 from sensor_msgs.msg import LaserScan
 
 
-PROFILE_NAMES = ("rs_crop_scan", "rs_nonground_scan", "sick_front")
+PROFILE_NAMES = (
+    "rs_crop_scan",
+    "rs_nonground_scan",
+    "rs_nonground_scan_torsten",
+    "sick_front",
+)
 
 
 class FrontScanMux(Node):
