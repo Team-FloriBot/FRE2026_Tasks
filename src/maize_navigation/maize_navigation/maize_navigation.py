@@ -186,6 +186,7 @@ class MissionState(Enum):
 @dataclass
 class NavigatorParams:
     cmd_vel_topic: str = "/cmd_vel"
+    cmd_vel_publish_frequency: float = 20.0
     base_frame: str = "base_link"
     map_frame: str = "map"
     map_topic: str = "/map"
@@ -200,8 +201,8 @@ class NavigatorParams:
     hist_roi_depth: float = 5.0
     hist_roi_width: float = 5.0
     hist_bin_size: float = 0.05
-    hist_peak_min_points: int = 3
-    occ_threshold: int = 50
+    hist_peak_min_points: int = 2
+    occ_threshold: int = 35
 
     row_segment_point_count: int = 5
     row_segment_point_spacing: float = 0.3
@@ -221,16 +222,16 @@ class NavigatorParams:
     laser_roi_center_offset_limit: float = 0.25
     laser_ransac_iterations: int = 80
     laser_ransac_distance: float = 0.08
-    laser_min_inliers: int = 5
-    laser_min_visible_length: float = 0.35
+    laser_min_inliers: int = 3
+    laser_min_visible_length: float = 0.25
     laser_max_abs_line_slope: float = 0.9
     laser_max_angle_to_map: float = 0.45
     laser_max_center_offset: float = 0.40
-    laser_min_confidence: float = 0.25
-    laser_full_confidence: float = 0.85
-    laser_max_weight_both_sides: float = 0.30
-    laser_max_weight_one_side: float = 0.15
-    laser_tracker_alpha: float = 0.25
+    laser_min_confidence: float = 0.10
+    laser_full_confidence: float = 0.65
+    laser_max_weight_both_sides: float = 0.55
+    laser_max_weight_one_side: float = 0.35
+    laser_tracker_alpha: float = 0.40
 
     follow_speed: float = 0.20
     slow_speed: float = 0.12
@@ -340,12 +341,12 @@ class LaserRowFollower:
         elif left_line.valid:
             result.center_slope = left_line.slope
             result.center_intercept = left_line.intercept - 0.5 * self.p.expected_row_width
-            raw_confidence = 0.60
+            raw_confidence = 0.70
             max_weight = self.p.laser_max_weight_one_side
         elif right_line.valid:
             result.center_slope = right_line.slope
             result.center_intercept = right_line.intercept + 0.5 * self.p.expected_row_width
-            raw_confidence = 0.60
+            raw_confidence = 0.70
             max_weight = self.p.laser_max_weight_one_side
         else:
             return self.reject(result, "no valid side line")
@@ -361,9 +362,10 @@ class LaserRowFollower:
         self.filtered_confidence = (1.0 - alpha) * self.filtered_confidence + alpha * raw_confidence
         confidence_range = max(1e-6, self.p.laser_full_confidence - self.p.laser_min_confidence)
         scale = (self.filtered_confidence - self.p.laser_min_confidence) / confidence_range
+        scale = math.sqrt(float(np.clip(scale, 0.0, 1.0)))
         result.valid = True
         result.confidence = self.filtered_confidence
-        result.weight = float(np.clip(scale, 0.0, 1.0)) * max_weight
+        result.weight = scale * max_weight
         result.target_base = np.array([target_x, laser_target_y], dtype=float)
         result.reason = "ok"
         return result
@@ -511,6 +513,7 @@ class MaizeNavigator(Node):
         self.row_exit_goal: Optional[np.ndarray] = None
         self.row_exit_heading_goal: Optional[np.ndarray] = None
         self.row_end_direction: Optional[np.ndarray] = None
+        self.current_cmd = Twist()
         self.last_cmd_angular_z: float = 0.0
         self.last_target_point: Optional[np.ndarray] = None
         self.current_lookahead_distance: float = self.p.lookahead_distance
@@ -577,6 +580,7 @@ class MaizeNavigator(Node):
         self.resume_srv = self.create_service(Trigger, "resume_navigation", self.resume_cb)
         self.reset_srv = self.create_service(Trigger, "reset_navigation", self.reset_cb)
         self.timer = self.create_timer(1.0 / self.p.control_frequency, self.control_loop)
+        self.cmd_timer = self.create_timer(1.0 / self.p.cmd_vel_publish_frequency, self.publish_current_cmd)
 
         self.get_logger().info("Maize Navigator initialized with rectangle marching row detection")
 
@@ -588,6 +592,9 @@ class MaizeNavigator(Node):
             return self.get_parameter(name).value
 
         p.cmd_vel_topic = str(get_param("cmd_vel_topic", p.cmd_vel_topic))
+        p.cmd_vel_publish_frequency = float(
+            get_param("cmd_vel_publish_frequency", p.cmd_vel_publish_frequency)
+        )
         p.base_frame = str(get_param("base_frame", p.base_frame))
         p.map_frame = str(get_param("map_frame", p.map_frame))
         p.map_topic = str(get_param("map_topic", p.map_topic))
@@ -751,6 +758,7 @@ class MaizeNavigator(Node):
         if self.p.row_segment_point_count % 2 == 0:
             self.get_logger().warn("row_segment_point_count must be odd; adding one")
             self.p.row_segment_point_count += 1
+        self.p.cmd_vel_publish_frequency = max(1.0, self.p.cmd_vel_publish_frequency)
         self.p.row_segment_point_spacing = max(0.05, self.p.row_segment_point_spacing)
         self.p.hist_roi_depth = max(self.p.hist_bin_size, self.p.hist_roi_depth)
         self.p.hist_roi_width = max(self.p.hist_bin_size, self.p.hist_roi_width)
@@ -995,8 +1003,8 @@ class MaizeNavigator(Node):
             maneuver_corner_radius=self.p.maneuver_corner_radius,
         )
         medium = DrivingProfile(
-            laser_max_weight_both_sides=0.55,
-            laser_max_weight_one_side=0.275,
+            laser_max_weight_both_sides=0.65,
+            laser_max_weight_one_side=0.45,
             follow_speed=high.follow_speed * 1.30,
             slow_speed=high.slow_speed * 1.25,
             pure_pursuit_gain=high.pure_pursuit_gain * 0.9,
@@ -1022,8 +1030,8 @@ class MaizeNavigator(Node):
             maneuver_corner_radius=high.maneuver_corner_radius * 1.25,
         )
         low = DrivingProfile(
-            laser_max_weight_both_sides=0.80,
-            laser_max_weight_one_side=0.40,
+            laser_max_weight_both_sides=0.85,
+            laser_max_weight_one_side=0.60,
             follow_speed=high.follow_speed * 1.60,
             slow_speed=high.slow_speed * 1.50,
             pure_pursuit_gain=high.pure_pursuit_gain * 0.8,
@@ -1092,7 +1100,7 @@ class MaizeNavigator(Node):
         self.max_navigation_duration_sec = None
         self.reset_entrance_state()
         self.reset_controller_state()
-        self.cmd_pub.publish(Twist())
+        self.stop_motion()
         res.success = True
         res.message = "Navigation stopped"
         if row_export_path is not None:
@@ -1115,7 +1123,7 @@ class MaizeNavigator(Node):
         self.paused_state = self.state
         self.state = MissionState.PAUSED
         self.reset_controller_state()
-        self.cmd_pub.publish(Twist())
+        self.stop_motion()
         self.stop_object_detection("navigation paused")
         res.success = True
         res.message = f"Navigation paused from state {self.paused_state.name}"
@@ -1147,7 +1155,7 @@ class MaizeNavigator(Node):
         self.max_navigation_duration_sec = None
         self.handled_tracked_object_ids = set()
         self.request_tracker_reset()
-        self.cmd_pub.publish(Twist())
+        self.stop_motion()
         slam_requested, slam_message = self.request_slam_reset()
         res.success = True
         res.message = f"Navigation reset; {slam_message}"
@@ -1321,6 +1329,17 @@ class MaizeNavigator(Node):
         msg.data = bool(active)
         self.tracker_active_pub.publish(msg)
 
+    def set_current_cmd(self, cmd: Twist) -> None:
+        self.current_cmd = cmd
+
+    def stop_motion(self) -> None:
+        self.set_current_cmd(Twist())
+
+    def publish_current_cmd(self) -> None:
+        if not hasattr(self, "cmd_pub"):
+            return
+        self.cmd_pub.publish(self.current_cmd)
+
     def reset_navigation_state(self, clear_sensor_cache: bool) -> None:
         self.p.expected_row_width = getattr(self, "configured_expected_row_width", self.p.expected_row_width)
         self.left_row = None
@@ -1424,9 +1443,9 @@ class MaizeNavigator(Node):
         elif self.state == MissionState.FIND_NEXT_ROW_ENTRANCE:
             self.handle_find_next_row_entrance()
         elif self.state == MissionState.FINISHED:
-            self.cmd_pub.publish(Twist())
+            self.stop_motion()
         elif self.state == MissionState.PAUSED:
-            self.cmd_pub.publish(Twist())
+            self.stop_motion()
 
         self.publish_visuals()
 
@@ -1443,7 +1462,7 @@ class MaizeNavigator(Node):
             return
         self.store_current_rows()
         self.reset_controller_state()
-        self.cmd_pub.publish(Twist())
+        self.stop_motion()
         self.get_logger().info(f"Mission finished: {reason}")
         self.export_row_map()
         self.export_object_positions()
@@ -1530,7 +1549,7 @@ class MaizeNavigator(Node):
 
         now_ns = self.get_clock().now().nanoseconds
         if stop.holding:
-            self.cmd_pub.publish(Twist())
+            self.stop_motion()
             if self.object_stop_hold_until_ns is not None and now_ns >= self.object_stop_hold_until_ns:
                 self.handled_tracked_object_ids.add(stop.object_id)
                 self.active_object_stop = None
@@ -1564,7 +1583,7 @@ class MaizeNavigator(Node):
         stop.final_started_ns = None
         self.object_stop_hold_until_ns = now_ns + int(self.p.object_stop_duration_sec * 1e9)
         self.reset_controller_state()
-        self.cmd_pub.publish(Twist())
+        self.stop_motion()
 
     def handle_object_stop_final_alignment(
         self,
@@ -1629,7 +1648,7 @@ class MaizeNavigator(Node):
         ))
         self.last_cmd_angular_z = angular_limited
         cmd.angular.z = angular_limited
-        self.cmd_pub.publish(cmd)
+        self.set_current_cmd(cmd)
         self.fused_target_point = robot_projection
         return True
 
@@ -1638,7 +1657,7 @@ class MaizeNavigator(Node):
         if len(self.midline) < 2:
             self.get_logger().warn("No usable midline from rectangle marching; stopping")
             self.publish_audio_text("navigation error")
-            self.cmd_pub.publish(Twist())
+            self.stop_motion()
             return
 
         robot_xy = np.array([self.robot_pose.x, self.robot_pose.y], dtype=float)
@@ -1651,7 +1670,7 @@ class MaizeNavigator(Node):
                 self.store_current_rows()
                 self.record_current_row_end_direction()
                 self.reset_controller_state()
-                self.cmd_pub.publish(Twist())
+                self.stop_motion()
                 self.get_logger().info("Row exit reached. Finding the next row entrance.")
                 self.reset_entrance_state()
                 self.state = MissionState.FIND_NEXT_ROW_ENTRANCE
@@ -2210,7 +2229,7 @@ class MaizeNavigator(Node):
 
     def handle_find_next_row_entrance(self) -> None:
         if not self.ensure_provisional_entrance_route():
-            self.cmd_pub.publish(Twist())
+            self.stop_motion()
             return
         if not self.lock_next_row_entrance() and self.entrance_target is None:
             self.rebuild_entrance_route(None)
@@ -2224,13 +2243,13 @@ class MaizeNavigator(Node):
 
         target = self.update_entrance_route_target()
         if target is None:
-            self.cmd_pub.publish(Twist())
+            self.stop_motion()
             return
         if (
             self.entrance_route_provisional
             and self.entrance_route_remaining_distance <= self.p.maneuver_goal_xy_tolerance
         ):
-            self.cmd_pub.publish(Twist())
+            self.stop_motion()
             return
         self.drive_to_point(target, self.p.maneuver_speed, self.p.maneuver_slow_speed)
 
@@ -2775,7 +2794,7 @@ class MaizeNavigator(Node):
     def initialize_selected_entrance_rows(self) -> None:
         models = self.build_selected_entrance_models()
         if models is None:
-            self.cmd_pub.publish(Twist())
+            self.stop_motion()
             return
 
         first, second = sorted(self.pending_target_peaks, key=lambda peak: peak.lateral)
@@ -3079,6 +3098,7 @@ class MaizeNavigator(Node):
         result.frozen_count = len(model.frozen_points)
         previous_valid_point: Optional[np.ndarray] = np.asarray(point2, dtype=float)
         last_valid_direction = np.asarray(direction, dtype=float)
+        last_complete_support_direction = np.asarray(direction, dtype=float)
 
         for _ in range(self.p.row_max_march_steps):
             search_point3 = line_points[2]
@@ -3099,7 +3119,10 @@ class MaizeNavigator(Node):
                 corrected_point3 = self.project_point_to_line(search_point3, fit_origin, fitted_direction)
 
             corrected_line_points = self.build_initial_line_from_point3(corrected_point3, corrected_direction)
-            field_count = self.count_points_in_fields_3_to_5(map_points, corrected_line_points, corrected_direction)
+            field_counts = self.count_points_per_line_field(map_points, corrected_line_points, corrected_direction)
+            field_count = int(sum(field_counts[2:5]))
+            if len(field_counts) >= self.p.row_segment_point_count and all(count > 0 for count in field_counts):
+                last_complete_support_direction = np.asarray(corrected_direction, dtype=float)
 
             local_point3_points = self.points_in_oriented_rectangle(
                 map_points,
@@ -3112,7 +3135,7 @@ class MaizeNavigator(Node):
             if len(exact_points) > 0 and field_count <= self.p.row_end_min_points_fields_3_to_5:
                 result.ended = True
                 result.end_point = previous_valid_point if previous_valid_point is not None else exact_points[-1]
-                result.end_direction = np.asarray(last_valid_direction, dtype=float)
+                result.end_direction = np.asarray(last_complete_support_direction, dtype=float)
                 break
 
             if len(local_point3_points) > 0:
@@ -3178,9 +3201,17 @@ class MaizeNavigator(Node):
         return float(self.p.row_segment_point_count) * self.p.row_segment_point_spacing
 
     def count_points_in_fields_3_to_5(self, map_points: np.ndarray, line_points: np.ndarray, direction: np.ndarray) -> int:
-        total = 0
-        for idx in (2, 3, 4):
-            total += len(
+        counts = self.count_points_per_line_field(map_points, line_points, direction)
+        return int(sum(counts[2:5]))
+
+    def count_points_per_line_field(
+        self,
+        map_points: np.ndarray,
+        line_points: np.ndarray,
+        direction: np.ndarray,
+    ) -> List[int]:
+        return [
+            len(
                 self.points_in_oriented_rectangle(
                     map_points,
                     line_points[idx],
@@ -3189,7 +3220,8 @@ class MaizeNavigator(Node):
                     self.p.row_rectangle_width,
                 )
             )
-        return total
+            for idx in range(min(len(line_points), self.p.row_segment_point_count))
+        ]
 
     def fit_line(self, points: np.ndarray, fallback_direction: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
         fallback_direction = self.normalize(fallback_direction)
@@ -3611,7 +3643,7 @@ class MaizeNavigator(Node):
         ))
         self.last_cmd_angular_z = angular_limited
         cmd.angular.z = angular_limited
-        self.cmd_pub.publish(cmd)
+        self.set_current_cmd(cmd)
 
     def get_map_points_in_hist_roi(self, pose: Pose2D) -> np.ndarray:
         points = self.get_all_map_points()

@@ -7,6 +7,7 @@ maize_navigator:
     scan_topic: "/sensors/merged_scan"
 
     control_frequency: 30.0
+    cmd_vel_publish_frequency: 20.0
 
     expected_row_width: 0.75
     min_lane_width: 0.55
@@ -18,8 +19,8 @@ maize_navigator:
     hist_roi_depth: 4.0
     hist_roi_width: 25.0
     hist_bin_size: 0.05
-    hist_peak_min_points: 3
-    map_row_occupancy_threshold: 50
+    hist_peak_min_points: 2
+    map_row_occupancy_threshold: 35
 
     # Rechteck-Marching-Reihenerkennung:
     # Die initiale linke/rechte Reihe kommt einmalig aus Histogrammpeaks.
@@ -46,16 +47,16 @@ maize_navigator:
     laser_roi_center_offset_limit: 0.2
     laser_ransac_iterations: 80
     laser_ransac_distance: 0.08
-    laser_min_inliers: 5
-    laser_min_visible_length: 0.35
+    laser_min_inliers: 3
+    laser_min_visible_length: 0.25
     laser_max_abs_line_slope: 0.90
     laser_max_angle_to_map: 0.45
     laser_max_center_offset: 0.40
-    laser_min_confidence: 0.25
-    laser_full_confidence: 0.85
-    laser_max_weight_both_sides: 0.30
-    laser_max_weight_one_side: 0.15
-    laser_tracker_alpha: 0.25
+    laser_min_confidence: 0.10
+    laser_full_confidence: 0.65
+    laser_max_weight_both_sides: 0.55
+    laser_max_weight_one_side: 0.35
+    laser_tracker_alpha: 0.40
 
     follow_speed: 0.5
     slow_speed: 0.12
