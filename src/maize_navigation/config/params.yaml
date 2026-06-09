@@ -1,6 +1,6 @@
 maize_navigator:
   ros__parameters:
-    cmd_vel_topic: "/cmd_vel"
+    cmd_vel_topic: "/cmd_vel/task"
     base_frame: "base_link"
     map_topic: "/map"
     map_frame: "map"
