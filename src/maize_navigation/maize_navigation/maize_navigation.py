@@ -185,7 +185,7 @@ class MissionState(Enum):
 
 @dataclass
 class NavigatorParams:
-    cmd_vel_topic: str = "/cmd_vel"
+    cmd_vel_topic: str = "/cmd_vel/task"
     cmd_vel_publish_frequency: float = 20.0
     base_frame: str = "base_link"
     map_frame: str = "map"
@@ -514,6 +514,7 @@ class MaizeNavigator(Node):
         self.row_exit_heading_goal: Optional[np.ndarray] = None
         self.row_end_direction: Optional[np.ndarray] = None
         self.current_cmd = Twist()
+        self.cmd_vel_stream_active = False
         self.last_cmd_angular_z: float = 0.0
         self.last_target_point: Optional[np.ndarray] = None
         self.current_lookahead_distance: float = self.p.lookahead_distance
@@ -961,6 +962,7 @@ class MaizeNavigator(Node):
         self.navigation_start_time_ns = self.get_clock().now().nanoseconds
         self.handled_tracked_object_ids = set()
         self.request_tracker_reset()
+        self.cmd_vel_stream_active = True
         self.state = MissionState.INITIALIZING
         res.success = True
         res.message = (
@@ -1100,7 +1102,7 @@ class MaizeNavigator(Node):
         self.max_navigation_duration_sec = None
         self.reset_entrance_state()
         self.reset_controller_state()
-        self.stop_motion()
+        self.stop_cmd_vel_stream()
         res.success = True
         res.message = "Navigation stopped"
         if row_export_path is not None:
@@ -1155,7 +1157,7 @@ class MaizeNavigator(Node):
         self.max_navigation_duration_sec = None
         self.handled_tracked_object_ids = set()
         self.request_tracker_reset()
-        self.stop_motion()
+        self.stop_cmd_vel_stream()
         slam_requested, slam_message = self.request_slam_reset()
         res.success = True
         res.message = f"Navigation reset; {slam_message}"
@@ -1335,8 +1337,17 @@ class MaizeNavigator(Node):
     def stop_motion(self) -> None:
         self.set_current_cmd(Twist())
 
-    def publish_current_cmd(self) -> None:
+    def stop_cmd_vel_stream(self) -> None:
+        was_active = self.cmd_vel_stream_active
+        self.stop_motion()
+        if was_active:
+            self.publish_current_cmd(force=True)
+        self.cmd_vel_stream_active = False
+
+    def publish_current_cmd(self, force: bool = False) -> None:
         if not hasattr(self, "cmd_pub"):
+            return
+        if not force and not self.cmd_vel_stream_active:
             return
         self.cmd_pub.publish(self.current_cmd)
 
@@ -1462,7 +1473,7 @@ class MaizeNavigator(Node):
             return
         self.store_current_rows()
         self.reset_controller_state()
-        self.stop_motion()
+        self.stop_cmd_vel_stream()
         self.get_logger().info(f"Mission finished: {reason}")
         self.export_row_map()
         self.export_object_positions()
