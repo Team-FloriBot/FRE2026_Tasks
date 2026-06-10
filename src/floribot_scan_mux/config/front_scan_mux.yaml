@@ -1,7 +1,8 @@
 front_scan_mux:
   ros__parameters:
     active_profile: "sick_front"
-    output_topic: "/laser_scan_mux/front_scan"
+    front_output_topic: "/laser_scan_mux/front_scan"
+    rear_output_topic: "/laser_scan_mux/rear_scan"
 
     # Input subscribers can be best_effort for common LaserScan drivers.
     # The output is reliable so it matches the current laser_scan_merger scan_policies config.
@@ -10,10 +11,14 @@ front_scan_mux:
 
     profiles:
       rs_crop_scan:
-        topic: "/crop_points_2d"
+        front_topic: "/sensors/robosense/front/crop_points_2d"
+        rear_topic: "/sensors/robosense/rear/crop_points_2d"
       rs_nonground_scan:
-        topic: "/nonground_points_2d"
+        front_topic: "/sensors/robosense/front/nonground_points_2d"
+        rear_topic: "/sensors/robosense/rear/nonground_points_2d"
       rs_nonground_scan_torsten:
-        topic: "/scan"
+        front_topic: "/sensors/robosense/front/scan"
+        rear_topic: "/sensors/robosense/rear/scan"
       sick_front:
-        topic: "/sensors/scan_front"
+        front_topic: "/sensors/scan_front"
+        rear_topic: "/sensors/scan_rear"
