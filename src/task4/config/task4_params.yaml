@@ -40,7 +40,7 @@ task4_brain:
     detector_classes: []
     detector_confidence: 0.5
     detector_model_type: "yolo"
-    detector_use_realsense_ros_wrapper: false
+    detector_use_realsense_ros_wrapper: true
     detector_use_decimation: false
     detector_use_spatial: false
     detector_use_temporal: true
