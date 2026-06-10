@@ -39,8 +39,8 @@
     angle_min: -3.14159265359
     angle_max: 3.14159265359
 
-    # 1° angular resolution.
-    angle_increment: 0.01745329252
+    # 0.25° angular resolution.
+    angle_increment: 0.0043633
 
     # Measured SICK scan rate is approx. 15 Hz.
     # scan_time = 1 / 15 Hz = 0.0667 s
