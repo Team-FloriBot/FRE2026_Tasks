@@ -19,6 +19,9 @@ front_scan_mux:
       rs_nonground_scan_torsten:
         front_topic: "/sensors/robosense/front/scan"
         rear_topic: "/sensors/robosense/rear/scan"
+      rs_aaron_nonground_scan:
+        front_topic: "/sensors/robosense/front/aaron_nonground_points_2d"
+        rear_topic: "/sensors/robosense/rear/aaron_nonground_points_2d"
       sick_front:
         front_topic: "/sensors/scan_front"
         rear_topic: "/sensors/scan_rear"

@@ -15,6 +15,7 @@ PROFILE_NAMES = (
     "rs_crop_scan",
     "rs_nonground_scan",
     "rs_nonground_scan_torsten",
+    "rs_aaron_nonground_scan",
     "sick_front",
 )
 

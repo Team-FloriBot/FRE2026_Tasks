@@ -1,1 +1,2 @@
-
+rs_aaron_nonground_scan.front_topic=/sensors/robosense/front/aaron_nonground_points_2d
+rs_aaron_nonground_scan.rear_topic=/sensors/robosense/rear/aaron_nonground_points_2d
