@@ -48,7 +48,7 @@
 
     # Range limits.
     # range_max is limited to the useful SLAM range to suppress far reflections/outliers.
-    range_min: 0.30
+    range_min: 0.0
     range_max: 20.0
 
     # Empty rays are published as +inf when use_inf is true.
