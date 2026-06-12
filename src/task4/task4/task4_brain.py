@@ -432,6 +432,15 @@ class Task4Brain(Node):
             self.start_next_shot_navigation()
             return
 
+        try:
+            targets = sorted(targets, key=lambda target: self.target_to_aim_point(target).x)
+        except Exception as exc:
+            self.fail_mission(
+                f"Ziele fuer Schusspunkt {self.current_shot_index + 1} konnten "
+                f"nicht nach aim_target_frame sortiert werden: {exc}"
+            )
+            return
+
         self.current_aim_targets = targets
         self.current_aim_target_index = 0
         self.next_aim_target_time = 0.0
