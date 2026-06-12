@@ -19,14 +19,9 @@ task4_brain:
 
     # Schussplanung: Winkel relativ zu base_link, 0 deg = +x nach vorne,
     # positive Winkel gegen den Uhrzeigersinn Richtung +y.
-    shooting_range_m: 2.0
-    shoot_angle_min_deg: -60.0
-    shoot_angle_max_deg: 60.0
-    candidate_grid_spacing_m: 0.5
-    yaw_sample_step_deg: 10.0
-    path_candidate_stride_m: 0.5
-    object_ring_distance_ratio: 0.75
-    object_ring_angle_step_deg: 20.0
+    shooting_range_m: 9.0
+    shoot_angle_min_deg: 20.0
+    shoot_angle_max_deg: 160.0
     min_navigation_segment_m: 0.05
 
     # Tracker und Detector Konfiguration

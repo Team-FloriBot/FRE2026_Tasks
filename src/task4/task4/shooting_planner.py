@@ -4,9 +4,14 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass, field
-from typing import Dict, List, Sequence, Set, Tuple
+from typing import List, Sequence, Tuple
 
-from task4.coverage_planner import Point2D, Waypoint, normalize_polygon_points
+from task4.coverage_planner import (
+    Point2D,
+    Waypoint,
+    normalize_polygon_points,
+    signed_area_twice,
+)
 
 
 @dataclass(frozen=True)
@@ -23,11 +28,7 @@ class ShootingPlannerConfig:
     shooting_range_m: float = 2.0
     shoot_angle_min_deg: float = -60.0
     shoot_angle_max_deg: float = 60.0
-    candidate_grid_spacing_m: float = 0.5
-    yaw_sample_step_deg: float = 10.0
-    path_candidate_stride_m: float = 0.5
-    object_ring_distance_ratio: float = 0.75
-    object_ring_angle_step_deg: float = 20.0
+    headland_width: float = 0.5
 
 
 @dataclass(frozen=True)
@@ -38,14 +39,6 @@ class ShootingPose:
     target_ids: List[int] = field(default_factory=list)
 
 
-@dataclass(frozen=True)
-class _Candidate:
-    x: float
-    y: float
-    yaw: float
-    covered_ids: frozenset
-
-
 def plan_shooting_poses(
     targets: Sequence[ShotTarget],
     polygon_points: Sequence[Point2D],
@@ -53,141 +46,108 @@ def plan_shooting_poses(
     start_xy: Point2D,
     config: ShootingPlannerConfig,
 ) -> Tuple[List[ShootingPose], List[ShotTarget]]:
+    del coverage_path, start_xy
+
     polygon = normalize_polygon_points(polygon_points)
     unique_targets = _unique_targets_inside_polygon(targets, polygon)
     if not unique_targets:
         return [], []
 
-    candidates = _build_candidates(unique_targets, polygon, coverage_path, start_xy, config)
-    scored_candidates = _score_candidates(candidates, unique_targets, config)
+    shooting_pose = _longest_edge_shooting_pose(polygon, unique_targets, config)
+    covered_ids = set(shooting_pose.target_ids)
+    uncovered = [
+        target for target in unique_targets
+        if int(target.target_id) not in covered_ids
+    ]
 
-    target_by_id = {target.target_id: target for target in unique_targets}
-    uncovered_ids: Set[int] = set(target_by_id)
-    selected: List[ShootingPose] = []
-    last_xy = (float(start_xy[0]), float(start_xy[1]))
+    if not shooting_pose.target_ids:
+        return [], uncovered
 
-    while uncovered_ids:
-        best = None
-        best_gain: Set[int] = set()
-        best_score = None
-
-        for candidate in scored_candidates:
-            gain = set(candidate.covered_ids) & uncovered_ids
-            if not gain:
-                continue
-
-            travel_distance = distance_2d(last_xy, (candidate.x, candidate.y))
-            score = (len(gain), len(candidate.covered_ids), -travel_distance)
-            if best_score is None or score > best_score:
-                best = candidate
-                best_gain = gain
-                best_score = score
-
-        if best is None:
-            break
-
-        selected.append(
-            ShootingPose(
-                x=best.x,
-                y=best.y,
-                yaw=best.yaw,
-                target_ids=sorted(best_gain),
-            )
-        )
-        uncovered_ids -= best_gain
-        last_xy = (best.x, best.y)
-
-    uncovered = [target_by_id[target_id] for target_id in sorted(uncovered_ids)]
-    return selected, uncovered
+    return [shooting_pose], uncovered
 
 
 def _unique_targets_inside_polygon(
     targets: Sequence[ShotTarget],
     polygon: Sequence[Point2D],
 ) -> List[ShotTarget]:
-    by_id: Dict[int, ShotTarget] = {}
+    by_id = {}
     for target in targets:
         if point_in_polygon((target.x, target.y), polygon):
             by_id[int(target.target_id)] = target
     return list(by_id.values())
 
 
-def _build_candidates(
-    targets: Sequence[ShotTarget],
+def _longest_edge_shooting_pose(
     polygon: Sequence[Point2D],
-    coverage_path: Sequence[Waypoint],
-    start_xy: Point2D,
-    config: ShootingPlannerConfig,
-) -> List[Point2D]:
-    candidates: Dict[Tuple[int, int], Point2D] = {}
-
-    def add_candidate(x: float, y: float) -> None:
-        point = (float(x), float(y))
-        if point_in_polygon(point, polygon):
-            key = (round(point[0] * 1000), round(point[1] * 1000))
-            candidates[key] = point
-
-    add_candidate(start_xy[0], start_xy[1])
-
-    stride = max(0.05, float(config.path_candidate_stride_m))
-    last_added = None
-    for waypoint in coverage_path:
-        point = (waypoint.x, waypoint.y)
-        if last_added is None or distance_2d(last_added, point) >= stride:
-            add_candidate(point[0], point[1])
-            last_added = point
-
-    min_x = min(point[0] for point in polygon)
-    max_x = max(point[0] for point in polygon)
-    min_y = min(point[1] for point in polygon)
-    max_y = max(point[1] for point in polygon)
-    spacing = max(0.05, float(config.candidate_grid_spacing_m))
-
-    x = min_x
-    while x <= max_x + 1e-9:
-        y = min_y
-        while y <= max_y + 1e-9:
-            add_candidate(x, y)
-            y += spacing
-        x += spacing
-
-    ring_distance = max(
-        0.05,
-        float(config.shooting_range_m) * max(0.05, min(1.0, config.object_ring_distance_ratio)),
-    )
-    angle_step = math.radians(max(1.0, float(config.object_ring_angle_step_deg)))
-    for target in targets:
-        angle = 0.0
-        while angle < 2.0 * math.pi:
-            add_candidate(
-                target.x - ring_distance * math.cos(angle),
-                target.y - ring_distance * math.sin(angle),
-            )
-            angle += angle_step
-
-    return list(candidates.values())
-
-
-def _score_candidates(
-    candidate_positions: Sequence[Point2D],
     targets: Sequence[ShotTarget],
     config: ShootingPlannerConfig,
-) -> List[_Candidate]:
-    scored = []
-    yaw_step = math.radians(max(1.0, float(config.yaw_sample_step_deg)))
+) -> ShootingPose:
+    start, end = _longest_edge_with_interior_left(polygon)
+    dx = end[0] - start[0]
+    dy = end[1] - start[1]
+    length = math.hypot(dx, dy)
+    if length <= 1e-9:
+        raise ValueError("Laengste Polygonkante ist degeneriert.")
 
-    for x, y in candidate_positions:
-        yaw = 0.0
-        while yaw < 2.0 * math.pi:
-            covered = set()
-            for target in targets:
-                if target_reachable((x, y), yaw, target, config):
-                    covered.add(int(target.target_id))
-            if covered:
-                scored.append(_Candidate(x=x, y=y, yaw=normalize_angle(yaw), covered_ids=frozenset(covered)))
-            yaw += yaw_step
+    ux = dx / length
+    uy = dy / length
+    left_normal = (-uy, ux)
+    midpoint = ((start[0] + end[0]) * 0.5, (start[1] + end[1]) * 0.5)
+    offset = max(0.0, float(config.headland_width)) * 0.5
+    shooter_xy = _inset_point_inside_polygon(midpoint, left_normal, offset, polygon)
+    yaw = normalize_angle(math.atan2(uy, ux))
 
-    return scored
+    covered_ids = [
+        int(target.target_id)
+        for target in targets
+        if target_reachable(shooter_xy, yaw, target, config)
+    ]
+
+    return ShootingPose(
+        x=shooter_xy[0],
+        y=shooter_xy[1],
+        yaw=yaw,
+        target_ids=sorted(covered_ids),
+    )
+
+
+def _longest_edge_with_interior_left(polygon: Sequence[Point2D]) -> Tuple[Point2D, Point2D]:
+    if len(polygon) < 2:
+        raise ValueError("Polygon enthaelt zu wenige Punkte.")
+
+    best_start = polygon[0]
+    best_end = polygon[1]
+    best_length = -1.0
+
+    for index, start in enumerate(polygon):
+        end = polygon[(index + 1) % len(polygon)]
+        length = distance_2d(start, end)
+        if length > best_length:
+            best_start = start
+            best_end = end
+            best_length = length
+
+    if signed_area_twice(polygon) < 0.0:
+        return best_end, best_start
+
+    return best_start, best_end
+
+
+def _inset_point_inside_polygon(
+    point: Point2D,
+    direction: Point2D,
+    offset: float,
+    polygon: Sequence[Point2D],
+) -> Point2D:
+    for ratio in (1.0, 0.75, 0.5, 0.25, 0.0):
+        candidate = (
+            float(point[0]) + float(direction[0]) * offset * ratio,
+            float(point[1]) + float(direction[1]) * offset * ratio,
+        )
+        if point_in_polygon(candidate, polygon):
+            return candidate
+
+    return (float(point[0]), float(point[1]))
 
 
 def target_reachable(

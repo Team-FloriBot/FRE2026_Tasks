@@ -77,11 +77,6 @@ class Task4Brain(Node):
         self.declare_parameter("shooting_range_m", 2.0)
         self.declare_parameter("shoot_angle_min_deg", -60.0)
         self.declare_parameter("shoot_angle_max_deg", 60.0)
-        self.declare_parameter("candidate_grid_spacing_m", 0.5)
-        self.declare_parameter("yaw_sample_step_deg", 10.0)
-        self.declare_parameter("path_candidate_stride_m", 0.5)
-        self.declare_parameter("object_ring_distance_ratio", 0.75)
-        self.declare_parameter("object_ring_angle_step_deg", 20.0)
         self.declare_parameter("min_navigation_segment_m", 0.05)
 
         self.declare_parameter("tracked_objects_topic", "/tracker/tracked_objects")
@@ -1056,11 +1051,7 @@ class Task4Brain(Node):
             shooting_range_m=float(self.get_parameter("shooting_range_m").value),
             shoot_angle_min_deg=float(self.get_parameter("shoot_angle_min_deg").value),
             shoot_angle_max_deg=float(self.get_parameter("shoot_angle_max_deg").value),
-            candidate_grid_spacing_m=float(self.get_parameter("candidate_grid_spacing_m").value),
-            yaw_sample_step_deg=float(self.get_parameter("yaw_sample_step_deg").value),
-            path_candidate_stride_m=float(self.get_parameter("path_candidate_stride_m").value),
-            object_ring_distance_ratio=float(self.get_parameter("object_ring_distance_ratio").value),
-            object_ring_angle_step_deg=float(self.get_parameter("object_ring_angle_step_deg").value),
+            headland_width=float(self.get_parameter("headland_width").value),
         )
 
     def detector_config(self) -> DetectorInitConfig:
