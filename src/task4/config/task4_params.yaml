@@ -36,7 +36,7 @@ task4_brain:
     detector_enabled: true
     detector_required: false
     detector_namespace: "/detector"
-    detector_model_path: ""
+    detector_model_path: "/models/yolo26n_soilspot-seg.pt"
     detector_classes: []
     detector_confidence: 0.5
     detector_model_type: "yolo"
