@@ -247,6 +247,8 @@ class NavigatorParams:
     curve_speed_reduction_gain: float = 1.0
     follow_max_angular_speed: float = 0.40
     min_follow_turn_radius: float = 0.37
+    linear_acceleration_limit: float = 0.30
+    linear_deceleration_limit: float = 0.45
     angular_rate_limit: float = 1.2
     target_filter_alpha: float = 0.35
     row_exit_extension_distance: float = 0.30
@@ -515,6 +517,7 @@ class MaizeNavigator(Node):
         self.row_end_direction: Optional[np.ndarray] = None
         self.current_cmd = Twist()
         self.cmd_vel_stream_active = False
+        self.last_cmd_linear_x: float = 0.0
         self.last_cmd_angular_z: float = 0.0
         self.last_target_point: Optional[np.ndarray] = None
         self.current_lookahead_distance: float = self.p.lookahead_distance
@@ -672,6 +675,12 @@ class MaizeNavigator(Node):
         p.curve_speed_reduction_gain = float(get_param("curve_speed_reduction_gain", p.curve_speed_reduction_gain))
         p.follow_max_angular_speed = float(get_param("follow_max_angular_speed", p.follow_max_angular_speed))
         p.min_follow_turn_radius = float(get_param("min_follow_turn_radius", p.min_follow_turn_radius))
+        p.linear_acceleration_limit = float(
+            get_param("linear_acceleration_limit", p.linear_acceleration_limit)
+        )
+        p.linear_deceleration_limit = float(
+            get_param("linear_deceleration_limit", p.linear_deceleration_limit)
+        )
         p.angular_rate_limit = float(get_param("angular_rate_limit", p.angular_rate_limit))
         p.target_filter_alpha = float(get_param("target_filter_alpha", p.target_filter_alpha))
         p.row_exit_extension_distance = float(get_param("row_exit_extension_distance", p.row_exit_extension_distance))
@@ -785,6 +794,8 @@ class MaizeNavigator(Node):
         self.p.laser_max_weight_one_side = float(np.clip(self.p.laser_max_weight_one_side, 0.0, 1.0))
         self.p.laser_tracker_alpha = float(np.clip(self.p.laser_tracker_alpha, 0.01, 1.0))
         self.p.min_follow_turn_radius = max(0.1, self.p.min_follow_turn_radius)
+        self.p.linear_acceleration_limit = max(0.01, self.p.linear_acceleration_limit)
+        self.p.linear_deceleration_limit = max(0.01, self.p.linear_deceleration_limit)
         self.p.angular_rate_limit = max(0.01, self.p.angular_rate_limit)
         self.p.target_filter_alpha = float(np.clip(self.p.target_filter_alpha, 0.01, 1.0))
         self.p.row_exit_extension_distance = max(0.0, self.p.row_exit_extension_distance)
@@ -1333,6 +1344,7 @@ class MaizeNavigator(Node):
 
     def set_current_cmd(self, cmd: Twist) -> None:
         self.current_cmd = cmd
+        self.last_cmd_linear_x = float(cmd.linear.x)
 
     def stop_motion(self) -> None:
         self.set_current_cmd(Twist())
@@ -1390,6 +1402,7 @@ class MaizeNavigator(Node):
             self.robot_pose = None
 
     def reset_controller_state(self) -> None:
+        self.last_cmd_linear_x = 0.0
         self.last_cmd_angular_z = 0.0
         self.last_target_point = None
         self.fused_target_point = None
@@ -2882,8 +2895,14 @@ class MaizeNavigator(Node):
             right_peak = sorted_peaks[left_idx][0]
             left_peak = sorted_peaks[left_idx + 1][0]
             sep = left_peak - right_peak
-            if sep < self.p.min_lane_width or sep > self.p.max_lane_width:
+            if sep > self.p.max_lane_width:
                 continue
+
+            if sep < self.p.min_lane_width:
+                midpoint = 0.5 * (left_peak + right_peak)
+                half_width = 0.5 * self.p.min_lane_width
+                right_peak = midpoint - half_width
+                left_peak = midpoint + half_width
 
             pair_count = sorted_peaks[left_idx][1] + sorted_peaks[left_idx + 1][1]
             candidate_pairs.append((left_peak, right_peak, pair_count))
@@ -3629,7 +3648,7 @@ class MaizeNavigator(Node):
                 )
             )
             lookahead_speed_penalty = self.p.maneuver_lookahead_speed_reduction_gain * (1.0 - lookahead_ratio)
-        cmd.linear.x = float(np.clip(
+        target_linear_x = float(np.clip(
             max_speed / (
                 1.0
                 + self.p.curve_speed_reduction_gain * abs(curvature)
@@ -3638,6 +3657,23 @@ class MaizeNavigator(Node):
             min_speed,
             max_speed,
         ))
+
+        dt = 1.0 / max(1e-6, self.p.control_frequency)
+        linear_delta = target_linear_x - self.last_cmd_linear_x
+        linear_limit = (
+            self.p.linear_acceleration_limit
+            if linear_delta >= 0.0
+            else self.p.linear_deceleration_limit
+        ) * dt
+        if abs(linear_delta) <= linear_limit:
+            linear_x = target_linear_x
+        else:
+            linear_x = self.last_cmd_linear_x + math.copysign(linear_limit, linear_delta)
+        if abs(linear_x) < 1e-3:
+            linear_x = 0.0
+        self.last_cmd_linear_x = linear_x
+        cmd.linear.x = linear_x
+
         radius_limited_angular = abs(cmd.linear.x) / self.p.min_follow_turn_radius
         max_angular = min(self.p.follow_max_angular_speed, radius_limited_angular)
         # Pure-pursuit curvature is calmer around the midline than a direct
@@ -3645,7 +3681,6 @@ class MaizeNavigator(Node):
         pursuit_angular = cmd.linear.x * curvature
         angular_raw = float(np.clip(pursuit_angular, -max_angular, max_angular))
 
-        dt = 1.0 / max(1e-6, self.p.control_frequency)
         max_delta = self.p.angular_rate_limit * dt
         angular_limited = float(np.clip(
             angular_raw,

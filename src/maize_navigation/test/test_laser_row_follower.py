@@ -1112,6 +1112,15 @@ def bare_navigator():
     navigator.entrance_route_target = None
     navigator.entrance_route_remaining_distance = 0.0
     navigator.entrance_route_provisional = False
+    navigator.current_cmd = types.SimpleNamespace(
+        linear=types.SimpleNamespace(x=0.0),
+        angular=types.SimpleNamespace(z=0.0),
+    )
+    navigator.last_cmd_linear_x = 0.0
+    navigator.last_cmd_angular_z = 0.0
+    navigator.last_target_point = None
+    navigator.current_lookahead_distance = navigator.p.lookahead_distance
+    navigator.current_lookahead_curvature = 0.0
     navigator.current_maneuver_lookahead_distance = navigator.p.maneuver_lookahead_distance
     navigator.current_maneuver_lookahead_curvature = 0.0
     navigator.get_logger = lambda: types.SimpleNamespace(
@@ -1182,6 +1191,26 @@ def test_histogram_peak_uses_actual_shifted_row_end():
 
     assert end[0] > 1.8
     assert abs(end[1] + 0.4) < 1e-6
+
+
+def test_start_peak_pair_expands_narrow_rows_to_min_lane_width():
+    navigator = bare_navigator()
+    navigator.p.hist_roi_width = 2.0
+    navigator.p.hist_bin_size = 0.05
+    navigator.p.hist_peak_min_points = 2
+    navigator.p.min_lane_width = 0.70
+    navigator.p.max_lane_width = 1.20
+    points = np.array(
+        [[x, 0.25] for x in np.linspace(0.0, 1.0, 8)]
+        + [[x, -0.25] for x in np.linspace(0.0, 1.0, 8)]
+    )
+
+    pair = navigator.find_start_peak_pair(points, Pose2D(0.0, 0.0, 0.0))
+
+    assert pair is not None
+    left_peak, right_peak = pair
+    assert math.isclose(left_peak - right_peak, navigator.p.min_lane_width)
+    assert math.isclose(0.5 * (left_peak + right_peak), 0.0, abs_tol=navigator.p.hist_bin_size)
 
 
 def test_row_end_direction_average_is_kept_per_field_side():
@@ -1313,12 +1342,14 @@ def test_dynamic_follow_lookahead_filter_smooths_sudden_reduction():
 
 
 def test_small_dynamic_lookahead_reduces_follow_speed_before_curvature_grows():
-    published = []
     navigator = bare_navigator()
-    navigator.cmd_pub = types.SimpleNamespace(publish=published.append)
     navigator.robot_pose = Pose2D(0.0, 0.0, 0.0)
     navigator.last_target_point = None
     navigator.last_cmd_angular_z = 0.0
+    navigator.last_cmd_linear_x = 0.0
+    navigator.p.control_frequency = 10.0
+    navigator.p.linear_acceleration_limit = 10.0
+    navigator.p.linear_deceleration_limit = 10.0
     navigator.p.follow_speed = 0.40
     navigator.p.slow_speed = 0.10
     navigator.p.lookahead_distance = 1.0
@@ -1327,25 +1358,28 @@ def test_small_dynamic_lookahead_reduces_follow_speed_before_curvature_grows():
     navigator.current_lookahead_distance = 1.0
 
     navigator.drive_to_point(np.array([1.0, 0.0]))
-    full_lookahead_speed = published[-1].linear.x
+    full_lookahead_speed = navigator.current_cmd.linear.x
 
     navigator.last_target_point = None
     navigator.last_cmd_angular_z = 0.0
+    navigator.last_cmd_linear_x = 0.0
     navigator.current_lookahead_distance = 0.5
     navigator.drive_to_point(np.array([1.0, 0.0]))
-    reduced_lookahead_speed = published[-1].linear.x
+    reduced_lookahead_speed = navigator.current_cmd.linear.x
 
     assert math.isclose(full_lookahead_speed, navigator.p.follow_speed)
     assert reduced_lookahead_speed < full_lookahead_speed
 
 
 def test_small_dynamic_maneuver_lookahead_reduces_maneuver_speed_before_curvature_grows():
-    published = []
     navigator = bare_navigator()
-    navigator.cmd_pub = types.SimpleNamespace(publish=published.append)
     navigator.robot_pose = Pose2D(0.0, 0.0, 0.0)
     navigator.last_target_point = None
     navigator.last_cmd_angular_z = 0.0
+    navigator.last_cmd_linear_x = 0.0
+    navigator.p.control_frequency = 10.0
+    navigator.p.linear_acceleration_limit = 10.0
+    navigator.p.linear_deceleration_limit = 10.0
     navigator.p.maneuver_speed = 0.40
     navigator.p.maneuver_slow_speed = 0.10
     navigator.p.maneuver_lookahead_distance = 1.0
@@ -1354,16 +1388,61 @@ def test_small_dynamic_maneuver_lookahead_reduces_maneuver_speed_before_curvatur
     navigator.current_maneuver_lookahead_distance = 1.0
 
     navigator.drive_to_point(np.array([1.0, 0.0]), navigator.p.maneuver_speed, navigator.p.maneuver_slow_speed)
-    full_lookahead_speed = published[-1].linear.x
+    full_lookahead_speed = navigator.current_cmd.linear.x
 
     navigator.last_target_point = None
     navigator.last_cmd_angular_z = 0.0
+    navigator.last_cmd_linear_x = 0.0
     navigator.current_maneuver_lookahead_distance = 0.5
     navigator.drive_to_point(np.array([1.0, 0.0]), navigator.p.maneuver_speed, navigator.p.maneuver_slow_speed)
-    reduced_lookahead_speed = published[-1].linear.x
+    reduced_lookahead_speed = navigator.current_cmd.linear.x
 
     assert math.isclose(full_lookahead_speed, navigator.p.maneuver_speed)
     assert reduced_lookahead_speed < full_lookahead_speed
+
+
+def test_drive_to_point_limits_linear_acceleration_per_control_tick():
+    navigator = bare_navigator()
+    navigator.robot_pose = Pose2D(0.0, 0.0, 0.0)
+    navigator.p.control_frequency = 10.0
+    navigator.p.follow_speed = 0.40
+    navigator.p.slow_speed = 0.0
+    navigator.p.linear_acceleration_limit = 0.30
+    navigator.p.linear_deceleration_limit = 1.0
+
+    navigator.drive_to_point(np.array([1.0, 0.0]))
+
+    assert math.isclose(navigator.current_cmd.linear.x, 0.03)
+
+
+def test_drive_to_point_limits_linear_deceleration_per_control_tick():
+    navigator = bare_navigator()
+    navigator.robot_pose = Pose2D(0.0, 0.0, 0.0)
+    navigator.last_cmd_linear_x = 0.40
+    navigator.p.control_frequency = 10.0
+    navigator.p.follow_speed = 0.40
+    navigator.p.slow_speed = 0.0
+    navigator.p.linear_acceleration_limit = 1.0
+    navigator.p.linear_deceleration_limit = 0.50
+    navigator.p.curve_speed_reduction_gain = 100.0
+
+    navigator.drive_to_point(np.array([1.0, 1.0]))
+
+    assert math.isclose(navigator.current_cmd.linear.x, 0.35)
+
+
+def test_drive_to_point_reaches_follow_speed_after_repeated_stable_ticks():
+    navigator = bare_navigator()
+    navigator.robot_pose = Pose2D(0.0, 0.0, 0.0)
+    navigator.p.control_frequency = 10.0
+    navigator.p.follow_speed = 0.30
+    navigator.p.slow_speed = 0.0
+    navigator.p.linear_acceleration_limit = 0.30
+
+    for _ in range(12):
+        navigator.drive_to_point(np.array([1.0, 0.0]))
+
+    assert math.isclose(navigator.current_cmd.linear.x, navigator.p.follow_speed)
 
 
 def test_rounded_route_replaces_sharp_corner_with_curve():
