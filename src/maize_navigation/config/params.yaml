@@ -10,7 +10,7 @@ maize_navigator:
     cmd_vel_publish_frequency: 20.0
 
     expected_row_width: 0.75
-    min_lane_width: 0.55
+    min_lane_width: 0.5
     max_lane_width: 1.20
 
     hist_roi_size: 5.0
@@ -63,6 +63,8 @@ maize_navigator:
     pure_pursuit_gain: 1.4
     curve_speed_reduction_gain: 2.5
     min_follow_turn_radius: 0.37
+    linear_acceleration_limit: 0.30
+    linear_deceleration_limit: 0.45
     target_filter_alpha: 0.45
     # Ausfahr- und Einfahrziel liegen so weit ausserhalb der Pflanzenenden.
     row_end_goal_outward_distance: 0.30
