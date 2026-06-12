@@ -644,6 +644,9 @@ private:
         if (std::abs(commanded_angular_velocity_) < 1e-3)
             commanded_angular_velocity_ = 0.0;
 
+        if (commanded_linear_speed_ == 0.0 && commanded_angular_velocity_ == 0.0)
+            return;
+
         geometry_msgs::msg::Twist cmd;
 
         cmd.linear.x = commanded_linear_speed_;

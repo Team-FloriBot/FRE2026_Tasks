@@ -36,11 +36,11 @@ task4_brain:
     detector_enabled: true
     detector_required: false
     detector_namespace: "/detector"
-    detector_model_path: ""
+    detector_model_path: "/models/yolo26n_soilspot-seg.pt"
     detector_classes: []
     detector_confidence: 0.5
     detector_model_type: "yolo"
-    detector_use_realsense_ros_wrapper: false
+    detector_use_realsense_ros_wrapper: true
     detector_use_decimation: false
     detector_use_spatial: false
     detector_use_temporal: true
@@ -63,3 +63,16 @@ task4_brain:
     aim_target_frame: "base_link"
     aim_target_interval_sec: 5.0
     tf_timeout_sec: 0.5
+
+    # Scanhöhe des externen pointcloud_to_laserscan-Knotens.
+    # Die Werte werden beim Aufruf von /task4/plan_coverage gesetzt,
+    # bevor die Coverage-Planung beginnt.
+    pointcloud_height_update_enabled: true
+    pointcloud_to_laserscan_node: "/pointcloud_to_laserscan"
+    pointcloud_min_height: 0.15
+    pointcloud_max_height: 0.8
+    pointcloud_parameter_timeout_sec: 2.0
+
+    # true: Die Coverage-Planung schlägt fehl, wenn die Parameter nicht gesetzt
+    # werden können. false: Nur Warnung ausgeben und trotzdem planen.
+    pointcloud_height_update_required: true

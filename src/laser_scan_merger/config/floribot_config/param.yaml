@@ -3,7 +3,7 @@
 
     # Input LaserScan topics.
     # Maximal 9 LaserScan topics are supported by the merger.
-    scan_topics: ["/laser_scan_mux/front_scan", "/sensors/scan_rear"]
+    scan_topics: ["/laser_scan_mux/front_scan", "/laser_scan_mux/rear_scan"]
 
     # QoS policy per scan topic:
     # 0 = reliable
@@ -39,8 +39,8 @@
     angle_min: -3.14159265359
     angle_max: 3.14159265359
 
-    # 1° angular resolution.
-    angle_increment: 0.01745329252
+    # 0.25° angular resolution.
+    angle_increment: 0.0043633
 
     # Measured SICK scan rate is approx. 15 Hz.
     # scan_time = 1 / 15 Hz = 0.0667 s
@@ -48,7 +48,7 @@
 
     # Range limits.
     # range_max is limited to the useful SLAM range to suppress far reflections/outliers.
-    range_min: 0.30
+    range_min: 0.0
     range_max: 20.0
 
     # Empty rays are published as +inf when use_inf is true.
