@@ -107,7 +107,7 @@ class Task4Brain(Node):
         self.declare_parameter("pure_pursuit_set_active_service", "/pure_pursuit_node/set_active")
         self.declare_parameter("pure_pursuit_status_topic", "/pure_pursuit_node/status")
         self.declare_parameter("aim_target_topic", "/target_point")
-        self.declare_parameter("aim_target_frame", "base_link")
+        self.declare_parameter("aim_target_frame", "pan_tilt_link_footprint")
         self.declare_parameter("aim_target_interval_sec", 5.0)
         self.declare_parameter("tf_timeout_sec", 0.5)
 

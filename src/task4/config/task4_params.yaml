@@ -55,7 +55,7 @@ task4_brain:
     pure_pursuit_set_active_service: "/pure_pursuit_node/set_active"
     pure_pursuit_status_topic: "/pure_pursuit_node/status"
     aim_target_topic: "/target_point"
-    aim_target_frame: "base_link"
+    aim_target_frame: "pan_tilt_link_footprint"
     aim_target_interval_sec: 5.0
     tf_timeout_sec: 0.5
 
