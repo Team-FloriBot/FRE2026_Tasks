@@ -10,13 +10,13 @@ maize_navigator:
     cmd_vel_publish_frequency: 20.0
 
     expected_row_width: 0.75
-    min_lane_width: 0.5
-    max_lane_width: 1.20
+    min_lane_width: 0.6
+    max_lane_width: 1.0
 
     hist_roi_size: 5.0
     # Histogramm-ROI: quer breit fuer mehr Reihen, laengs kompakter.
     # hist_roi_size bleibt als Fallback fuer alte Konfigurationen erhalten.
-    hist_roi_depth: 4.0
+    hist_roi_depth: 3.0
     hist_roi_width: 25.0
     hist_bin_size: 0.05
     hist_peak_min_points: 2
@@ -43,7 +43,7 @@ maize_navigator:
     laser_roi_x_min: 0.1
     laser_roi_x_max: 1.7
     laser_roi_length: 1.55
-    laser_roi_width: 0.5
+    laser_roi_width: 0.6
     laser_roi_center_offset_limit: 0.2
     laser_ransac_iterations: 80
     laser_ransac_distance: 0.08
@@ -58,13 +58,13 @@ maize_navigator:
     laser_max_weight_one_side: 0.35
     laser_tracker_alpha: 0.40
 
-    follow_speed: 0.5
+    follow_speed: 0.4
     slow_speed: 0.12
     pure_pursuit_gain: 1.4
     curve_speed_reduction_gain: 2.5
     min_follow_turn_radius: 0.37
-    linear_acceleration_limit: 0.30
-    linear_deceleration_limit: 0.45
+    linear_acceleration_limit: 0.18
+    linear_deceleration_limit: 0.30
     target_filter_alpha: 0.45
     # Ausfahr- und Einfahrziel liegen so weit ausserhalb der Pflanzenenden.
     row_end_goal_outward_distance: 0.30
@@ -72,7 +72,7 @@ maize_navigator:
     row_exit_extension_distance: 0.50
 
     follow_max_angular_speed: 0.90
-    angular_rate_limit: 2.8
+    angular_rate_limit: 2.0
 
     lookahead_distance: 2.0
     turn_lookahead_distance: 0.25

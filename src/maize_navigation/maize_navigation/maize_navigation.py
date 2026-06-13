@@ -194,11 +194,11 @@ class NavigatorParams:
 
     control_frequency: float = 30.0
     expected_row_width: float = 0.75
-    min_lane_width: float = 0.55
-    max_lane_width: float = 1.20
+    min_lane_width: float = 0.60
+    max_lane_width: float = 1.00
 
     hist_roi_size: float = 5.0
-    hist_roi_depth: float = 5.0
+    hist_roi_depth: float = 3.0
     hist_roi_width: float = 5.0
     hist_bin_size: float = 0.05
     hist_peak_min_points: int = 2
@@ -218,7 +218,7 @@ class NavigatorParams:
     laser_roi_x_min: float = 0.25
     laser_roi_x_max: float = 1.80
     laser_roi_length: float = 1.55
-    laser_roi_width: float = 0.32
+    laser_roi_width: float = 0.60
     laser_roi_center_offset_limit: float = 0.25
     laser_ransac_iterations: int = 80
     laser_ransac_distance: float = 0.08
@@ -247,8 +247,8 @@ class NavigatorParams:
     curve_speed_reduction_gain: float = 1.0
     follow_max_angular_speed: float = 0.40
     min_follow_turn_radius: float = 0.37
-    linear_acceleration_limit: float = 0.30
-    linear_deceleration_limit: float = 0.45
+    linear_acceleration_limit: float = 0.18
+    linear_deceleration_limit: float = 0.30
     angular_rate_limit: float = 1.2
     target_filter_alpha: float = 0.35
     row_exit_extension_distance: float = 0.30
@@ -416,7 +416,7 @@ class LaserRowFollower:
         return points[mask]
 
     def effective_roi_width(self) -> float:
-        return float(min(self.p.laser_roi_width, max(0.05, 0.45 * self.p.expected_row_width)))
+        return float(self.p.laser_roi_width)
 
     def fit_line_in_roi(
         self,
@@ -2369,12 +2369,13 @@ class MaizeNavigator(Node):
 
         center = np.asarray(self.plant_row_end_point, dtype=float)
         outgoing = self.average_row_end_direction_for_side(self.row_end_direction)
-        roi_points = self.points_in_oriented_rectangle(
+        roi_points = self.points_in_oriented_rectangle_asymmetric(
             self.get_all_map_points(),
             center,
             outgoing,
-            self.p.hist_roi_depth,
-            self.p.hist_roi_width,
+            backward_length=2.0,
+            forward_length=1.0,
+            width=self.p.hist_roi_width,
         )
         self.entrance_hist_center = center
         self.entrance_hist_direction = outgoing
@@ -2708,7 +2709,7 @@ class MaizeNavigator(Node):
 
         # Broad occupied bands often form several adjacent local maxima. Count them
         # as one plant row before applying pattern-relative peak offsets.
-        min_peak_spacing = max(2.0 * self.p.hist_bin_size, 0.5 * self.p.min_lane_width)
+        min_peak_spacing = max(2.0 * self.p.hist_bin_size, self.p.min_lane_width)
         peaks: List[EntrancePeak] = []
         for _, candidate in sorted(candidates, key=lambda item: item[0], reverse=True):
             if all(abs(candidate.lateral - peak.lateral) >= min_peak_spacing for peak in peaks):
@@ -2846,12 +2847,13 @@ class MaizeNavigator(Node):
 
         outgoing = self.normalize(self.entrance_hist_direction)
         incoming = -outgoing
-        roi_points = self.points_in_oriented_rectangle(
+        roi_points = self.points_in_oriented_rectangle_asymmetric(
             self.get_all_map_points(),
             self.entrance_hist_center,
             outgoing,
-            self.p.hist_roi_depth,
-            self.p.hist_roi_width,
+            backward_length=2.0,
+            forward_length=1.0,
+            width=self.p.hist_roi_width,
         )
         first, second = sorted(self.pending_target_peaks, key=lambda peak: peak.lateral)
         # Seen in the new incoming direction, the lower outgoing-lateral peak is the left row.
@@ -2895,7 +2897,9 @@ class MaizeNavigator(Node):
             right_peak = sorted_peaks[left_idx][0]
             left_peak = sorted_peaks[left_idx + 1][0]
             sep = left_peak - right_peak
-            if sep > self.p.max_lane_width:
+            if right_peak > -0.2 or left_peak < 0.2:
+                continue
+            if sep < 0.4 or sep > self.p.max_lane_width:
                 continue
 
             if sep < self.p.min_lane_width:
@@ -2913,9 +2917,7 @@ class MaizeNavigator(Node):
             # The first measurement defines expected_row_width, so do not score
             # candidates against the old configured width. Prefer the plant-row
             # pair that brackets the robot's current lateral position.
-            bracketing_pairs = [
-                pair for pair in candidate_pairs if pair[1] <= 0.0 <= pair[0]
-            ]
+            bracketing_pairs = [pair for pair in candidate_pairs if pair[1] <= -0.2 and pair[0] >= 0.2]
             scored_pairs = bracketing_pairs if bracketing_pairs else candidate_pairs
             best_left, best_right, _ = min(
                 scored_pairs,
@@ -3343,6 +3345,29 @@ class MaizeNavigator(Node):
         mask = (np.abs(along) <= 0.5 * length) & (np.abs(lateral) <= 0.5 * width)
         return points[mask]
 
+    def points_in_oriented_rectangle_asymmetric(
+        self,
+        points: np.ndarray,
+        center: np.ndarray,
+        direction: np.ndarray,
+        backward_length: float,
+        forward_length: float,
+        width: float,
+    ) -> np.ndarray:
+        if len(points) == 0:
+            return np.empty((0, 2), dtype=float)
+        direction = self.normalize(direction)
+        perp = np.array([-direction[1], direction[0]], dtype=float)
+        rel = points - np.asarray(center, dtype=float)
+        along = rel @ direction
+        lateral = rel @ perp
+        mask = (
+            (along >= -float(backward_length))
+            & (along <= float(forward_length))
+            & (np.abs(lateral) <= 0.5 * width)
+        )
+        return points[mask]
+
     def build_midline(self, left_points: np.ndarray, right_points: np.ndarray) -> np.ndarray:
         if len(left_points) == 0 or len(right_points) == 0:
             return np.empty((0, 2), dtype=float)
@@ -3697,12 +3722,13 @@ class MaizeNavigator(Node):
             return points
         center = np.array([pose.x, pose.y], dtype=float)
         forward = self.yaw_to_vector(pose.yaw)
-        return self.points_in_oriented_rectangle(
+        return self.points_in_oriented_rectangle_asymmetric(
             points,
             center,
             forward,
-            self.p.hist_roi_depth,
-            self.p.hist_roi_width,
+            backward_length=1.0,
+            forward_length=2.0,
+            width=self.p.hist_roi_width,
         )
 
     def get_all_map_points(self) -> np.ndarray:
@@ -3771,12 +3797,17 @@ class MaizeNavigator(Node):
             )
             marker_id += 1
         if self.entrance_hist_center is not None and self.entrance_hist_direction is not None:
+            entrance_hist_direction = self.normalize(self.entrance_hist_direction)
+            entrance_hist_marker_center = (
+                self.entrance_hist_center
+                + 0.5 * (1.0 - 2.0) * entrance_hist_direction
+            )
             markers.markers.append(
                 self.create_rectangle_marker(
                     "entrance_histogram_roi",
                     marker_id,
-                    self.entrance_hist_center,
-                    self.entrance_hist_direction,
+                    entrance_hist_marker_center,
+                    entrance_hist_direction,
                     self.p.hist_roi_depth,
                     self.p.hist_roi_width,
                     (0.1, 1.0, 0.9, 0.8),
