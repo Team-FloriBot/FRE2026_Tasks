@@ -967,7 +967,7 @@ class Task4Brain(Node):
     def detector_config(self) -> DetectorInitConfig:
         return DetectorInitConfig(
             model_path=str(self.get_parameter("detector_model_path").value),
-            classes=list(self.get_parameter("detector_classes").value),
+            classes=[],
             confidence=float(self.get_parameter("detector_confidence").value),
             use_realsense_ros_wrapper=bool(
                 self.get_parameter("detector_use_realsense_ros_wrapper").value
@@ -985,8 +985,9 @@ class Task4Brain(Node):
                 self.get_parameter("detector_color_resolution_height").value
             ),
             fps=int(self.get_parameter("detector_fps").value),
-            rcnn_class_names=list(self.get_parameter("detector_rcnn_class_names").value),
+            rcnn_class_names=self.string_array_parameter("detector_rcnn_class_names"),
         )
+
 
     def point_from_target(self, target: ShotTarget) -> Point:
         point = Point()
