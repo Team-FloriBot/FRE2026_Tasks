@@ -42,3 +42,5 @@ pure_pursuit_node:
     final_heading_min_angular_velocity: 0.08
     final_heading_max_angular_velocity: 0.45
     final_heading_timeout: 8.0
+
+
