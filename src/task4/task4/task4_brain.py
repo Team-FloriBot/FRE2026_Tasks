@@ -8,13 +8,11 @@ from threading import Event
 from typing import Dict, List, Sequence, Tuple
 
 import rclpy
-from rcl_interfaces.msg import SetParametersResult
+from rcl_interfaces.msg import ParameterDescriptor, ParameterType, SetParametersResult
 from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.duration import Duration
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
-from rclpy.parameter import Parameter
-from rclpy.parameter_client import AsyncParameterClient
 from rclpy.time import Time
 
 from fre2026_detection_client import DetectorClient, DetectorInitConfig
@@ -86,7 +84,10 @@ class Task4Brain(Node):
         self.declare_parameter("detector_required", False)
         self.declare_parameter("detector_namespace", "/detector")
         self.declare_parameter("detector_model_path", "")
-        self.declare_parameter("detector_classes", [])
+        string_array_descriptor = ParameterDescriptor(
+            type=ParameterType.PARAMETER_STRING_ARRAY,
+        )
+        self.declare_parameter("detector_classes", [], string_array_descriptor)
         self.declare_parameter("detector_confidence", 0.5)
         self.declare_parameter("detector_model_type", "yolo")
         self.declare_parameter("detector_use_realsense_ros_wrapper", False)
@@ -98,7 +99,7 @@ class Task4Brain(Node):
         self.declare_parameter("detector_color_resolution_width", 640)
         self.declare_parameter("detector_color_resolution_height", 480)
         self.declare_parameter("detector_fps", 30)
-        self.declare_parameter("detector_rcnn_class_names", [])
+        self.declare_parameter("detector_rcnn_class_names", [], string_array_descriptor)
         self.declare_parameter("detector_service_timeout_sec", 10.0)
         self.declare_parameter("detector_release_after_coverage", False)
         self.declare_parameter("plan_topic", "/plan")
@@ -110,13 +111,6 @@ class Task4Brain(Node):
         self.declare_parameter("aim_target_frame", "pan_tilt_link_footprint")
         self.declare_parameter("aim_target_interval_sec", 5.0)
         self.declare_parameter("tf_timeout_sec", 0.5)
-
-        self.declare_parameter("pointcloud_height_update_enabled", True)
-        self.declare_parameter("pointcloud_to_laserscan_node", "/pointcloud_to_laserscan")
-        self.declare_parameter("pointcloud_min_height", 0.15)
-        self.declare_parameter("pointcloud_max_height", 0.8)
-        self.declare_parameter("pointcloud_parameter_timeout_sec", 2.0)
-        self.declare_parameter("pointcloud_height_update_required", True)
 
         self.callback_group = ReentrantCallbackGroup()
         self.tf_buffer = Buffer()
@@ -167,11 +161,6 @@ class Task4Brain(Node):
         self.tracker_reset_client = self.create_client(
             Trigger,
             str(self.get_parameter("tracker_reset_service").value),
-            callback_group=self.callback_group,
-        )
-        self.pointcloud_parameter_client = AsyncParameterClient(
-            self,
-            str(self.get_parameter("pointcloud_to_laserscan_node").value),
             callback_group=self.callback_group,
         )
         self.detector = DetectorClient(
@@ -277,7 +266,6 @@ class Task4Brain(Node):
         self.clear_planned_mission()
 
         try:
-            self.set_pointcloud_height_for_planning()
             polygon_points, start_waypoint = self.load_polygon_and_start_pose()
             self.coverage_polygon = polygon_points
             self.publish_polygon_marker(polygon_points)
@@ -717,93 +705,6 @@ class Task4Brain(Node):
         msg = Bool()
         msg.data = bool(active)
         self.tracker_active_pub.publish(msg)
-
-    def set_pointcloud_height_for_planning(self):
-        if not bool(self.get_parameter("pointcloud_height_update_enabled").value):
-            self.get_logger().info(
-                "Anpassung der Pointcloud-Scanhöhe ist per Parameter deaktiviert."
-            )
-            return
-
-        min_height = float(self.get_parameter("pointcloud_min_height").value)
-        max_height = float(self.get_parameter("pointcloud_max_height").value)
-        timeout_sec = max(
-            0.1,
-            float(self.get_parameter("pointcloud_parameter_timeout_sec").value),
-        )
-        required = bool(self.get_parameter("pointcloud_height_update_required").value)
-        remote_node = str(self.get_parameter("pointcloud_to_laserscan_node").value)
-
-        if min_height >= max_height:
-            raise ValueError(
-                "pointcloud_min_height muss kleiner als pointcloud_max_height sein "
-                f"(aktuell {min_height} >= {max_height})."
-            )
-
-        if not self.pointcloud_parameter_client.wait_for_services(timeout_sec=timeout_sec):
-            message = (
-                f"Parameter-Services des Knotens '{remote_node}' sind nicht erreichbar."
-            )
-            if required:
-                raise RuntimeError(message)
-            self.get_logger().warn(message + " Coverage-Planung wird trotzdem fortgesetzt.")
-            return
-
-        future = self.pointcloud_parameter_client.set_parameters(
-            [
-                Parameter("min_height", Parameter.Type.DOUBLE, min_height),
-                Parameter("max_height", Parameter.Type.DOUBLE, max_height),
-            ]
-        )
-        completed = Event()
-        future.add_done_callback(lambda _: completed.set())
-
-        if not completed.wait(timeout=timeout_sec):
-            message = (
-                f"Timeout beim Setzen der Scanhöhe auf Knoten '{remote_node}'."
-            )
-            if required:
-                raise RuntimeError(message)
-            self.get_logger().warn(message + " Coverage-Planung wird trotzdem fortgesetzt.")
-            return
-
-        try:
-            results = future.result()
-        except Exception as exc:
-            message = (
-                f"Scanhöhe auf Knoten '{remote_node}' konnte nicht gesetzt werden: {exc}"
-            )
-            if required:
-                raise RuntimeError(message) from exc
-            self.get_logger().warn(message + " Coverage-Planung wird trotzdem fortgesetzt.")
-            return
-
-        failures = []
-        parameter_names = ("min_height", "max_height")
-        for name, result in zip(parameter_names, results):
-            if not result.successful:
-                failures.append(f"{name}: {result.reason}")
-
-        if len(results) != len(parameter_names):
-            failures.append(
-                f"unerwartete Anzahl Antworten: {len(results)} statt {len(parameter_names)}"
-            )
-
-        if failures:
-            message = (
-                f"Knoten '{remote_node}' hat Scanhöhen-Parameter abgelehnt: "
-                + "; ".join(failures)
-            )
-            if required:
-                raise RuntimeError(message)
-            self.get_logger().warn(message + " Coverage-Planung wird trotzdem fortgesetzt.")
-            return
-
-        self.get_logger().info(
-            f"Scanhöhe für Coverage-Planung gesetzt: "
-            f"min_height={min_height:.3f} m, max_height={max_height:.3f} m "
-            f"auf '{remote_node}'."
-        )
 
     def reset_tracker(self):
         if not self.tracker_reset_client.service_is_ready():
