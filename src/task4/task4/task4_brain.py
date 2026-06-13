@@ -8,7 +8,7 @@ from threading import Event
 from typing import Dict, List, Sequence, Tuple
 
 import rclpy
-from rcl_interfaces.msg import SetParametersResult
+from rcl_interfaces.msg import ParameterDescriptor, ParameterType, SetParametersResult
 from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.duration import Duration
 from rclpy.executors import MultiThreadedExecutor
@@ -84,7 +84,10 @@ class Task4Brain(Node):
         self.declare_parameter("detector_required", False)
         self.declare_parameter("detector_namespace", "/detector")
         self.declare_parameter("detector_model_path", "")
-        self.declare_parameter("detector_classes", [])
+        string_array_descriptor = ParameterDescriptor(
+            type=ParameterType.PARAMETER_STRING_ARRAY,
+        )
+        self.declare_parameter("detector_classes", [], string_array_descriptor)
         self.declare_parameter("detector_confidence", 0.5)
         self.declare_parameter("detector_model_type", "yolo")
         self.declare_parameter("detector_use_realsense_ros_wrapper", False)
@@ -96,7 +99,7 @@ class Task4Brain(Node):
         self.declare_parameter("detector_color_resolution_width", 640)
         self.declare_parameter("detector_color_resolution_height", 480)
         self.declare_parameter("detector_fps", 30)
-        self.declare_parameter("detector_rcnn_class_names", [])
+        self.declare_parameter("detector_rcnn_class_names", [], string_array_descriptor)
         self.declare_parameter("detector_service_timeout_sec", 10.0)
         self.declare_parameter("detector_release_after_coverage", False)
         self.declare_parameter("plan_topic", "/plan")
