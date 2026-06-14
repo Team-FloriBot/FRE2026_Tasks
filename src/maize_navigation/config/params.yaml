@@ -69,9 +69,9 @@ maize_navigator:
     linear_deceleration_limit: 0.30
     target_filter_alpha: 0.30
     # Ausfahr- und Einfahrziel liegen so weit ausserhalb der Pflanzenenden.
-    row_end_goal_outward_distance: 0.30
+    row_end_goal_outward_distance: 0.15
     # Sicherheitsabstand der Wende-Querlinie hinter dem aeussersten relevanten Peak.
-    row_exit_extension_distance: 0.50
+    row_exit_extension_distance: 0.40
 
     follow_max_angular_speed: 0.90
     angular_rate_limit: 1.4
@@ -107,14 +107,14 @@ maize_navigator:
     # Verrundete, monoton verfolgte Route fuer das Vorgewende.
     maneuver_speed: 0.5
     maneuver_slow_speed: 0.10
-    maneuver_lookahead_distance: 1.2
-    maneuver_turn_lookahead_distance: 0.35
+    maneuver_lookahead_distance: 1.4
+    maneuver_turn_lookahead_distance: 0.4
     maneuver_lookahead_curvature_gain: 2.5
     maneuver_lookahead_lateral_error_gain: 0.5
     maneuver_lookahead_filter_alpha: 0.25
     maneuver_lookahead_speed_reduction_gain: 2.0
     maneuver_route_spacing: 0.08
-    maneuver_corner_radius: 0.40
+    maneuver_corner_radius: 0.50
     maneuver_entry_extension_distance: 0.80
     maneuver_max_route_deviation: 0.70
     maneuver_entry_lateral_tolerance: 0.25
