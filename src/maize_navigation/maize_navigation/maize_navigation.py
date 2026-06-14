@@ -222,16 +222,18 @@ class NavigatorParams:
     laser_roi_center_offset_limit: float = 0.25
     laser_ransac_iterations: int = 80
     laser_ransac_distance: float = 0.08
-    laser_min_inliers: int = 3
-    laser_min_visible_length: float = 0.25
+    laser_min_inliers: int = 5
+    laser_min_visible_length: float = 0.40
     laser_max_abs_line_slope: float = 0.9
     laser_max_angle_to_map: float = 0.45
     laser_max_center_offset: float = 0.40
     laser_min_confidence: float = 0.10
-    laser_full_confidence: float = 0.65
+    laser_full_confidence: float = 0.75
     laser_max_weight_both_sides: float = 0.55
     laser_max_weight_one_side: float = 0.35
-    laser_tracker_alpha: float = 0.40
+    laser_tracker_alpha: float = 0.25
+    laser_line_filter_alpha: float = 0.20
+    laser_target_max_lateral_step: float = 0.05
 
     follow_speed: float = 0.20
     slow_speed: float = 0.12
@@ -249,8 +251,8 @@ class NavigatorParams:
     min_follow_turn_radius: float = 0.37
     linear_acceleration_limit: float = 0.18
     linear_deceleration_limit: float = 0.30
-    angular_rate_limit: float = 1.2
-    target_filter_alpha: float = 0.35
+    angular_rate_limit: float = 1.4
+    target_filter_alpha: float = 0.30
     row_exit_extension_distance: float = 0.30
     row_end_goal_outward_distance: float = 0.30
     path_goal_xy_tolerance: float = 0.20
@@ -297,9 +299,13 @@ class LaserRowFollower:
     def __init__(self, params: NavigatorParams) -> None:
         self.p = params
         self.filtered_confidence = 0.0
+        self.filtered_center_slope: Optional[float] = None
+        self.filtered_center_intercept: Optional[float] = None
 
     def reset(self) -> None:
         self.filtered_confidence = 0.0
+        self.filtered_center_slope = None
+        self.filtered_center_intercept = None
 
     def reject(self, result: LaserFollowResult, reason: str) -> LaserFollowResult:
         self.filtered_confidence *= 1.0 - self.p.laser_tracker_alpha
@@ -360,6 +366,12 @@ class LaserRowFollower:
         if abs(laser_target_y - float(map_target_base[1])) > self.p.laser_max_center_offset:
             return self.reject(result, "center differs from map")
 
+        result.center_slope, result.center_intercept, laser_target_y = self.filter_center_line(
+            result.center_slope,
+            result.center_intercept,
+            target_x,
+        )
+
         alpha = self.p.laser_tracker_alpha
         self.filtered_confidence = (1.0 - alpha) * self.filtered_confidence + alpha * raw_confidence
         confidence_range = max(1e-6, self.p.laser_full_confidence - self.p.laser_min_confidence)
@@ -371,6 +383,33 @@ class LaserRowFollower:
         result.target_base = np.array([target_x, laser_target_y], dtype=float)
         result.reason = "ok"
         return result
+
+    def filter_center_line(
+        self,
+        raw_slope: float,
+        raw_intercept: float,
+        target_x: float,
+    ) -> Tuple[float, float, float]:
+        if self.filtered_center_slope is None or self.filtered_center_intercept is None:
+            self.filtered_center_slope = float(raw_slope)
+            self.filtered_center_intercept = float(raw_intercept)
+            return float(raw_slope), float(raw_intercept), float(raw_slope * target_x + raw_intercept)
+
+        previous_target_y = self.filtered_center_slope * target_x + self.filtered_center_intercept
+        alpha = self.p.laser_line_filter_alpha
+        slope = (1.0 - alpha) * self.filtered_center_slope + alpha * float(raw_slope)
+        intercept = (1.0 - alpha) * self.filtered_center_intercept + alpha * float(raw_intercept)
+        target_y = slope * target_x + intercept
+
+        max_step = self.p.laser_target_max_lateral_step
+        if max_step > 0.0:
+            delta_y = float(np.clip(target_y - previous_target_y, -max_step, max_step))
+            target_y = previous_target_y + delta_y
+            intercept = target_y - slope * target_x
+
+        self.filtered_center_slope = float(slope)
+        self.filtered_center_intercept = float(intercept)
+        return float(slope), float(intercept), float(target_y)
 
     def scan_to_points(self, scan: LaserScan) -> np.ndarray:
         ranges = np.asarray(scan.ranges, dtype=float)
@@ -652,6 +691,10 @@ class MaizeNavigator(Node):
             get_param("laser_max_weight_one_side", p.laser_max_weight_one_side)
         )
         p.laser_tracker_alpha = float(get_param("laser_tracker_alpha", p.laser_tracker_alpha))
+        p.laser_line_filter_alpha = float(get_param("laser_line_filter_alpha", p.laser_line_filter_alpha))
+        p.laser_target_max_lateral_step = float(
+            get_param("laser_target_max_lateral_step", p.laser_target_max_lateral_step)
+        )
 
         p.follow_speed = float(get_param("follow_speed", p.follow_speed))
         p.slow_speed = float(get_param("slow_speed", p.slow_speed))
@@ -793,6 +836,8 @@ class MaizeNavigator(Node):
         self.p.laser_max_weight_both_sides = float(np.clip(self.p.laser_max_weight_both_sides, 0.0, 1.0))
         self.p.laser_max_weight_one_side = float(np.clip(self.p.laser_max_weight_one_side, 0.0, 1.0))
         self.p.laser_tracker_alpha = float(np.clip(self.p.laser_tracker_alpha, 0.01, 1.0))
+        self.p.laser_line_filter_alpha = float(np.clip(self.p.laser_line_filter_alpha, 0.01, 1.0))
+        self.p.laser_target_max_lateral_step = max(0.0, self.p.laser_target_max_lateral_step)
         self.p.min_follow_turn_radius = max(0.1, self.p.min_follow_turn_radius)
         self.p.linear_acceleration_limit = max(0.01, self.p.linear_acceleration_limit)
         self.p.linear_deceleration_limit = max(0.01, self.p.linear_deceleration_limit)
