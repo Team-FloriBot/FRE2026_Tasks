@@ -120,6 +120,16 @@ maize_navigator:
     maneuver_entry_lateral_tolerance: 0.25
     maneuver_entry_yaw_tolerance: 0.45
 
+    # Rechteckbasierte Reiheneingang-Erkennung im Vorgewende.
+    entrance_rect_enabled: true
+    entrance_histogram_emergency_enabled: true
+    entrance_rect_max_angle_to_prediction_deg: 20.0
+    entrance_rect_max_angle_to_reference_deg: 40.0
+    entrance_rect_max_position_correction: 0.50
+    entrance_rect_backtrack_steps: 4
+    entrance_rect_retry_until_remaining_distance: 0.60
+    entrance_rect_min_failed_attempts_before_histogram: 5
+
     pattern: "3L 6R 5R 4R 3R 2R 1R"
     # Startgasse 1 liegt zwischen Pflanzenreihe 1 und 2.
     # Die Richtung gilt feldfest relativ zur Blickrichtung beim Missionsstart.
