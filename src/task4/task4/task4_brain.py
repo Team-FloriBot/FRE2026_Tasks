@@ -8,14 +8,14 @@ from threading import Event
 from typing import Dict, List, Sequence, Tuple
 
 import rclpy
-from rcl_interfaces.msg import ParameterDescriptor, ParameterType, SetParametersResult
+from rcl_interfaces.msg import SetParametersResult
 from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.duration import Duration
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
 from rclpy.time import Time
 
-from fre2026_detection_client import DetectorClient, DetectorInitConfig
+from fre2026_detection_client import DetectorClient
 from fre2026_detection_interfaces.msg import TrackedObjectArray
 from geometry_msgs.msg import Point, PointStamped, PoseStamped
 from nav_msgs.msg import Path
@@ -72,36 +72,15 @@ class Task4Brain(Node):
         self.declare_parameter("headland_width", 0.5)
         self.declare_parameter("return_start_tolerance_m", 0.15)
 
-        self.declare_parameter("shooting_range_m", 2.0)
-        self.declare_parameter("shoot_angle_min_deg", -60.0)
-        self.declare_parameter("shoot_angle_max_deg", 60.0)
+        self.declare_parameter("shooting_range_m", 9.0)
+        self.declare_parameter("shoot_angle_min_deg", 20.0)
+        self.declare_parameter("shoot_angle_max_deg", 160.0)
         self.declare_parameter("min_navigation_segment_m", 0.05)
 
         self.declare_parameter("tracked_objects_topic", "/tracker/tracked_objects")
         self.declare_parameter("tracker_active_topic", "/tracker/active")
         self.declare_parameter("tracker_reset_service", "/tracker/reset")
-        self.declare_parameter("detector_enabled", True)
-        self.declare_parameter("detector_required", False)
-        self.declare_parameter("detector_namespace", "/detector")
         self.declare_parameter("detector_model_path", "")
-        string_array_descriptor = ParameterDescriptor(
-            type=ParameterType.PARAMETER_STRING_ARRAY,
-        )
-        self.declare_parameter("detector_classes", [], string_array_descriptor)
-        self.declare_parameter("detector_confidence", 0.5)
-        self.declare_parameter("detector_model_type", "yolo")
-        self.declare_parameter("detector_use_realsense_ros_wrapper", False)
-        self.declare_parameter("detector_use_decimation", False)
-        self.declare_parameter("detector_use_spatial", False)
-        self.declare_parameter("detector_use_temporal", True)
-        self.declare_parameter("detector_use_hole_filling", True)
-        self.declare_parameter("detector_use_mask_filter", True)
-        self.declare_parameter("detector_color_resolution_width", 640)
-        self.declare_parameter("detector_color_resolution_height", 480)
-        self.declare_parameter("detector_fps", 30)
-        self.declare_parameter("detector_rcnn_class_names", [], string_array_descriptor)
-        self.declare_parameter("detector_service_timeout_sec", 10.0)
-        self.declare_parameter("detector_release_after_coverage", False)
         self.declare_parameter("plan_topic", "/plan")
         self.declare_parameter("polygon_marker_topic", "/task4/coverage_polygon_marker")
         self.declare_parameter("shooting_marker_topic", "/task4/shooting_markers")
@@ -165,7 +144,6 @@ class Task4Brain(Node):
         )
         self.detector = DetectorClient(
             self,
-            namespace=str(self.get_parameter("detector_namespace").value),
             callback_group=self.callback_group,
         )
 
@@ -721,29 +699,18 @@ class Task4Brain(Node):
         completed.wait(timeout=1.0)
 
     def start_detector_for_coverage(self):
-        if not bool(self.get_parameter("detector_enabled").value):
-            self.get_logger().info("Detector ist per Parameter deaktiviert.")
-            return
-
         model_path = str(self.get_parameter("detector_model_path").value)
         if not model_path:
-            message = "detector_model_path ist leer; Detector wird nicht gestartet."
-            if bool(self.get_parameter("detector_required").value):
-                raise RuntimeError(message)
-            self.get_logger().warn(message)
+            self.get_logger().warn("detector_model_path ist leer; Detector wird nicht gestartet.")
             return
 
-        timeout_sec = float(self.get_parameter("detector_service_timeout_sec").value)
+        timeout_sec = 2.0
         if not self.detector.wait_for_services(timeout_sec=timeout_sec):
-            message = "Detector-Services sind nicht erreichbar."
-            if bool(self.get_parameter("detector_required").value):
-                raise RuntimeError(message)
-            self.get_logger().warn(message)
+            self.get_logger().warn("Detector-Services sind nicht erreichbar.")
             return
 
-        config = self.detector_config()
         self.call_detector_service_sync(
-            self.detector.init_from_config(config),
+            self.detector.init(model_path=model_path),
             "init",
             timeout_sec,
         )
@@ -756,15 +723,10 @@ class Task4Brain(Node):
         )
         self.detector_started = True
         self.detector.clear_results()
-        self.get_logger().info(
-            f"Detector gestartet: model='{config.model_path}', classes={list(config.classes)}"
-        )
+        self.get_logger().info(f"Detector gestartet: model='{model_path}'")
 
     def stop_detector_for_coverage(self, reason: str):
-        if not bool(self.get_parameter("detector_enabled").value):
-            return
-
-        timeout_sec = float(self.get_parameter("detector_service_timeout_sec").value)
+        timeout_sec = 2.0
 
         if self.detector_started:
             try:
@@ -776,17 +738,6 @@ class Task4Brain(Node):
                 )
             finally:
                 self.detector_started = False
-
-        if self.detector_initialized and bool(self.get_parameter("detector_release_after_coverage").value):
-            try:
-                self.call_detector_service_sync(
-                    self.detector.release(),
-                    "release",
-                    timeout_sec,
-                    raise_on_failure=False,
-                )
-            finally:
-                self.detector_initialized = False
 
         self.get_logger().info(f"Detector fuer Coverage gestoppt: {reason}")
 
@@ -963,31 +914,6 @@ class Task4Brain(Node):
             shoot_angle_max_deg=float(self.get_parameter("shoot_angle_max_deg").value),
             headland_width=float(self.get_parameter("headland_width").value),
         )
-
-    def detector_config(self) -> DetectorInitConfig:
-        return DetectorInitConfig(
-            model_path=str(self.get_parameter("detector_model_path").value),
-            classes=[],
-            confidence=float(self.get_parameter("detector_confidence").value),
-            use_realsense_ros_wrapper=bool(
-                self.get_parameter("detector_use_realsense_ros_wrapper").value
-            ),
-            model_type=str(self.get_parameter("detector_model_type").value),
-            use_decimation=bool(self.get_parameter("detector_use_decimation").value),
-            use_spatial=bool(self.get_parameter("detector_use_spatial").value),
-            use_temporal=bool(self.get_parameter("detector_use_temporal").value),
-            use_hole_filling=bool(self.get_parameter("detector_use_hole_filling").value),
-            use_mask_filter=bool(self.get_parameter("detector_use_mask_filter").value),
-            color_resolution_width=int(
-                self.get_parameter("detector_color_resolution_width").value
-            ),
-            color_resolution_height=int(
-                self.get_parameter("detector_color_resolution_height").value
-            ),
-            fps=int(self.get_parameter("detector_fps").value),
-            rcnn_class_names=self.string_array_parameter("detector_rcnn_class_names"),
-        )
-
 
     def point_from_target(self, target: ShotTarget) -> Point:
         point = Point()
