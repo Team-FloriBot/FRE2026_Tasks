@@ -317,7 +317,7 @@ class Task4Brain(Node):
     def finish_coverage_drive(self):
         self.set_path_tracking_active(False)
         self.set_tracker_active(False)
-        self.stop_detector_for_coverage("Coverage-Fahrt beendet.")
+        self.stop_detector_for_coverage("Coverage-Fahrt beendet.", release_detector=True)
         self.set_state(MissionState.PLAN_SHOOTING)
 
     def plan_shooting_phase(self):
@@ -725,7 +725,7 @@ class Task4Brain(Node):
         self.detector.clear_results()
         self.get_logger().info(f"Detector gestartet: model='{model_path}'")
 
-    def stop_detector_for_coverage(self, reason: str):
+    def stop_detector_for_coverage(self, reason: str, release_detector: bool = False):
         timeout_sec = 2.0
 
         if self.detector_started:
@@ -739,7 +739,19 @@ class Task4Brain(Node):
             finally:
                 self.detector_started = False
 
-        self.get_logger().info(f"Detector fuer Coverage gestoppt: {reason}")
+        if release_detector and self.detector_initialized:
+            try:
+                self.call_detector_service_sync(
+                    self.detector.release(),
+                    "release",
+                    timeout_sec,
+                    raise_on_failure=False,
+                )
+            finally:
+                self.detector_initialized = False
+
+        action = "freigegeben" if release_detector else "gestoppt"
+        self.get_logger().info(f"Detector fuer Coverage {action}: {reason}")
 
     def call_detector_service_sync(
         self,
@@ -810,7 +822,7 @@ class Task4Brain(Node):
     def abort_mission(self, reason: str):
         self.set_path_tracking_active(False)
         self.set_tracker_active(False)
-        self.stop_detector_for_coverage(reason)
+        self.stop_detector_for_coverage(reason, release_detector=True)
         self.current_aim_targets = []
         self.current_aim_target_index = 0
         self.last_error = reason
@@ -864,7 +876,7 @@ class Task4Brain(Node):
     def reset_mission(self):
         self.set_path_tracking_active(False)
         self.set_tracker_active(False)
-        self.stop_detector_for_coverage("Task4 Reset.")
+        self.stop_detector_for_coverage("Task4 Reset.", release_detector=True)
         self.clear_planned_mission()
         self.last_error = ""
         self.last_pp_status = ""
@@ -887,7 +899,7 @@ class Task4Brain(Node):
     def fail_mission(self, reason: str):
         self.set_path_tracking_active(False)
         self.set_tracker_active(False)
-        self.stop_detector_for_coverage(reason)
+        self.stop_detector_for_coverage(reason, release_detector=True)
         self.current_aim_targets = []
         self.current_aim_target_index = 0
         self.last_error = reason
