@@ -49,7 +49,11 @@ def plan_shooting_poses(
     del coverage_path, start_xy
 
     polygon = normalize_polygon_points(polygon_points)
-    unique_targets = _unique_targets_inside_polygon(targets, polygon)
+    unique_targets = _unique_targets_inside_headland_area(
+        targets,
+        polygon,
+        float(config.headland_width),
+    )
     if not unique_targets:
         return [], []
 
@@ -66,13 +70,19 @@ def plan_shooting_poses(
     return [shooting_pose], uncovered
 
 
-def _unique_targets_inside_polygon(
+def _unique_targets_inside_headland_area(
     targets: Sequence[ShotTarget],
     polygon: Sequence[Point2D],
+    headland_width: float,
 ) -> List[ShotTarget]:
+    min_boundary_distance = max(0.0, float(headland_width))
     by_id = {}
     for target in targets:
-        if point_in_polygon((target.x, target.y), polygon):
+        point = (target.x, target.y)
+        if (
+            point_in_polygon(point, polygon)
+            and distance_to_polygon_boundary(point, polygon) >= min_boundary_distance
+        ):
             by_id[int(target.target_id)] = target
     return list(by_id.values())
 
@@ -215,6 +225,34 @@ def point_on_segment(point: Point2D, first: Point2D, second: Point2D) -> bool:
         return False
     dot = (px - x1) * (px - x2) + (py - y1) * (py - y2)
     return dot <= 1e-9
+
+
+def distance_to_polygon_boundary(point: Point2D, polygon_points: Sequence[Point2D]) -> float:
+    polygon = normalize_polygon_points(polygon_points)
+    if len(polygon) < 2:
+        return 0.0
+
+    return min(
+        distance_to_segment(point, first, polygon[(index + 1) % len(polygon)])
+        for index, first in enumerate(polygon)
+    )
+
+
+def distance_to_segment(point: Point2D, first: Point2D, second: Point2D) -> float:
+    px, py = float(point[0]), float(point[1])
+    x1, y1 = float(first[0]), float(first[1])
+    x2, y2 = float(second[0]), float(second[1])
+    dx = x2 - x1
+    dy = y2 - y1
+    length_sq = dx * dx + dy * dy
+    if length_sq <= 1e-12:
+        return math.hypot(px - x1, py - y1)
+
+    t = ((px - x1) * dx + (py - y1) * dy) / length_sq
+    t = max(0.0, min(1.0, t))
+    closest_x = x1 + t * dx
+    closest_y = y1 + t * dy
+    return math.hypot(px - closest_x, py - closest_y)
 
 
 def distance_2d(first: Point2D, second: Point2D) -> float:
