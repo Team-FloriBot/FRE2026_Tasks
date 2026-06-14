@@ -62,6 +62,19 @@ class SegmentDebug:
 
 
 @dataclass
+class RowEndRectangle:
+    center: np.ndarray
+    direction: np.ndarray
+    line_points: np.ndarray
+    field_counts: List[int]
+    support_count: int
+    row_number: Optional[int] = None
+    side: str = ""
+    predicted: bool = False
+    corrected: bool = False
+
+
+@dataclass
 class RowMarchResult:
     points: np.ndarray = field(default_factory=lambda: np.empty((0, 2), dtype=float))
     point_directions: np.ndarray = field(default_factory=lambda: np.empty((0, 2), dtype=float))
@@ -71,6 +84,9 @@ class RowMarchResult:
     ended: bool = False
     end_point: Optional[np.ndarray] = None
     end_direction: Optional[np.ndarray] = None
+    end_rectangle: Optional[RowEndRectangle] = None
+    fifth_segment_rectangle: Optional[RowEndRectangle] = None
+    full_support_rectangle: Optional[RowEndRectangle] = None
 
 
 @dataclass
@@ -222,16 +238,18 @@ class NavigatorParams:
     laser_roi_center_offset_limit: float = 0.25
     laser_ransac_iterations: int = 80
     laser_ransac_distance: float = 0.08
-    laser_min_inliers: int = 3
-    laser_min_visible_length: float = 0.25
+    laser_min_inliers: int = 5
+    laser_min_visible_length: float = 0.40
     laser_max_abs_line_slope: float = 0.9
     laser_max_angle_to_map: float = 0.45
     laser_max_center_offset: float = 0.40
     laser_min_confidence: float = 0.10
-    laser_full_confidence: float = 0.65
+    laser_full_confidence: float = 0.75
     laser_max_weight_both_sides: float = 0.55
     laser_max_weight_one_side: float = 0.35
-    laser_tracker_alpha: float = 0.40
+    laser_tracker_alpha: float = 0.25
+    laser_line_filter_alpha: float = 0.20
+    laser_target_max_lateral_step: float = 0.05
 
     follow_speed: float = 0.20
     slow_speed: float = 0.12
@@ -249,8 +267,8 @@ class NavigatorParams:
     min_follow_turn_radius: float = 0.37
     linear_acceleration_limit: float = 0.18
     linear_deceleration_limit: float = 0.30
-    angular_rate_limit: float = 1.2
-    target_filter_alpha: float = 0.35
+    angular_rate_limit: float = 1.4
+    target_filter_alpha: float = 0.30
     row_exit_extension_distance: float = 0.30
     row_end_goal_outward_distance: float = 0.30
     path_goal_xy_tolerance: float = 0.20
@@ -271,6 +289,14 @@ class NavigatorParams:
     maneuver_max_route_deviation: float = 0.70
     maneuver_entry_lateral_tolerance: float = 0.25
     maneuver_entry_yaw_tolerance: float = 0.45
+    entrance_rect_enabled: bool = True
+    entrance_histogram_emergency_enabled: bool = True
+    entrance_rect_max_angle_to_prediction_deg: float = 20.0
+    entrance_rect_max_angle_to_reference_deg: float = 40.0
+    entrance_rect_max_position_correction: float = 0.50
+    entrance_rect_backtrack_steps: int = 4
+    entrance_rect_retry_until_remaining_distance: float = 0.60
+    entrance_rect_min_failed_attempts_before_histogram: int = 5
     row_map_output_directory: str = "~/.ros/maize_navigation"
     object_positions_output_directory: str = "~/.ros/maize_navigation"
     slam_reset_service: str = "/slam_toolbox/reset"
@@ -297,9 +323,13 @@ class LaserRowFollower:
     def __init__(self, params: NavigatorParams) -> None:
         self.p = params
         self.filtered_confidence = 0.0
+        self.filtered_center_slope: Optional[float] = None
+        self.filtered_center_intercept: Optional[float] = None
 
     def reset(self) -> None:
         self.filtered_confidence = 0.0
+        self.filtered_center_slope = None
+        self.filtered_center_intercept = None
 
     def reject(self, result: LaserFollowResult, reason: str) -> LaserFollowResult:
         self.filtered_confidence *= 1.0 - self.p.laser_tracker_alpha
@@ -360,6 +390,12 @@ class LaserRowFollower:
         if abs(laser_target_y - float(map_target_base[1])) > self.p.laser_max_center_offset:
             return self.reject(result, "center differs from map")
 
+        result.center_slope, result.center_intercept, laser_target_y = self.filter_center_line(
+            result.center_slope,
+            result.center_intercept,
+            target_x,
+        )
+
         alpha = self.p.laser_tracker_alpha
         self.filtered_confidence = (1.0 - alpha) * self.filtered_confidence + alpha * raw_confidence
         confidence_range = max(1e-6, self.p.laser_full_confidence - self.p.laser_min_confidence)
@@ -371,6 +407,33 @@ class LaserRowFollower:
         result.target_base = np.array([target_x, laser_target_y], dtype=float)
         result.reason = "ok"
         return result
+
+    def filter_center_line(
+        self,
+        raw_slope: float,
+        raw_intercept: float,
+        target_x: float,
+    ) -> Tuple[float, float, float]:
+        if self.filtered_center_slope is None or self.filtered_center_intercept is None:
+            self.filtered_center_slope = float(raw_slope)
+            self.filtered_center_intercept = float(raw_intercept)
+            return float(raw_slope), float(raw_intercept), float(raw_slope * target_x + raw_intercept)
+
+        previous_target_y = self.filtered_center_slope * target_x + self.filtered_center_intercept
+        alpha = self.p.laser_line_filter_alpha
+        slope = (1.0 - alpha) * self.filtered_center_slope + alpha * float(raw_slope)
+        intercept = (1.0 - alpha) * self.filtered_center_intercept + alpha * float(raw_intercept)
+        target_y = slope * target_x + intercept
+
+        max_step = self.p.laser_target_max_lateral_step
+        if max_step > 0.0:
+            delta_y = float(np.clip(target_y - previous_target_y, -max_step, max_step))
+            target_y = previous_target_y + delta_y
+            intercept = target_y - slope * target_x
+
+        self.filtered_center_slope = float(slope)
+        self.filtered_center_intercept = float(intercept)
+        return float(slope), float(intercept), float(target_y)
 
     def scan_to_points(self, scan: LaserScan) -> np.ndarray:
         ranges = np.asarray(scan.ranges, dtype=float)
@@ -549,6 +612,10 @@ class MaizeNavigator(Node):
         self.entrance_active_step: Optional[PatternStep] = None
         self.entrance_traverse_outward: Optional[float] = None
         self.pending_target_peaks: Optional[Tuple[EntrancePeak, EntrancePeak]] = None
+        self.entrance_rect_failed_attempts: int = 0
+        self.entrance_lock_source: str = ""
+        self.entrance_rect_debug_predicted: List[RowEndRectangle] = []
+        self.entrance_rect_debug_corrected: List[RowEndRectangle] = []
         self.stored_rows: Dict[int, np.ndarray] = {}
         self.row_end_directions_by_side: Dict[str, List[np.ndarray]] = {"forward": [], "backward": []}
         self.row_map_exported: bool = False
@@ -652,6 +719,10 @@ class MaizeNavigator(Node):
             get_param("laser_max_weight_one_side", p.laser_max_weight_one_side)
         )
         p.laser_tracker_alpha = float(get_param("laser_tracker_alpha", p.laser_tracker_alpha))
+        p.laser_line_filter_alpha = float(get_param("laser_line_filter_alpha", p.laser_line_filter_alpha))
+        p.laser_target_max_lateral_step = float(
+            get_param("laser_target_max_lateral_step", p.laser_target_max_lateral_step)
+        )
 
         p.follow_speed = float(get_param("follow_speed", p.follow_speed))
         p.slow_speed = float(get_param("slow_speed", p.slow_speed))
@@ -725,6 +796,31 @@ class MaizeNavigator(Node):
         p.maneuver_entry_yaw_tolerance = float(
             get_param("maneuver_entry_yaw_tolerance", p.maneuver_entry_yaw_tolerance)
         )
+        p.entrance_rect_enabled = bool(get_param("entrance_rect_enabled", p.entrance_rect_enabled))
+        p.entrance_histogram_emergency_enabled = bool(
+            get_param("entrance_histogram_emergency_enabled", p.entrance_histogram_emergency_enabled)
+        )
+        p.entrance_rect_max_angle_to_prediction_deg = float(
+            get_param("entrance_rect_max_angle_to_prediction_deg", p.entrance_rect_max_angle_to_prediction_deg)
+        )
+        p.entrance_rect_max_angle_to_reference_deg = float(
+            get_param("entrance_rect_max_angle_to_reference_deg", p.entrance_rect_max_angle_to_reference_deg)
+        )
+        p.entrance_rect_max_position_correction = float(
+            get_param("entrance_rect_max_position_correction", p.entrance_rect_max_position_correction)
+        )
+        p.entrance_rect_backtrack_steps = int(
+            get_param("entrance_rect_backtrack_steps", p.entrance_rect_backtrack_steps)
+        )
+        p.entrance_rect_retry_until_remaining_distance = float(
+            get_param("entrance_rect_retry_until_remaining_distance", p.entrance_rect_retry_until_remaining_distance)
+        )
+        p.entrance_rect_min_failed_attempts_before_histogram = int(
+            get_param(
+                "entrance_rect_min_failed_attempts_before_histogram",
+                p.entrance_rect_min_failed_attempts_before_histogram,
+            )
+        )
         p.row_map_output_directory = str(get_param("row_map_output_directory", p.row_map_output_directory))
         p.object_positions_output_directory = str(
             get_param("object_positions_output_directory", p.object_positions_output_directory)
@@ -793,6 +889,8 @@ class MaizeNavigator(Node):
         self.p.laser_max_weight_both_sides = float(np.clip(self.p.laser_max_weight_both_sides, 0.0, 1.0))
         self.p.laser_max_weight_one_side = float(np.clip(self.p.laser_max_weight_one_side, 0.0, 1.0))
         self.p.laser_tracker_alpha = float(np.clip(self.p.laser_tracker_alpha, 0.01, 1.0))
+        self.p.laser_line_filter_alpha = float(np.clip(self.p.laser_line_filter_alpha, 0.01, 1.0))
+        self.p.laser_target_max_lateral_step = max(0.0, self.p.laser_target_max_lateral_step)
         self.p.min_follow_turn_radius = max(0.1, self.p.min_follow_turn_radius)
         self.p.linear_acceleration_limit = max(0.01, self.p.linear_acceleration_limit)
         self.p.linear_deceleration_limit = max(0.01, self.p.linear_deceleration_limit)
@@ -847,6 +945,24 @@ class MaizeNavigator(Node):
         self.p.maneuver_max_route_deviation = max(0.10, self.p.maneuver_max_route_deviation)
         self.p.maneuver_entry_lateral_tolerance = max(0.05, self.p.maneuver_entry_lateral_tolerance)
         self.p.maneuver_entry_yaw_tolerance = max(0.05, self.p.maneuver_entry_yaw_tolerance)
+        self.p.entrance_rect_max_angle_to_prediction_deg = max(
+            0.0,
+            self.p.entrance_rect_max_angle_to_prediction_deg,
+        )
+        self.p.entrance_rect_max_angle_to_reference_deg = max(
+            self.p.entrance_rect_max_angle_to_prediction_deg,
+            self.p.entrance_rect_max_angle_to_reference_deg,
+        )
+        self.p.entrance_rect_max_position_correction = max(0.0, self.p.entrance_rect_max_position_correction)
+        self.p.entrance_rect_backtrack_steps = max(0, self.p.entrance_rect_backtrack_steps)
+        self.p.entrance_rect_retry_until_remaining_distance = max(
+            0.0,
+            self.p.entrance_rect_retry_until_remaining_distance,
+        )
+        self.p.entrance_rect_min_failed_attempts_before_histogram = max(
+            0,
+            self.p.entrance_rect_min_failed_attempts_before_histogram,
+        )
         self.p.starting_lane_number = max(1, self.p.starting_lane_number)
         self.p.row_numbers_increase_to = self.p.row_numbers_increase_to.lower()
         if self.p.row_numbers_increase_to not in ("left", "right"):
@@ -1018,9 +1134,9 @@ class MaizeNavigator(Node):
         medium = DrivingProfile(
             laser_max_weight_both_sides=0.65,
             laser_max_weight_one_side=0.45,
-            follow_speed=high.follow_speed * 1.30,
-            slow_speed=high.slow_speed * 1.25,
-            pure_pursuit_gain=high.pure_pursuit_gain * 0.9,
+            follow_speed=high.follow_speed * 1.60,
+            slow_speed=high.slow_speed * 1.6,
+            pure_pursuit_gain=high.pure_pursuit_gain * 0.8,
             curve_speed_reduction_gain=high.curve_speed_reduction_gain * 0.60,
             follow_max_angular_speed=high.follow_max_angular_speed * 1.10,
             min_follow_turn_radius=high.min_follow_turn_radius,
@@ -1032,22 +1148,22 @@ class MaizeNavigator(Node):
             lookahead_lateral_error_gain=high.lookahead_lateral_error_gain * 0.9,
             lookahead_filter_alpha=min(1.0, high.lookahead_filter_alpha * 1.15),
             lookahead_speed_reduction_gain=high.lookahead_speed_reduction_gain * 0.9,
-            maneuver_speed=high.maneuver_speed * 1.20,
-            maneuver_slow_speed=high.maneuver_slow_speed * 1.20,
+            maneuver_speed=high.maneuver_speed * 1.50,
+            maneuver_slow_speed=high.maneuver_slow_speed * 1.50,
             maneuver_lookahead_distance=high.maneuver_lookahead_distance * 1.20,
             maneuver_turn_lookahead_distance=high.maneuver_turn_lookahead_distance * 1.10,
             maneuver_lookahead_curvature_gain=high.maneuver_lookahead_curvature_gain,
             maneuver_lookahead_lateral_error_gain=high.maneuver_lookahead_lateral_error_gain * 0.9,
             maneuver_lookahead_filter_alpha=min(1.0, high.maneuver_lookahead_filter_alpha * 1.10),
             maneuver_lookahead_speed_reduction_gain=high.maneuver_lookahead_speed_reduction_gain,
-            maneuver_corner_radius=high.maneuver_corner_radius * 1.25,
+            maneuver_corner_radius=high.maneuver_corner_radius * 1.1,
         )
         low = DrivingProfile(
             laser_max_weight_both_sides=0.85,
             laser_max_weight_one_side=0.60,
-            follow_speed=high.follow_speed * 1.60,
-            slow_speed=high.slow_speed * 1.50,
-            pure_pursuit_gain=high.pure_pursuit_gain * 0.8,
+            follow_speed=high.follow_speed * 2.0,
+            slow_speed=high.slow_speed * 2.00,
+            pure_pursuit_gain=high.pure_pursuit_gain * 0.6,
             curve_speed_reduction_gain=high.curve_speed_reduction_gain * 0.35,
             follow_max_angular_speed=high.follow_max_angular_speed * 1.20,
             min_follow_turn_radius=high.min_follow_turn_radius,
@@ -1059,15 +1175,15 @@ class MaizeNavigator(Node):
             lookahead_lateral_error_gain=high.lookahead_lateral_error_gain * 0.8,
             lookahead_filter_alpha=min(1.0, high.lookahead_filter_alpha * 1.30),
             lookahead_speed_reduction_gain=high.lookahead_speed_reduction_gain * 0.8,
-            maneuver_speed=high.maneuver_speed * 1.40,
-            maneuver_slow_speed=high.maneuver_slow_speed * 1.5,
+            maneuver_speed=high.maneuver_speed * 2.0,
+            maneuver_slow_speed=high.maneuver_slow_speed * 2.0,
             maneuver_lookahead_distance=high.maneuver_lookahead_distance * 1.38,
-            maneuver_turn_lookahead_distance=high.maneuver_turn_lookahead_distance * 1.20,
+            maneuver_turn_lookahead_distance=high.maneuver_turn_lookahead_distance * 1.50,
             maneuver_lookahead_curvature_gain=high.maneuver_lookahead_curvature_gain,
             maneuver_lookahead_lateral_error_gain=high.maneuver_lookahead_lateral_error_gain * 0.8,
             maneuver_lookahead_filter_alpha=min(1.0, high.maneuver_lookahead_filter_alpha * 1.20),
             maneuver_lookahead_speed_reduction_gain=high.maneuver_lookahead_speed_reduction_gain,
-            maneuver_corner_radius=high.maneuver_corner_radius * 1.50,
+            maneuver_corner_radius=high.maneuver_corner_radius * 1.20,
         )
 
         weight_profiles = {
@@ -1430,6 +1546,10 @@ class MaizeNavigator(Node):
         self.entrance_active_step = None
         self.entrance_traverse_outward = None
         self.pending_target_peaks = None
+        self.entrance_rect_failed_attempts = 0
+        self.entrance_lock_source = ""
+        self.entrance_rect_debug_predicted = []
+        self.entrance_rect_debug_corrected = []
 
     def parse_pattern(self, pattern: str) -> List[PatternStep]:
         steps: List[PatternStep] = []
@@ -2357,6 +2477,280 @@ class MaizeNavigator(Node):
         return position_reached and yaw_error <= self.p.maneuver_goal_yaw_tolerance
 
     def lock_next_row_entrance(self) -> bool:
+        if self.p.entrance_rect_enabled:
+            if self.lock_next_row_entrance_from_rectangles():
+                self.entrance_rect_failed_attempts = 0
+                return True
+            self.entrance_rect_failed_attempts += 1
+
+        if not self.histogram_emergency_allowed():
+            self.get_logger().info(
+                (
+                    "Rectangle entrance not ready; keeping provisional headland route "
+                    f"(attempts={self.entrance_rect_failed_attempts}, "
+                    f"remaining={self.entrance_route_remaining_distance:.2f})"
+                ),
+                throttle_duration_sec=1.0,
+            )
+            return False
+
+        return self.lock_next_row_entrance_from_histogram_emergency()
+
+    def histogram_emergency_allowed(self) -> bool:
+        if not self.p.entrance_histogram_emergency_enabled:
+            return False
+        if not self.p.entrance_rect_enabled:
+            return True
+        enough_attempts = (
+            self.entrance_rect_failed_attempts
+            >= self.p.entrance_rect_min_failed_attempts_before_histogram
+        )
+        route_nearly_used = (
+            len(self.entrance_route) >= 2
+            and self.entrance_route_remaining_distance <= self.p.entrance_rect_retry_until_remaining_distance
+        )
+        return enough_attempts and route_nearly_used
+
+    def lock_next_row_entrance_from_rectangles(self) -> bool:
+        self.entrance_rect_debug_predicted = []
+        self.entrance_rect_debug_corrected = []
+        if (
+            self.plant_row_end_point is None
+            or self.row_end_direction is None
+            or self.left_row is None
+            or self.right_row is None
+            or self.entrance_active_step is None
+        ):
+            return False
+
+        left_rect = self.left_row.result.end_rectangle
+        right_rect = self.right_row.result.end_rectangle
+        if left_rect is None or right_rect is None:
+            self.get_logger().info("Rectangle entrance not ready: current row end rectangles missing", throttle_duration_sec=1.0)
+            return False
+
+        center = np.asarray(self.plant_row_end_point, dtype=float)
+        outgoing = self.average_row_end_direction_for_side(self.row_end_direction)
+        lateral_direction = np.array([-outgoing[1], outgoing[0]], dtype=float)
+        map_points = self.get_all_map_points()
+        if len(map_points) == 0:
+            return False
+
+        initial_rects = [
+            self.copy_row_end_rectangle(left_rect, self.left_row.row_number, "left"),
+            self.copy_row_end_rectangle(right_rect, self.right_row.row_number, "right"),
+        ]
+        initial_rects.sort(key=lambda rect: float((rect.center - center) @ lateral_direction))
+        rects_by_index: Dict[int, RowEndRectangle] = {0: initial_rects[0], 1: initial_rects[1]}
+
+        step = self.entrance_active_step
+        shift = step.lane_shift if step.direction == "L" else -step.lane_shift
+        target_indices = tuple(sorted((shift, shift + 1)))
+        if not self.extend_entrance_rectangle_chain(rects_by_index, target_indices, outgoing, map_points):
+            return False
+
+        first_rect = rects_by_index[target_indices[0]]
+        second_rect = rects_by_index[target_indices[1]]
+        first_lateral = float((first_rect.center - center) @ lateral_direction)
+        second_lateral = float((second_rect.center - center) @ lateral_direction)
+        first = EntrancePeak(first_lateral, np.asarray(first_rect.center, dtype=float), first_rect.row_number, True)
+        second = EntrancePeak(second_lateral, np.asarray(second_rect.center, dtype=float), second_rect.row_number, True)
+
+        sorted_peaks = [
+            EntrancePeak(
+                float((rect.center - center) @ lateral_direction),
+                np.asarray(rect.center, dtype=float),
+                rect.row_number,
+                idx in target_indices,
+            )
+            for idx, rect in sorted(rects_by_index.items())
+        ]
+        self.entrance_hist_center = center
+        self.entrance_hist_direction = outgoing
+        self.entrance_hist_peaks = sorted(sorted_peaks, key=lambda peak: peak.lateral)
+
+        target_row_end = 0.5 * (first.point + second.point)
+        new_target = target_row_end + self.p.row_end_goal_outward_distance * outgoing
+        if not self.update_locked_entrance_target(first, second, new_target, outgoing, "rectangles"):
+            return False
+        return True
+
+    def extend_entrance_rectangle_chain(
+        self,
+        rects_by_index: Dict[int, RowEndRectangle],
+        target_indices: Tuple[int, int],
+        outgoing: np.ndarray,
+        map_points: np.ndarray,
+    ) -> bool:
+        while min(rects_by_index) > target_indices[0]:
+            edge = rects_by_index[min(rects_by_index)]
+            neighbor = rects_by_index[min(rects_by_index) + 1]
+            predicted = self.predict_next_entrance_rectangle(neighbor, edge, -1, outgoing)
+            corrected = self.correct_entrance_rectangle(predicted, edge, outgoing, map_points)
+            if corrected is None:
+                return False
+            rects_by_index[min(rects_by_index) - 1] = corrected
+
+        while max(rects_by_index) < target_indices[1]:
+            neighbor = rects_by_index[max(rects_by_index) - 1]
+            edge = rects_by_index[max(rects_by_index)]
+            predicted = self.predict_next_entrance_rectangle(neighbor, edge, 1, outgoing)
+            corrected = self.correct_entrance_rectangle(predicted, edge, outgoing, map_points)
+            if corrected is None:
+                return False
+            rects_by_index[max(rects_by_index) + 1] = corrected
+        return True
+
+    def predict_next_entrance_rectangle(
+        self,
+        previous: RowEndRectangle,
+        current: RowEndRectangle,
+        side_sign: int,
+        outgoing: np.ndarray,
+    ) -> RowEndRectangle:
+        direction = self.mean_direction(previous.direction, current.direction)
+        lateral_delta = np.asarray(current.center, dtype=float) - np.asarray(previous.center, dtype=float)
+        spacing = float(np.linalg.norm(lateral_delta))
+        if spacing < 1e-6:
+            lateral = np.array([-outgoing[1], outgoing[0]], dtype=float)
+            lateral_delta = float(side_sign) * self.p.expected_row_width * self.normalize(lateral)
+        else:
+            spacing = float(np.clip(spacing, self.p.min_lane_width, self.p.max_lane_width))
+            lateral_delta = spacing * self.normalize(lateral_delta)
+        center = np.asarray(current.center, dtype=float) + lateral_delta
+        line_points = self.build_initial_line_from_point3(center, direction)
+        row_number = None
+        if previous.row_number is not None and current.row_number is not None:
+            row_number = int(current.row_number + (current.row_number - previous.row_number))
+        return RowEndRectangle(
+            center=center,
+            direction=direction,
+            line_points=line_points,
+            field_counts=[],
+            support_count=0,
+            row_number=row_number,
+            side="predicted",
+            predicted=True,
+        )
+
+    def correct_entrance_rectangle(
+        self,
+        predicted: RowEndRectangle,
+        reference: RowEndRectangle,
+        outgoing: np.ndarray,
+        map_points: np.ndarray,
+    ) -> Optional[RowEndRectangle]:
+        self.entrance_rect_debug_predicted.append(predicted)
+        predicted_direction = self.normalize(predicted.direction)
+        reference_direction = self.normalize(reference.direction)
+        for backtrack_idx in range(self.p.entrance_rect_backtrack_steps + 1):
+            candidate_center = np.asarray(predicted.center, dtype=float) - (
+                float(backtrack_idx) * self.p.row_segment_point_spacing * predicted_direction
+            )
+            fit_points = self.points_in_oriented_rectangle(
+                map_points,
+                candidate_center,
+                predicted_direction,
+                self.big_rectangle_length(),
+                self.p.row_rectangle_width,
+            )
+            if len(fit_points) < self.p.row_min_fit_points:
+                continue
+            fit_origin, fitted_direction = self.fit_line(fit_points, predicted_direction)
+            fitted_direction = self.clamp_direction_angle(
+                predicted_direction,
+                fitted_direction,
+                math.radians(self.p.entrance_rect_max_angle_to_prediction_deg),
+            )
+            fitted_direction = self.clamp_direction_angle(
+                reference_direction,
+                fitted_direction,
+                math.radians(self.p.entrance_rect_max_angle_to_reference_deg),
+            )
+            corrected_center = self.project_point_to_line(candidate_center, fit_origin, fitted_direction)
+            correction = np.asarray(corrected_center, dtype=float) - candidate_center
+            correction_norm = float(np.linalg.norm(correction))
+            if correction_norm > self.p.entrance_rect_max_position_correction > 0.0:
+                correction *= self.p.entrance_rect_max_position_correction / correction_norm
+                corrected_center = candidate_center + correction
+            line_points = self.build_initial_line_from_point3(corrected_center, fitted_direction)
+            field_counts = self.count_points_per_line_field(map_points, line_points, fitted_direction)
+            if len(field_counts) < 5 or field_counts[4] <= 0:
+                continue
+
+            seed_model = RowMarchModel(
+                "entrance_rect",
+                line_points[0],
+                line_points[1],
+                fitted_direction,
+                int(predicted.row_number) if predicted.row_number is not None else 0,
+            )
+            march = self.march_row(seed_model, map_points)
+            end_rect = march.end_rectangle
+            if end_rect is None or not march.ended:
+                continue
+            end_rect = self.copy_row_end_rectangle(end_rect, predicted.row_number, "entrance_rect")
+            end_rect.direction = self.clamp_direction_angle(
+                reference_direction,
+                end_rect.direction,
+                math.radians(self.p.entrance_rect_max_angle_to_reference_deg),
+            )
+            end_rect.corrected = True
+            self.entrance_rect_debug_corrected.append(end_rect)
+            return end_rect
+        return None
+
+    def update_locked_entrance_target(
+        self,
+        first: EntrancePeak,
+        second: EntrancePeak,
+        new_target: np.ndarray,
+        outgoing: np.ndarray,
+        source: str,
+    ) -> bool:
+        first_lock = self.entrance_route_provisional
+        target_shift = (
+            float("inf")
+            if self.entrance_target is None
+            else float(np.linalg.norm(new_target - self.entrance_target))
+        )
+        center = np.asarray(self.plant_row_end_point, dtype=float)
+        lateral_direction = np.array([-outgoing[1], outgoing[0]], dtype=float)
+        new_target_lateral = float((new_target - center) @ lateral_direction)
+        new_traverse_outward = self.compute_headland_traverse_outward(center, outgoing, new_target_lateral)
+        traverse_shift = (
+            float("inf")
+            if self.entrance_traverse_outward is None
+            else abs(new_traverse_outward - self.entrance_traverse_outward)
+        )
+        replan_threshold = max(0.15, 0.25 * self.p.expected_row_width)
+        should_replan = (
+            first_lock
+            or len(self.entrance_route) < 2
+            or target_shift >= replan_threshold
+            or traverse_shift >= replan_threshold
+        )
+        if should_replan:
+            self.pending_target_peaks = (first, second)
+            self.entrance_target = np.asarray(new_target, dtype=float)
+            self.entrance_target_direction = -outgoing
+            self.entrance_heading_goal = (
+                self.entrance_target
+                + self.p.maneuver_entry_extension_distance * self.entrance_target_direction
+            )
+            self.entrance_follow_path = self.build_entrance_follow_path()
+            self.rebuild_entrance_route(self.entrance_target)
+        if first_lock:
+            self.pattern_index += 1
+            self.finish_after_current_row = self.pattern_index >= len(self.pattern_steps)
+            self.reset_controller_state()
+            self.entrance_lock_source = source
+            self.get_logger().info(
+                f"Locked next entrance from {source}: rows {first.row_number}/{second.row_number}"
+            )
+        return True
+
+    def lock_next_row_entrance_from_histogram_emergency(self) -> bool:
         if (
             self.plant_row_end_point is None
             or self.row_end_direction is None
@@ -2439,8 +2833,9 @@ class MaizeNavigator(Node):
             self.pattern_index += 1
             self.finish_after_current_row = self.pattern_index >= len(self.pattern_steps)
             self.reset_controller_state()
+            self.entrance_lock_source = "histogram"
             self.get_logger().info(
-                f"Locked next entrance for pattern step {step.lane_shift}{step.direction}: "
+                f"Emergency histogram locked next entrance for pattern step {step.lane_shift}{step.direction}: "
                 f"rows {first.row_number}/{second.row_number}"
             )
         return True
@@ -3131,6 +3526,8 @@ class MaizeNavigator(Node):
         previous_valid_point: Optional[np.ndarray] = np.asarray(point2, dtype=float)
         last_valid_direction = np.asarray(direction, dtype=float)
         last_complete_support_direction = np.asarray(direction, dtype=float)
+        last_fifth_segment_rectangle: Optional[RowEndRectangle] = None
+        last_complete_support_rectangle: Optional[RowEndRectangle] = None
 
         for _ in range(self.p.row_max_march_steps):
             search_point3 = line_points[2]
@@ -3153,8 +3550,20 @@ class MaizeNavigator(Node):
             corrected_line_points = self.build_initial_line_from_point3(corrected_point3, corrected_direction)
             field_counts = self.count_points_per_line_field(map_points, corrected_line_points, corrected_direction)
             field_count = int(sum(field_counts[2:5]))
+            current_rectangle = RowEndRectangle(
+                center=np.asarray(corrected_point3, dtype=float),
+                direction=np.asarray(corrected_direction, dtype=float),
+                line_points=np.asarray(corrected_line_points, dtype=float),
+                field_counts=list(field_counts),
+                support_count=len(fit_points),
+                row_number=model.row_number,
+                side=model.side,
+            )
+            if len(field_counts) >= 5 and field_counts[4] > 0:
+                last_fifth_segment_rectangle = current_rectangle
             if len(field_counts) >= self.p.row_segment_point_count and all(count > 0 for count in field_counts):
                 last_complete_support_direction = np.asarray(corrected_direction, dtype=float)
+                last_complete_support_rectangle = current_rectangle
 
             local_point3_points = self.points_in_oriented_rectangle(
                 map_points,
@@ -3166,8 +3575,22 @@ class MaizeNavigator(Node):
 
             if len(exact_points) > 0 and field_count <= self.p.row_end_min_points_fields_3_to_5:
                 result.ended = True
-                result.end_point = previous_valid_point if previous_valid_point is not None else exact_points[-1]
-                result.end_direction = np.asarray(last_complete_support_direction, dtype=float)
+                result.fifth_segment_rectangle = last_fifth_segment_rectangle
+                result.full_support_rectangle = last_complete_support_rectangle
+                result.end_rectangle = (
+                    last_fifth_segment_rectangle
+                    if last_fifth_segment_rectangle is not None
+                    else last_complete_support_rectangle
+                )
+                if result.end_rectangle is not None:
+                    result.end_point = np.asarray(result.end_rectangle.center, dtype=float)
+                    if last_complete_support_rectangle is not None:
+                        result.end_direction = np.asarray(last_complete_support_rectangle.direction, dtype=float)
+                    else:
+                        result.end_direction = np.asarray(result.end_rectangle.direction, dtype=float)
+                else:
+                    result.end_point = previous_valid_point if previous_valid_point is not None else exact_points[-1]
+                    result.end_direction = np.asarray(last_complete_support_direction, dtype=float)
                 break
 
             if len(local_point3_points) > 0:
@@ -3202,10 +3625,26 @@ class MaizeNavigator(Node):
             np.asarray(exact_directions, dtype=float) if exact_directions else np.empty((0, 2), dtype=float)
         )
         result.current_line_points = np.asarray(line_points, dtype=float)
+        result.fifth_segment_rectangle = last_fifth_segment_rectangle
+        result.full_support_rectangle = last_complete_support_rectangle
+        if result.end_rectangle is None:
+            result.end_rectangle = (
+                last_fifth_segment_rectangle
+                if last_fifth_segment_rectangle is not None
+                else last_complete_support_rectangle
+            )
         if result.ended and result.end_point is None and len(result.points) > 0:
-            result.end_point = result.points[-1]
+            if result.end_rectangle is not None:
+                result.end_point = np.asarray(result.end_rectangle.center, dtype=float)
+            else:
+                result.end_point = result.points[-1]
         if result.end_direction is None:
-            result.end_direction = np.asarray(last_valid_direction, dtype=float)
+            if last_complete_support_rectangle is not None:
+                result.end_direction = np.asarray(last_complete_support_rectangle.direction, dtype=float)
+            elif result.end_rectangle is not None:
+                result.end_direction = np.asarray(result.end_rectangle.direction, dtype=float)
+            else:
+                result.end_direction = np.asarray(last_valid_direction, dtype=float)
         return result
 
     def build_initial_line_from_point3(self, point3: np.ndarray, direction: np.ndarray) -> np.ndarray:
@@ -3318,6 +3757,44 @@ class MaizeNavigator(Node):
         if np.dot(first, second) < 0.0:
             second = -second
         return self.normalize(first + second)
+
+    def copy_row_end_rectangle(
+        self,
+        rectangle: RowEndRectangle,
+        row_number: Optional[int],
+        side: str,
+    ) -> RowEndRectangle:
+        return RowEndRectangle(
+            center=np.array(rectangle.center, copy=True),
+            direction=np.array(rectangle.direction, copy=True),
+            line_points=np.array(rectangle.line_points, copy=True),
+            field_counts=list(rectangle.field_counts),
+            support_count=int(rectangle.support_count),
+            row_number=row_number,
+            side=side,
+            predicted=rectangle.predicted,
+            corrected=rectangle.corrected,
+        )
+
+    def clamp_direction_angle(self, reference: np.ndarray, candidate: np.ndarray, max_angle: float) -> np.ndarray:
+        reference = self.normalize(reference)
+        candidate = self.normalize(candidate)
+        if float(reference @ candidate) < 0.0:
+            candidate = -candidate
+        signed_angle = math.atan2(
+            float(reference[0] * candidate[1] - reference[1] * candidate[0]),
+            float(reference @ candidate),
+        )
+        clamped_angle = float(np.clip(signed_angle, -max_angle, max_angle))
+        cosine = math.cos(clamped_angle)
+        sine = math.sin(clamped_angle)
+        return np.array(
+            [
+                cosine * reference[0] - sine * reference[1],
+                sine * reference[0] + cosine * reference[1],
+            ],
+            dtype=float,
+        )
 
     def append_polyline_point(self, polyline: np.ndarray, point: np.ndarray) -> np.ndarray:
         point = np.asarray(point, dtype=float)
@@ -3796,6 +4273,46 @@ class MaizeNavigator(Node):
                 self.create_sphere_marker("row_exit_heading_goal", marker_id, self.row_exit_heading_goal, (0.7, 0.0, 1.0, 0.55), 0.13, stamp)
             )
             marker_id += 1
+        for rect in self.entrance_rect_debug_predicted[-20:]:
+            markers.markers.append(
+                self.create_rectangle_marker(
+                    "entrance_rect_predicted",
+                    marker_id,
+                    rect.center,
+                    rect.direction,
+                    self.big_rectangle_length(),
+                    self.p.row_rectangle_width,
+                    (0.95, 0.95, 0.1, 0.65),
+                    stamp,
+                )
+            )
+            marker_id += 1
+        for rect in self.entrance_rect_debug_corrected[-20:]:
+            markers.markers.append(
+                self.create_rectangle_marker(
+                    "entrance_rect_corrected",
+                    marker_id,
+                    rect.center,
+                    rect.direction,
+                    self.big_rectangle_length(),
+                    self.p.row_rectangle_width,
+                    (0.1, 1.0, 0.35, 0.8),
+                    stamp,
+                )
+            )
+            marker_id += 1
+        if self.entrance_target is not None and self.entrance_lock_source:
+            markers.markers.append(
+                self.create_text_marker(
+                    "entrance_lock_source",
+                    marker_id,
+                    self.entrance_target,
+                    self.entrance_lock_source,
+                    (1.0, 1.0, 1.0, 1.0),
+                    stamp,
+                )
+            )
+            marker_id += 1
         if self.entrance_hist_center is not None and self.entrance_hist_direction is not None:
             entrance_hist_direction = self.normalize(self.entrance_hist_direction)
             entrance_hist_marker_center = (
@@ -4073,6 +4590,20 @@ class MaizeNavigator(Node):
 
         if result.end_point is not None:
             markers.markers.append(self.create_sphere_marker(f"{model.side}_end_point", marker_id, result.end_point, (1.0, 0.0, 0.0, 1.0), 0.18, stamp))
+            marker_id += 1
+        if result.end_rectangle is not None:
+            markers.markers.append(
+                self.create_rectangle_marker(
+                    f"{model.side}_end_rectangle",
+                    marker_id,
+                    result.end_rectangle.center,
+                    result.end_rectangle.direction,
+                    self.big_rectangle_length(),
+                    self.p.row_rectangle_width,
+                    (1.0, 0.0, 0.0, 0.72),
+                    stamp,
+                )
+            )
             marker_id += 1
         return marker_id
 

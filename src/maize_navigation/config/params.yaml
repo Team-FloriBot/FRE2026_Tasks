@@ -47,16 +47,18 @@ maize_navigator:
     laser_roi_center_offset_limit: 0.2
     laser_ransac_iterations: 80
     laser_ransac_distance: 0.08
-    laser_min_inliers: 3
-    laser_min_visible_length: 0.25
+    laser_min_inliers: 5
+    laser_min_visible_length: 0.40
     laser_max_abs_line_slope: 0.90
     laser_max_angle_to_map: 0.45
     laser_max_center_offset: 0.40
     laser_min_confidence: 0.10
-    laser_full_confidence: 0.65
+    laser_full_confidence: 0.75
     laser_max_weight_both_sides: 0.55
     laser_max_weight_one_side: 0.35
-    laser_tracker_alpha: 0.40
+    laser_tracker_alpha: 0.25
+    laser_line_filter_alpha: 0.20
+    laser_target_max_lateral_step: 0.05
 
     follow_speed: 0.4
     slow_speed: 0.12
@@ -65,14 +67,14 @@ maize_navigator:
     min_follow_turn_radius: 0.37
     linear_acceleration_limit: 0.18
     linear_deceleration_limit: 0.30
-    target_filter_alpha: 0.45
+    target_filter_alpha: 0.30
     # Ausfahr- und Einfahrziel liegen so weit ausserhalb der Pflanzenenden.
-    row_end_goal_outward_distance: 0.30
+    row_end_goal_outward_distance: 0.15
     # Sicherheitsabstand der Wende-Querlinie hinter dem aeussersten relevanten Peak.
-    row_exit_extension_distance: 0.50
+    row_exit_extension_distance: 0.40
 
     follow_max_angular_speed: 0.90
-    angular_rate_limit: 2.0
+    angular_rate_limit: 1.4
 
     lookahead_distance: 2.0
     turn_lookahead_distance: 0.25
@@ -105,18 +107,28 @@ maize_navigator:
     # Verrundete, monoton verfolgte Route fuer das Vorgewende.
     maneuver_speed: 0.5
     maneuver_slow_speed: 0.10
-    maneuver_lookahead_distance: 1.2
-    maneuver_turn_lookahead_distance: 0.35
+    maneuver_lookahead_distance: 1.4
+    maneuver_turn_lookahead_distance: 0.4
     maneuver_lookahead_curvature_gain: 2.5
     maneuver_lookahead_lateral_error_gain: 0.5
     maneuver_lookahead_filter_alpha: 0.25
     maneuver_lookahead_speed_reduction_gain: 2.0
     maneuver_route_spacing: 0.08
-    maneuver_corner_radius: 0.40
+    maneuver_corner_radius: 0.50
     maneuver_entry_extension_distance: 0.80
     maneuver_max_route_deviation: 0.70
     maneuver_entry_lateral_tolerance: 0.25
     maneuver_entry_yaw_tolerance: 0.45
+
+    # Rechteckbasierte Reiheneingang-Erkennung im Vorgewende.
+    entrance_rect_enabled: true
+    entrance_histogram_emergency_enabled: true
+    entrance_rect_max_angle_to_prediction_deg: 20.0
+    entrance_rect_max_angle_to_reference_deg: 40.0
+    entrance_rect_max_position_correction: 0.50
+    entrance_rect_backtrack_steps: 4
+    entrance_rect_retry_until_remaining_distance: 0.60
+    entrance_rect_min_failed_attempts_before_histogram: 5
 
     pattern: "3L 6R 5R 4R 3R 2R 1R"
     # Startgasse 1 liegt zwischen Pflanzenreihe 1 und 2.
