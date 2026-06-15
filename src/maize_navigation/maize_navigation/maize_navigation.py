@@ -228,6 +228,8 @@ class NavigatorParams:
     row_max_march_steps: int = 120
     row_min_fit_points: int = 3
     row_freeze_behind_distance: float = 0.0
+    row_fit_max_angle_to_previous_deg: float = 20.0
+    row_pair_direction_blend: float = 0.5
 
     laser_follow_enabled: bool = True
     laser_scan_timeout: float = 0.50
@@ -268,6 +270,7 @@ class NavigatorParams:
     linear_acceleration_limit: float = 0.18
     linear_deceleration_limit: float = 0.30
     angular_rate_limit: float = 1.4
+    angular_command_filter_alpha: float = 0.60
     target_filter_alpha: float = 0.30
     row_exit_extension_distance: float = 0.30
     row_end_goal_outward_distance: float = 0.30
@@ -294,7 +297,7 @@ class NavigatorParams:
     entrance_rect_max_angle_to_prediction_deg: float = 20.0
     entrance_rect_max_angle_to_reference_deg: float = 40.0
     entrance_rect_max_position_correction: float = 0.50
-    entrance_rect_backtrack_steps: int = 4
+    entrance_rect_backtrack_steps: int = 2
     entrance_rect_retry_until_remaining_distance: float = 0.60
     entrance_rect_min_failed_attempts_before_histogram: int = 5
     row_map_output_directory: str = "~/.ros/maize_navigation"
@@ -583,6 +586,7 @@ class MaizeNavigator(Node):
         self.last_cmd_linear_x: float = 0.0
         self.last_cmd_angular_z: float = 0.0
         self.last_target_point: Optional[np.ndarray] = None
+        self.follow_progress_s: Optional[float] = None
         self.current_lookahead_distance: float = self.p.lookahead_distance
         self.current_lookahead_curvature: float = 0.0
         self.current_maneuver_lookahead_distance: float = self.p.maneuver_lookahead_distance
@@ -693,6 +697,10 @@ class MaizeNavigator(Node):
         p.row_max_march_steps = int(get_param("row_max_march_steps", p.row_max_march_steps))
         p.row_min_fit_points = int(get_param("row_min_fit_points", p.row_min_fit_points))
         p.row_freeze_behind_distance = float(get_param("row_freeze_behind_distance", p.row_freeze_behind_distance))
+        p.row_fit_max_angle_to_previous_deg = float(
+            get_param("row_fit_max_angle_to_previous_deg", p.row_fit_max_angle_to_previous_deg)
+        )
+        p.row_pair_direction_blend = float(get_param("row_pair_direction_blend", p.row_pair_direction_blend))
 
         p.laser_follow_enabled = bool(get_param("laser_follow_enabled", p.laser_follow_enabled))
         p.laser_scan_timeout = float(get_param("laser_scan_timeout", p.laser_scan_timeout))
@@ -753,6 +761,9 @@ class MaizeNavigator(Node):
             get_param("linear_deceleration_limit", p.linear_deceleration_limit)
         )
         p.angular_rate_limit = float(get_param("angular_rate_limit", p.angular_rate_limit))
+        p.angular_command_filter_alpha = float(
+            get_param("angular_command_filter_alpha", p.angular_command_filter_alpha)
+        )
         p.target_filter_alpha = float(get_param("target_filter_alpha", p.target_filter_alpha))
         p.row_exit_extension_distance = float(get_param("row_exit_extension_distance", p.row_exit_extension_distance))
         p.row_end_goal_outward_distance = float(
@@ -872,6 +883,8 @@ class MaizeNavigator(Node):
         self.p.row_point_window_length = max(0.05, self.p.row_point_window_length)
         self.p.row_max_march_steps = max(1, self.p.row_max_march_steps)
         self.p.row_freeze_behind_distance = max(0.0, self.p.row_freeze_behind_distance)
+        self.p.row_fit_max_angle_to_previous_deg = float(np.clip(self.p.row_fit_max_angle_to_previous_deg, 1.0, 90.0))
+        self.p.row_pair_direction_blend = float(np.clip(self.p.row_pair_direction_blend, 0.0, 1.0))
         self.p.laser_scan_timeout = max(0.05, self.p.laser_scan_timeout)
         self.p.laser_roi_length = max(0.05, self.p.laser_roi_length)
         self.p.laser_roi_x_max = self.p.laser_roi_x_min + self.p.laser_roi_length
@@ -895,6 +908,7 @@ class MaizeNavigator(Node):
         self.p.linear_acceleration_limit = max(0.01, self.p.linear_acceleration_limit)
         self.p.linear_deceleration_limit = max(0.01, self.p.linear_deceleration_limit)
         self.p.angular_rate_limit = max(0.01, self.p.angular_rate_limit)
+        self.p.angular_command_filter_alpha = float(np.clip(self.p.angular_command_filter_alpha, 0.0, 1.0))
         self.p.target_filter_alpha = float(np.clip(self.p.target_filter_alpha, 0.01, 1.0))
         self.p.row_exit_extension_distance = max(0.0, self.p.row_exit_extension_distance)
         self.p.row_end_goal_outward_distance = max(0.0, self.p.row_end_goal_outward_distance)
@@ -1463,12 +1477,47 @@ class MaizeNavigator(Node):
         self.last_cmd_linear_x = float(cmd.linear.x)
         self.last_cmd_angular_z = float(cmd.angular.z)
 
-    def stop_motion(self) -> None:
-        self.set_current_cmd(Twist())
+    def ramp_current_cmd_towards(self, target: Twist) -> None:
+        dt = 1.0 / max(1e-6, self.p.control_frequency)
+
+        target_linear_x = float(target.linear.x)
+        linear_delta = target_linear_x - self.last_cmd_linear_x
+        linear_limit = (
+            self.p.linear_acceleration_limit
+            if linear_delta >= 0.0
+            else self.p.linear_deceleration_limit
+        ) * dt
+        if abs(linear_delta) <= linear_limit:
+            linear_x = target_linear_x
+        else:
+            linear_x = self.last_cmd_linear_x + math.copysign(linear_limit, linear_delta)
+        if abs(linear_x) < 1e-3:
+            linear_x = 0.0
+
+        target_angular_z = float(target.angular.z)
+        angular_delta = target_angular_z - self.last_cmd_angular_z
+        angular_limit = self.p.angular_rate_limit * dt
+        if abs(angular_delta) <= angular_limit:
+            angular_z = target_angular_z
+        else:
+            angular_z = self.last_cmd_angular_z + math.copysign(angular_limit, angular_delta)
+        if abs(angular_z) < 1e-3:
+            angular_z = 0.0
+
+        cmd = Twist()
+        cmd.linear.x = linear_x
+        cmd.angular.z = angular_z
+        self.set_current_cmd(cmd)
+
+    def stop_motion(self, immediate: bool = False) -> None:
+        if immediate:
+            self.set_current_cmd(Twist())
+            return
+        self.ramp_current_cmd_towards(Twist())
 
     def stop_cmd_vel_stream(self) -> None:
         was_active = self.cmd_vel_stream_active
-        self.stop_motion()
+        self.stop_motion(immediate=True)
         if was_active:
             self.publish_current_cmd(force=True)
         self.cmd_vel_stream_active = False
@@ -1522,6 +1571,7 @@ class MaizeNavigator(Node):
         self.last_cmd_linear_x = 0.0
         self.last_cmd_angular_z = 0.0
         self.last_target_point = None
+        self.follow_progress_s = None
         self.fused_target_point = None
         self.current_lookahead_distance = self.p.lookahead_distance
         self.current_lookahead_curvature = 0.0
@@ -1827,18 +1877,36 @@ class MaizeNavigator(Node):
         if self.active_object_stop is None:
             self.active_object_stop = self.find_next_object_stop(robot_xy, self.midline)
 
-        lookahead_distance = self.dynamic_follow_lookahead(self.midline, robot_xy)
+        projection, projection_segment_idx, projection_s = self.project_onto_polyline_with_distance(
+            self.midline,
+            robot_xy,
+        )
+        midline_length = self.polyline_length(self.midline)
+        if self.follow_progress_s is None:
+            self.follow_progress_s = projection_s
+        else:
+            self.follow_progress_s = max(self.follow_progress_s, projection_s)
+        self.follow_progress_s = float(np.clip(self.follow_progress_s, 0.0, midline_length))
+
+        lookahead_distance = self.dynamic_follow_lookahead(
+            self.midline,
+            robot_xy,
+            projection=projection,
+            segment_idx=projection_segment_idx,
+        )
         self.get_logger().info(
             (
                 "Dynamic lookahead: "
                 f"distance={lookahead_distance:.3f} "
                 f"curvature={self.current_lookahead_curvature:.3f} "
+                f"progress={self.follow_progress_s:.3f}/{midline_length:.3f} "
                 f"min={self.p.turn_lookahead_distance:.3f} "
                 f"max={self.p.lookahead_distance:.3f}"
             ),
             throttle_duration_sec=0.5,
         )
-        target = self.lookahead_point_from_polyline_projection(self.midline, robot_xy, lookahead_distance)
+        target_s = min(midline_length, self.follow_progress_s + lookahead_distance)
+        target = self.point_at_polyline_s(self.midline, target_s)
         if target is None:
             target = self.midline[-1]
         target = np.asarray(target, dtype=float)
@@ -2644,9 +2712,24 @@ class MaizeNavigator(Node):
         self.entrance_rect_debug_predicted.append(predicted)
         predicted_direction = self.normalize(predicted.direction)
         reference_direction = self.normalize(reference.direction)
+        fallback_rect = self.entrance_segment5_fallback_rectangle(
+            predicted,
+            predicted_direction,
+            predicted.line_points,
+            predicted.field_counts,
+            predicted.support_count,
+        )
         for backtrack_idx in range(self.p.entrance_rect_backtrack_steps + 1):
             candidate_center = np.asarray(predicted.center, dtype=float) - (
                 float(backtrack_idx) * self.p.row_segment_point_spacing * predicted_direction
+            )
+            candidate_line_points = self.build_initial_line_from_point3(candidate_center, predicted_direction)
+            fallback_rect = self.entrance_segment5_fallback_rectangle(
+                predicted,
+                predicted_direction,
+                candidate_line_points,
+                [],
+                0,
             )
             fit_points = self.points_in_oriented_rectangle(
                 map_points,
@@ -2676,6 +2759,13 @@ class MaizeNavigator(Node):
                 corrected_center = candidate_center + correction
             line_points = self.build_initial_line_from_point3(corrected_center, fitted_direction)
             field_counts = self.count_points_per_line_field(map_points, line_points, fitted_direction)
+            fallback_rect = self.entrance_segment5_fallback_rectangle(
+                predicted,
+                fitted_direction,
+                line_points,
+                field_counts,
+                len(fit_points),
+            )
             if len(field_counts) < 5 or field_counts[4] <= 0:
                 continue
 
@@ -2699,7 +2789,38 @@ class MaizeNavigator(Node):
             end_rect.corrected = True
             self.entrance_rect_debug_corrected.append(end_rect)
             return end_rect
-        return None
+        fallback_rect.corrected = True
+        self.entrance_rect_debug_corrected.append(fallback_rect)
+        self.get_logger().info(
+            "Rectangle entrance fallback: using segment-5 midpoint after backtracking",
+            throttle_duration_sec=1.0,
+        )
+        return fallback_rect
+
+    def entrance_segment5_fallback_rectangle(
+        self,
+        predicted: RowEndRectangle,
+        direction: np.ndarray,
+        line_points: np.ndarray,
+        field_counts: List[int],
+        support_count: int,
+    ) -> RowEndRectangle:
+        direction = self.normalize(direction)
+        if len(line_points) >= 5:
+            center = np.asarray(line_points[4], dtype=float)
+        else:
+            center = np.asarray(predicted.center, dtype=float) + 2.0 * self.p.row_segment_point_spacing * direction
+        return RowEndRectangle(
+            center=center,
+            direction=direction,
+            line_points=self.build_initial_line_from_point3(center, direction),
+            field_counts=list(field_counts),
+            support_count=int(support_count),
+            row_number=predicted.row_number,
+            side="entrance_rect_fallback",
+            predicted=predicted.predicted,
+            corrected=False,
+        )
 
     def update_locked_entrance_target(
         self,
@@ -3455,9 +3576,10 @@ class MaizeNavigator(Node):
 
         self.left_row.result = self.march_row(self.left_row, map_points)
         self.right_row.result = self.march_row(self.right_row, map_points)
+        self.harmonize_row_pair_directions(self.left_row.result, self.right_row.result)
         self.update_frozen_prefix(self.left_row)
         self.update_frozen_prefix(self.right_row)
-        self.midline = self.build_midline(self.left_row.result.points, self.right_row.result.points)
+        self.midline = self.build_navigation_midline()
 
         if self.left_row.result.ended and self.right_row.result.ended:
             left_end = self.left_row.result.end_point
@@ -3545,8 +3667,12 @@ class MaizeNavigator(Node):
             corrected_point3 = np.array(search_point3, copy=True)
             if len(fit_points) >= self.p.row_min_fit_points:
                 fit_origin, fitted_direction = self.fit_line(fit_points, direction)
-                corrected_direction = fitted_direction
-                corrected_point3 = self.project_point_to_line(search_point3, fit_origin, fitted_direction)
+                corrected_direction = self.clamp_direction_angle(
+                    direction,
+                    fitted_direction,
+                    math.radians(self.p.row_fit_max_angle_to_previous_deg),
+                )
+                corrected_point3 = self.project_point_to_line(search_point3, fit_origin, corrected_direction)
 
             corrected_line_points = self.build_initial_line_from_point3(corrected_point3, corrected_direction)
             field_counts = self.count_points_per_line_field(map_points, corrected_line_points, corrected_direction)
@@ -3852,6 +3978,63 @@ class MaizeNavigator(Node):
         count = min(len(left_points), len(right_points))
         return 0.5 * (left_points[:count] + right_points[:count])
 
+    def build_navigation_midline(self) -> np.ndarray:
+        if self.left_row is None or self.right_row is None:
+            return np.empty((0, 2), dtype=float)
+
+        midline = self.build_midline(self.left_row.result.points, self.right_row.result.points)
+        if len(midline) >= 2:
+            return midline
+
+        left_midline = self.estimate_midline_from_single_row(self.left_row)
+        if len(left_midline) >= 2:
+            return left_midline
+
+        right_midline = self.estimate_midline_from_single_row(self.right_row)
+        if len(right_midline) >= 2:
+            return right_midline
+
+        return np.empty((0, 2), dtype=float)
+
+    def estimate_midline_from_single_row(self, model: RowMarchModel) -> np.ndarray:
+        points = np.asarray(model.result.points, dtype=float)
+        if len(points) < 2:
+            return np.empty((0, 2), dtype=float)
+
+        if len(model.result.point_directions) == len(points):
+            directions = np.asarray(model.result.point_directions, dtype=float)
+        else:
+            fallback_direction = self.normalize(points[-1] - points[0])
+            directions = np.array([fallback_direction for _ in points], dtype=float)
+
+        offsets = []
+        for direction in directions:
+            direction = self.normalize(direction)
+            left_normal = np.array([-direction[1], direction[0]], dtype=float)
+            sign = -1.0 if model.side == "left" else 1.0
+            offsets.append(sign * 0.5 * self.p.expected_row_width * left_normal)
+        return points + np.asarray(offsets, dtype=float)
+
+    def harmonize_row_pair_directions(self, left: RowMarchResult, right: RowMarchResult) -> None:
+        if self.p.row_pair_direction_blend <= 0.0:
+            return
+        count = min(len(left.point_directions), len(right.point_directions))
+        if count == 0:
+            return
+
+        blend = self.p.row_pair_direction_blend
+        for idx in range(count):
+            left_dir = self.normalize(left.point_directions[idx])
+            right_dir = self.normalize(right.point_directions[idx])
+            mean_dir = self.mean_direction(left_dir, right_dir)
+            left.point_directions[idx] = self.normalize((1.0 - blend) * left_dir + blend * mean_dir)
+            right.point_directions[idx] = self.normalize((1.0 - blend) * right_dir + blend * mean_dir)
+
+        if left.end_direction is not None and right.end_direction is not None:
+            mean_end = self.mean_direction(left.end_direction, right.end_direction)
+            left.end_direction = self.normalize((1.0 - blend) * self.normalize(left.end_direction) + blend * mean_end)
+            right.end_direction = self.normalize((1.0 - blend) * self.normalize(right.end_direction) + blend * mean_end)
+
     def point_at_polyline_distance(self, polyline: np.ndarray, start_idx: int, distance_ahead: float) -> Optional[np.ndarray]:
         if len(polyline) == 0:
             return None
@@ -3869,6 +4052,26 @@ class MaizeNavigator(Node):
                 return polyline[idx] + ratio * segment
             travelled += seg_len
         return polyline[-1]
+
+    def point_at_polyline_s(self, polyline: np.ndarray, distance_from_start: float) -> Optional[np.ndarray]:
+        if len(polyline) == 0:
+            return None
+        if len(polyline) == 1:
+            return np.asarray(polyline[0], dtype=float)
+        distance_from_start = max(0.0, float(distance_from_start))
+        travelled = 0.0
+        for idx in range(len(polyline) - 1):
+            start = np.asarray(polyline[idx], dtype=float)
+            end = np.asarray(polyline[idx + 1], dtype=float)
+            segment = end - start
+            seg_len = float(np.linalg.norm(segment))
+            if seg_len < 1e-9:
+                continue
+            if travelled + seg_len >= distance_from_start:
+                ratio = (distance_from_start - travelled) / seg_len
+                return start + ratio * segment
+            travelled += seg_len
+        return np.asarray(polyline[-1], dtype=float)
 
     def project_onto_polyline(self, polyline: np.ndarray, point: np.ndarray) -> Tuple[np.ndarray, int]:
         point = np.asarray(point, dtype=float)
@@ -3891,6 +4094,35 @@ class MaizeNavigator(Node):
                 best_projection = projection
                 best_segment_idx = idx
         return np.asarray(best_projection, dtype=float), best_segment_idx
+
+    def project_onto_polyline_with_distance(self, polyline: np.ndarray, point: np.ndarray) -> Tuple[np.ndarray, int, float]:
+        point = np.asarray(point, dtype=float)
+        if len(polyline) < 2:
+            return point, 0, 0.0
+
+        best_projection = np.asarray(polyline[0], dtype=float)
+        best_segment_idx = 0
+        best_distance = float("inf")
+        best_s = 0.0
+        travelled = 0.0
+        for idx in range(len(polyline) - 1):
+            start = np.asarray(polyline[idx], dtype=float)
+            end = np.asarray(polyline[idx + 1], dtype=float)
+            segment = end - start
+            seg_len = float(np.linalg.norm(segment))
+            seg_len_sq = float(segment @ segment)
+            if seg_len_sq < 1e-12:
+                continue
+            ratio = float(np.clip(((point - start) @ segment) / seg_len_sq, 0.0, 1.0))
+            projection = start + ratio * segment
+            distance = float(np.linalg.norm(point - projection))
+            if distance < best_distance:
+                best_distance = distance
+                best_projection = projection
+                best_segment_idx = idx
+                best_s = travelled + ratio * seg_len
+            travelled += seg_len
+        return np.asarray(best_projection, dtype=float), best_segment_idx, float(best_s)
 
     def point_at_polyline_distance_from_projection(
         self,
@@ -3994,9 +4226,21 @@ class MaizeNavigator(Node):
             total_heading_change += abs(wrap_to_pi(current - previous))
         return total_heading_change / arc_length
 
-    def dynamic_follow_lookahead(self, polyline: np.ndarray, point: np.ndarray) -> float:
-        curvature = self.estimate_polyline_curvature_ahead(polyline, point)
-        projection, _ = self.project_onto_polyline(polyline, point)
+    def dynamic_follow_lookahead(
+        self,
+        polyline: np.ndarray,
+        point: np.ndarray,
+        projection: Optional[np.ndarray] = None,
+        segment_idx: Optional[int] = None,
+    ) -> float:
+        curvature = self.estimate_polyline_curvature_ahead(
+            polyline,
+            point,
+            projection=projection,
+            segment_idx=segment_idx,
+        )
+        if projection is None:
+            projection, _ = self.project_onto_polyline(polyline, point)
         lateral_error = float(np.linalg.norm(np.asarray(point, dtype=float) - projection))
         raw_lookahead = self.p.lookahead_distance / (
             1.0
@@ -4183,10 +4427,13 @@ class MaizeNavigator(Node):
         # proportional yaw correction and still works for headland waypoints.
         pursuit_angular = cmd.linear.x * curvature
         angular_raw = float(np.clip(pursuit_angular, -max_angular, max_angular))
+        alpha = self.p.angular_command_filter_alpha
+        angular_filtered = alpha * angular_raw + (1.0 - alpha) * self.last_cmd_angular_z
+        angular_filtered = float(np.clip(angular_filtered, -max_angular, max_angular))
 
         max_delta = self.p.angular_rate_limit * dt
         angular_limited = float(np.clip(
-            angular_raw,
+            angular_filtered,
             self.last_cmd_angular_z - max_delta,
             self.last_cmd_angular_z + max_delta,
         ))

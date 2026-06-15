@@ -10,8 +10,8 @@ maize_navigator:
     cmd_vel_publish_frequency: 30.0
 
     expected_row_width: 0.75
-    min_lane_width: 0.6
-    max_lane_width: 1.0
+    min_lane_width: 0.7
+    max_lane_width: 0.8
 
     hist_roi_size: 5.0
     # Histogramm-ROI: quer breit fuer mehr Reihen, laengs kompakter.
@@ -25,20 +25,22 @@ maize_navigator:
     # Rechteck-Marching-Reihenerkennung:
     # Die initiale linke/rechte Reihe kommt einmalig aus Histogrammpeaks.
     # Danach werden beide Reihen bei jedem Kartenupdate von dieser Initialgeraden neu berechnet.
-    row_segment_point_count: 5
+    row_segment_point_count: 7
     row_segment_point_spacing: 0.30
     row_rectangle_width: 0.6
     row_point_window_length: 0.30
     row_end_min_points_fields_3_to_5: 2
     row_max_march_steps: 120
     row_min_fit_points: 3
+    row_fit_max_angle_to_previous_deg: 10.0
+    row_pair_direction_blend: 0.5
     # Bereits passierte Kartenpunkte bis zur aktuellen Roboterhoehe bleiben stabil.
     # Linke und rechte Kartenreihe werden weiterhin unabhaengig erkannt.
     row_freeze_behind_distance: 0.0
 
     # Lokale LaserScan-Feinfuehrung innerhalb der Reihe.
     # Karte bleibt Prior und Fallback; Reihenende und Vorgewende bleiben kartenbasiert.
-    laser_follow_enabled: true
+    laser_follow_enabled: false
     laser_scan_timeout: 0.50
     laser_roi_x_min: 0.1
     laser_roi_x_max: 1.7
@@ -60,30 +62,31 @@ maize_navigator:
     laser_line_filter_alpha: 0.20
     laser_target_max_lateral_step: 0.05
 
-    follow_speed: 0.28
-    slow_speed: 0.12
-    pure_pursuit_gain: 1.0
-    curve_speed_reduction_gain: 3.0
+    follow_speed: 0.4
+    slow_speed: 0.1
+    pure_pursuit_gain: 0.8
+    curve_speed_reduction_gain: 1.0
     min_follow_turn_radius: 0.37
-    linear_acceleration_limit: 0.18
-    linear_deceleration_limit: 0.30
-    target_filter_alpha: 0.18
+    linear_acceleration_limit: 0.3
+    linear_deceleration_limit: 0.40
+    target_filter_alpha: 0.20
     # Ausfahr- und Einfahrziel liegen so weit ausserhalb der Pflanzenenden.
     row_end_goal_outward_distance: 0.15
     # Sicherheitsabstand der Wende-Querlinie hinter dem aeussersten relevanten Peak.
     row_exit_extension_distance: 0.40
 
-    follow_max_angular_speed: 0.55
-    angular_rate_limit: 0.85
+    follow_max_angular_speed: 0.7
+    angular_rate_limit: 1.2
+    angular_command_filter_alpha: 0.60
 
-    lookahead_distance: 2.0
-    turn_lookahead_distance: 0.65
-    lookahead_curvature_gain: 2.0
+    lookahead_distance: 1.5
+    turn_lookahead_distance: 1.0
+    lookahead_curvature_gain: 1.5
     lookahead_curvature_sample_count: 7
-    lookahead_curvature_back_distance: 0.5
+    lookahead_curvature_back_distance: 1.0
     lookahead_lateral_error_gain: 1.0
-    lookahead_filter_alpha: 0.18
-    lookahead_speed_reduction_gain: 3.0
+    lookahead_filter_alpha: 0.25
+    lookahead_speed_reduction_gain: 2.0
 
     # Stopps an getrackten Objekten in den aktuell benachbarten Pflanzenreihen.
     object_stop_enabled: true
@@ -105,14 +108,14 @@ maize_navigator:
     # Virtueller Fuehrungspunkt hinter der Zielpose verhindert Drehen auf der Stelle.
     maneuver_heading_lookahead_distance: 0.2
     # Verrundete, monoton verfolgte Route fuer das Vorgewende.
-    maneuver_speed: 0.28
+    maneuver_speed: 0.5
     maneuver_slow_speed: 0.10
     maneuver_lookahead_distance: 1.4
-    maneuver_turn_lookahead_distance: 0.6
-    maneuver_lookahead_curvature_gain: 1.8
+    maneuver_turn_lookahead_distance: 0.4
+    maneuver_lookahead_curvature_gain: 2.5
     maneuver_lookahead_lateral_error_gain: 0.5
-    maneuver_lookahead_filter_alpha: 0.18
-    maneuver_lookahead_speed_reduction_gain: 2.5
+    maneuver_lookahead_filter_alpha: 0.25
+    maneuver_lookahead_speed_reduction_gain: 2.0
     maneuver_route_spacing: 0.08
     maneuver_corner_radius: 0.50
     maneuver_entry_extension_distance: 0.80
@@ -123,10 +126,10 @@ maize_navigator:
     # Rechteckbasierte Reiheneingang-Erkennung im Vorgewende.
     entrance_rect_enabled: true
     entrance_histogram_emergency_enabled: true
-    entrance_rect_max_angle_to_prediction_deg: 20.0
-    entrance_rect_max_angle_to_reference_deg: 40.0
+    entrance_rect_max_angle_to_prediction_deg: 10.0
+    entrance_rect_max_angle_to_reference_deg: 20.0
     entrance_rect_max_position_correction: 0.50
-    entrance_rect_backtrack_steps: 4
+    entrance_rect_backtrack_steps: 2
     entrance_rect_retry_until_remaining_distance: 0.60
     entrance_rect_min_failed_attempts_before_histogram: 5
 
