@@ -7,7 +7,7 @@ maize_navigator:
     scan_topic: "/sensors/merged_scan"
 
     control_frequency: 30.0
-    cmd_vel_publish_frequency: 20.0
+    cmd_vel_publish_frequency: 30.0
 
     expected_row_width: 0.75
     min_lane_width: 0.6
@@ -60,30 +60,30 @@ maize_navigator:
     laser_line_filter_alpha: 0.20
     laser_target_max_lateral_step: 0.05
 
-    follow_speed: 0.4
+    follow_speed: 0.28
     slow_speed: 0.12
-    pure_pursuit_gain: 1.4
-    curve_speed_reduction_gain: 2.5
+    pure_pursuit_gain: 1.0
+    curve_speed_reduction_gain: 3.0
     min_follow_turn_radius: 0.37
     linear_acceleration_limit: 0.18
     linear_deceleration_limit: 0.30
-    target_filter_alpha: 0.30
+    target_filter_alpha: 0.18
     # Ausfahr- und Einfahrziel liegen so weit ausserhalb der Pflanzenenden.
     row_end_goal_outward_distance: 0.15
     # Sicherheitsabstand der Wende-Querlinie hinter dem aeussersten relevanten Peak.
     row_exit_extension_distance: 0.40
 
-    follow_max_angular_speed: 0.90
-    angular_rate_limit: 1.4
+    follow_max_angular_speed: 0.55
+    angular_rate_limit: 0.85
 
     lookahead_distance: 2.0
-    turn_lookahead_distance: 0.25
-    lookahead_curvature_gain: 4.5
+    turn_lookahead_distance: 0.65
+    lookahead_curvature_gain: 2.0
     lookahead_curvature_sample_count: 7
     lookahead_curvature_back_distance: 0.5
     lookahead_lateral_error_gain: 1.0
-    lookahead_filter_alpha: 0.25
-    lookahead_speed_reduction_gain: 2.5
+    lookahead_filter_alpha: 0.18
+    lookahead_speed_reduction_gain: 3.0
 
     # Stopps an getrackten Objekten in den aktuell benachbarten Pflanzenreihen.
     object_stop_enabled: true
@@ -105,14 +105,14 @@ maize_navigator:
     # Virtueller Fuehrungspunkt hinter der Zielpose verhindert Drehen auf der Stelle.
     maneuver_heading_lookahead_distance: 0.2
     # Verrundete, monoton verfolgte Route fuer das Vorgewende.
-    maneuver_speed: 0.5
+    maneuver_speed: 0.28
     maneuver_slow_speed: 0.10
     maneuver_lookahead_distance: 1.4
-    maneuver_turn_lookahead_distance: 0.4
-    maneuver_lookahead_curvature_gain: 2.5
+    maneuver_turn_lookahead_distance: 0.6
+    maneuver_lookahead_curvature_gain: 1.8
     maneuver_lookahead_lateral_error_gain: 0.5
-    maneuver_lookahead_filter_alpha: 0.25
-    maneuver_lookahead_speed_reduction_gain: 2.0
+    maneuver_lookahead_filter_alpha: 0.18
+    maneuver_lookahead_speed_reduction_gain: 2.5
     maneuver_route_spacing: 0.08
     maneuver_corner_radius: 0.50
     maneuver_entry_extension_distance: 0.80
