@@ -14,6 +14,8 @@ from typing import Dict, List, Optional, Set, Tuple
 import numpy as np
 
 import rclpy
+from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
+from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
 
 from fre2026_detection_client import DetectorClient
@@ -656,8 +658,13 @@ class MaizeNavigator(Node):
         self.pause_srv = self.create_service(Trigger, "pause_navigation", self.pause_cb)
         self.resume_srv = self.create_service(Trigger, "resume_navigation", self.resume_cb)
         self.reset_srv = self.create_service(Trigger, "reset_navigation", self.reset_cb)
+        self.cmd_timer_callback_group = MutuallyExclusiveCallbackGroup()
         self.timer = self.create_timer(1.0 / self.p.control_frequency, self.control_loop)
-        self.cmd_timer = self.create_timer(1.0 / self.p.cmd_vel_publish_frequency, self.publish_current_cmd)
+        self.cmd_timer = self.create_timer(
+            1.0 / self.p.cmd_vel_publish_frequency,
+            self.publish_current_cmd,
+            callback_group=self.cmd_timer_callback_group,
+        )
 
         self.get_logger().info("Maize Navigator initialized with rectangle marching row detection")
 
@@ -5064,11 +5071,14 @@ class MaizeNavigator(Node):
 def main(args=None) -> None:
     rclpy.init(args=args)
     node = MaizeNavigator()
+    executor = MultiThreadedExecutor(num_threads=2)
+    executor.add_node(node)
     try:
-        rclpy.spin(node)
+        executor.spin()
     except KeyboardInterrupt:
         pass
     finally:
+        executor.shutdown()
         node.destroy_node()
         rclpy.shutdown()
 
