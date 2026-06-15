@@ -219,6 +219,8 @@ class NavigatorParams:
     hist_bin_size: float = 0.05
     hist_peak_min_points: int = 2
     occ_threshold: int = 35
+    start_fixed_initial_peaks_enabled: bool = False
+    start_fixed_initial_half_width: float = 0.375
 
     row_segment_point_count: int = 5
     row_segment_point_spacing: float = 0.3
@@ -686,6 +688,12 @@ class MaizeNavigator(Node):
         p.hist_bin_size = float(get_param("hist_bin_size", p.hist_bin_size))
         p.hist_peak_min_points = int(get_param("hist_peak_min_points", p.hist_peak_min_points))
         p.occ_threshold = int(get_param("map_row_occupancy_threshold", p.occ_threshold))
+        p.start_fixed_initial_peaks_enabled = bool(
+            get_param("start_fixed_initial_peaks_enabled", p.start_fixed_initial_peaks_enabled)
+        )
+        p.start_fixed_initial_half_width = float(
+            get_param("start_fixed_initial_half_width", p.start_fixed_initial_half_width)
+        )
 
         p.row_segment_point_count = int(get_param("row_segment_point_count", p.row_segment_point_count))
         p.row_segment_point_spacing = float(get_param("row_segment_point_spacing", p.row_segment_point_spacing))
@@ -879,6 +887,11 @@ class MaizeNavigator(Node):
         self.p.row_segment_point_spacing = max(0.05, self.p.row_segment_point_spacing)
         self.p.hist_roi_depth = max(self.p.hist_bin_size, self.p.hist_roi_depth)
         self.p.hist_roi_width = max(self.p.hist_bin_size, self.p.hist_roi_width)
+        self.p.start_fixed_initial_half_width = float(np.clip(
+            self.p.start_fixed_initial_half_width,
+            0.5 * self.p.min_lane_width,
+            0.5 * self.p.max_lane_width,
+        ))
         self.p.row_rectangle_width = max(0.05, self.p.row_rectangle_width)
         self.p.row_point_window_length = max(0.05, self.p.row_point_window_length)
         self.p.row_max_march_steps = max(1, self.p.row_max_march_steps)
@@ -1673,10 +1686,18 @@ class MaizeNavigator(Node):
             self.get_logger().info(f"Not enough occupied map points for histogram: {len(points)}", throttle_duration_sec=2.0)
             return
 
-        peak_pair = self.find_start_peak_pair(points, self.robot_pose)
-        if peak_pair is None:
-            self.get_logger().info("No valid left/right histogram peak pair found", throttle_duration_sec=2.0)
-            return
+        if self.p.start_fixed_initial_peaks_enabled:
+            half_width = self.p.start_fixed_initial_half_width
+            peak_pair = (half_width, -half_width)
+            self.get_logger().info(
+                f"Using fixed initial row peaks: left={half_width:.3f}, right={-half_width:.3f}",
+                throttle_duration_sec=2.0,
+            )
+        else:
+            peak_pair = self.find_start_peak_pair(points, self.robot_pose)
+            if peak_pair is None:
+                self.get_logger().info("No valid left/right histogram peak pair found", throttle_duration_sec=2.0)
+                return
 
         left_peak, right_peak = peak_pair
         measured_row_width = left_peak - right_peak
@@ -1712,8 +1733,9 @@ class MaizeNavigator(Node):
             return
 
         self.state = MissionState.FOLLOW_ROW
+        source = "fixed initial peaks" if self.p.start_fixed_initial_peaks_enabled else "histogram peaks"
         self.get_logger().info(
-            f"Initial rows locked once from histogram peaks: left={left_peak:.3f}, "
+            f"Initial rows locked once from {source}: left={left_peak:.3f}, "
             f"right={right_peak:.3f}, reference_width={self.p.expected_row_width:.3f}"
         )
 
@@ -3409,24 +3431,17 @@ class MaizeNavigator(Node):
             return None
 
         sorted_peaks = sorted(peaks, key=lambda item: item[0])
+        grouped_peaks = self.merge_start_histogram_peaks(sorted_peaks)
         candidate_pairs: List[Tuple[float, float, int]] = []
-        for left_idx in range(len(sorted_peaks) - 1):
-            right_peak = sorted_peaks[left_idx][0]
-            left_peak = sorted_peaks[left_idx + 1][0]
-            sep = left_peak - right_peak
-            if right_peak > -0.2 or left_peak < 0.2:
-                continue
-            if sep < 0.4 or sep > self.p.max_lane_width:
-                continue
-
-            if sep < self.p.min_lane_width:
-                midpoint = 0.5 * (left_peak + right_peak)
-                half_width = 0.5 * self.p.min_lane_width
-                right_peak = midpoint - half_width
-                left_peak = midpoint + half_width
-
-            pair_count = sorted_peaks[left_idx][1] + sorted_peaks[left_idx + 1][1]
-            candidate_pairs.append((left_peak, right_peak, pair_count))
+        right_candidates = [(peak, count) for peak, count in grouped_peaks if peak <= -0.2]
+        left_candidates = [(peak, count) for peak, count in grouped_peaks if peak >= 0.2]
+        for right_peak, right_count in right_candidates:
+            for left_peak, left_count in left_candidates:
+                sep = left_peak - right_peak
+                if sep < self.p.min_lane_width or sep > self.p.max_lane_width:
+                    continue
+                pair_count = right_count + left_count
+                candidate_pairs.append((left_peak, right_peak, pair_count))
 
         if not candidate_pairs:
             best_pair = None
@@ -3440,16 +3455,48 @@ class MaizeNavigator(Node):
                 scored_pairs,
                 key=lambda pair: (
                     abs(0.5 * (pair[0] + pair[1])),
+                    abs((pair[0] - pair[1]) - self.p.expected_row_width),
                     -pair[2],
                 ),
             )
             best_pair = (best_left, best_right)
 
         self.get_logger().info(
-            f"Histogram peaks: {[round(p[0], 3) for p in sorted_peaks]}, selected={best_pair}",
+            (
+                f"Histogram peaks: {[round(p[0], 3) for p in sorted_peaks]}, "
+                f"grouped={[round(p[0], 3) for p in grouped_peaks]}, selected={best_pair}"
+            ),
             throttle_duration_sec=2.0,
         )
         return best_pair
+
+    def merge_start_histogram_peaks(self, peaks: List[Tuple[float, int]]) -> List[Tuple[float, int]]:
+        if not peaks:
+            return []
+        merge_distance = max(2.0 * self.p.hist_bin_size, 0.12)
+        grouped: List[Tuple[float, int]] = []
+        group_values: List[float] = []
+        group_counts: List[int] = []
+
+        for peak, count in sorted(peaks, key=lambda item: item[0]):
+            if group_values and abs(float(peak) - group_values[-1]) > merge_distance:
+                total_count = int(sum(group_counts))
+                grouped.append((
+                    float(np.average(group_values, weights=group_counts)),
+                    total_count,
+                ))
+                group_values = []
+                group_counts = []
+            group_values.append(float(peak))
+            group_counts.append(int(count))
+
+        if group_values:
+            total_count = int(sum(group_counts))
+            grouped.append((
+                float(np.average(group_values, weights=group_counts)),
+                total_count,
+            ))
+        return grouped
 
     def start_point1_from_peak(self, points: np.ndarray, pose: Pose2D, peak_y: float) -> np.ndarray:
         forward = self.yaw_to_vector(pose.yaw)

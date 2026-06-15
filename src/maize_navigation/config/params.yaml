@@ -21,6 +21,8 @@ maize_navigator:
     hist_bin_size: 0.05
     hist_peak_min_points: 2
     map_row_occupancy_threshold: 35
+    start_fixed_initial_peaks_enabled: false
+    start_fixed_initial_half_width: 0.375
 
     # Rechteck-Marching-Reihenerkennung:
     # Die initiale linke/rechte Reihe kommt einmalig aus Histogrammpeaks.
