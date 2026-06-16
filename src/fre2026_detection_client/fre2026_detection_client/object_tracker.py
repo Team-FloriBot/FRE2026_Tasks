@@ -49,8 +49,10 @@ class ObjectTracker(Node):
         self.declare_parameter("min_observations_for_label", 8)
         self.declare_parameter("unlabeled_timeout_sec", 10.0)
         self.declare_parameter("tf_timeout_sec", 0.10)
+        self.declare_parameter("tf_lookup_offset_sec", 0.0)
         self.declare_parameter("publish_ground_z", True)
         self.declare_parameter("ground_z", 0.0)
+        self.declare_parameter("publish_tentative_markers", True)
         self.declare_parameter("marker_z_offset", 0.15)
         self.declare_parameter("marker_sphere_scale", 0.18)
         self.declare_parameter("marker_text_scale", 0.28)
@@ -77,8 +79,12 @@ class ObjectTracker(Node):
         self.min_observations_for_label = int(self.get_parameter("min_observations_for_label").value)
         self.unlabeled_timeout_sec = float(self.get_parameter("unlabeled_timeout_sec").value)
         self.tf_timeout_sec = float(self.get_parameter("tf_timeout_sec").value)
+        self.tf_lookup_offset_sec = float(self.get_parameter("tf_lookup_offset_sec").value)
         self.publish_ground_z = bool(self.get_parameter("publish_ground_z").value)
         self.ground_z = float(self.get_parameter("ground_z").value)
+        self.publish_tentative_markers = bool(
+            self.get_parameter("publish_tentative_markers").value
+        )
         self.marker_z_offset = float(self.get_parameter("marker_z_offset").value)
         self.marker_sphere_scale = float(self.get_parameter("marker_sphere_scale").value)
         self.marker_text_scale = float(self.get_parameter("marker_text_scale").value)
@@ -186,6 +192,7 @@ class ObjectTracker(Node):
                 f"from {msg.header.frame_id} to {self.target_frame}",
                 throttle_duration_sec=2.0,
             )
+            self.publish_tracks(msg.header.stamp)
             return
 
         updated_before = len(self.objects)
@@ -351,7 +358,8 @@ class ObjectTracker(Node):
             )
 
         self.tracked_objects_pub.publish(msg)
-        self.publish_markers(msg)
+        marker_msg = self.build_marker_object_array(msg.header, include_tentative=True)
+        self.publish_markers(marker_msg)
         self.get_logger().debug(
             f"Published {len(msg.objects)} confirmed tracked objects "
             f"from {len(self.objects)} stored tracks",
@@ -370,6 +378,26 @@ class ObjectTracker(Node):
             markers.markers.append(self.create_text_marker(tracked_objects.header, tracked))
 
         self.marker_pub.publish(markers)
+
+    def build_marker_object_array(self, header, include_tentative: bool) -> TrackedObjectArray:
+        if not include_tentative or not self.publish_tentative_markers:
+            marker_objects = TrackedObjectArray()
+            marker_objects.header = header
+            return marker_objects
+
+        marker_objects = TrackedObjectArray()
+        marker_objects.header = header
+        for tracked in self.objects.values():
+            if tracked.position is None:
+                continue
+            tracked_msg = TrackedObject()
+            tracked_msg.id = tracked.object_id
+            tracked_msg.label = tracked.label or self.best_tentative_label(tracked)
+            tracked_msg.position.x = tracked.position.x
+            tracked_msg.position.y = tracked.position.y
+            tracked_msg.position.z = self.output_z(tracked.position)
+            marker_objects.objects.append(tracked_msg)
+        return marker_objects
 
     def publish_delete_all_markers(self) -> None:
         if not hasattr(self, "marker_pub"):
@@ -437,6 +465,13 @@ class ObjectTracker(Node):
         if self.publish_ground_z:
             return self.ground_z
         return float(position.z)
+
+    @staticmethod
+    def best_tentative_label(tracked: TrackedState) -> str:
+        if not tracked.label_scores:
+            return "tentative"
+        label = max(tracked.label_scores, key=tracked.label_scores.get)
+        return str(label) if label else "tentative"
 
 
 def main(args=None) -> None:
