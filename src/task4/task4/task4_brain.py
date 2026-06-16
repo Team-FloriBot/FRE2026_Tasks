@@ -13,6 +13,7 @@ from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.duration import Duration
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
+from rclpy.qos import DurabilityPolicy, QoSProfile
 from rclpy.time import Time
 
 from fre2026_detection_client import DetectorClient
@@ -106,10 +107,12 @@ class Task4Brain(Node):
             str(self.get_parameter("shooting_marker_topic").value),
             10,
         )
+        tracker_active_qos = QoSProfile(depth=1)
+        tracker_active_qos.durability = DurabilityPolicy.TRANSIENT_LOCAL
         self.tracker_active_pub = self.create_publisher(
             Bool,
             str(self.get_parameter("tracker_active_topic").value),
-            10,
+            tracker_active_qos,
         )
         self.aim_target_pub = self.create_publisher(
             Point,
@@ -449,9 +452,10 @@ class Task4Brain(Node):
         )
 
     def tracked_objects_callback(self, msg: TrackedObjectArray):
-        if self.state != MissionState.DRIVE_COVERAGE:
+        if self.state not in (MissionState.DRIVE_COVERAGE, MissionState.PLAN_SHOOTING):
             return
 
+        added_or_updated = 0
         for tracked in msg.objects:
             try:
                 point = self.transform_point_to_target_frame(msg.header.frame_id, tracked.position)
@@ -465,6 +469,13 @@ class Task4Brain(Node):
                 y=float(point.y),
                 z=float(point.z),
                 label=str(tracked.label),
+            )
+            added_or_updated += 1
+
+        if added_or_updated:
+            self.get_logger().debug(
+                f"{added_or_updated} Tracker-Objekte uebernommen; "
+                f"object_map enthaelt {len(self.object_map)} Ziele."
             )
 
     def pure_pursuit_status_callback(self, msg: String):

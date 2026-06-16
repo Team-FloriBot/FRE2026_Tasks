@@ -10,6 +10,7 @@ from typing import Dict, Optional
 import rclpy
 from rclpy.duration import Duration
 from rclpy.node import Node
+from rclpy.qos import DurabilityPolicy, QoSProfile
 from rclpy.time import Time
 
 from fre2026_detection_interfaces.msg import TrackedObject, TrackedObjectArray
@@ -91,13 +92,21 @@ class ObjectTracker(Node):
         self.tf_buffer = Buffer()
         self.tf_listener = TransformListener(self.tf_buffer, self)
 
+        tracker_active_qos = QoSProfile(depth=1)
+        tracker_active_qos.durability = DurabilityPolicy.TRANSIENT_LOCAL
+
         self.results_sub = self.create_subscription(
             DetectionArray,
             detector_results_topic,
             self.detection_results_callback,
             2,
         )
-        self.active_sub = self.create_subscription(Bool, active_topic, self.active_callback, 10)
+        self.active_sub = self.create_subscription(
+            Bool,
+            active_topic,
+            self.active_callback,
+            tracker_active_qos,
+        )
         self.tracked_objects_pub = self.create_publisher(TrackedObjectArray, tracked_objects_topic, 10)
         self.marker_pub = self.create_publisher(MarkerArray, marker_topic, 10)
         self.reset_srv = self.create_service(Trigger, reset_service, self.reset_callback)
@@ -142,15 +151,8 @@ class ObjectTracker(Node):
         if not self.active:
             return
 
-        try:
-            transform = self.tf_buffer.lookup_transform(
-                self.target_frame,
-                msg.header.frame_id,
-                msg.header.stamp,
-                timeout=Duration(seconds=self.tf_timeout_sec),
-            )
-        except Exception as exc:
-            self.get_logger().warn(f"TF lookup failed: {exc}")
+        transform = self.lookup_detection_transform(msg)
+        if transform is None:
             return
 
         for detection in msg.detections:
@@ -162,6 +164,33 @@ class ObjectTracker(Node):
             self.update_track(detection, point_out.point, msg.header.stamp)
 
         self.publish_tracks(msg.header.stamp)
+
+    def lookup_detection_transform(self, msg: DetectionArray):
+        try:
+            return self.tf_buffer.lookup_transform(
+                self.target_frame,
+                msg.header.frame_id,
+                msg.header.stamp,
+                timeout=Duration(seconds=self.tf_timeout_sec),
+            )
+        except Exception as stamped_exc:
+            try:
+                transform = self.tf_buffer.lookup_transform(
+                    self.target_frame,
+                    msg.header.frame_id,
+                    Time(),
+                    timeout=Duration(seconds=self.tf_timeout_sec),
+                )
+            except Exception as latest_exc:
+                self.get_logger().warn(
+                    f"TF lookup failed: stamped={stamped_exc}; latest={latest_exc}"
+                )
+                return None
+
+            self.get_logger().debug(
+                f"Using latest TF for detection timestamp after stamped lookup failed: {stamped_exc}"
+            )
+            return transform
 
     def create_simulated_objects(self) -> TrackedObjectArray:
         rng = random.Random(self.simulation_seed)
