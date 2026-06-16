@@ -36,7 +36,13 @@ maize_navigator:
     row_end_min_points_fields_3_to_5: 2
     row_max_march_steps: 120
     row_min_fit_points: 3
-    row_fit_max_angle_to_previous_deg: 10.0
+    row_fit_max_angle_to_previous_deg: 3.0
+    # Erste Rechtecke bleiben nah an der Initialrichtung, damit sparse RANSAC-Fits
+    # den Reihenstart nicht schraeg wegziehen.
+    row_initial_fit_warmup_steps: 5
+    row_initial_fit_max_angle_to_initial_deg: 5.0
+    # Maximaler seitlicher Sprung des korrigierten Punkt-3 pro Marching-Schritt.
+    row_max_lateral_correction: 0.15
     # Linkes/rechtes Rechteckpaar soll parallel bleiben und etwa Reihenabstand halten.
     # 1.0 bedeutet: Richtung auf gemeinsame Richtung, Abstand auf expected_row_width.
     row_pair_direction_blend: 1.0
@@ -47,7 +53,9 @@ maize_navigator:
 
     # Lokale LaserScan-Feinfuehrung innerhalb der Reihe.
     # Karte bleibt Prior und Fallback; Reihenende und Vorgewende bleiben kartenbasiert.
-    laser_follow_enabled: false
+    laser_follow_enabled: true
+    # weighted: Karte/Laser mischen; only: Follow-Ziel direkt aus Laserlinie.
+    laser_follow_mode: "only"
     laser_scan_timeout: 0.50
     laser_roi_x_min: 0.1
     laser_roi_x_max: 1.7

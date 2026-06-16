@@ -234,10 +234,14 @@ class NavigatorParams:
     row_min_fit_points: int = 3
     row_freeze_behind_distance: float = 0.0
     row_fit_max_angle_to_previous_deg: float = 20.0
+    row_initial_fit_warmup_steps: int = 5
+    row_initial_fit_max_angle_to_initial_deg: float = 5.0
+    row_max_lateral_correction: float = 0.15
     row_pair_direction_blend: float = 1.0
     row_pair_distance_blend: float = 1.0
 
     laser_follow_enabled: bool = True
+    laser_follow_mode: str = "weighted"
     laser_scan_timeout: float = 0.50
     laser_roi_x_min: float = 0.25
     laser_roi_x_max: float = 1.80
@@ -351,6 +355,7 @@ class LaserRowFollower:
         scan: Optional[LaserScan],
         map_slope: Optional[float],
         map_target_base: np.ndarray,
+        trust_laser: bool = False,
     ) -> LaserFollowResult:
         if scan is None:
             return self.reject(LaserFollowResult(), "no scan")
@@ -394,9 +399,9 @@ class LaserRowFollower:
 
         laser_target_y = result.center_slope * target_x + result.center_intercept
         angle_error = 0.0 if map_slope is None else abs(wrap_to_pi(math.atan(result.center_slope) - math.atan(map_slope)))
-        if map_slope is not None and angle_error > self.p.laser_max_angle_to_map:
+        if not trust_laser and map_slope is not None and angle_error > self.p.laser_max_angle_to_map:
             return self.reject(result, "angle differs from map")
-        if abs(laser_target_y - float(map_target_base[1])) > self.p.laser_max_center_offset:
+        if not trust_laser and abs(laser_target_y - float(map_target_base[1])) > self.p.laser_max_center_offset:
             return self.reject(result, "center differs from map")
 
         result.center_slope, result.center_intercept, laser_target_y = self.filter_center_line(
@@ -412,9 +417,9 @@ class LaserRowFollower:
         scale = math.sqrt(float(np.clip(scale, 0.0, 1.0)))
         result.valid = True
         result.confidence = self.filtered_confidence
-        result.weight = scale * max_weight
+        result.weight = 1.0 if trust_laser else scale * max_weight
         result.target_base = np.array([target_x, laser_target_y], dtype=float)
-        result.reason = "ok"
+        result.reason = "laser only" if trust_laser else "ok"
         return result
 
     def filter_center_line(
@@ -717,10 +722,20 @@ class MaizeNavigator(Node):
         p.row_fit_max_angle_to_previous_deg = float(
             get_param("row_fit_max_angle_to_previous_deg", p.row_fit_max_angle_to_previous_deg)
         )
+        p.row_initial_fit_warmup_steps = int(
+            get_param("row_initial_fit_warmup_steps", p.row_initial_fit_warmup_steps)
+        )
+        p.row_initial_fit_max_angle_to_initial_deg = float(
+            get_param("row_initial_fit_max_angle_to_initial_deg", p.row_initial_fit_max_angle_to_initial_deg)
+        )
+        p.row_max_lateral_correction = float(
+            get_param("row_max_lateral_correction", p.row_max_lateral_correction)
+        )
         p.row_pair_direction_blend = float(get_param("row_pair_direction_blend", p.row_pair_direction_blend))
         p.row_pair_distance_blend = float(get_param("row_pair_distance_blend", p.row_pair_distance_blend))
 
         p.laser_follow_enabled = bool(get_param("laser_follow_enabled", p.laser_follow_enabled))
+        p.laser_follow_mode = str(get_param("laser_follow_mode", p.laser_follow_mode))
         p.laser_scan_timeout = float(get_param("laser_scan_timeout", p.laser_scan_timeout))
         p.laser_roi_x_min = float(get_param("laser_roi_x_min", p.laser_roi_x_min))
         p.laser_roi_x_max = float(get_param("laser_roi_x_max", p.laser_roi_x_max))
@@ -907,8 +922,19 @@ class MaizeNavigator(Node):
         self.p.row_max_march_steps = max(1, self.p.row_max_march_steps)
         self.p.row_freeze_behind_distance = max(0.0, self.p.row_freeze_behind_distance)
         self.p.row_fit_max_angle_to_previous_deg = float(np.clip(self.p.row_fit_max_angle_to_previous_deg, 1.0, 90.0))
+        self.p.row_initial_fit_warmup_steps = max(0, self.p.row_initial_fit_warmup_steps)
+        self.p.row_initial_fit_max_angle_to_initial_deg = float(
+            np.clip(self.p.row_initial_fit_max_angle_to_initial_deg, 1.0, self.p.row_fit_max_angle_to_previous_deg)
+        )
+        self.p.row_max_lateral_correction = max(0.0, self.p.row_max_lateral_correction)
         self.p.row_pair_direction_blend = float(np.clip(self.p.row_pair_direction_blend, 0.0, 1.0))
         self.p.row_pair_distance_blend = float(np.clip(self.p.row_pair_distance_blend, 0.0, 1.0))
+        self.p.laser_follow_mode = str(self.p.laser_follow_mode).strip().lower()
+        if self.p.laser_follow_mode not in ("weighted", "only"):
+            self.get_logger().warn(
+                f"laser_follow_mode must be 'weighted' or 'only'; using 'weighted' instead of '{self.p.laser_follow_mode}'"
+            )
+            self.p.laser_follow_mode = "weighted"
         self.p.laser_scan_timeout = max(0.05, self.p.laser_scan_timeout)
         self.p.laser_roi_length = max(0.05, self.p.laser_roi_length)
         self.p.laser_roi_x_max = self.p.laser_roi_x_min + self.p.laser_roi_length
@@ -2251,10 +2277,18 @@ class MaizeNavigator(Node):
         else:
             map_slope = float(tangent_base[1] / tangent_base[0])
 
-        self.laser_follow_result = self.laser_follower.process_scan(scan, map_slope, map_target_base)
+        laser_only = self.p.laser_follow_mode == "only"
+        self.laser_follow_result = self.laser_follower.process_scan(
+            scan,
+            map_slope,
+            map_target_base,
+            trust_laser=laser_only,
+        )
         result = self.laser_follow_result
         if not result.valid or result.target_base is None or result.weight <= 0.0:
             return np.asarray(map_target, dtype=float)
+        if laser_only:
+            return self.base_point_to_map(result.target_base)
         fused_base = (1.0 - result.weight) * map_target_base + result.weight * result.target_base
         return self.base_point_to_map(fused_base)
 
@@ -3715,7 +3749,8 @@ class MaizeNavigator(Node):
         last_fifth_segment_rectangle: Optional[RowEndRectangle] = None
         last_complete_support_rectangle: Optional[RowEndRectangle] = None
 
-        for _ in range(self.p.row_max_march_steps):
+        initial_reference_direction = self.normalize(model.initial_direction)
+        for step_idx in range(self.p.row_max_march_steps):
             search_point3 = line_points[2]
             big_rect_length = self.big_rectangle_length()
             fit_points = self.points_in_oriented_rectangle(
@@ -3735,7 +3770,19 @@ class MaizeNavigator(Node):
                     fitted_direction,
                     math.radians(self.p.row_fit_max_angle_to_previous_deg),
                 )
+                if step_idx < self.p.row_initial_fit_warmup_steps:
+                    corrected_direction = self.clamp_direction_angle(
+                        initial_reference_direction,
+                        corrected_direction,
+                        math.radians(self.p.row_initial_fit_max_angle_to_initial_deg),
+                    )
                 corrected_point3 = self.project_point_to_line(search_point3, fit_origin, corrected_direction)
+                corrected_point3 = self.clamp_lateral_correction(
+                    search_point3,
+                    corrected_point3,
+                    direction,
+                    self.p.row_max_lateral_correction,
+                )
 
             corrected_line_points = self.build_initial_line_from_point3(corrected_point3, corrected_direction)
             field_counts = self.count_points_per_line_field(map_points, corrected_line_points, corrected_direction)
@@ -3947,6 +3994,23 @@ class MaizeNavigator(Node):
         line_direction = self.normalize(line_direction)
         rel = np.asarray(point, dtype=float) - np.asarray(line_origin, dtype=float)
         return np.asarray(line_origin, dtype=float) + float(rel @ line_direction) * line_direction
+
+    def clamp_lateral_correction(
+        self,
+        original_point: np.ndarray,
+        corrected_point: np.ndarray,
+        reference_direction: np.ndarray,
+        max_lateral_shift: float,
+    ) -> np.ndarray:
+        if max_lateral_shift <= 0.0:
+            return np.asarray(corrected_point, dtype=float)
+        reference_direction = self.normalize(reference_direction)
+        lateral_direction = np.array([-reference_direction[1], reference_direction[0]], dtype=float)
+        original_point = np.asarray(original_point, dtype=float)
+        correction = np.asarray(corrected_point, dtype=float) - original_point
+        lateral_shift = float(correction @ lateral_direction)
+        clamped_lateral_shift = float(np.clip(lateral_shift, -max_lateral_shift, max_lateral_shift))
+        return np.asarray(corrected_point, dtype=float) + (clamped_lateral_shift - lateral_shift) * lateral_direction
 
     def mean_direction(self, first: np.ndarray, second: np.ndarray) -> np.ndarray:
         first = self.normalize(first)
@@ -4160,7 +4224,16 @@ class MaizeNavigator(Node):
             left_point = np.asarray(left.points[idx], dtype=float)
             right_point = np.asarray(right.points[idx], dtype=float)
             direction = self.mean_direction(left.point_directions[idx], right.point_directions[idx])
-            left.points[idx], right.points[idx] = self.regularized_row_pair_centers(left_point, right_point, direction, blend)
+            left_weight = self.row_point_support_weight(left, idx)
+            right_weight = self.row_point_support_weight(right, idx)
+            left.points[idx], right.points[idx] = self.regularized_row_pair_centers(
+                left_point,
+                right_point,
+                direction,
+                blend,
+                left_weight,
+                right_weight,
+            )
 
         debug_count = min(len(left.debug_segments), len(right.debug_segments))
         for idx in range(debug_count):
@@ -4172,6 +4245,8 @@ class MaizeNavigator(Node):
                 right_segment.point3_rect_center,
                 direction,
                 blend,
+                self.segment_support_weight(left_segment),
+                self.segment_support_weight(right_segment),
             )
             left_delta = left_center - left_segment.point3_rect_center
             right_delta = right_center - right_segment.point3_rect_center
@@ -4189,6 +4264,8 @@ class MaizeNavigator(Node):
                 right.end_rectangle.center,
                 direction,
                 blend,
+                self.rectangle_support_weight(left.end_rectangle),
+                self.rectangle_support_weight(right.end_rectangle),
             )
             left.end_rectangle.center = left_center
             right.end_rectangle.center = right_center
@@ -4211,10 +4288,15 @@ class MaizeNavigator(Node):
         right_center: np.ndarray,
         direction: np.ndarray,
         blend: float,
+        left_weight: float = 1.0,
+        right_weight: float = 1.0,
     ) -> Tuple[np.ndarray, np.ndarray]:
         left_center = np.asarray(left_center, dtype=float)
         right_center = np.asarray(right_center, dtype=float)
-        center = 0.5 * (left_center + right_center)
+        left_weight = max(0.1, float(left_weight))
+        right_weight = max(0.1, float(right_weight))
+        weight_sum = left_weight + right_weight
+        center = (left_weight * left_center + right_weight * right_center) / weight_sum
         direction = self.normalize(direction)
         lateral = np.array([-direction[1], direction[0]], dtype=float)
         signed_width = float((left_center - right_center) @ lateral)
@@ -4226,7 +4308,24 @@ class MaizeNavigator(Node):
         target_width = float(np.clip(self.p.expected_row_width, self.p.min_lane_width, self.p.max_lane_width))
         clamped_width = float(np.clip(signed_width, self.p.min_lane_width, self.p.max_lane_width))
         desired_width = (1.0 - blend) * clamped_width + blend * target_width
-        return center + 0.5 * desired_width * lateral, center - 0.5 * desired_width * lateral
+        left_offset = (right_weight / weight_sum) * desired_width
+        right_offset = (left_weight / weight_sum) * desired_width
+        return center + left_offset * lateral, center - right_offset * lateral
+
+    def row_point_support_weight(self, result: RowMarchResult, idx: int) -> float:
+        if not self.row_result_point_observed(result, idx):
+            return 0.25
+        segment_idx = idx - 2
+        if 0 <= segment_idx < len(result.debug_segments):
+            return self.segment_support_weight(result.debug_segments[segment_idx])
+        return 1.0
+
+    def segment_support_weight(self, segment: SegmentDebug) -> float:
+        return 1.0 + float(max(0, segment.support_count)) + 0.5 * float(max(0, segment.end_field_count))
+
+    def rectangle_support_weight(self, rectangle: RowEndRectangle) -> float:
+        field_support = int(sum(max(0, count) for count in rectangle.field_counts))
+        return 1.0 + float(max(0, rectangle.support_count)) + 0.5 * float(field_support)
 
     def build_navigation_midline(self) -> np.ndarray:
         if self.left_row is None or self.right_row is None:
