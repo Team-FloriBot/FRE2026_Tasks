@@ -48,7 +48,8 @@ class ObjectTracker(Node):
         self.declare_parameter("position_smoothing_alpha", 0.30)
         self.declare_parameter("min_observations_for_label", 8)
         self.declare_parameter("unlabeled_timeout_sec", 10.0)
-        self.declare_parameter("tf_timeout_sec", 0.10)
+        self.declare_parameter("tf_timeout_sec", 0.20)
+        self.declare_parameter("tf_lookup_offset_sec", 0.10)
         self.declare_parameter("marker_z_offset", 0.15)
         self.declare_parameter("marker_sphere_scale", 0.18)
         self.declare_parameter("marker_text_scale", 0.28)
@@ -75,6 +76,7 @@ class ObjectTracker(Node):
         self.min_observations_for_label = int(self.get_parameter("min_observations_for_label").value)
         self.unlabeled_timeout_sec = float(self.get_parameter("unlabeled_timeout_sec").value)
         self.tf_timeout_sec = float(self.get_parameter("tf_timeout_sec").value)
+        self.tf_lookup_offset_sec = float(self.get_parameter("tf_lookup_offset_sec").value)
         self.marker_z_offset = float(self.get_parameter("marker_z_offset").value)
         self.marker_sphere_scale = float(self.get_parameter("marker_sphere_scale").value)
         self.marker_text_scale = float(self.get_parameter("marker_text_scale").value)
@@ -166,11 +168,14 @@ class ObjectTracker(Node):
         self.publish_tracks(msg.header.stamp)
 
     def lookup_detection_transform(self, msg: DetectionArray):
+        lookup_time = Time.from_msg(msg.header.stamp) - Duration(
+            seconds=max(0.0, self.tf_lookup_offset_sec)
+        )
         try:
             return self.tf_buffer.lookup_transform(
                 self.target_frame,
                 msg.header.frame_id,
-                msg.header.stamp,
+                lookup_time,
                 timeout=Duration(seconds=self.tf_timeout_sec),
             )
         except Exception as stamped_exc:

@@ -17,6 +17,16 @@ def generate_launch_description():
             default_value="false",
             description="Publish simulated tracked objects from the object tracker.",
         ),
+        DeclareLaunchArgument(
+            "tracker_tf_lookup_offset_sec",
+            default_value="0.10",
+            description="Subtract this offset from detection stamps before TF lookup.",
+        ),
+        DeclareLaunchArgument(
+            "tracker_tf_timeout_sec",
+            default_value="0.20",
+            description="How long the object tracker waits for TF data.",
+        ),
         Node(
             package="maize_navigation",
             executable="navigator",
@@ -31,6 +41,8 @@ def generate_launch_description():
             output="screen",
             parameters=[{
                 "simulation_enabled": LaunchConfiguration("simulate_tracked_objects"),
+                "tf_lookup_offset_sec": LaunchConfiguration("tracker_tf_lookup_offset_sec"),
+                "tf_timeout_sec": LaunchConfiguration("tracker_tf_timeout_sec"),
             }],
         ),
     ])
