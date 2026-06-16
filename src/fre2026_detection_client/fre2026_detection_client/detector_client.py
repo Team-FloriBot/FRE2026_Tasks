@@ -115,7 +115,7 @@ class DetectorClient:
         self,
         model_path: str,
         classes: Optional[Sequence[str]] = None,
-        confidence: float = 0.5,
+        confidence: float = 0.25,
         use_realsense_ros_wrapper: bool = False,
     ) -> Future:
         config = DetectorInitConfig(
