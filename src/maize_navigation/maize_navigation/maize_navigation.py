@@ -80,6 +80,7 @@ class RowEndRectangle:
 class RowMarchResult:
     points: np.ndarray = field(default_factory=lambda: np.empty((0, 2), dtype=float))
     point_directions: np.ndarray = field(default_factory=lambda: np.empty((0, 2), dtype=float))
+    point_observed: np.ndarray = field(default_factory=lambda: np.empty((0,), dtype=bool))
     frozen_count: int = 0
     debug_segments: List[SegmentDebug] = field(default_factory=list)
     current_line_points: np.ndarray = field(default_factory=lambda: np.empty((0, 2), dtype=float))
@@ -3630,6 +3631,7 @@ class MaizeNavigator(Node):
 
         self.left_row.result = self.march_row(self.left_row, map_points)
         self.right_row.result = self.march_row(self.right_row, map_points)
+        self.align_unobserved_row_points_from_known_side(self.left_row.result, self.right_row.result)
         self.extend_missing_row_tail_from_known_side(self.left_row, self.right_row)
         self.harmonize_row_pair_directions(self.left_row.result, self.right_row.result)
         self.update_frozen_prefix(self.left_row)
@@ -3692,6 +3694,7 @@ class MaizeNavigator(Node):
             else:
                 direction = self.initial_direction_from_points(point1, point2, model.initial_direction)
                 exact_directions = [np.asarray(direction, dtype=float) for _ in exact_points]
+            exact_observed = [True for _ in exact_points]
             line_points = self.build_next_line_from_old_point3(point2, direction)
         else:
             point1 = np.asarray(model.initial_point1, dtype=float)
@@ -3699,6 +3702,7 @@ class MaizeNavigator(Node):
             direction = self.normalize(model.initial_direction)
             exact_points = [point1, point2]
             exact_directions = [np.asarray(direction, dtype=float), np.asarray(direction, dtype=float)]
+            exact_observed = [True, True]
             line_points = self.build_initial_line_from_point1_and_point2(point1, point2, direction)
         result.frozen_count = len(model.frozen_points)
         previous_valid_point: Optional[np.ndarray] = np.asarray(point2, dtype=float)
@@ -3778,11 +3782,14 @@ class MaizeNavigator(Node):
             if len(local_point3_points) > 0:
                 row_point = np.mean(local_point3_points, axis=0)
                 previous_valid_point = row_point
+                point_observed = True
             else:
                 row_point = np.array(corrected_point3, copy=True)
+                point_observed = False
 
             exact_points.append(row_point)
             exact_directions.append(np.asarray(corrected_direction, dtype=float))
+            exact_observed.append(point_observed)
             last_valid_direction = np.asarray(corrected_direction, dtype=float)
             result.debug_segments.append(
                 SegmentDebug(
@@ -3806,6 +3813,7 @@ class MaizeNavigator(Node):
         result.point_directions = (
             np.asarray(exact_directions, dtype=float) if exact_directions else np.empty((0, 2), dtype=float)
         )
+        result.point_observed = np.asarray(exact_observed, dtype=bool) if exact_observed else np.empty((0,), dtype=bool)
         result.current_line_points = np.asarray(line_points, dtype=float)
         result.fifth_segment_rectangle = last_fifth_segment_rectangle
         result.full_support_rectangle = last_complete_support_rectangle
@@ -4036,6 +4044,53 @@ class MaizeNavigator(Node):
         count = min(len(left_points), len(right_points))
         return 0.5 * (left_points[:count] + right_points[:count])
 
+    def align_unobserved_row_points_from_known_side(self, left: RowMarchResult, right: RowMarchResult) -> None:
+        count = min(len(left.points), len(right.points))
+        if count == 0:
+            return
+
+        for idx in range(count):
+            left_observed = self.row_result_point_observed(left, idx)
+            right_observed = self.row_result_point_observed(right, idx)
+            if left_observed == right_observed:
+                continue
+
+            if not left_observed and right_observed:
+                direction = self.row_result_direction_at(right, idx)
+                left.points[idx] = self.parallel_row_point_from_known_side(right.points[idx], direction, "left")
+                if len(left.point_directions) > idx:
+                    left.point_directions[idx] = direction
+            elif not right_observed and left_observed:
+                direction = self.row_result_direction_at(left, idx)
+                right.points[idx] = self.parallel_row_point_from_known_side(left.points[idx], direction, "right")
+                if len(right.point_directions) > idx:
+                    right.point_directions[idx] = direction
+
+    def row_result_point_observed(self, result: RowMarchResult, idx: int) -> bool:
+        if len(result.point_observed) == len(result.points):
+            return bool(result.point_observed[idx])
+        return True
+
+    def row_result_direction_at(self, result: RowMarchResult, idx: int) -> np.ndarray:
+        if len(result.point_directions) > idx:
+            return self.normalize(result.point_directions[idx])
+        if len(result.points) >= 2:
+            return self.normalize(result.points[-1] - result.points[0])
+        return np.array([1.0, 0.0], dtype=float)
+
+    def parallel_row_point_from_known_side(
+        self,
+        known_point: np.ndarray,
+        known_direction: np.ndarray,
+        target_side: str,
+    ) -> np.ndarray:
+        direction = self.normalize(known_direction)
+        left_normal = np.array([-direction[1], direction[0]], dtype=float)
+        lateral_offset = self.p.expected_row_width * left_normal
+        if target_side == "left":
+            return np.asarray(known_point, dtype=float) + lateral_offset
+        return np.asarray(known_point, dtype=float) - lateral_offset
+
     def extend_missing_row_tail_from_known_side(self, left: RowMarchModel, right: RowMarchModel) -> None:
         left_count = len(left.result.points)
         right_count = len(right.result.points)
@@ -4068,12 +4123,7 @@ class MaizeNavigator(Node):
         predicted_directions = []
         for idx in range(target_count, source_count):
             direction = self.normalize(source_directions[idx])
-            left_normal = np.array([-direction[1], direction[0]], dtype=float)
-            lateral_offset = self.p.expected_row_width * left_normal
-            if target_side == "left":
-                predicted_point = np.asarray(source.points[idx], dtype=float) + lateral_offset
-            else:
-                predicted_point = np.asarray(source.points[idx], dtype=float) - lateral_offset
+            predicted_point = self.parallel_row_point_from_known_side(source.points[idx], direction, target_side)
             predicted_points.append(predicted_point)
             predicted_directions.append(direction)
 
@@ -4087,6 +4137,15 @@ class MaizeNavigator(Node):
             fallback_direction = self.normalize(target.points[min(target_count - 1, len(target.points) - 1)] - target.points[0])
             base_directions = np.array([fallback_direction for _ in range(target_count)], dtype=float)
             target.point_directions = np.vstack((base_directions, np.asarray(predicted_directions, dtype=float)))
+        if len(target.point_observed) == target_count:
+            target.point_observed = np.concatenate((target.point_observed, np.zeros(len(predicted_points), dtype=bool)))
+        else:
+            target.point_observed = np.concatenate(
+                (
+                    np.ones(target_count, dtype=bool),
+                    np.zeros(len(predicted_points), dtype=bool),
+                )
+            )
 
     def build_navigation_midline(self) -> np.ndarray:
         if self.left_row is None or self.right_row is None:
@@ -4139,6 +4198,18 @@ class MaizeNavigator(Node):
             mean_dir = self.mean_direction(left_dir, right_dir)
             left.point_directions[idx] = self.normalize((1.0 - blend) * left_dir + blend * mean_dir)
             right.point_directions[idx] = self.normalize((1.0 - blend) * right_dir + blend * mean_dir)
+
+        debug_count = min(len(left.debug_segments), len(right.debug_segments))
+        for idx in range(debug_count):
+            left_segment = left.debug_segments[idx]
+            right_segment = right.debug_segments[idx]
+            mean_dir = self.mean_direction(left_segment.direction, right_segment.direction)
+            left_dir = self.normalize((1.0 - blend) * self.normalize(left_segment.direction) + blend * mean_dir)
+            right_dir = self.normalize((1.0 - blend) * self.normalize(right_segment.direction) + blend * mean_dir)
+            left_segment.direction = left_dir
+            right_segment.direction = right_dir
+            left_segment.line_points = self.build_initial_line_from_point3(left_segment.point3_rect_center, left_dir)
+            right_segment.line_points = self.build_initial_line_from_point3(right_segment.point3_rect_center, right_dir)
 
         if left.end_direction is not None and right.end_direction is not None:
             mean_end = self.mean_direction(left.end_direction, right.end_direction)
