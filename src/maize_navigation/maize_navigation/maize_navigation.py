@@ -579,7 +579,7 @@ class MaizeNavigator(Node):
         self.object_detection_started = False
         self.object_detection_start_requested = False
         self.object_detection_session_id = 0
-        self.active_object_row_range = 1
+        self.active_object_row_range = 2
         self.active_plant_row_count: Optional[int] = None
         self.latest_tracked_objects: Optional[TrackedObjectArray] = None
         self.handled_tracked_object_ids: Set[int] = set()
@@ -1103,7 +1103,7 @@ class MaizeNavigator(Node):
             self.publish_audio_text("navigation error")
             return res
         model_path = getattr(req, "model_path", "").strip()
-        object_row_range = int(getattr(req, "object_row_range", 1))
+        object_row_range = int(getattr(req, "object_row_range", 2))
         plant_row_count = int(getattr(req, "plant_row_count", 0))
         starting_lane_number = int(getattr(req, "starting_lane_number", 0))
         row_numbers_increase_to = str(getattr(req, "row_numbers_increase_to", "")).strip().lower()
@@ -2251,6 +2251,54 @@ class MaizeNavigator(Node):
             f"distance_from_start={distance_from_start:.1f} m"
         )
 
+    def record_latest_tracked_object_positions(self) -> int:
+        self.ensure_object_position_storage()
+        if self.latest_tracked_objects is None:
+            return 0
+
+        recorded_count = 0
+        for tracked in self.latest_tracked_objects.objects:
+            object_id = int(tracked.id)
+            if object_id in self.object_row_positions:
+                continue
+
+            object_xy = np.array([float(tracked.position.x), float(tracked.position.y)], dtype=float)
+            row_side, row_distance, plant_row_number, plant_row_offset = self.match_tracked_object_to_active_rows(
+                object_xy
+            )
+            if row_side is None or row_distance > self.p.object_row_match_tolerance:
+                self.get_logger().info(
+                    f"Tracked object {object_id} not exported: no active-row match "
+                    f"(distance={row_distance:.2f} m, tolerance={self.p.object_row_match_tolerance:.2f} m)",
+                    throttle_duration_sec=2.0,
+                )
+                continue
+            if plant_row_number is None:
+                self.get_logger().info(
+                    f"Tracked object {object_id} not exported: plant row number is unknown",
+                    throttle_duration_sec=2.0,
+                )
+                continue
+
+            stop = ObjectStop(
+                object_id=object_id,
+                label=str(getattr(tracked, "label", "")),
+                row_side=row_side,
+                object_point=object_xy,
+                stop_point=object_xy,
+                distance_ahead=0.0,
+                plant_row_number=plant_row_number,
+                plant_row_offset=plant_row_offset,
+            )
+            before_count = len(self.object_row_positions)
+            self.record_object_row_position(stop)
+            if len(self.object_row_positions) > before_count:
+                recorded_count += 1
+
+        if recorded_count > 0:
+            self.get_logger().info(f"Recorded {recorded_count} tracked objects for CSV export")
+        return recorded_count
+
     def ensure_object_position_storage(self) -> None:
         if not hasattr(self, "object_row_positions"):
             self.object_row_positions = {}
@@ -2566,7 +2614,12 @@ class MaizeNavigator(Node):
 
     def export_object_positions(self) -> Optional[str]:
         self.ensure_object_position_storage()
+        self.record_latest_tracked_object_positions()
         if self.object_positions_exported or len(self.object_row_positions) == 0:
+            self.get_logger().info(
+                "No detected object positions to export",
+                throttle_duration_sec=2.0,
+            )
             return None
         output_directory_param = getattr(
             self.p,
