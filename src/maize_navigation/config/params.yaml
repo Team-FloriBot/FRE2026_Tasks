@@ -39,10 +39,10 @@ maize_navigator:
     row_fit_max_angle_to_previous_deg: 3.0
     # Erste Rechtecke bleiben nah an der Initialrichtung, damit sparse RANSAC-Fits
     # den Reihenstart nicht schraeg wegziehen.
-    row_initial_fit_warmup_steps: 5
+    row_initial_fit_warmup_steps: 3
     row_initial_fit_max_angle_to_initial_deg: 5.0
     # Maximaler seitlicher Sprung des korrigierten Punkt-3 pro Marching-Schritt.
-    row_max_lateral_correction: 0.15
+    row_max_lateral_correction: 0.05
     # Linkes/rechtes Rechteckpaar soll parallel bleiben und etwa Reihenabstand halten.
     # 1.0 bedeutet: Richtung auf gemeinsame Richtung, Abstand auf expected_row_width.
     row_pair_direction_blend: 1.0
@@ -53,9 +53,7 @@ maize_navigator:
 
     # Lokale LaserScan-Feinfuehrung innerhalb der Reihe.
     # Karte bleibt Prior und Fallback; Reihenende und Vorgewende bleiben kartenbasiert.
-    laser_follow_enabled: true
-    # weighted: Karte/Laser mischen; only: Follow-Ziel direkt aus Laserlinie.
-    laser_follow_mode: "only"
+    laser_follow_enabled: false
     laser_scan_timeout: 0.50
     laser_roi_x_min: 0.1
     laser_roi_x_max: 1.7
@@ -67,7 +65,7 @@ maize_navigator:
     laser_min_inliers: 5
     laser_min_visible_length: 0.40
     laser_max_abs_line_slope: 0.90
-    laser_max_angle_to_map: 0.45
+    laser_max_angle_to_map: 0.25
     laser_max_center_offset: 0.40
     laser_min_confidence: 0.10
     laser_full_confidence: 0.75
@@ -141,8 +139,8 @@ maize_navigator:
     # Rechteckbasierte Reiheneingang-Erkennung im Vorgewende.
     entrance_rect_enabled: true
     entrance_histogram_emergency_enabled: true
-    entrance_rect_max_angle_to_prediction_deg: 10.0
-    entrance_rect_max_angle_to_reference_deg: 20.0
+    entrance_rect_max_angle_to_prediction_deg: 5.0
+    entrance_rect_max_angle_to_reference_deg: 10.0
     entrance_rect_max_position_correction: 0.50
     entrance_rect_backtrack_steps: 2
     entrance_rect_retry_until_remaining_distance: 0.60
