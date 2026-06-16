@@ -1414,7 +1414,7 @@ class MaizeNavigator(Node):
         self.object_detection_initialized = False
         self.object_detection_started = False
         self.detector.clear_results()
-        future = self.detector.init(model_path=model_path)
+        future = self.detector.init(model_path=model_path, confidence=0.2)
         future.add_done_callback(self.handle_detector_init_response)
         return True, f"object detection init requested with model: {model_path}"
 
@@ -1467,7 +1467,7 @@ class MaizeNavigator(Node):
             self.start_object_detection("navigation resumed")
             return
         if getattr(self, "object_detection_model_path", ""):
-            future = self.detector.init(model_path=self.object_detection_model_path)
+            future = self.detector.init(model_path=self.object_detection_model_path, confidence=0.2)
             future.add_done_callback(self.handle_detector_init_response)
 
     def release_object_detection(self, reason: str) -> None:
