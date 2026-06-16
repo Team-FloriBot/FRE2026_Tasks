@@ -320,7 +320,7 @@ class NavigatorParams:
     object_stop_duration_sec: float = 2.0
     object_stop_xy_tolerance: float = 0.20
     object_stop_max_ahead_distance: float = 4.0
-    object_stop_past_tolerance: float = 0.20
+    object_stop_past_tolerance: float = 0.60
     object_stop_final_distance: float = 0.45
     object_stop_final_speed: float = 0.06
     object_stop_final_lateral_tolerance: float = 0.12

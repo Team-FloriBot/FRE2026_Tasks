@@ -46,7 +46,8 @@ class ObjectTracker(Node):
         self.declare_parameter("reset_service", "/tracker/reset")
         self.declare_parameter("match_distance", 0.30)
         self.declare_parameter("position_smoothing_alpha", 0.30)
-        self.declare_parameter("min_observations_for_label", 8)
+        self.declare_parameter("min_observations_for_publish", 2)
+        self.declare_parameter("min_observations_for_label", 2)
         self.declare_parameter("unlabeled_timeout_sec", 10.0)
         self.declare_parameter("tf_timeout_sec", 0.10)
         self.declare_parameter("tf_lookup_offset_sec", 0.0)
@@ -76,6 +77,9 @@ class ObjectTracker(Node):
 
         self.match_distance = float(self.get_parameter("match_distance").value)
         self.position_smoothing_alpha = float(self.get_parameter("position_smoothing_alpha").value)
+        self.min_observations_for_publish = int(
+            self.get_parameter("min_observations_for_publish").value
+        )
         self.min_observations_for_label = int(self.get_parameter("min_observations_for_label").value)
         self.unlabeled_timeout_sec = float(self.get_parameter("unlabeled_timeout_sec").value)
         self.tf_timeout_sec = float(self.get_parameter("tf_timeout_sec").value)
@@ -334,6 +338,7 @@ class ObjectTracker(Node):
 
         current_time = Time.from_msg(stamp)
         expired_ids = []
+        confirmed_count = 0
         for object_id, tracked in self.objects.items():
             if tracked.label is None:
                 last_seen = Time.from_msg(tracked.last_seen)
@@ -341,14 +346,7 @@ class ObjectTracker(Node):
                 if age_sec > self.unlabeled_timeout_sec:
                     expired_ids.append(object_id)
                 continue
-
-            tracked_msg = TrackedObject()
-            tracked_msg.id = tracked.object_id
-            tracked_msg.label = tracked.label
-            tracked_msg.position.x = tracked.position.x
-            tracked_msg.position.y = tracked.position.y
-            tracked_msg.position.z = self.output_z(tracked.position)
-            msg.objects.append(tracked_msg)
+            confirmed_count += 1
 
         for object_id in expired_ids:
             del self.objects[object_id]
@@ -357,12 +355,17 @@ class ObjectTracker(Node):
                 f"{self.unlabeled_timeout_sec:.1f}s without confirmation"
             )
 
+        for tracked in self.objects.values():
+            if tracked.counter < max(1, self.min_observations_for_publish):
+                continue
+            msg.objects.append(self.tracked_state_to_msg(tracked))
+
         self.tracked_objects_pub.publish(msg)
         marker_msg = self.build_marker_object_array(msg.header, include_tentative=True)
         self.publish_markers(marker_msg)
         self.get_logger().debug(
-            f"Published {len(msg.objects)} confirmed tracked objects "
-            f"from {len(self.objects)} stored tracks",
+            f"Published {len(msg.objects)} tracked objects "
+            f"({confirmed_count} confirmed) from {len(self.objects)} stored tracks",
             throttle_duration_sec=1.0,
         )
 
@@ -390,14 +393,17 @@ class ObjectTracker(Node):
         for tracked in self.objects.values():
             if tracked.position is None:
                 continue
-            tracked_msg = TrackedObject()
-            tracked_msg.id = tracked.object_id
-            tracked_msg.label = tracked.label or self.best_tentative_label(tracked)
-            tracked_msg.position.x = tracked.position.x
-            tracked_msg.position.y = tracked.position.y
-            tracked_msg.position.z = self.output_z(tracked.position)
-            marker_objects.objects.append(tracked_msg)
+            marker_objects.objects.append(self.tracked_state_to_msg(tracked))
         return marker_objects
+
+    def tracked_state_to_msg(self, tracked: TrackedState) -> TrackedObject:
+        tracked_msg = TrackedObject()
+        tracked_msg.id = tracked.object_id
+        tracked_msg.label = tracked.label or self.best_tentative_label(tracked)
+        tracked_msg.position.x = tracked.position.x
+        tracked_msg.position.y = tracked.position.y
+        tracked_msg.position.z = self.output_z(tracked.position)
+        return tracked_msg
 
     def publish_delete_all_markers(self) -> None:
         if not hasattr(self, "marker_pub"):
