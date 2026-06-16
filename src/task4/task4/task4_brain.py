@@ -82,6 +82,7 @@ class Task4Brain(Node):
         self.declare_parameter("tracker_active_topic", "/tracker/active")
         self.declare_parameter("tracker_reset_service", "/tracker/reset")
         self.declare_parameter("detector_model_path", "")
+        self.declare_parameter("detector_confidence", 0.25)
         self.declare_parameter("plan_topic", "/plan")
         self.declare_parameter("polygon_marker_topic", "/task4/coverage_polygon_marker")
         self.declare_parameter("shooting_marker_topic", "/task4/shooting_markers")
@@ -714,6 +715,10 @@ class Task4Brain(Node):
         if not model_path:
             self.get_logger().warn("detector_model_path ist leer; Detector wird nicht gestartet.")
             return
+        detector_confidence = max(
+            0.0,
+            min(1.0, float(self.get_parameter("detector_confidence").value)),
+        )
 
         timeout_sec = 2.0
         if not self.detector.wait_for_services(timeout_sec=timeout_sec):
@@ -721,7 +726,10 @@ class Task4Brain(Node):
             return
 
         self.call_detector_service_sync(
-            self.detector.init(model_path=model_path),
+            self.detector.init(
+                model_path=model_path,
+                confidence=detector_confidence,
+            ),
             "init",
             timeout_sec,
         )
@@ -734,7 +742,9 @@ class Task4Brain(Node):
         )
         self.detector_started = True
         self.detector.clear_results()
-        self.get_logger().info(f"Detector gestartet: model='{model_path}'")
+        self.get_logger().info(
+            f"Detector gestartet: model='{model_path}', confidence={detector_confidence:.2f}"
+        )
 
     def stop_detector_for_coverage(self, reason: str, release_detector: bool = False):
         timeout_sec = 2.0
