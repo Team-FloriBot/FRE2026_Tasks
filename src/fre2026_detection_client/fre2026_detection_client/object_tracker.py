@@ -205,11 +205,14 @@ class ObjectTracker(Node):
         self.publish_tracks(msg.header.stamp)
 
     def lookup_detection_transform(self, msg: DetectionArray):
+        lookup_time = Time.from_msg(msg.header.stamp) - Duration(
+            seconds=max(0.0, self.tf_lookup_offset_sec)
+        )
         try:
             return self.tf_buffer.lookup_transform(
                 self.target_frame,
                 msg.header.frame_id,
-                msg.header.stamp,
+                lookup_time,
                 timeout=Duration(seconds=self.tf_timeout_sec),
             )
         except Exception as stamped_exc:

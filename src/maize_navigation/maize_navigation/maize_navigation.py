@@ -17,6 +17,7 @@ import rclpy
 from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
+from rclpy.qos import DurabilityPolicy, QoSProfile
 
 from fre2026_detection_client import DetectorClient
 from fre2026_detection_interfaces.msg import TrackedObjectArray
@@ -652,7 +653,9 @@ class MaizeNavigator(Node):
         )
         self.cmd_pub = self.create_publisher(Twist, self.p.cmd_vel_topic, 10)
         self.marker_pub = self.create_publisher(MarkerArray, "navigation_markers", 10)
-        self.tracker_active_pub = self.create_publisher(Bool, "/tracker/active", 10)
+        tracker_active_qos = QoSProfile(depth=1)
+        tracker_active_qos.durability = DurabilityPolicy.TRANSIENT_LOCAL
+        self.tracker_active_pub = self.create_publisher(Bool, "/tracker/active", tracker_active_qos)
         self.audio_pub = self.create_publisher(String, "/classification_result", 10)
         self.tracker_reset_client = self.create_client(Trigger, "/tracker/reset")
         self.slam_reset_client = (
@@ -1430,7 +1433,7 @@ class MaizeNavigator(Node):
         self.object_detection_start_requested = False
         self.detector.clear_results()
         future = self.detector.init(model_path=model_path)
-        future.add_done_callback(lambda done: self.handle_detector_init_response(done, session_id))
+        future.add_done_callback(self.handle_detector_init_response)
         return True, f"object detection init requested with model: {model_path}"
 
     def handle_detector_init_response(self, future, session_id: Optional[int] = None) -> None:
@@ -1499,9 +1502,8 @@ class MaizeNavigator(Node):
             self.start_object_detection("navigation resumed")
             return
         if getattr(self, "object_detection_model_path", ""):
-            session_id = self.object_detection_session_id
             future = self.detector.init(model_path=self.object_detection_model_path)
-            future.add_done_callback(lambda done: self.handle_detector_init_response(done, session_id))
+            future.add_done_callback(self.handle_detector_init_response)
 
     def release_object_detection(self, reason: str) -> None:
         if not getattr(self, "object_detection_enabled", False):
