@@ -17,6 +17,7 @@ import rclpy
 from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
+from rclpy.qos import DurabilityPolicy, QoSProfile
 
 from fre2026_detection_client import DetectorClient
 from fre2026_detection_interfaces.msg import TrackedObjectArray
@@ -650,7 +651,9 @@ class MaizeNavigator(Node):
         )
         self.cmd_pub = self.create_publisher(Twist, self.p.cmd_vel_topic, 10)
         self.marker_pub = self.create_publisher(MarkerArray, "navigation_markers", 10)
-        self.tracker_active_pub = self.create_publisher(Bool, "/tracker/active", 10)
+        tracker_active_qos = QoSProfile(depth=1)
+        tracker_active_qos.durability = DurabilityPolicy.TRANSIENT_LOCAL
+        self.tracker_active_pub = self.create_publisher(Bool, "/tracker/active", tracker_active_qos)
         self.audio_pub = self.create_publisher(String, "/classification_result", 10)
         self.tracker_reset_client = self.create_client(Trigger, "/tracker/reset")
         self.slam_reset_client = (
