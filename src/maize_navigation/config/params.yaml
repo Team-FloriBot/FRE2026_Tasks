@@ -31,6 +31,8 @@ maize_navigator:
     row_segment_point_spacing: 0.30
     row_rectangle_width: 0.6
     row_point_window_length: 0.30
+    # Reihenende: zaehlt Punkte ab Feld 3 bis zum letzten Segment der Suchlinie.
+    # Bei 5 Segmenten entspricht das Feldern 3-5, bei 7 Segmenten Feldern 3-7.
     row_end_min_points_fields_3_to_5: 2
     row_max_march_steps: 120
     row_min_fit_points: 3

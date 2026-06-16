@@ -3630,6 +3630,7 @@ class MaizeNavigator(Node):
 
         self.left_row.result = self.march_row(self.left_row, map_points)
         self.right_row.result = self.march_row(self.right_row, map_points)
+        self.extend_missing_row_tail_from_known_side(self.left_row, self.right_row)
         self.harmonize_row_pair_directions(self.left_row.result, self.right_row.result)
         self.update_frozen_prefix(self.left_row)
         self.update_frozen_prefix(self.right_row)
@@ -3730,7 +3731,7 @@ class MaizeNavigator(Node):
 
             corrected_line_points = self.build_initial_line_from_point3(corrected_point3, corrected_direction)
             field_counts = self.count_points_per_line_field(map_points, corrected_line_points, corrected_direction)
-            field_count = int(sum(field_counts[2:5]))
+            field_count = self.count_points_in_row_end_fields(field_counts)
             current_rectangle = RowEndRectangle(
                 center=np.asarray(corrected_point3, dtype=float),
                 direction=np.asarray(corrected_direction, dtype=float),
@@ -3852,9 +3853,12 @@ class MaizeNavigator(Node):
     def big_rectangle_length(self) -> float:
         return float(self.p.row_segment_point_count) * self.p.row_segment_point_spacing
 
+    def count_points_in_row_end_fields(self, field_counts: List[int]) -> int:
+        return int(sum(field_counts[2:]))
+
     def count_points_in_fields_3_to_5(self, map_points: np.ndarray, line_points: np.ndarray, direction: np.ndarray) -> int:
         counts = self.count_points_per_line_field(map_points, line_points, direction)
-        return int(sum(counts[2:5]))
+        return self.count_points_in_row_end_fields(counts)
 
     def count_points_per_line_field(
         self,
@@ -4031,6 +4035,58 @@ class MaizeNavigator(Node):
             return np.empty((0, 2), dtype=float)
         count = min(len(left_points), len(right_points))
         return 0.5 * (left_points[:count] + right_points[:count])
+
+    def extend_missing_row_tail_from_known_side(self, left: RowMarchModel, right: RowMarchModel) -> None:
+        left_count = len(left.result.points)
+        right_count = len(right.result.points)
+        if left_count == right_count or left_count == 0 or right_count == 0:
+            return
+
+        if left_count < right_count and left.result.ended:
+            self.extend_row_result_from_opposite_row(left.result, right.result, "left")
+        elif right_count < left_count and right.result.ended:
+            self.extend_row_result_from_opposite_row(right.result, left.result, "right")
+
+    def extend_row_result_from_opposite_row(
+        self,
+        target: RowMarchResult,
+        source: RowMarchResult,
+        target_side: str,
+    ) -> None:
+        target_count = len(target.points)
+        source_count = len(source.points)
+        if target_count == 0 or source_count <= target_count:
+            return
+
+        if len(source.point_directions) == source_count:
+            source_directions = np.asarray(source.point_directions, dtype=float)
+        else:
+            fallback_direction = self.normalize(source.points[-1] - source.points[0])
+            source_directions = np.array([fallback_direction for _ in range(source_count)], dtype=float)
+
+        predicted_points = []
+        predicted_directions = []
+        for idx in range(target_count, source_count):
+            direction = self.normalize(source_directions[idx])
+            left_normal = np.array([-direction[1], direction[0]], dtype=float)
+            lateral_offset = self.p.expected_row_width * left_normal
+            if target_side == "left":
+                predicted_point = np.asarray(source.points[idx], dtype=float) + lateral_offset
+            else:
+                predicted_point = np.asarray(source.points[idx], dtype=float) - lateral_offset
+            predicted_points.append(predicted_point)
+            predicted_directions.append(direction)
+
+        if not predicted_points:
+            return
+
+        target.points = np.vstack((target.points, np.asarray(predicted_points, dtype=float)))
+        if len(target.point_directions) == target_count:
+            target.point_directions = np.vstack((target.point_directions, np.asarray(predicted_directions, dtype=float)))
+        else:
+            fallback_direction = self.normalize(target.points[min(target_count - 1, len(target.points) - 1)] - target.points[0])
+            base_directions = np.array([fallback_direction for _ in range(target_count)], dtype=float)
+            target.point_directions = np.vstack((base_directions, np.asarray(predicted_directions, dtype=float)))
 
     def build_navigation_midline(self) -> np.ndarray:
         if self.left_row is None or self.right_row is None:
