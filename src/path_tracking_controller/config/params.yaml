@@ -15,7 +15,7 @@ pure_pursuit_node:
     min_speed: 0.10
 
     curvature_gain: 1.0 # senken falls in Kurven zu langsam oder langsam schnell ruckeln
-    pure_pursuit_gain: 0.60
+    pure_pursuit_gain: 1.5
 
     max_angular_velocity: 0.85 # runter auf 0.75 falls in Kurven zu aggressiv
     min_follow_turn_radius: 0.28
