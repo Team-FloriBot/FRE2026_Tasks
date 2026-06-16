@@ -574,12 +574,12 @@ class MaizeNavigator(Node):
         self.driving_profiles = self.build_driving_profiles()
         self.current_carefulness = "high"
         self.object_detection_enabled = False
-        self.object_detection_model_path = ""
+        self.object_detection_model_path = "/jutestripe_yellow_paper-seg.pt"
         self.object_detection_initialized = False
         self.object_detection_started = False
         self.object_detection_start_requested = False
         self.object_detection_session_id = 0
-        self.active_object_row_range = 2
+        self.active_object_row_range = 1
         self.active_plant_row_count: Optional[int] = None
         self.latest_tracked_objects: Optional[TrackedObjectArray] = None
         self.handled_tracked_object_ids: Set[int] = set()
@@ -1102,8 +1102,8 @@ class MaizeNavigator(Node):
             res.message = f"Invalid carefulness. Use one of: {', '.join(sorted(self.driving_profiles))}."
             self.publish_audio_text("navigation error")
             return res
-        model_path = getattr(req, "model_path", "").strip()
-        object_row_range = int(getattr(req, "object_row_range", 2))
+        model_path = getattr(req, "model_path", "/jutestripe_yellow_paper-seg.pt").strip()
+        object_row_range = int(getattr(req, "object_row_range", 1))
         plant_row_count = int(getattr(req, "plant_row_count", 0))
         starting_lane_number = int(getattr(req, "starting_lane_number", 0))
         row_numbers_increase_to = str(getattr(req, "row_numbers_increase_to", "")).strip().lower()
