@@ -29,7 +29,7 @@ task4_brain:
     tracker_active_topic: "/tracker/active"
     tracker_reset_service: "/tracker/reset"
     detector_model_path: "/models/yolo26n_soilspot-seg.pt"
-    detector_confidence: 0.7
+    detector_confidence: 0.25
 
     # ROS-Schnittstellen
     plan_topic: "/plan"
