@@ -37,7 +37,10 @@ maize_navigator:
     row_max_march_steps: 120
     row_min_fit_points: 3
     row_fit_max_angle_to_previous_deg: 10.0
-    row_pair_direction_blend: 0.5
+    # Linkes/rechtes Rechteckpaar soll parallel bleiben und etwa Reihenabstand halten.
+    # 1.0 bedeutet: Richtung auf gemeinsame Richtung, Abstand auf expected_row_width.
+    row_pair_direction_blend: 1.0
+    row_pair_distance_blend: 1.0
     # Bereits passierte Kartenpunkte bis zur aktuellen Roboterhoehe bleiben stabil.
     # Linke und rechte Kartenreihe werden weiterhin unabhaengig erkannt.
     row_freeze_behind_distance: 0.0

@@ -234,7 +234,8 @@ class NavigatorParams:
     row_min_fit_points: int = 3
     row_freeze_behind_distance: float = 0.0
     row_fit_max_angle_to_previous_deg: float = 20.0
-    row_pair_direction_blend: float = 0.5
+    row_pair_direction_blend: float = 1.0
+    row_pair_distance_blend: float = 1.0
 
     laser_follow_enabled: bool = True
     laser_scan_timeout: float = 0.50
@@ -717,6 +718,7 @@ class MaizeNavigator(Node):
             get_param("row_fit_max_angle_to_previous_deg", p.row_fit_max_angle_to_previous_deg)
         )
         p.row_pair_direction_blend = float(get_param("row_pair_direction_blend", p.row_pair_direction_blend))
+        p.row_pair_distance_blend = float(get_param("row_pair_distance_blend", p.row_pair_distance_blend))
 
         p.laser_follow_enabled = bool(get_param("laser_follow_enabled", p.laser_follow_enabled))
         p.laser_scan_timeout = float(get_param("laser_scan_timeout", p.laser_scan_timeout))
@@ -906,6 +908,7 @@ class MaizeNavigator(Node):
         self.p.row_freeze_behind_distance = max(0.0, self.p.row_freeze_behind_distance)
         self.p.row_fit_max_angle_to_previous_deg = float(np.clip(self.p.row_fit_max_angle_to_previous_deg, 1.0, 90.0))
         self.p.row_pair_direction_blend = float(np.clip(self.p.row_pair_direction_blend, 0.0, 1.0))
+        self.p.row_pair_distance_blend = float(np.clip(self.p.row_pair_distance_blend, 0.0, 1.0))
         self.p.laser_scan_timeout = max(0.05, self.p.laser_scan_timeout)
         self.p.laser_roi_length = max(0.05, self.p.laser_roi_length)
         self.p.laser_roi_x_max = self.p.laser_roi_x_min + self.p.laser_roi_length
@@ -3634,6 +3637,7 @@ class MaizeNavigator(Node):
         self.align_unobserved_row_points_from_known_side(self.left_row.result, self.right_row.result)
         self.extend_missing_row_tail_from_known_side(self.left_row, self.right_row)
         self.harmonize_row_pair_directions(self.left_row.result, self.right_row.result)
+        self.regularize_row_pair_distance(self.left_row.result, self.right_row.result)
         self.update_frozen_prefix(self.left_row)
         self.update_frozen_prefix(self.right_row)
         self.midline = self.build_navigation_midline()
@@ -4147,6 +4151,83 @@ class MaizeNavigator(Node):
                 )
             )
 
+    def regularize_row_pair_distance(self, left: RowMarchResult, right: RowMarchResult) -> None:
+        blend = self.p.row_pair_distance_blend
+        if blend <= 0.0:
+            return
+        count = min(len(left.points), len(right.points), len(left.point_directions), len(right.point_directions))
+        for idx in range(count):
+            left_point = np.asarray(left.points[idx], dtype=float)
+            right_point = np.asarray(right.points[idx], dtype=float)
+            direction = self.mean_direction(left.point_directions[idx], right.point_directions[idx])
+            left.points[idx], right.points[idx] = self.regularized_row_pair_centers(left_point, right_point, direction, blend)
+
+        debug_count = min(len(left.debug_segments), len(right.debug_segments))
+        for idx in range(debug_count):
+            left_segment = left.debug_segments[idx]
+            right_segment = right.debug_segments[idx]
+            direction = self.mean_direction(left_segment.direction, right_segment.direction)
+            left_center, right_center = self.regularized_row_pair_centers(
+                left_segment.point3_rect_center,
+                right_segment.point3_rect_center,
+                direction,
+                blend,
+            )
+            left_delta = left_center - left_segment.point3_rect_center
+            right_delta = right_center - right_segment.point3_rect_center
+            left_segment.point3_rect_center = left_center
+            right_segment.point3_rect_center = right_center
+            left_segment.big_rect_center = left_segment.big_rect_center + left_delta
+            right_segment.big_rect_center = right_segment.big_rect_center + right_delta
+            left_segment.line_points = self.build_initial_line_from_point3(left_center, left_segment.direction)
+            right_segment.line_points = self.build_initial_line_from_point3(right_center, right_segment.direction)
+
+        if left.end_rectangle is not None and right.end_rectangle is not None:
+            direction = self.mean_direction(left.end_rectangle.direction, right.end_rectangle.direction)
+            left_center, right_center = self.regularized_row_pair_centers(
+                left.end_rectangle.center,
+                right.end_rectangle.center,
+                direction,
+                blend,
+            )
+            left.end_rectangle.center = left_center
+            right.end_rectangle.center = right_center
+            left.end_rectangle.line_points = self.build_initial_line_from_point3(
+                left_center,
+                left.end_rectangle.direction,
+            )
+            right.end_rectangle.line_points = self.build_initial_line_from_point3(
+                right_center,
+                right.end_rectangle.direction,
+            )
+            if left.end_point is not None:
+                left.end_point = np.asarray(left_center, dtype=float)
+            if right.end_point is not None:
+                right.end_point = np.asarray(right_center, dtype=float)
+
+    def regularized_row_pair_centers(
+        self,
+        left_center: np.ndarray,
+        right_center: np.ndarray,
+        direction: np.ndarray,
+        blend: float,
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        left_center = np.asarray(left_center, dtype=float)
+        right_center = np.asarray(right_center, dtype=float)
+        center = 0.5 * (left_center + right_center)
+        direction = self.normalize(direction)
+        lateral = np.array([-direction[1], direction[0]], dtype=float)
+        signed_width = float((left_center - right_center) @ lateral)
+
+        if signed_width < 0.0:
+            lateral = -lateral
+            signed_width = -signed_width
+
+        target_width = float(np.clip(self.p.expected_row_width, self.p.min_lane_width, self.p.max_lane_width))
+        clamped_width = float(np.clip(signed_width, self.p.min_lane_width, self.p.max_lane_width))
+        desired_width = (1.0 - blend) * clamped_width + blend * target_width
+        return center + 0.5 * desired_width * lateral, center - 0.5 * desired_width * lateral
+
     def build_navigation_midline(self) -> np.ndarray:
         if self.left_row is None or self.right_row is None:
             return np.empty((0, 2), dtype=float)
@@ -4215,6 +4296,9 @@ class MaizeNavigator(Node):
             mean_end = self.mean_direction(left.end_direction, right.end_direction)
             left.end_direction = self.normalize((1.0 - blend) * self.normalize(left.end_direction) + blend * mean_end)
             right.end_direction = self.normalize((1.0 - blend) * self.normalize(right.end_direction) + blend * mean_end)
+            if left.end_rectangle is not None and right.end_rectangle is not None:
+                left.end_rectangle.direction = np.asarray(left.end_direction, dtype=float)
+                right.end_rectangle.direction = np.asarray(right.end_direction, dtype=float)
 
     def point_at_polyline_distance(self, polyline: np.ndarray, start_idx: int, distance_ahead: float) -> Optional[np.ndarray]:
         if len(polyline) == 0:
