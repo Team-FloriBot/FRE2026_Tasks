@@ -49,6 +49,8 @@ class ObjectTracker(Node):
         self.declare_parameter("min_observations_for_label", 8)
         self.declare_parameter("unlabeled_timeout_sec", 10.0)
         self.declare_parameter("tf_timeout_sec", 0.10)
+        self.declare_parameter("publish_ground_z", True)
+        self.declare_parameter("ground_z", 0.0)
         self.declare_parameter("marker_z_offset", 0.15)
         self.declare_parameter("marker_sphere_scale", 0.18)
         self.declare_parameter("marker_text_scale", 0.28)
@@ -75,6 +77,8 @@ class ObjectTracker(Node):
         self.min_observations_for_label = int(self.get_parameter("min_observations_for_label").value)
         self.unlabeled_timeout_sec = float(self.get_parameter("unlabeled_timeout_sec").value)
         self.tf_timeout_sec = float(self.get_parameter("tf_timeout_sec").value)
+        self.publish_ground_z = bool(self.get_parameter("publish_ground_z").value)
+        self.ground_z = float(self.get_parameter("ground_z").value)
         self.marker_z_offset = float(self.get_parameter("marker_z_offset").value)
         self.marker_sphere_scale = float(self.get_parameter("marker_sphere_scale").value)
         self.marker_text_scale = float(self.get_parameter("marker_text_scale").value)
@@ -129,32 +133,62 @@ class ObjectTracker(Node):
         )
 
     def active_callback(self, msg: Bool) -> None:
-        self.active = bool(msg.data)
+        requested_active = bool(msg.data)
+        if requested_active != self.active:
+            self.get_logger().info(
+                f"Object tracker {'activated' if requested_active else 'deactivated'}"
+            )
+        self.active = requested_active
 
     def reset_callback(self, request, response):
         self.reset_tracks()
         response.success = True
         response.message = "Object tracker reset"
+        self.get_logger().info("Object tracker reset requested via service")
         return response
 
     def reset_tracks(self) -> None:
+        object_count = len(self.objects)
         self.objects.clear()
         self.next_id = 0
         self.simulated_objects = self.create_simulated_objects() if self.simulation_enabled else None
         self.publish_delete_all_markers()
         if self.simulated_objects is not None:
             self.publish_simulated_objects()
+        self.get_logger().info(f"Object tracker cleared {object_count} tracked objects")
 
     def detection_results_callback(self, msg: DetectionArray) -> None:
         if self.simulation_enabled:
+            self.get_logger().debug(
+                "Ignoring detector results because simulation mode is enabled",
+                throttle_duration_sec=5.0,
+            )
             return
         if not self.active:
+            self.get_logger().debug(
+                "Ignoring detector results because tracker is inactive",
+                throttle_duration_sec=5.0,
+            )
+            return
+
+        detection_count = len(msg.detections)
+        if detection_count == 0:
+            self.get_logger().debug(
+                "Received empty detector result batch",
+                throttle_duration_sec=5.0,
+            )
             return
 
         transform = self.lookup_detection_transform(msg)
         if transform is None:
+            self.get_logger().warn(
+                f"Dropping {detection_count} detections because no TF is available "
+                f"from {msg.header.frame_id} to {self.target_frame}",
+                throttle_duration_sec=2.0,
+            )
             return
 
+        updated_before = len(self.objects)
         for detection in msg.detections:
             point_in = PointStamped()
             point_in.header.frame_id = msg.header.frame_id
@@ -163,6 +197,11 @@ class ObjectTracker(Node):
             point_out = do_transform_point(point_in, transform)
             self.update_track(detection, point_out.point, msg.header.stamp)
 
+        self.get_logger().debug(
+            f"Processed {detection_count} detections; "
+            f"tracks {updated_before} -> {len(self.objects)}",
+            throttle_duration_sec=1.0,
+        )
         self.publish_tracks(msg.header.stamp)
 
     def lookup_detection_transform(self, msg: DetectionArray):
@@ -183,12 +222,15 @@ class ObjectTracker(Node):
                 )
             except Exception as latest_exc:
                 self.get_logger().warn(
-                    f"TF lookup failed: stamped={stamped_exc}; latest={latest_exc}"
+                    f"TF lookup failed: stamped={stamped_exc}; latest={latest_exc}",
+                    throttle_duration_sec=2.0,
                 )
                 return None
 
             self.get_logger().debug(
-                f"Using latest TF for detection timestamp after stamped lookup failed: {stamped_exc}"
+                "Using latest TF for detection timestamp after stamped lookup failed: "
+                f"{stamped_exc}",
+                throttle_duration_sec=2.0,
             )
             return transform
 
@@ -215,6 +257,10 @@ class ObjectTracker(Node):
         self.simulated_objects.header.stamp = self.get_clock().now().to_msg()
         self.tracked_objects_pub.publish(self.simulated_objects)
         self.publish_markers(self.simulated_objects)
+        self.get_logger().debug(
+            f"Published {len(self.simulated_objects.objects)} simulated tracked objects",
+            throttle_duration_sec=5.0,
+        )
 
     def update_track(self, detection, position, stamp) -> None:
         matched_id = self.find_match(position)
@@ -234,9 +280,15 @@ class ObjectTracker(Node):
                 counter=1,
                 last_detection_id=detection_id,
             )
+            self.get_logger().info(
+                f"Created track {object_id} from detection {detection_id} "
+                f"label={label!r} confidence={confidence:.2f} "
+                f"position=({position.x:.2f}, {position.y:.2f}, {position.z:.2f})"
+            )
             return
 
         tracked = self.objects[matched_id]
+        previous_label = tracked.label
         alpha = float(max(0.0, min(1.0, self.position_smoothing_alpha)))
         tracked.position.x = (1.0 - alpha) * tracked.position.x + alpha * position.x
         tracked.position.y = (1.0 - alpha) * tracked.position.y + alpha * position.y
@@ -247,6 +299,11 @@ class ObjectTracker(Node):
             tracked.label = max(tracked.label_scores, key=tracked.label_scores.get)
         tracked.last_seen = stamp
         tracked.last_detection_id = detection_id
+        if previous_label is None and tracked.label is not None:
+            self.get_logger().info(
+                f"Track {tracked.object_id} confirmed as {tracked.label!r} "
+                f"after {tracked.counter} observations"
+            )
 
     def find_match(self, position) -> Optional[int]:
         best_id: Optional[int] = None
@@ -254,7 +311,7 @@ class ObjectTracker(Node):
         for object_id, tracked in self.objects.items():
             if tracked.position is None:
                 continue
-            distance = self.distance(tracked.position, position)
+            distance = self.horizontal_distance(tracked.position, position)
             if distance < self.match_distance and distance < best_distance:
                 best_distance = distance
                 best_id = object_id
@@ -280,14 +337,23 @@ class ObjectTracker(Node):
             tracked_msg.label = tracked.label
             tracked_msg.position.x = tracked.position.x
             tracked_msg.position.y = tracked.position.y
-            tracked_msg.position.z = tracked.position.z
+            tracked_msg.position.z = self.output_z(tracked.position)
             msg.objects.append(tracked_msg)
 
         for object_id in expired_ids:
             del self.objects[object_id]
+            self.get_logger().info(
+                f"Dropped unlabeled track {object_id} after "
+                f"{self.unlabeled_timeout_sec:.1f}s without confirmation"
+            )
 
         self.tracked_objects_pub.publish(msg)
         self.publish_markers(msg)
+        self.get_logger().debug(
+            f"Published {len(msg.objects)} confirmed tracked objects "
+            f"from {len(self.objects)} stored tracks",
+            throttle_duration_sec=1.0,
+        )
 
     def publish_markers(self, tracked_objects: TrackedObjectArray) -> None:
         markers = MarkerArray()
@@ -359,6 +425,15 @@ class ObjectTracker(Node):
             + (first.y - second.y) ** 2
             + (first.z - second.z) ** 2
         )
+
+    @staticmethod
+    def horizontal_distance(first, second) -> float:
+        return math.sqrt((first.x - second.x) ** 2 + (first.y - second.y) ** 2)
+
+    def output_z(self, position) -> float:
+        if self.publish_ground_z:
+            return self.ground_z
+        return float(position.z)
 
 
 def main(args=None) -> None:

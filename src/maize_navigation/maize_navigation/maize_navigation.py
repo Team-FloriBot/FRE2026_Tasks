@@ -576,6 +576,8 @@ class MaizeNavigator(Node):
         self.object_detection_model_path = ""
         self.object_detection_initialized = False
         self.object_detection_started = False
+        self.object_detection_start_requested = False
+        self.object_detection_session_id = 0
         self.active_object_row_range = 1
         self.active_plant_row_count: Optional[int] = None
         self.latest_tracked_objects: Optional[TrackedObjectArray] = None
@@ -1042,6 +1044,10 @@ class MaizeNavigator(Node):
 
     def tracked_objects_callback(self, msg: TrackedObjectArray) -> None:
         self.latest_tracked_objects = msg
+        self.get_logger().info(
+            f"Received {len(msg.objects)} tracked objects",
+            throttle_duration_sec=2.0,
+        )
 
     def publish_audio_text(self, text: str) -> None:
         if not hasattr(self, "audio_pub"):
@@ -1146,6 +1152,11 @@ class MaizeNavigator(Node):
         self.pattern_steps = self.parse_pattern(pattern)
         self.reset_navigation_state(clear_sensor_cache=False)
         self.active_object_row_range = object_row_range if model_path else 0
+        if model_path and self.active_object_row_range == 0:
+            self.get_logger().warn(
+                "Object detection is enabled, but object stops are disabled because "
+                "start_navigation.object_row_range is 0. Use a positive value to stop for objects."
+            )
         self.active_plant_row_count = plant_row_count if plant_row_count > 0 else None
         self.max_navigation_duration_sec = (
             max_navigation_duration_sec if max_navigation_duration_sec > 0.0 else None
@@ -1399,6 +1410,7 @@ class MaizeNavigator(Node):
             self.object_detection_model_path = ""
             self.object_detection_initialized = False
             self.object_detection_started = False
+            self.object_detection_start_requested = False
             if hasattr(self, "detector"):
                 self.detector.clear_results()
             return True, "object detection disabled"
@@ -1409,21 +1421,28 @@ class MaizeNavigator(Node):
             return False, "Detector services are not available; navigation not started."
 
         self.release_object_detection("new navigation start")
+        self.object_detection_session_id += 1
+        session_id = self.object_detection_session_id
         self.object_detection_enabled = True
         self.object_detection_model_path = model_path
         self.object_detection_initialized = False
         self.object_detection_started = False
+        self.object_detection_start_requested = False
         self.detector.clear_results()
         future = self.detector.init(model_path=model_path)
-        future.add_done_callback(self.handle_detector_init_response)
+        future.add_done_callback(lambda done: self.handle_detector_init_response(done, session_id))
         return True, f"object detection init requested with model: {model_path}"
 
-    def handle_detector_init_response(self, future) -> None:
+    def handle_detector_init_response(self, future, session_id: Optional[int] = None) -> None:
+        if session_id is not None and session_id != self.object_detection_session_id:
+            self.get_logger().info("Ignoring stale detector init response")
+            return
         if not getattr(self, "object_detection_enabled", False):
             return
         if not self.service_response_success(future, "detector init"):
             self.object_detection_initialized = False
             self.object_detection_started = False
+            self.object_detection_start_requested = False
             self.release_object_detection("detector init failed")
             return
 
@@ -1433,13 +1452,22 @@ class MaizeNavigator(Node):
     def start_object_detection(self, reason: str) -> None:
         if not getattr(self, "object_detection_enabled", False):
             return
+        if getattr(self, "object_detection_started", False) or getattr(self, "object_detection_start_requested", False):
+            self.get_logger().info(f"Detector start skipped ({reason}); already started or start pending")
+            return
+        self.object_detection_start_requested = True
+        session_id = self.object_detection_session_id
         future = self.detector.start()
-        future.add_done_callback(lambda done: self.handle_detector_start_response(done, reason))
+        future.add_done_callback(lambda done: self.handle_detector_start_response(done, reason, session_id))
 
-    def handle_detector_start_response(self, future, reason: str) -> None:
+    def handle_detector_start_response(self, future, reason: str, session_id: Optional[int] = None) -> None:
+        if session_id is not None and session_id != self.object_detection_session_id:
+            self.get_logger().info("Ignoring stale detector start response")
+            return
         if not getattr(self, "object_detection_enabled", False):
             return
         success = self.service_response_success(future, "detector start")
+        self.object_detection_start_requested = False
         self.object_detection_started = success
         if success:
             self.get_logger().info(f"Object detection started ({reason})")
@@ -1453,9 +1481,11 @@ class MaizeNavigator(Node):
         if not getattr(self, "object_detection_enabled", False):
             return
         if not getattr(self, "object_detection_started", False):
+            self.object_detection_start_requested = False
             self.set_tracker_active(False)
             return
         self.object_detection_started = False
+        self.object_detection_start_requested = False
         self.set_tracker_active(False)
         future = self.detector.stop()
         future.add_done_callback(lambda done: self.service_response_success(done, f"detector stop ({reason})"))
@@ -1463,12 +1493,15 @@ class MaizeNavigator(Node):
     def resume_object_detection(self) -> None:
         if not getattr(self, "object_detection_enabled", False):
             return
+        if getattr(self, "object_detection_started", False) or getattr(self, "object_detection_start_requested", False):
+            return
         if getattr(self, "object_detection_initialized", False):
             self.start_object_detection("navigation resumed")
             return
         if getattr(self, "object_detection_model_path", ""):
+            session_id = self.object_detection_session_id
             future = self.detector.init(model_path=self.object_detection_model_path)
-            future.add_done_callback(self.handle_detector_init_response)
+            future.add_done_callback(lambda done: self.handle_detector_init_response(done, session_id))
 
     def release_object_detection(self, reason: str) -> None:
         if not getattr(self, "object_detection_enabled", False):
@@ -1477,9 +1510,11 @@ class MaizeNavigator(Node):
         if not hasattr(self, "detector"):
             return
         was_started = self.object_detection_started
+        self.object_detection_session_id += 1
         self.object_detection_enabled = False
         self.object_detection_initialized = False
         self.object_detection_started = False
+        self.object_detection_start_requested = False
         self.object_detection_model_path = ""
         self.set_tracker_active(False)
         self.detector.clear_results()
@@ -1521,6 +1556,7 @@ class MaizeNavigator(Node):
         msg = Bool()
         msg.data = bool(active)
         self.tracker_active_pub.publish(msg)
+        self.get_logger().info(f"Tracker active set to {msg.data}", throttle_duration_sec=1.0)
 
     def set_current_cmd(self, cmd: Twist) -> None:
         self.current_cmd = cmd
@@ -1991,23 +2027,55 @@ class MaizeNavigator(Node):
         self.drive_to_point(self.fused_target_point)
 
     def find_next_object_stop(self, robot_xy: np.ndarray, midline: np.ndarray) -> Optional[ObjectStop]:
-        if not self.p.object_stop_enabled or self.latest_tracked_objects is None:
+        if not self.p.object_stop_enabled:
+            self.get_logger().info(
+                "Object stop search skipped: object_stop_enabled is false",
+                throttle_duration_sec=2.0,
+            )
+            return None
+        if self.latest_tracked_objects is None:
+            self.get_logger().info(
+                "Object stop search skipped: no tracked objects received yet",
+                throttle_duration_sec=2.0,
+            )
             return None
         if len(midline) < 2:
+            self.get_logger().info(
+                "Object stop search skipped: midline is not usable",
+                throttle_duration_sec=2.0,
+            )
+            return None
+        if int(max(0, getattr(self, "active_object_row_range", 1))) <= 0:
+            self.get_logger().info(
+                "Object stop search skipped: active_object_row_range is 0",
+                throttle_duration_sec=2.0,
+            )
             return None
 
         robot_projection, robot_segment_idx = self.project_onto_polyline(midline, robot_xy)
         best_stop: Optional[ObjectStop] = None
         best_distance = float("inf")
+        rejected_count = 0
         for tracked in self.latest_tracked_objects.objects:
             object_id = int(tracked.id)
             if object_id in self.handled_tracked_object_ids:
+                rejected_count += 1
+                self.get_logger().info(
+                    f"Tracked object {object_id} ignored: already handled",
+                    throttle_duration_sec=2.0,
+                )
                 continue
             object_xy = np.array([float(tracked.position.x), float(tracked.position.y)], dtype=float)
             row_side, row_distance, plant_row_number, plant_row_offset = self.match_tracked_object_to_active_rows(
                 object_xy
             )
             if row_side is None or row_distance > self.p.object_row_match_tolerance:
+                rejected_count += 1
+                self.get_logger().info(
+                    f"Tracked object {object_id} ignored: no active-row match "
+                    f"(distance={row_distance:.2f} m, tolerance={self.p.object_row_match_tolerance:.2f} m)",
+                    throttle_duration_sec=2.0,
+                )
                 continue
 
             object_projection, object_segment_idx = self.project_onto_polyline(midline, object_xy)
@@ -2019,9 +2087,21 @@ class MaizeNavigator(Node):
                 object_segment_idx,
             )
             if distance_ahead < -self.p.object_stop_past_tolerance:
+                rejected_count += 1
+                self.get_logger().info(
+                    f"Tracked object {object_id} ignored: already behind robot "
+                    f"(distance={distance_ahead:.2f} m)",
+                    throttle_duration_sec=2.0,
+                )
                 continue
             distance_ahead = max(0.0, distance_ahead)
             if distance_ahead > self.p.object_stop_max_ahead_distance:
+                rejected_count += 1
+                self.get_logger().info(
+                    f"Tracked object {object_id} ignored: too far ahead "
+                    f"(distance={distance_ahead:.2f} m, max={self.p.object_stop_max_ahead_distance:.2f} m)",
+                    throttle_duration_sec=2.0,
+                )
                 continue
             if distance_ahead < best_distance:
                 best_distance = distance_ahead
@@ -2040,6 +2120,11 @@ class MaizeNavigator(Node):
             self.get_logger().info(
                 f"Next tracked object stop: id={best_stop.object_id} "
                 f"row={best_stop.row_side} distance={best_stop.distance_ahead:.2f} m"
+            )
+        elif rejected_count > 0:
+            self.get_logger().info(
+                f"No object stop candidate from {len(self.latest_tracked_objects.objects)} tracked objects",
+                throttle_duration_sec=2.0,
             )
         return best_stop
 
