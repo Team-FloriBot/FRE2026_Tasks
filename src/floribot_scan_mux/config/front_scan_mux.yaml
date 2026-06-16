@@ -1,6 +1,6 @@
 front_scan_mux:
   ros__parameters:
-    active_profile: "sick_front"
+    active_profile: "rs_crop_scan"
     front_output_topic: "/laser_scan_mux/front_scan"
     rear_output_topic: "/laser_scan_mux/rear_scan"
 
