@@ -132,6 +132,15 @@ Zum Starten der geplanten Navigation:
 ros2 service call /task4/start_navigation std_srvs/srv/Trigger "{}"
 ```
 
+Nach der Coverage-Fahrt faehrt Task4 fuer das Schiessen an die erste Feldkante
+zurueck. Der finale Schusspunkt liegt auf dieser Kante, damit die linke
+Roboterseite ins Feldinnere zeigt. Relevante Parameter:
+
+| Parameter | Bedeutung |
+| --- | --- |
+| `start_shoot_alignment_distance_m` | Distanz vom Kantenanker bis zum finalen Schusspunkt auf der ersten Feldkante. |
+| `start_shoot_use_headland_filter` | Wenn `true`, werden erkannte Ziele im Headland-Randbereich fuer das Schiessen herausgefiltert. |
+
 
 Unterbrechung (Stop)
 ```

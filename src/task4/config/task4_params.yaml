@@ -23,6 +23,12 @@ task4_brain:
     shoot_angle_min_deg: 20.0
     shoot_angle_max_deg: 160.0
     min_navigation_segment_m: 0.05
+    # Distanz auf der ersten Feldkante vom Kantenanker bis zum finalen Schusspunkt.
+    # Dieser Zusatzpunkt gibt dem Path-Controller genug Strecke, um den Roboter
+    # mit linker Seite zum Feldinneren auszurichten.
+    start_shoot_alignment_distance_m: 1.2
+    # Wenn true, werden Ziele im Headland-Randbereich nicht beschossen.
+    start_shoot_use_headland_filter: true
 
     # Tracker und Detector Konfiguration
     tracked_objects_topic: "/tracker/tracked_objects"

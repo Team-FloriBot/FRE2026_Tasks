@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass, field
-from typing import List, Sequence, Tuple
+from typing import List, Optional, Sequence, Tuple
 
 from task4.coverage_planner import (
     Point2D,
@@ -39,44 +39,50 @@ class ShootingPose:
     target_ids: List[int] = field(default_factory=list)
 
 
-def plan_shooting_poses(
+def plan_start_edge_shooting_pose(
     targets: Sequence[ShotTarget],
     polygon_points: Sequence[Point2D],
-    coverage_path: Sequence[Waypoint],
-    start_xy: Point2D,
     config: ShootingPlannerConfig,
-) -> Tuple[List[ShootingPose], List[ShotTarget]]:
-    del coverage_path, start_xy
-
+    alignment_distance_m: float,
+    use_headland_filter: bool = True,
+) -> Tuple[Optional[Waypoint], Optional[ShootingPose], List[ShotTarget]]:
     polygon = normalize_polygon_points(polygon_points)
-    unique_targets = _unique_targets_inside_headland_area(
+    filtered_targets = _unique_targets_inside_start_shooting_area(
         targets,
         polygon,
         float(config.headland_width),
+        bool(use_headland_filter),
     )
-    if not unique_targets:
-        return [], []
+    if not filtered_targets:
+        return None, None, []
 
-    shooting_pose = _longest_edge_shooting_pose(polygon, unique_targets, config)
+    approach, shooting_pose = _start_edge_shooting_pose(
+        polygon,
+        filtered_targets,
+        config,
+        alignment_distance_m,
+    )
     covered_ids = set(shooting_pose.target_ids)
     uncovered = [
-        target for target in unique_targets
+        target for target in filtered_targets
         if int(target.target_id) not in covered_ids
     ]
 
     if not shooting_pose.target_ids:
-        return [], uncovered
+        return approach, None, uncovered
 
-    return [shooting_pose], uncovered
+    return approach, shooting_pose, uncovered
 
 
-def _unique_targets_inside_headland_area(
+def _unique_targets_inside_start_shooting_area(
     targets: Sequence[ShotTarget],
     polygon: Sequence[Point2D],
     headland_width: float,
+    use_headland_filter: bool,
 ) -> List[ShotTarget]:
-    min_boundary_distance = max(0.0, float(headland_width))
     by_id = {}
+    min_boundary_distance = max(0.0, float(headland_width)) if use_headland_filter else 0.0
+
     for target in targets:
         point = (target.x, target.y)
         if (
@@ -84,28 +90,31 @@ def _unique_targets_inside_headland_area(
             and distance_to_polygon_boundary(point, polygon) >= min_boundary_distance
         ):
             by_id[int(target.target_id)] = target
+
     return list(by_id.values())
 
 
-def _longest_edge_shooting_pose(
+def _start_edge_shooting_pose(
     polygon: Sequence[Point2D],
     targets: Sequence[ShotTarget],
     config: ShootingPlannerConfig,
-) -> ShootingPose:
-    start, end = _longest_edge_with_interior_left(polygon)
+    alignment_distance_m: float,
+) -> Tuple[Waypoint, ShootingPose]:
+    start, end = _first_edge_with_interior_left(polygon)
     dx = end[0] - start[0]
     dy = end[1] - start[1]
     length = math.hypot(dx, dy)
     if length <= 1e-9:
-        raise ValueError("Laengste Polygonkante ist degeneriert.")
+        raise ValueError("Erste Polygonkante ist degeneriert.")
 
     ux = dx / length
     uy = dy / length
-    left_normal = (-uy, ux)
-    midpoint = ((start[0] + end[0]) * 0.5, (start[1] + end[1]) * 0.5)
-    offset = max(0.0, float(config.headland_width)) * 0.5
-    shooter_xy = _inset_point_inside_polygon(midpoint, left_normal, offset, polygon)
     yaw = normalize_angle(math.atan2(uy, ux))
+    travel = min(max(0.0, float(alignment_distance_m)), length)
+    shooter_xy = (
+        float(start[0]) + ux * travel,
+        float(start[1]) + uy * travel,
+    )
 
     covered_ids = [
         int(target.target_id)
@@ -113,51 +122,28 @@ def _longest_edge_shooting_pose(
         if target_reachable(shooter_xy, yaw, target, config)
     ]
 
-    return ShootingPose(
-        x=shooter_xy[0],
-        y=shooter_xy[1],
-        yaw=yaw,
-        target_ids=sorted(covered_ids),
+    return (
+        Waypoint(x=float(start[0]), y=float(start[1]), yaw=yaw),
+        ShootingPose(
+            x=shooter_xy[0],
+            y=shooter_xy[1],
+            yaw=yaw,
+            target_ids=sorted(covered_ids),
+        ),
     )
 
 
-def _longest_edge_with_interior_left(polygon: Sequence[Point2D]) -> Tuple[Point2D, Point2D]:
+def _first_edge_with_interior_left(polygon: Sequence[Point2D]) -> Tuple[Point2D, Point2D]:
     if len(polygon) < 2:
         raise ValueError("Polygon enthaelt zu wenige Punkte.")
 
-    best_start = polygon[0]
-    best_end = polygon[1]
-    best_length = -1.0
-
-    for index, start in enumerate(polygon):
-        end = polygon[(index + 1) % len(polygon)]
-        length = distance_2d(start, end)
-        if length > best_length:
-            best_start = start
-            best_end = end
-            best_length = length
+    start = polygon[0]
+    end = polygon[1]
 
     if signed_area_twice(polygon) < 0.0:
-        return best_end, best_start
+        return end, start
 
-    return best_start, best_end
-
-
-def _inset_point_inside_polygon(
-    point: Point2D,
-    direction: Point2D,
-    offset: float,
-    polygon: Sequence[Point2D],
-) -> Point2D:
-    for ratio in (1.0, 0.75, 0.5, 0.25, 0.0):
-        candidate = (
-            float(point[0]) + float(direction[0]) * offset * ratio,
-            float(point[1]) + float(direction[1]) * offset * ratio,
-        )
-        if point_in_polygon(candidate, polygon):
-            return candidate
-
-    return (float(point[0]), float(point[1]))
+    return start, end
 
 
 def target_reachable(

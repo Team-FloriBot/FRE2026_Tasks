@@ -41,7 +41,7 @@ from task4.shooting_planner import (
     ShootingPose,
     ShotTarget,
     distance_2d,
-    plan_shooting_poses,
+    plan_start_edge_shooting_pose,
 )
 
 
@@ -77,6 +77,8 @@ class Task4Brain(Node):
         self.declare_parameter("shoot_angle_min_deg", 20.0)
         self.declare_parameter("shoot_angle_max_deg", 160.0)
         self.declare_parameter("min_navigation_segment_m", 0.05)
+        self.declare_parameter("start_shoot_alignment_distance_m", 1.2)
+        self.declare_parameter("start_shoot_use_headland_filter", True)
 
         self.declare_parameter("tracked_objects_topic", "/tracker/tracked_objects")
         self.declare_parameter("tracker_active_topic", "/tracker/active")
@@ -185,6 +187,8 @@ class Task4Brain(Node):
         self.object_map: Dict[int, ShotTarget] = {}
         self.coverage_polygon: List[Point2D] = []
         self.coverage_path: List[Waypoint] = []
+        self.start_waypoint = None
+        self.start_shoot_approach_waypoint = None
         self.shooting_poses: List[ShootingPose] = []
         self.uncovered_targets: List[ShotTarget] = []
         self.current_shot_index = 0
@@ -251,6 +255,7 @@ class Task4Brain(Node):
         try:
             polygon_points, start_waypoint = self.load_polygon_and_start_pose()
             self.coverage_polygon = polygon_points
+            self.start_waypoint = start_waypoint
             self.publish_polygon_marker(polygon_points)
 
             coverage_path = plan_coverage_path(
@@ -333,19 +338,19 @@ class Task4Brain(Node):
             return
 
         try:
-            current = self.current_robot_waypoint()
-            shooting_poses, uncovered = plan_shooting_poses(
+            approach, shooting_pose, uncovered = plan_start_edge_shooting_pose(
                 targets,
                 self.coverage_polygon,
-                self.coverage_path,
-                (current.x, current.y),
                 self.shooting_config(),
+                float(self.get_parameter("start_shoot_alignment_distance_m").value),
+                bool(self.get_parameter("start_shoot_use_headland_filter").value),
             )
         except Exception as exc:
             self.fail_mission(f"Schussplanung fehlgeschlagen: {exc}")
             return
 
-        self.shooting_poses = shooting_poses
+        self.start_shoot_approach_waypoint = approach
+        self.shooting_poses = [shooting_pose] if shooting_pose is not None else []
         self.uncovered_targets = uncovered
         self.current_shot_index = 0
         self.publish_shooting_markers()
@@ -355,8 +360,8 @@ class Task4Brain(Node):
                 f"{len(uncovered)} Objekte konnten keinem Schusspunkt zugeordnet werden."
             )
 
-        if not shooting_poses:
-            self.fail_mission("Keine erreichbaren Schusspunkte gefunden.")
+        if not self.shooting_poses:
+            self.fail_mission("Keine vom Startkanten-Schusspunkt erreichbaren Ziele gefunden.")
             return
 
         self.start_next_shot_navigation()
@@ -376,12 +381,7 @@ class Task4Brain(Node):
         try:
             current = self.current_robot_waypoint()
             target = Waypoint(x=pose.x, y=pose.y, yaw=pose.yaw)
-            if distance_2d((current.x, current.y), (target.x, target.y)) < float(
-                self.get_parameter("min_navigation_segment_m").value
-            ):
-                path = [target]
-            else:
-                path = [current, target]
+            path = self.build_start_shooting_path(current, target)
 
             self.last_pp_status = ""
             self.publish_path(path, self.target_frame())
@@ -962,6 +962,8 @@ class Task4Brain(Node):
         self.object_map.clear()
         self.coverage_polygon = []
         self.coverage_path = []
+        self.start_waypoint = None
+        self.start_shoot_approach_waypoint = None
         self.shooting_poses = []
         self.uncovered_targets = []
         self.current_shot_index = 0
@@ -999,6 +1001,27 @@ class Task4Brain(Node):
             shoot_angle_max_deg=float(self.get_parameter("shoot_angle_max_deg").value),
             headland_width=float(self.get_parameter("headland_width").value),
         )
+
+    def build_start_shooting_path(self, current: Waypoint, target: Waypoint) -> List[Waypoint]:
+        min_segment = float(self.get_parameter("min_navigation_segment_m").value)
+        path = [current]
+
+        approach = self.start_shoot_approach_waypoint
+        if approach is not None and distance_2d(
+            (path[-1].x, path[-1].y),
+            (approach.x, approach.y),
+        ) >= min_segment:
+            path.append(approach)
+
+        if distance_2d((path[-1].x, path[-1].y), (target.x, target.y)) >= min_segment:
+            path.append(target)
+        else:
+            path[-1] = target
+
+        if len(path) < 2:
+            return [target]
+
+        return path
 
     def point_from_target(self, target: ShotTarget) -> Point:
         point = Point()
