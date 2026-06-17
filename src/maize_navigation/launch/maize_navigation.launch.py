@@ -24,7 +24,7 @@ def generate_launch_description():
         ),
         DeclareLaunchArgument(
             "tracker_tf_timeout_sec",
-            default_value="0.20",
+            default_value="2.0",
             description="How long the object tracker waits for TF data.",
         ),
         Node(
