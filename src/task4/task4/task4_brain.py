@@ -92,6 +92,7 @@ class Task4Brain(Node):
         self.declare_parameter("aim_target_frame", "pan_tilt_link_footprint")
         self.declare_parameter("aim_target_interval_sec", 5.0)
         self.declare_parameter("tf_timeout_sec", 0.5)
+        self.declare_parameter("tf_lookup_offset_sec", 0.0)
 
         self.callback_group = ReentrantCallbackGroup()
         self.tf_buffer = Buffer()
@@ -458,11 +459,18 @@ class Task4Brain(Node):
 
         added_or_updated = 0
         for tracked in msg.objects:
+            # Try a stamped lookup first (use detection timestamp), then retry
+            # with latest transform if that fails. This reduces "extrapolation to
+            # the future" errors for slightly out-of-sync timestamps.
             try:
-                point = self.transform_point_to_target_frame(msg.header.frame_id, tracked.position)
+                point = self.transform_point_to_target_frame(msg.header.frame_id, tracked.position, msg.header.stamp)
             except Exception as exc:
-                self.get_logger().warn(f"Objekt {tracked.id} konnte nicht transformiert werden: {exc}")
-                continue
+                self.get_logger().debug(f"Stamped TF lookup failed for object {tracked.id}: {exc}")
+                try:
+                    point = self.transform_point_to_target_frame(msg.header.frame_id, tracked.position, None)
+                except Exception as exc2:
+                    self.get_logger().warn(f"Objekt {tracked.id} konnte nicht transformiert werden: {exc2}")
+                    continue
 
             self.object_map[int(tracked.id)] = ShotTarget(
                 target_id=int(tracked.id),
@@ -533,19 +541,63 @@ class Task4Brain(Node):
             yaw=float(yaw),
         )
 
-    def transform_point_to_target_frame(self, source_frame: str, point: Point) -> Point:
+    def transform_point_to_target_frame(self, source_frame: str, point: Point, stamp=None) -> Point:
+        """Transform a Point into `target_frame`.
+
+        If `stamp` (a ROS Time message) is provided, this will first try a
+        stamped lookup (optionally offset by `tf_lookup_offset_sec`). If that
+        fails it will retry with the latest available transform. If `stamp` is
+        None, a latest lookup is performed.
+        """
         if not source_frame or source_frame == self.target_frame():
             return point
 
         point_in = PointStamped()
         point_in.header.frame_id = source_frame
         point_in.point = point
-        transform = self.tf_buffer.lookup_transform(
-            self.target_frame(),
-            source_frame,
-            Time(),
-            timeout=Duration(seconds=self.tf_timeout_sec()),
-        )
+
+        # If a stamp is provided, try stamped lookup first (with offset),
+        # then fall back to latest. On complete failure an exception is raised.
+        if stamp is not None:
+            try:
+                lookup_time = Time.from_msg(stamp) - Duration(seconds=max(0.0, float(self.get_parameter("tf_lookup_offset_sec").value)))
+            except Exception:
+                lookup_time = Time()
+
+            try:
+                transform = self.tf_buffer.lookup_transform(
+                    self.target_frame(),
+                    source_frame,
+                    lookup_time,
+                    timeout=Duration(seconds=self.tf_timeout_sec()),
+                )
+            except Exception as stamped_exc:
+                try:
+                    transform = self.tf_buffer.lookup_transform(
+                        self.target_frame(),
+                        source_frame,
+                        Time(),
+                        timeout=Duration(seconds=self.tf_timeout_sec()),
+                    )
+                    self.get_logger().debug(
+                        "Using latest TF for detection timestamp after stamped lookup failed: %s",
+                        str(stamped_exc),
+                        throttle_duration_sec=2.0,
+                    )
+                except Exception as latest_exc:
+                    self.get_logger().warn(
+                        f"TF lookup failed: stamped={stamped_exc}; latest={latest_exc}",
+                        throttle_duration_sec=2.0,
+                    )
+                    raise
+        else:
+            transform = self.tf_buffer.lookup_transform(
+                self.target_frame(),
+                source_frame,
+                Time(),
+                timeout=Duration(seconds=self.tf_timeout_sec()),
+            )
+
         return do_transform_point(point_in, transform).point
 
     def target_to_aim_point(self, target: ShotTarget) -> Point:
