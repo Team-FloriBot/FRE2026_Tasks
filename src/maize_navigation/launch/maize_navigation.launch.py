@@ -19,12 +19,12 @@ def generate_launch_description():
         ),
         DeclareLaunchArgument(
             "tracker_tf_lookup_offset_sec",
-            default_value="0.10",
+            default_value="0.0",
             description="Subtract this offset from detection stamps before TF lookup.",
         ),
         DeclareLaunchArgument(
             "tracker_tf_timeout_sec",
-            default_value="2.0",
+            default_value="5.0",
             description="How long the object tracker waits for TF data.",
         ),
         Node(
