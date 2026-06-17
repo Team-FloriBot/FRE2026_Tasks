@@ -219,6 +219,7 @@ class ObjectTracker(Node):
         lookup_time = Time.from_msg(msg.header.stamp) - Duration(
             seconds=max(0.0, self.tf_lookup_offset_sec)
         )
+        self.get_logger().info("1")
         try:
             return self.tf_buffer.lookup_transform(
                 self.target_frame,
@@ -226,8 +227,11 @@ class ObjectTracker(Node):
                 lookup_time,
                 timeout=Duration(seconds=self.tf_timeout_sec),
             )
+        self.get_logger().info("2")
         except Exception as stamped_exc:
+            self.get_logger().info("3")
             try:
+                
                 transform = self.tf_buffer.lookup_transform(
                     self.target_frame,
                     msg.header.frame_id,
@@ -235,11 +239,13 @@ class ObjectTracker(Node):
                     timeout=Duration(seconds=self.tf_timeout_sec),
                 )
             except Exception as latest_exc:
+                self.get_logger().info("5")
                 self.get_logger().warn(
                     f"TF lookup failed: stamped={stamped_exc}; latest={latest_exc}",
                     throttle_duration_sec=2.0,
                 )
                 return None
+            self.get_logger().info("6")
 
             self.get_logger().debug(
                 "Using latest TF for detection timestamp after stamped lookup failed: "
