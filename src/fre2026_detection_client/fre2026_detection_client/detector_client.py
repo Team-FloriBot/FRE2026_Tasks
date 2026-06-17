@@ -19,7 +19,7 @@ from ros2_detection_interfaces.srv import Init, Release, Start, Stop
 class DetectorInitConfig:
     model_path: str
     classes: Sequence[str] = field(default_factory=list)
-    confidence: float = 0.15
+    confidence: float = 0.1
     use_realsense_ros_wrapper: bool = False
     model_type: str = "yolo"
     use_decimation: bool = False
@@ -115,7 +115,7 @@ class DetectorClient:
         self,
         model_path: str,
         classes: Optional[Sequence[str]] = None,
-        confidence: float = 0.15,
+        confidence: float = 0.1,
         use_realsense_ros_wrapper: bool = False,
     ) -> Future:
         config = DetectorInitConfig(
