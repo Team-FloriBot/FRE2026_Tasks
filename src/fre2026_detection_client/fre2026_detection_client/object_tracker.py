@@ -49,7 +49,7 @@ class ObjectTracker(Node):
         self.declare_parameter("min_observations_for_publish", 2)
         self.declare_parameter("min_observations_for_label", 2)
         self.declare_parameter("unlabeled_timeout_sec", 10.0)
-        self.declare_parameter("tf_timeout_sec", 0.50)
+        self.declare_parameter("tf_timeout_sec", 1.0)
         self.declare_parameter("tf_lookup_offset_sec", 0.0)
         self.declare_parameter("publish_ground_z", True)
         self.declare_parameter("ground_z", 0.0)
