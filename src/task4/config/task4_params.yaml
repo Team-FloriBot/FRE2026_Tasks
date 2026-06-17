@@ -40,4 +40,5 @@ task4_brain:
     aim_target_topic: "/target_point"
     aim_target_frame: "pan_tilt_link_footprint"
     aim_target_interval_sec: 5.0
-    tf_timeout_sec: 0.5
+    tf_timeout_sec: 1.0
+    tf_lookup_offset_sec: 0.0
